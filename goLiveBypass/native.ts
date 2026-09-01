@@ -702,9 +702,13 @@ function userpluginSource() {
 }
 
 function rebuildUserplugin(projectRoot: string) {
-    const pnpm = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+    // O spawn direto de .cmd falha no Electron/Node no Windows. O mesmo comando
+    // funciona no terminal porque ele passa pelo cmd.exe; fazemos isso
+    // explicitamente aqui para o updater ter o mesmo comportamento.
+    const command = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "pnpm";
+    const args = process.platform === "win32" ? ["/d", "/s", "/c", "pnpm.cmd build"] : ["build"];
     try {
-        execFileSync(pnpm, ["build"], {
+        execFileSync(command, args, {
             cwd: projectRoot,
             stdio: "pipe",
             windowsHide: true,
