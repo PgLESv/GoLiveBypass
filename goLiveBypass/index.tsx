@@ -12,7 +12,13 @@ import { Logger } from "@utils/Logger";
 import { useAwaiter } from "@utils/react";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findStoreLazy } from "@webpack";
-import { Constants, MaskedLink, RestAPI, SearchableSelect, showToast, Toasts, UserStore } from "@webpack/common";
+import { Button, Constants, MaskedLink, React, RestAPI, SearchableSelect, showToast, Toasts, UserStore, useEffect, useState } from "@webpack/common";
+
+import {
+    evaluateStreamClaim,
+    initialStreamClaimState,
+    type StreamClaimState
+} from "./stability";
 
 const Native = VencordNative?.pluginHelpers?.GoLiveBypass as PluginNative<typeof import("./native")> | undefined;
 
@@ -58,6 +64,7 @@ const VIDEO_GUARD = "2026-08-video-guard";
 // O experimento so e reavaliado alguns ticks apos o CONNECTION_OPEN; perguntar na hora exata
 // respondia "bloqueado" mesmo em sessao ja liberada, e o plugin recarregava a toa.
 const VERDICT_DELAY_MS = 1500;
+const PLUGIN_VERSION = "1.1.12-beta.13";
 
 const AUTOMATIC = "";
 const VOICE_KEYS: "voiceRegion"[] = ["voiceRegion"];
@@ -65,6 +72,10 @@ const STREAM_KEYS: "streamRegion"[] = ["streamRegion"];
 
 let original: RegionStore | undefined;
 let lastScope: string | null = null;
+let streamClaimTimer: ReturnType<typeof setInterval> | null = null;
+let streamClaimState: StreamClaimState = initialStreamClaimState();
+let streamClaimStatus = "idle";
+let streamClaimProbeFailed = false;
 
 interface RegionSelectProps {
     value: string;
@@ -130,8 +141,64 @@ function StreamRegionPicker() {
 
 function AboutPlugin() {
     return (
+        <>
+            <PluginUpdateSettings />
+            <Paragraph>
+                Made by bezumiya. Source and issues on <MaskedLink href="https://github.com/bezumiya/GoLiveBypass">GitHub</MaskedLink>, and I post about it on <MaskedLink href="https://twitter.com/obezumiya">Twitter</MaskedLink>.
+            </Paragraph>
+        </>
+    );
+}
+
+function PluginUpdateSettings() {
+    const [state, setState] = useState<{ label: string; tone: "neutral" | "success" | "warning" }>({
+        label: `v${PLUGIN_VERSION} · instalada`, tone: "neutral"
+    });
+    const [busy, setBusy] = useState(false);
+
+    const check = async () => {
+        if (!Native || busy) return;
+        setBusy(true);
+        try {
+            const result = await Native.checkPluginUpdate();
+            if (!result.ok) {
+                setState({ label: `v${PLUGIN_VERSION} · não foi possível verificar`, tone: "neutral" });
+            } else if (result.available) {
+                setState({ label: `v${PLUGIN_VERSION} · v${result.latest} disponível`, tone: "warning" });
+            } else {
+                setState({ label: `v${PLUGIN_VERSION} · atualizada`, tone: "success" });
+            }
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    useEffect(() => { void check(); }, []);
+
+    const update = async () => {
+        if (!Native || busy) return;
+        setBusy(true);
+        try {
+            const result = await Native.updatePlugin();
+            if (result.updated) {
+                setState({ label: `v${result.latest} · atualizada`, tone: "success" });
+                showToast("GoLiveBypass atualizado. Recarregue o Discord para aplicar a nova versão.", Toasts.Type.SUCCESS);
+            } else {
+                setState({ label: `v${result.latest} · atualizada`, tone: "success" });
+            }
+        } catch (error) {
+            setState({ label: `v${PLUGIN_VERSION} · atualização falhou`, tone: "warning" });
+            showToast(`GoLiveBypass não conseguiu atualizar: ${error instanceof Error ? error.message : String(error)}`, Toasts.Type.FAILURE);
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    return (
         <Paragraph>
-            Made by bezumiya. Source and issues on <MaskedLink href="https://github.com/bezumiya/GoLiveBypass">GitHub</MaskedLink>, and I post about it on <MaskedLink href="https://twitter.com/obezumiya">Twitter</MaskedLink>.
+            <strong>{state.label}</strong>{" "}
+            <Button onClick={() => void check()} disabled={busy}>{busy ? "Verificando…" : "Verificar"}</Button>{" "}
+            {state.tone === "warning" && <Button onClick={() => void update()} disabled={busy}>Atualizar</Button>}
         </Paragraph>
     );
 }
@@ -344,6 +411,91 @@ function ask(store: object, method: string, ...args: unknown[]) {
     }
 }
 
+function readStore(store: object, method: string) {
+    const fn = (store as DiagnosticStore)[method];
+    if (typeof fn !== "function") return { known: false as const, value: null };
+
+    try {
+        return { known: true as const, value: (fn as () => unknown).call(store) };
+    } catch {
+        return { known: false as const, value: null };
+    }
+}
+
+function collectionCount(value: unknown): number | null {
+    if (Array.isArray(value)) return value.length;
+    if (value instanceof Set || value instanceof Map) return value.size;
+    if (value !== null && typeof value === "object") {
+        try {
+            return Object.keys(value).length;
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
+
+// Guarda especifica para o falso "transmitindo"/erro 2001 visto no fogo da
+// beta 13. Nao tenta inferir fps nem fechar sockets: as stores do renderer so
+// provam que a UI afirma uma Live e se a conexao nativa de stream chegou a
+// existir. Dado ausente falha fechado; a unica acao e um aviso manual.
+function pollStreamClaimOnce() {
+    const claimed = readStore(ApplicationStreamingStore, "getCurrentUserActiveStream");
+    const nativeKeys = readStore(StreamRTCConnectionStore, "getAllActiveStreamKeys");
+
+    const senderClaimed = !claimed.known || claimed.value === undefined
+        ? null
+        : claimed.value !== null;
+    const nativeStreamCount = nativeKeys.known ? collectionCount(nativeKeys.value) : null;
+    const decision = evaluateStreamClaim({
+        now: Date.now(), senderClaimed, nativeStreamCount
+    }, streamClaimState);
+
+    streamClaimState = decision.state;
+    const previousStatus = streamClaimStatus;
+    streamClaimStatus = decision.status;
+
+    if (decision.warn) {
+        record("stream.guard | UI afirma transmissao, mas nenhuma conexao nativa apareceu em 30s; possivel erro 2001, sem acao automatica");
+        showToast(
+            "GoLiveBypass: Discord says you're streaming, but no native Live connection appeared (possible error 2001). Stop the false Live, reload with Ctrl+R, then start it again.",
+            Toasts.Type.FAILURE
+        );
+    } else if (previousStatus.startsWith("failed") && decision.status === "healthy") {
+        record("stream.guard | conexao nativa apareceu depois do aviso; estado recuperado");
+    }
+}
+
+function pollStreamClaim() {
+    try {
+        pollStreamClaimOnce();
+        streamClaimProbeFailed = false;
+    } catch (error) {
+        // Watchdog e diagnostico: uma mudanca de store nunca pode derrubar o
+        // renderer. Registra uma vez e continua tentando nos proximos ciclos.
+        if (!streamClaimProbeFailed)
+            logger.error("Failed to inspect the native stream state", error);
+        streamClaimProbeFailed = true;
+    }
+}
+
+function startStreamClaimWatch() {
+    if (streamClaimTimer !== null) return;
+    streamClaimState = initialStreamClaimState();
+    streamClaimStatus = "idle";
+    streamClaimProbeFailed = false;
+    pollStreamClaim();
+    streamClaimTimer = setInterval(pollStreamClaim, 5_000);
+}
+
+function stopStreamClaimWatch() {
+    if (streamClaimTimer !== null) clearInterval(streamClaimTimer);
+    streamClaimTimer = null;
+    streamClaimState = initialStreamClaimState();
+    streamClaimStatus = "idle";
+    streamClaimProbeFailed = false;
+}
+
 async function buildReport() {
     const user = UserStore.getCurrentUser();
     const lines: string[] = ["GoLiveBypass, diagnostico"];
@@ -362,6 +514,7 @@ async function buildReport() {
     lines.push(`transmissoes visiveis    ${JSON.stringify(ask(ApplicationStreamingStore, "getAllActiveStreams"))}`);
     lines.push(`conexoes de midia        ${JSON.stringify(ask(StreamRTCConnectionStore, "getAllActiveStreamKeys"))}`);
     lines.push(`estado da call           ${ask(RTCConnectionStore, "getState")} em ${ask(RTCConnectionStore, "getHostname")}`);
+    lines.push(`guarda UI/conexao nativa ${streamClaimStatus}`);
 
     lines.push("", "== regiao ==");
     lines.push(`preferida  ${ask(RTCRegionStore, "getPreferredRegion")}`);
@@ -446,6 +599,16 @@ export default definePlugin({
 
     start() {
         forceRegion();
+        startStreamClaimWatch();
+
+        // O aviso aparece mesmo para quem nunca abre a aba de configuracao. Consulta uma vez
+        // por sessao; o botao da configuracao continua disponivel para uma consulta manual.
+        setTimeout(() => {
+            Native?.checkPluginUpdate().then(result => {
+                if (result.ok && result.available)
+                    showToast(`GoLiveBypass v${result.latest} disponível. Abra as configurações do plugin para atualizar.`, Toasts.Type.MESSAGE);
+            }).catch(() => { });
+        }, 8_000);
 
         // Cobre ativar o plugin com o Discord ja aberto: no boot o processo principal ja
         // chama isto sozinho, e la as duas chamadas dividem uma unica subida.
@@ -456,6 +619,7 @@ export default definePlugin({
     },
 
     stop() {
+        stopStreamClaimWatch();
         restoreRegion();
         Native?.shutdown().catch(error => logger.error("Failed to reach the desktop process", error));
     }

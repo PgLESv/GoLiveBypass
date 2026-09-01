@@ -6,11 +6,19 @@
 
 import { NativeSettings, RendererSettings } from "@main/settings";
 import { app, IpcMainInvokeEvent, session } from "electron";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { request } from "https";
 import { AddressInfo, connect, createServer, Server, Socket } from "net";
+import { execFileSync } from "child_process";
+import { createHash } from "crypto";
 import { dirname, join } from "path";
+import { tmpdir } from "os";
 import { connect as connectTls } from "tls";
+
+import {
+    isStrictManualTor,
+    shouldReplaceActiveExit
+} from "./stability";
 
 const FREE_PROXY_API = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=socks5&proxy_format=protocolipport&format=json&timeout=1500";
 const DISCORD_HOST = "discord.com";
@@ -77,6 +85,11 @@ const POOL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const HEARTBEAT_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 4000;
 
+// Proxy manual e uma escolha explicita, frequentemente com RTT maior que uma gratuita.
+// Quatro segundos confundiam latencia com morte e permitiam a troca do gateway na reentrada
+// da Live (#170/#171). A rota so sai depois de dois batimentos deste prazo mais largo.
+const MANUAL_HEARTBEAT_TIMEOUT_MS = 12_000;
+
 // Batimento contra uma saida Tor: mais largo pelo mesmo motivo do TOR_RELAY_TIMEOUT_MS (ver
 // comentario acima, perto de TOR_PORTS). Uma falha aqui e so INFORMATIVA -- ver checkPool --
 // nunca troca nem descarta a saida ativa; a morte real do daemon aparece no trafego vivo,
@@ -100,6 +113,11 @@ const MAX_LOG_LINES = 400;
 const MAX_LOG_BYTES = 256 * 1024;
 const MAX_RETRIES = 2;
 
+const GITHUB_RELEASES_URL = "https://api.github.com/repos/pdl-clay/GoLiveBypass/releases/latest";
+const PLUGIN_ASSET = "goLiveBypass-vencord.zip";
+const PLUGIN_UPDATE_TIMEOUT_MS = 30_000;
+const PLUGIN_VERSION = "1.1.12-beta.13";
+
 // Quanto uma conexao de gateway espera por uma saida antes de sair direta. Segurar para
 // sempre travaria o login; soltar na hora perderia a corrida em toda abertura fria. Se
 // estourar, perde-se o Go Live daquela sessao, nunca o Discord.
@@ -108,6 +126,7 @@ const STALL_BUDGET_MS = 12_000;
 // Menores que o teste de candidata: uma saida agonizante que demora a falhar no trafego vivo
 // faria o Chromium desistir do roteador inteiro.
 const RELAY_TUNNEL_TIMEOUT_MS = 2500;
+const MANUAL_RELAY_TUNNEL_TIMEOUT_MS = 12_000;
 const RELAY_DIRECT_TIMEOUT_MS = 8000;
 
 const INTERCEPTING_PORTS = new Set([4145]);
@@ -236,6 +255,11 @@ function manualProxy(): { proxy: string; } | "auto" | "invalid" {
 
     const trimmed = proxy.trim();
     return parseProxy(trimmed) === null ? "invalid" : { proxy: trimmed };
+}
+
+function strictManualTor(): string | null {
+    const manual = manualProxy();
+    return isStrictManualTor(manual, isTorProxy) ? manual.proxy : null;
 }
 
 function excludedCountries() {
@@ -546,6 +570,127 @@ function downloadText(url: string): Promise<string> {
     });
 }
 
+function downloadBytes(url: string): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const req = request(url, res => {
+            if (res.statusCode !== 200) {
+                res.resume();
+                reject(new Error(`HTTP ${res.statusCode ?? 0}`));
+                return;
+            }
+            const chunks: Buffer[] = [];
+            let size = 0;
+            res.on("data", (chunk: Buffer) => {
+                size += chunk.length;
+                if (size > 8 * 1024 * 1024) {
+                    res.destroy(new Error("update package too large"));
+                    return;
+                }
+                chunks.push(chunk);
+            });
+            res.on("end", () => resolve(Buffer.concat(chunks)));
+            res.on("error", reject);
+        });
+        req.setTimeout(PLUGIN_UPDATE_TIMEOUT_MS, () => req.destroy(new Error("update request timed out")));
+        req.on("error", reject);
+        req.end();
+    });
+}
+
+function updateVersion(value: string): string {
+    return value.trim().replace(/^v/i, "");
+}
+
+function compareUpdateVersion(local: string, remote: string): number {
+    const parse = (value: string) => updateVersion(value).split(/[.-]/).map(part => /^\d+$/.test(part) ? Number(part) : part);
+    const a = parse(local);
+    const b = parse(remote);
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const left = a[i] ?? 0;
+        const right = b[i] ?? 0;
+        if (left === right) continue;
+        if (typeof left === "number" && typeof right === "number") return left < right ? -1 : 1;
+        if (typeof left === "number") return 1;
+        if (typeof right === "number") return -1;
+        return String(left).localeCompare(String(right)) < 0 ? -1 : 1;
+    }
+    return 0;
+}
+
+function releaseInfo(): Promise<{ version: string; zipUrl: string; shaUrl: string; prerelease: boolean; }> {
+    return downloadText(GITHUB_RELEASES_URL).then(raw => {
+        const release = JSON.parse(raw) as {
+            tag_name?: unknown;
+            prerelease?: unknown;
+            draft?: unknown;
+            assets?: Array<{ name?: unknown; browser_download_url?: unknown; }>;
+        };
+        if (release.draft === true || release.prerelease === true || typeof release.tag_name !== "string")
+            throw new Error("no stable release available");
+        const asset = release.assets?.find(item => item.name === PLUGIN_ASSET && typeof item.browser_download_url === "string");
+        if (!asset || typeof asset.browser_download_url !== "string") throw new Error("release has no plugin asset");
+        return {
+            version: updateVersion(release.tag_name),
+            zipUrl: asset.browser_download_url,
+            shaUrl: `${asset.browser_download_url}.sha256`,
+            prerelease: false
+        };
+    });
+}
+
+export async function checkPluginUpdate(_: IpcMainInvokeEvent) {
+    try {
+        const release = await releaseInfo();
+        const comparison = compareUpdateVersion(PLUGIN_VERSION, release.version);
+        return { ok: true as const, current: PLUGIN_VERSION, latest: release.version, available: comparison < 0 };
+    } catch (error) {
+        return { ok: false as const, current: PLUGIN_VERSION, error: error instanceof Error ? error.message : String(error) };
+    }
+}
+
+export async function updatePlugin(_: IpcMainInvokeEvent) {
+    const release = await releaseInfo();
+    if (compareUpdateVersion(PLUGIN_VERSION, release.version) >= 0)
+        return { ok: true as const, updated: false as const, current: PLUGIN_VERSION, latest: release.version };
+
+    const [zip, checksumText] = await Promise.all([downloadBytes(release.zipUrl), downloadText(release.shaUrl)]);
+    const expected = /^([a-f0-9]{64})\b/i.exec(checksumText)?.[1]?.toLowerCase();
+    if (!expected) throw new Error("release has no valid SHA-256");
+    const actual = createHash("sha256").update(zip).digest("hex");
+    if (actual !== expected) throw new Error("plugin SHA-256 mismatch");
+
+    const work = mkdtempSync(join(tmpdir(), "golivebypass-update-"));
+    const archive = join(work, PLUGIN_ASSET);
+    const extracted = join(work, "extract");
+    writeFileSync(archive, zip);
+    mkdirSync(extracted);
+    try {
+        try {
+            execFileSync("unzip", ["-q", archive, "-d", extracted], { stdio: "ignore" });
+        } catch {
+            execFileSync("tar", ["-xf", archive, "-C", extracted], { stdio: "ignore" });
+        }
+        const source = join(extracted, "goLiveBypass");
+        const manifest = JSON.parse(readFileSync(join(source, "manifest.json"), "utf8")) as { name?: unknown; version?: unknown; };
+        if (manifest.name !== "GoLiveBypass" || typeof manifest.version !== "string" || updateVersion(manifest.version) !== release.version)
+            throw new Error("plugin manifest does not match release");
+
+        const target = __dirname;
+        const backup = `${target}.update-backup-${Date.now()}`;
+        renameSync(target, backup);
+        try {
+            renameSync(source, target);
+        } catch (error) {
+            renameSync(backup, target);
+            throw error;
+        }
+        log(`plugin atualizado de ${PLUGIN_VERSION} para ${release.version}; reload do Discord necessario`);
+        return { ok: true as const, updated: true as const, current: PLUGIN_VERSION, latest: release.version };
+    } finally {
+        rmSync(work, { recursive: true, force: true });
+    }
+}
+
 // ------------------------------------------------------------------ provar uma saida
 
 // O trace da Cloudflare prova que a saida chega na internet, nao que alcanca o Discord --
@@ -759,6 +904,7 @@ function sharedFreeExit(excluded: Set<string>, want: number) {
 let exit: string | null = null;
 let exitSettled = false;
 let waiting: ((value: string | null) => void)[] = [];
+const confirmedDeadManuals = new Set<string>();
 
 function settleExit(value: string | null) {
     exit = value;
@@ -838,6 +984,19 @@ async function pickExit(excluded: Set<string>) {
     }
 
     if (manual !== "auto") {
+        if (!isTorProxy(manual.proxy) && !confirmedDeadManuals.has(manual.proxy)) {
+            // Igual ao standalone, entra imediatamente para vencer a corrida do gateway.
+            // O batimento abaixo e quem valida a saude; um checkout curto aqui faria uma rota
+            // manual lenta cair em gratuitas e reconectar a Live do viewer sem necessidade.
+            log(`usando a saida manual configurada: ${safeProxy(manual.proxy)}`);
+            return settleExit(manual.proxy);
+        }
+
+        if (!isTorProxy(manual.proxy)) {
+            log(`proxy manual confirmado morto; procurando alternativa verificada: ${safeProxy(manual.proxy)}`);
+            return autoExit(excluded);
+        }
+
         // Sem testar, uma saida fora do ar viraria conexao direta dentro do roteador e o
         // bypass falharia em silencio, que foi exatamente o que aconteceu com o Tor fechado.
         // Tor configurado a mao ganha o mesmo checkout rapido (torReachable) do Tor
@@ -856,7 +1015,15 @@ async function pickExit(excluded: Set<string>) {
         }
 
         log(`seu proxy nao respondeu: ${safeProxy(manual.proxy)}`);
-        log("se for Tor, ele precisa estar aberto ANTES do Discord. Procurando alternativa.");
+        if (isTorProxy(manual.proxy)) {
+            // Um Tor local escrito explicitamente no campo e uma escolha de
+            // privacidade, nao uma sugestao. Igual ao routeMode=tor do
+            // standalone/GUI: sem daemon/circuito, o gateway falha fechado e o
+            // heartbeat tenta o mesmo Tor novamente; nunca gratuita ou DIRECT.
+            log("Tor manual indisponivel: modo estrito preservado, sem proxy gratuita ou saida direta");
+            return settleExit(null);
+        }
+        log("proxy manual indisponivel; procurando alternativa verificada");
     }
 
     return autoExit(excluded);
@@ -951,6 +1118,23 @@ async function beat() {
 // mais uma conexao simultanea numa saida que talvez nao aceite duas.
 async function checkPool() {
     const active = exit;
+    const strictTor = strictManualTor();
+
+    // O campo aponta explicitamente para um Tor local: preserve exatamente
+    // essa saida. Se a setting mudou enquanto o Discord estava aberto, uma
+    // saida gratuita anterior deixa de valer imediatamente; so o Tor
+    // configurado pode ser reinstalado quando voltar a responder.
+    if (strictTor !== null && active !== strictTor) {
+        if (active !== null) settleExit(null);
+        const ok = await torReachable(strictTor, TOR_HEARTBEAT_TIMEOUT_MS);
+        if (ok) {
+            settleExit(strictTor);
+            log(`Tor manual voltou a responder: ${safeProxy(strictTor)}`);
+        } else {
+            log(`Tor manual (${safeProxy(strictTor)}) ainda indisponivel -- mantendo gateway fechado`);
+        }
+        return;
+    }
 
     // Saida Tor: o batimento e so INFORMATIVO -- nunca troca nem descarta (ver comentario de
     // TOR_HEARTBEAT_TIMEOUT_MS). Sem esta excecao, uma falha de probe durante a construcao de
@@ -970,15 +1154,23 @@ async function checkPool() {
 
     // A ativa entra na rodada mesmo estando fora do pote: proxy do campo e Tor local nunca sao
     // guardados, e sao exatamente os que a pessoa mais sente quando caem.
+    const manual = manualProxy();
+    const configuredManual = manual !== "auto" && manual !== "invalid" && !isTorProxy(manual.proxy)
+        ? manual.proxy
+        : null;
     const targets = [...new Set([...(active === null ? [] : [active]), ...stored.map(entry => entry.proxy)])];
     if (targets.length === 0) return huntReserves(0);
 
-    const beats = await Promise.all(targets.map(async proxy => ({ proxy, ok: await reachesGateway(proxy, HEARTBEAT_TIMEOUT_MS) })));
+    const beats = await Promise.all(targets.map(async proxy => ({
+        proxy,
+        ok: await reachesGateway(proxy, proxy === configuredManual ? MANUAL_HEARTBEAT_TIMEOUT_MS : HEARTBEAT_TIMEOUT_MS)
+    })));
 
     const dead = new Set<string>();
     for (const { proxy, ok } of beats) {
         if (ok) {
             missed.delete(proxy);
+            confirmedDeadManuals.delete(proxy);
             continue;
         }
 
@@ -986,6 +1178,8 @@ async function checkPool() {
         missed.set(proxy, count);
         if (count >= MAX_MISSED_BEATS) dead.add(proxy);
     }
+
+    const activeMissedBeats = active === null ? 0 : (missed.get(active) ?? 0);
 
     if (dead.size > 0) {
         const survivors = stored.filter(entry => !dead.has(entry.proxy));
@@ -999,13 +1193,20 @@ async function checkPool() {
 
     const live = beats.filter(entry => entry.ok).map(entry => entry.proxy);
 
-    // A ativa e trocada no primeiro erro, nao no segundo: trocar nao custa nada -- socket que ja
-    // esta de pe continua no tunel antigo, so conexao nova nasce pela reserva -- e a proxima
-    // conexao do gateway pode ser a reconexao que decide a transmissao.
-    if (active !== null && !live.includes(active)) {
+    // Nenhuma ativa e trocada no primeiro erro. Na reentrada de uma Live, uma reconexao
+    // desnecessaria do gateway pode deixar o motor WASM de video preso em so-audio (issues
+    // #170/#171), entao gratuita e manual usam a mesma confirmacao de morte: dois batimentos.
+    const replaceActive = shouldReplaceActiveExit({
+        failed: active !== null && !live.includes(active),
+        missedBeats: activeMissedBeats,
+        maxMissedBeats: MAX_MISSED_BEATS
+    });
+
+    if (active !== null && replaceActive) {
         const reserve = live.find(proxy => proxy !== active);
         if (reserve === undefined) {
             log(`${safeProxy(active)} perdeu o batimento e nao ha reserva viva`);
+            if (active === configuredManual) confirmedDeadManuals.add(active);
             dropExit(active);
         } else {
             log(`${safeProxy(active)} perdeu o batimento, assumindo a reserva ${safeProxy(reserve)}`);
@@ -1019,6 +1220,7 @@ async function checkPool() {
 // A busca cara nunca acontece dentro do batimento: ela e solta em segundo plano e o pote so
 // muda quando ela volta, entao um batimento continua custando o mesmo com o pote vazio.
 function huntReserves(liveReserves: number) {
+    if (strictManualTor() !== null) return;
     if (liveReserves >= MIN_LIVE_RESERVES) return;
     if (Date.now() - lastHunt < HUNT_COOLDOWN_MS) return;
 
@@ -1139,6 +1341,18 @@ async function serveRequest(client: Socket, request: Buffer | null) {
 
     const through = await currentExit();
     if (client.destroyed) return;
+    const strictTor = strictManualTor();
+    const manual = manualProxy();
+    const activeManual = manual !== "auto" && manual !== "invalid" &&
+        !isTorProxy(manual.proxy) && through === manual.proxy &&
+        !confirmedDeadManuals.has(manual.proxy);
+
+    // Setting alterada em runtime ou Tor ainda no bootstrap: uma saida antiga
+    // nunca pode atravessar a escolha explicita do usuario.
+    if (strictTor !== null && through !== strictTor) {
+        log(`gateway aguardando o Tor manual ${safeProxy(strictTor)}; sem fallback`);
+        return client.destroy();
+    }
 
     // Login (autenticacao) falha fechado -- diferente do gateway, onde cair para direto e
     // proposital. Vazar o IP real no login seria o oposto do que a setting promete.
@@ -1149,14 +1363,16 @@ async function serveRequest(client: Socket, request: Buffer | null) {
         // Saida Tor ganha prazo bem mais largo (rotacao de circuito, ver TOR_RELAY_TIMEOUT_MS)
         // -- so na tentativa pela ATIVA. As reservas abaixo nunca sao Tor (ele nunca entra no
         // pote persistente), entao continuam no prazo curto de sempre.
-        const prazoAtiva = isTorProxy(through) ? TOR_RELAY_TIMEOUT_MS : RELAY_TUNNEL_TIMEOUT_MS;
+        const prazoAtiva = isTorProxy(through)
+            ? TOR_RELAY_TIMEOUT_MS
+            : activeManual ? MANUAL_RELAY_TUNNEL_TIMEOUT_MS : RELAY_TUNNEL_TIMEOUT_MS;
         upstream = await openTunnel(through, target.host, target.port, prazoAtiva);
 
         // Trocar para uma reserva ja testada custa uma conexao; esperar a proxima abertura do
         // Discord custa a sessao inteira sem bypass. As reservas correm juntas em vez de uma
         // por vez: com 2,5s de prazo cada, a fila somava mais de dez segundos com o gateway
         // reconectando, tempo de sobra para o Chromium desistir do roteador.
-        if (upstream === null) {
+        if (upstream === null && strictTor === null && !activeManual) {
             const won = await firstTunnel(
                 readPool().map(entry => entry.proxy).filter(proxy => proxy !== through),
                 target.host, target.port, RELAY_TUNNEL_TIMEOUT_MS
@@ -1171,12 +1387,27 @@ async function serveRequest(client: Socket, request: Buffer | null) {
             }
         }
 
+        if (upstream === null && strictTor !== null) {
+            log(`Tor manual nao completou o tunel em ${Math.round(TOR_RELAY_TIMEOUT_MS / 1000)}s; gateway fechado, sem fallback`);
+            return client.destroy();
+        }
+
+        // Uma unica abertura falha nao troca a rota manual nem vaza em DIRECT. O batimento
+        // com prazo largo conta duas falhas antes de dropExit liberar uma alternativa; trocar
+        // antes disso era a reconexao que congelava o video ao voltar a assistir (#170/#171).
+        if (upstream === null && activeManual) {
+            log(`saida manual falhou no trafego vivo; mantendo ate ${MAX_MISSED_BEATS} batimentos confirmarem morte`);
+            return client.destroy();
+        }
+
         if (upstream === null) {
             dropExit(through);
             upstream = isLoginHost ? null : await openDirect(target.host, target.port, RELAY_DIRECT_TIMEOUT_MS);
         }
     } else {
-        upstream = isLoginHost ? null : await openDirect(target.host, target.port, RELAY_DIRECT_TIMEOUT_MS);
+        upstream = isLoginHost || strictTor !== null
+            ? null
+            : await openDirect(target.host, target.port, RELAY_DIRECT_TIMEOUT_MS);
     }
 
     if (upstream === null) return client.destroy();
