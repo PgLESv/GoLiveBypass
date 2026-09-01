@@ -130,7 +130,7 @@ test("plugin mostra versao e oferece verificacao na configuracao", () => {
 test("plugin atualiza somente no processo nativo com checksum e backup", () => {
     assert.match(pluginNative, /GITHUB_RELEASES_URL/);
     assert.match(pluginNative, /createHash\("sha256"\)/);
-    assert.match(pluginNative, /update-backup-/);
+    assert.match(pluginNative, /\.golivebypass-update-backups/);
     assert.match(pluginNative, /export async function updatePlugin/);
 });
 
@@ -138,6 +138,7 @@ test("updater do plugin nunca substitui o bundle dist do Vencord/Equicord", () =
     assert.match(pluginNative, /function userpluginSource\(\)/);
     assert.match(pluginNative, /src", "userplugins", USERPLUGIN_DIR/);
     assert.match(pluginNative, /rebuildUserplugin\(projectRoot\)/);
+    assert.match(pluginNative, /\.golivebypass-update-backups/);
     assert.doesNotMatch(pluginNative, /const target = __dirname;/);
 });
 

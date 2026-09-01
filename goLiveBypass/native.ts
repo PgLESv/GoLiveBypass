@@ -749,7 +749,12 @@ export async function updatePlugin(_: IpcMainInvokeEvent) {
             throw new Error("plugin manifest does not match release");
 
         const { projectRoot, target } = userpluginSource();
-        const backup = join(dirname(target), `.${USERPLUGIN_DIR}.update-backup-${Date.now()}`);
+        // O gerador de plugins varre todos os diretórios em src/userplugins,
+        // inclusive os iniciados por ponto. Backup ali duplica o plugin no build.
+        // Mantemos a cópia recuperável fora da árvore que o Vencord/Equicord compila.
+        const backupRoot = join(projectRoot, ".golivebypass-update-backups");
+        mkdirSync(backupRoot, { recursive: true });
+        const backup = join(backupRoot, `${USERPLUGIN_DIR}-${Date.now()}`);
         renameSync(target, backup);
         try {
             renameSync(source, target);
