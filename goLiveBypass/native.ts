@@ -705,8 +705,12 @@ function rebuildUserplugin(projectRoot: string) {
     // O spawn direto de .cmd falha no Electron/Node no Windows. O mesmo comando
     // funciona no terminal porque ele passa pelo cmd.exe; fazemos isso
     // explicitamente aqui para o updater ter o mesmo comportamento.
-    const command = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "pnpm";
-    const args = process.platform === "win32" ? ["/d", "/s", "/c", "pnpm.cmd build"] : ["build"];
+    // Nao dependemos do PATH que o processo Electron herdou: em algumas
+    // instalações ele não inclui System32, embora o cmd.exe exista normalmente.
+    // `call` também faz o cmd aguardar o pnpm.cmd e repassar seu exit code.
+    const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+    const command = process.platform === "win32" ? join(windowsRoot, "System32", "cmd.exe") : "pnpm";
+    const args = process.platform === "win32" ? ["/d", "/s", "/c", "call pnpm.cmd build"] : ["build"];
     try {
         execFileSync(command, args, {
             cwd: projectRoot,
@@ -716,9 +720,10 @@ function rebuildUserplugin(projectRoot: string) {
         });
     } catch (error) {
         const failure = error as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string; };
-        const detail = [failure.stderr, failure.stdout]
+        const detail = [failure.message, failure.stderr, failure.stdout]
             .filter(Boolean)
             .map(value => String(value).trim())
+            .filter((value, index, values) => values.indexOf(value) === index)
             .join("\n")
             .slice(-1200);
         throw new Error(`nao consegui recompilar o plugin${detail ? `: ${detail}` : ""}`);

@@ -143,8 +143,9 @@ test("updater do plugin nunca substitui o bundle dist do Vencord/Equicord", () =
 });
 
 test("updater recompila pelo cmd.exe no Windows", () => {
-    assert.match(pluginNative, /process\.env\.ComSpec/);
-    assert.match(pluginNative, /"pnpm\.cmd build"/);
+    assert.match(pluginNative, /System32", "cmd\.exe"/);
+    assert.match(pluginNative, /"call pnpm\.cmd build"/);
+    assert.match(pluginNative, /failure\.message/);
 });
 
 test("TUI do plugin separa verificar de atualizar", () => {
