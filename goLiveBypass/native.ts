@@ -530,9 +530,23 @@ function listening(port: number, timeoutMs: number): Promise<boolean> {
     });
 }
 
-function downloadText(url: string): Promise<string> {
+function downloadText(url: string, redirects = 0): Promise<string> {
     return new Promise((resolve, reject) => {
-        const req = request(url, res => {
+        const req = request(url, {
+            headers: {
+                "User-Agent": "GoLiveBypass-updater/1.0",
+                Accept: "application/vnd.github+json"
+            }
+        }, res => {
+            if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                res.resume();
+                if (redirects >= 4) {
+                    reject(new Error("too many update redirects"));
+                    return;
+                }
+                downloadText(res.headers.location, redirects + 1).then(resolve, reject);
+                return;
+            }
             if (res.statusCode !== 200) {
                 res.resume();
                 reject(new Error("Unexpected response status"));
@@ -570,9 +584,20 @@ function downloadText(url: string): Promise<string> {
     });
 }
 
-function downloadBytes(url: string): Promise<Buffer> {
+function downloadBytes(url: string, redirects = 0): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-        const req = request(url, res => {
+        const req = request(url, {
+            headers: { "User-Agent": "GoLiveBypass-updater/1.0" }
+        }, res => {
+            if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                res.resume();
+                if (redirects >= 4) {
+                    reject(new Error("too many update redirects"));
+                    return;
+                }
+                downloadBytes(res.headers.location, redirects + 1).then(resolve, reject);
+                return;
+            }
             if (res.statusCode !== 200) {
                 res.resume();
                 reject(new Error(`HTTP ${res.statusCode ?? 0}`));
