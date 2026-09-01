@@ -705,17 +705,18 @@ function rebuildUserplugin(projectRoot: string) {
     // O spawn direto de .cmd falha no Electron/Node no Windows. O mesmo comando
     // funciona no terminal porque ele passa pelo cmd.exe; fazemos isso
     // explicitamente aqui para o updater ter o mesmo comportamento.
-    // Nao dependemos do PATH que o processo Electron herdou: em algumas
-    // instalações ele não inclui System32, embora o cmd.exe exista normalmente.
-    // `call` também faz o cmd aguardar o pnpm.cmd e repassar seu exit code.
-    const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
-    const command = process.platform === "win32" ? join(windowsRoot, "System32", "cmd.exe") : "pnpm";
-    const args = process.platform === "win32" ? ["/d", "/s", "/c", "call pnpm.cmd build"] : ["build"];
+    // No Windows, .cmd deve ser executado pelo shell (sem isso o Electron pode
+    // criar o processo, mas não aguardar corretamente o batch do pnpm). Esta é
+    // a forma suportada pelo Node para arquivos .cmd/.bat.
+    const windows = process.platform === "win32";
+    const command = windows ? "pnpm.cmd" : "pnpm";
+    const args = windows ? ["build"] : ["build"];
     try {
         execFileSync(command, args, {
             cwd: projectRoot,
             stdio: "pipe",
             windowsHide: true,
+            shell: windows,
             timeout: USERPLUGIN_BUILD_TIMEOUT_MS
         });
     } catch (error) {
