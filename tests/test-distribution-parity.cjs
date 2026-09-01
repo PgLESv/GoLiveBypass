@@ -146,6 +146,7 @@ test("updater recompila pelo cmd.exe no Windows", () => {
     assert.match(pluginNative, /const command = windows \? "pnpm\.cmd" : "pnpm"/);
     assert.match(pluginNative, /shell: windows/);
     assert.match(pluginNative, /failure\.message/);
+    assert.match(pluginNative, /falha ao recompilar userplugin/);
 });
 
 test("TUI do plugin separa verificar de atualizar", () => {

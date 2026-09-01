@@ -721,12 +721,13 @@ function rebuildUserplugin(projectRoot: string) {
         });
     } catch (error) {
         const failure = error as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string; };
-        const detail = [failure.message, failure.stderr, failure.stdout]
+        const detail = [String(error), failure.message, failure.stderr, failure.stdout]
             .filter(Boolean)
             .map(value => String(value).trim())
             .filter((value, index, values) => values.indexOf(value) === index)
             .join("\n")
             .slice(-1200);
+        log(`falha ao recompilar userplugin: ${detail || "erro sem detalhes"}`);
         throw new Error(`nao consegui recompilar o plugin${detail ? `: ${detail}` : ""}`);
     }
 }
