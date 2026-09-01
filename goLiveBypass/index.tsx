@@ -162,7 +162,8 @@ function PluginUpdateSettings() {
         try {
             const result = await Native.checkPluginUpdate();
             if (!result.ok) {
-                setState({ label: `v${PLUGIN_VERSION} · não foi possível verificar`, tone: "neutral" });
+                const detail = result.error ? ` · ${result.error.slice(0, 48)}` : "";
+                setState({ label: `v${PLUGIN_VERSION} · verificação falhou${detail}`, tone: "neutral" });
             } else if (result.available) {
                 setState({ label: `v${PLUGIN_VERSION} · v${result.latest} disponível`, tone: "warning" });
             } else {
