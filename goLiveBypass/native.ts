@@ -11,7 +11,7 @@ import { request } from "https";
 import { AddressInfo, connect, createServer, Server, Socket } from "net";
 import { execFileSync } from "child_process";
 import { createHash } from "crypto";
-import { dirname, join } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { tmpdir } from "os";
 import { connect as connectTls } from "tls";
 
@@ -673,6 +673,54 @@ export async function checkPluginUpdate(_: IpcMainInvokeEvent) {
     }
 }
 
+const USERPLUGIN_DIR = "goLiveBypass";
+const USERPLUGIN_BUILD_TIMEOUT_MS = 120_000;
+
+/**
+ * O native.ts nao e executado dentro de src/userplugins: depois do build ele vira
+ * parte de dist/desktop. Usar __dirname como destino da atualizacao parecia
+ * conveniente, mas sobrescreve o bundle inteiro do Vencord/Equicord e impede o
+ * Discord de abrir na proxima reinicializacao. A unica fonte que pode ser
+ * atualizada e o userplugin de onde aquele bundle foi construido.
+ */
+function userpluginSource() {
+    const runtimeDir = resolve(__dirname);
+    if (basename(runtimeDir) !== "desktop" || basename(dirname(runtimeDir)) !== "dist")
+        throw new Error("nao foi possivel localizar o build do Vencord/Equicord para atualizar com seguranca");
+
+    const projectRoot = dirname(dirname(runtimeDir));
+    const target = join(projectRoot, "src", "userplugins", USERPLUGIN_DIR);
+    const manifestPath = join(target, "manifest.json");
+    if (!existsSync(manifestPath))
+        throw new Error("nao achei src/userplugins/goLiveBypass; atualize pelo instalador do projeto");
+
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { name?: unknown; };
+    if (manifest.name !== "GoLiveBypass")
+        throw new Error("o destino do updater nao e o userplugin GoLiveBypass");
+
+    return { projectRoot, target };
+}
+
+function rebuildUserplugin(projectRoot: string) {
+    const pnpm = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+    try {
+        execFileSync(pnpm, ["build"], {
+            cwd: projectRoot,
+            stdio: "pipe",
+            windowsHide: true,
+            timeout: USERPLUGIN_BUILD_TIMEOUT_MS
+        });
+    } catch (error) {
+        const failure = error as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string; };
+        const detail = [failure.stderr, failure.stdout]
+            .filter(Boolean)
+            .map(value => String(value).trim())
+            .join("\n")
+            .slice(-1200);
+        throw new Error(`nao consegui recompilar o plugin${detail ? `: ${detail}` : ""}`);
+    }
+}
+
 export async function updatePlugin(_: IpcMainInvokeEvent) {
     const release = await releaseInfo();
     if (compareUpdateVersion(PLUGIN_VERSION, release.version) >= 0)
@@ -700,16 +748,23 @@ export async function updatePlugin(_: IpcMainInvokeEvent) {
         if (manifest.name !== "GoLiveBypass" || typeof manifest.version !== "string" || updateVersion(manifest.version) !== release.version)
             throw new Error("plugin manifest does not match release");
 
-        const target = __dirname;
-        const backup = `${target}.update-backup-${Date.now()}`;
+        const { projectRoot, target } = userpluginSource();
+        const backup = join(dirname(target), `.${USERPLUGIN_DIR}.update-backup-${Date.now()}`);
         renameSync(target, backup);
         try {
             renameSync(source, target);
+            rebuildUserplugin(projectRoot);
         } catch (error) {
+            rmSync(target, { recursive: true, force: true });
             renameSync(backup, target);
+            try {
+                rebuildUserplugin(projectRoot);
+            } catch (rollbackError) {
+                log(`falha ao restaurar o build anterior: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+            }
             throw error;
         }
-        log(`plugin atualizado de ${PLUGIN_VERSION} para ${release.version}; reload do Discord necessario`);
+        log(`plugin atualizado de ${PLUGIN_VERSION} para ${release.version}; build recompilado, reload do Discord necessario`);
         return { ok: true as const, updated: true as const, current: PLUGIN_VERSION, latest: release.version };
     } finally {
         rmSync(work, { recursive: true, force: true });
