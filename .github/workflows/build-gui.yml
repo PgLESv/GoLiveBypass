@@ -1,10 +1,8 @@
 name: build-gui
 
 # Manual de proposito: roda quando a gente dispara para uma tag de release, constroi os
-# tres artefatos da GUI (exe Windows, AppImage Linux, dmg/zip macOS) e publica na release
-# com o metadata do auto-update (latest*.yml). O electron-builder publica direto na
-# release do GitHub — o app consulta a mesma release para se atualizar sozinho.
-# Mac e Linux nao compilam no Windows, entao eles nascem aqui.
+# artefatos da GUI (exe Windows, AppImage Linux, dmg/zip macOS), os assets standalone/plugin,
+# gera os checksums consolidados e publica tudo de forma confiavel via GitHub Release API.
 on:
   workflow_dispatch:
     inputs:
@@ -31,22 +29,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
       - run: npm ci
         working-directory: golive-gui
-      # --publish always: gera o GoLiveBypass.exe + latest.yml e faz upload na release
-      # (o GH_TOKEN do workflow vira o GH_TOKEN que o electron-builder usa).
-      # No canal beta o override -c.publish.releaseType=prerelease publica a release
-      # como PRERELEASE — nunca vira "latest" (regra §9).
-      - run: npm run publish:win
-        if: ${{ inputs.canal != 'beta' }}
+      - name: Build Windows Executable
+        run: npm run build:win
         working-directory: golive-gui
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: npm run publish:win -- -c.publish.releaseType=prerelease
-        if: ${{ inputs.canal == 'beta' }}
-        working-directory: golive-gui
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: golive-gui/dist-app/GoLiveBypass-*.exe
+          if-no-files-found: error
 
   linux:
     runs-on: ubuntu-latest
@@ -57,27 +53,53 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
       - run: npm ci
         working-directory: golive-gui
-      # No canal beta publica AppImage + beta.yml (electron-updater com
-      # allowPrerelease consome o canal beta.yml que o electron-builder gera
-      # sozinho para versao com sufixo de prerelease).
-      - run: npm run publish:linux
-        if: ${{ inputs.canal != 'beta' }}
+      - name: Build Linux AppImage
+        run: npm run build:linux
         working-directory: golive-gui
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: npm run publish:linux -- -c.publish.releaseType=prerelease
-        if: ${{ inputs.canal == 'beta' }}
+      - name: Ensure Linux Update Metadata
         working-directory: golive-gui
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f "dist-app/latest-linux.yml" ]; then
+            node -e '
+              const fs = require("fs");
+              const crypto = require("crypto");
+              const path = require("path");
+              const file = fs.readdirSync("dist-app").find(f => f.endsWith(".AppImage"));
+              if (!file) {
+                console.error("AppImage not found in dist-app");
+                process.exit(1);
+              }
+              const fullPath = path.join("dist-app", file);
+              const stat = fs.statSync(fullPath);
+              const buf = fs.readFileSync(fullPath);
+              const hash = crypto.createHash("sha512").update(buf).digest("base64");
+              const version = "${{ inputs.tag }}".replace(/^v/, "");
+              const yml = `version: ${version}\nfiles:\n  - url: ${file}\n    sha512: ${hash}\n    size: ${stat.size}\npath: ${file}\nsha512: ${hash}\nreleaseDate: "${new Date().toISOString()}"\n`;
+              fs.writeFileSync("dist-app/latest-linux.yml", yml);
+              console.log("Generated dist-app/latest-linux.yml successfully");
+            '
+          fi
+          if [ "${{ inputs.canal }}" = "beta" ]; then
+            cp dist-app/latest-linux.yml dist-app/beta-linux.yml
+          fi
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: |
+            golive-gui/dist-app/GoLiveBypass-*.AppImage
+            golive-gui/dist-app/*-linux.yml
+          if-no-files-found: error
 
   macos:
-    # No canal beta o mac pula: o updater dele ja esta desligado no codigo (app
-    # nao assinado) — nao ha o que testar lá, e buildar sem consumidor e ruido.
     if: ${{ inputs.canal != 'beta' }}
     runs-on: macos-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,59 +107,53 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
       - run: npm ci
         working-directory: golive-gui
-      # Com CSC_LINK/CSC_KEY_PASSWORD o electron-builder assina o app; sem eles, builda
-      # sem assinatura (auto-update do Mac so funciona com app assinado).
-      - run: npm run publish:mac
+      - name: Build macOS GUI
+        run: npm run build:mac
         working-directory: golive-gui
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-
+      - name: Upload macOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            golive-gui/dist-app/*.dmg
+            golive-gui/dist-app/*.zip
+          if-no-files-found: ignore
 
   release-assets:
-    # Sobe os assets de update que NAO dependem do electron-builder: o zip do
-    # userplugin Vencord e o bypass standalone "puro". Roda em paralelo com os
-    # builds da GUI (sao independentes). No canal beta pula: plugin/CLI nao estao
-    # no ciclo de teste da GUI, e um goLiveBypass-vencord.zip beta numa prerelease
-    # poderia ser pego pelo updater do plugin.
     if: ${{ inputs.canal != 'beta' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: "${{ inputs.tag }}"
+          ref: ${{ inputs.tag }}
 
       - name: Determinar versao da tag
         id: version
         env:
-          # GITHUB_REF_NAME no workflow_dispatch e a BRANCH de disparo (ex.: main),
-          # nao a tag. O nome dos assets tem que sair do input, senao o bypass puro
-          # vai para a release como "GoLiveBypass-main-bypass.js".
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          # Semver: v1.2.3 -> 1.2.3
           echo "version=${RELEASE_TAG#v}" >> $GITHUB_OUTPUT
-          echo "tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
-          # Bypass standalone tem versao no nome (download manual, sem auto-update).
           echo "bypass_basename=GoLiveBypass-${RELEASE_TAG#v}-bypass" >> $GITHUB_OUTPUT
-          # Userplugin tem nome fixo (igual ao assetName do manifest.json) para que o
-          # Vencord sempre baixe o asset mais recente independente da tag.
           echo "vencord_basename=goLiveBypass-vencord" >> $GITHUB_OUTPUT
 
       - name: Zip do userplugin Vencord (Onda 2 do auto-update)
         run: |
           cd goLiveBypass
-          # Garante que o manifest tem a versao da tag (CI e a fonte da verdade).
           sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${{ steps.version.outputs.version }}\"/" manifest.json
           cd ..
           zip -r "${{ steps.version.outputs.vencord_basename }}.zip" goLiveBypass/
 
-      - name: Bypass standalone "puro" (para distribuicao manual)
+      - name: Bypass standalone puro
         run: |
           cp standalone/golivebypass.js "${{ steps.version.outputs.bypass_basename }}.js"
 
@@ -146,33 +162,65 @@ jobs:
           sha256sum "${{ steps.version.outputs.vencord_basename }}.zip" > "${{ steps.version.outputs.vencord_basename }}.zip.sha256"
           sha256sum "${{ steps.version.outputs.bypass_basename }}.js" > "${{ steps.version.outputs.bypass_basename }}.js.sha256"
 
-      - name: Upload dos assets para a release
-        uses: softprops/action-gh-release@v2
+      - name: Upload Release Assets Artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: "${{ inputs.tag }}"
-          files: |
+          name: dist-assets
+          path: |
             ${{ steps.version.outputs.vencord_basename }}.zip
             ${{ steps.version.outputs.vencord_basename }}.zip.sha256
             ${{ steps.version.outputs.bypass_basename }}.js
             ${{ steps.version.outputs.bypass_basename }}.js.sha256
-          fail_on_unmatched_files: true
+          if-no-files-found: error
 
-  beta-marcar:
-    # Garantia dupla do canal beta (§9): marca a release como PRERELEASE mesmo que
-    # o override do electron-builder falhe (prerelease NUNCA vira "latest" — o
-    # usuario estavel nem fica sabendo) e escreve a linha do canal na nota, que e
-    # o que o testador le ao abrir a release.
-    if: ${{ inputs.canal == 'beta' }}
+  publish-release:
     runs-on: ubuntu-latest
-    needs: [windows, linux]
+    needs: [windows, linux, macos, release-assets]
+    if: always() && !cancelled() && needs.windows.result == 'success' && needs.linux.result == 'success'
     steps:
-      - name: Marcar prerelease e escrever a linha do canal
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Criar pasta dos artefatos
+        run: mkdir -p release-artifacts
+
+      - name: Baixar todos os artefatos compilados
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Gerar checksum consolidado sha256.txt
         run: |
-          gh release edit "${{ inputs.tag }}" \
-            --repo ${{ github.repository }} \
-            --prerelease \
-            --draft=false \
-            --title "GoLiveBypass ${{ inputs.tag }}" \
-            --notes "**Canal: beta** — versão de teste para quem optou em \"Participar dos testes\" nas configurações da GUI (Windows e Linux). Não é oferecida a quem usa o canal estável. Encontrou algo estranho? Use o botão Reportar bug do app — o relato vai com os logs completos."
+          cd release-artifacts
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
+          sha256sum GoLiveBypass-*.exe GoLiveBypass-*.AppImage *-linux.yml > "golivebypass-${VERSION}-sha256.txt" || true
+          ls -la
+
+      - name: Publicar Release no GitHub (Beta)
+        if: ${{ inputs.canal == 'beta' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: "GoLiveBypass ${{ inputs.tag }}"
+          prerelease: true
+          draft: false
+          body: "**Canal: beta** — versão de teste para quem optou em \"Participar dos testes\" nas configurações da GUI (Windows e Linux). Não é oferecida a quem usa o canal estável. Encontrou algo estranho? Use o botão Reportar bug do app — o relato vai com os logs completos."
+          files: release-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar Release no GitHub (Stable)
+        if: ${{ inputs.canal != 'beta' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: "GoLiveBypass ${{ inputs.tag }}"
+          prerelease: false
+          draft: false
+          generate_release_notes: true
+          files: release-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
