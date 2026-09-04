@@ -134,7 +134,15 @@ export function getProtonSessionFile(installDir: string): string {
 export async function checkProtonSession(
   installDir: string,
   username: string
-): Promise<{ valid: boolean; username?: string; expiresIn?: string; error?: string }> {
+): Promise<{
+  valid: boolean;
+  username?: string;
+  expiresIn?: string;
+  tier?: number;
+  planTitle?: string;
+  isPaid?: boolean;
+  error?: string;
+}> {
   if (!username) {
     return { valid: false, error: 'Usuário não especificado.' };
   }
@@ -157,6 +165,9 @@ export async function checkProtonSession(
       valid: true,
       username: res.json.username || username,
       expiresIn: res.json.expiresIn,
+      tier: res.json.tier,
+      planTitle: res.json.planTitle,
+      isPaid: res.json.isPaid,
     };
   }
 
@@ -171,7 +182,13 @@ export async function loginProton(
   username: string,
   password?: string,
   twoFactorCode?: string
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{
+  success: boolean;
+  tier?: number;
+  planTitle?: string;
+  isPaid?: boolean;
+  error?: string;
+}> {
   const sessionFile = getProtonSessionFile(installDir);
   const args = [
     '-username',
@@ -193,8 +210,13 @@ export async function loginProton(
   const res = await runConfgen({ args, timeoutMs: 25000 });
 
   if (res.json && res.json.success) {
-    logger.info('proton', 'autenticação bem-sucedida');
-    return { success: true };
+    logger.info('proton', 'autenticação bem-sucedida', { planTitle: res.json.planTitle, tier: res.json.tier });
+    return {
+      success: true,
+      tier: res.json.tier,
+      planTitle: res.json.planTitle,
+      isPaid: res.json.isPaid,
+    };
   }
 
   const errorMsg = res.json?.error || res.stderr || res.stdout || 'Falha na autenticação ProtonVPN.';
@@ -240,7 +262,8 @@ export async function generateOptimalProtonConfig(
     args.push('-auto-ping');
   }
 
-  if (options.freeOnly !== false) {
+  // Usuários com plano pago (Plus, Unlimited, Family) acessam todos os servidores de qualquer país
+  if (options.freeOnly === true) {
     args.push('-free-only');
   }
 
@@ -250,6 +273,7 @@ export async function generateOptimalProtonConfig(
 
   logger.info('proton', 'gerando configuração ótima WireGuard ProtonVPN', {
     country: options.countries || 'AUTO',
+    freeOnly: options.freeOnly === true,
     autoPing: options.autoPing !== false,
   });
 

@@ -4,7 +4,17 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [2.0.1] - 2026-09-04
+## [2.1.0] - 2026-09-04
+
+### Adicionado
+- **Suporte a assinaturas pagas da ProtonVPN (Plus, Unlimited, Family):**
+  - Consulta automática à API `/vpn/v2` para detectar o tipo de conta (`MaxTier >= 2`) e o título do plano (`Proton Family`, `Proton Plus`, etc.).
+  - Badge visual temático ao lado do status da conta na interface gráfica, identificando o plano ativo.
+  - Liberação de acesso irrestrito a todos os servidores Plus mundiais sem limitar a contas Free.
+- **Desbloqueio global de servidores em mais de 140 países:**
+  - Dropdown "Escolha sua rota" agora agrupa servidores por continentes (América do Sul, América do Norte, Europa, Ásia & Oceania) e lista todos os países em ordem alfabética com bandeiras emoji e nomes em português nativos (`Intl.DisplayNames`).
+- **Otimização inteligente de latência regional para o Brasil:**
+  - O modo "Automático · menor ping" mede a latência UDP em tempo real e exclui servidores com saída brasileira (`BR`) para contornar com sucesso o bloqueio regional do Discord. Com plano pago, conecta automaticamente a servidores de latência mínima na América do Sul (como Argentina a ~45ms ou Chile a ~70ms) com fluidez muito superior à rota tradicional dos EUA (~140ms).
 
 ### Corrigido
 - **Autenticação ProtonVPN: "this version of the app is no longer supported" (code 2028)** — o
@@ -12,6 +22,8 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   descontinuou a série v4 legado. Atualizado para `linux-vpn-cli@5.6.10` acompanhado do cabeçalho
   `x-pm-apiversion: 3` (arquitetura v5 do cliente oficial Proton Linux). O erro se manifestava como
   falha imediata com código 2028 ao tentar autenticar a conta Proton na GUI.
+- **Reutilização de sessão salva sem prompt no terminal:**
+  - O backend do `proton-confgen` agora recupera o usuário e valida o token persistente salvo sem solicitar entrada interativa no terminal stdin.
 
 ## [2.0.0] - 2026-09-04
 

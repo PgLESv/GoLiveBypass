@@ -39,6 +39,15 @@ func (c *Client) doJSON(method, url string, body, out any) error {
 	return api.Do(c.httpClient, req, out)
 }
 
+// GetAccountSettings queries /vpn/v2 to fetch user VPN subscription and tier details
+func (c *Client) GetAccountSettings() (*api.VPNSettingsResponse, error) {
+	var resp api.VPNSettingsResponse
+	if err := c.doJSON(http.MethodGet, c.config.APIURL+"/vpn/v2", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // requestCertificate posts a certificate request and validates the response code.
 func (c *Client) requestCertificate(certReq map[string]any) (*api.VPNInfo, error) {
 	var vpnInfo api.VPNInfo

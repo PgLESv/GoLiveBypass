@@ -3403,21 +3403,28 @@ ipcMain.handle("set-vpn-mode", async (_event, mode: "proton" | "custom") => {
 
 ipcMain.handle("get-proton-settings", async () => {
   const s = readSharedSettings() as any;
+  const isPaid = Boolean(s.protonIsPaid);
   return {
     vpnMode: (s.vpnMode as string) || "proton",
     username: (s.protonUsername as string) || "",
     country: (s.protonCountry as string) || "",
-    freeOnly: s.protonFreeOnly !== false,
+    freeOnly: s.protonFreeOnly !== undefined ? Boolean(s.protonFreeOnly) : !isPaid,
     autoPing: s.protonAutoPing !== false,
     lastServer: s.protonLastServer,
+    tier: s.protonTier,
+    planTitle: s.protonPlanTitle,
+    isPaid: isPaid,
   };
 });
 
 ipcMain.handle("set-proton-settings", async (_event, settings: any) => {
+  const s = readSharedSettings() as any;
+  const isPaid = Boolean(s.protonIsPaid);
+  const freeOnly = settings.freeOnly !== undefined ? Boolean(settings.freeOnly) : (s.protonFreeOnly !== undefined ? Boolean(s.protonFreeOnly) : !isPaid);
   updateSharedSettings({
-    protonUsername: settings.username,
-    protonCountry: settings.country,
-    protonFreeOnly: settings.freeOnly !== false,
+    ...(settings.username !== undefined ? { protonUsername: settings.username } : {}),
+    ...(settings.country !== undefined ? { protonCountry: settings.country } : {}),
+    protonFreeOnly: freeOnly,
     protonAutoPing: settings.autoPing !== false,
   });
   return true;
@@ -3427,19 +3434,35 @@ ipcMain.handle("check-proton-session", async (_event, username?: string) => {
   const s = readSharedSettings() as any;
   const user = username || (s.protonUsername as string) || "";
   if (!user) return { valid: false, error: "Usuário não especificado" };
-  return await proton.checkProtonSession(settingsDir(), user);
+  const res = await proton.checkProtonSession(settingsDir(), user);
+  if (res.valid) {
+    updateSharedSettings({
+      protonUsername: res.username || user,
+      protonTier: res.tier,
+      protonPlanTitle: res.planTitle,
+      protonIsPaid: res.isPaid,
+      ...(res.isPaid ? { protonFreeOnly: false } : {}),
+    });
+  }
+  return res;
 });
 
 ipcMain.handle("login-proton", async (_event, payload: { username: string; password?: string; twoFactorCode?: string }) => {
   const res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode);
   if (res.success) {
-    updateSharedSettings({ protonUsername: payload.username });
+    updateSharedSettings({
+      protonUsername: payload.username,
+      protonTier: res.tier,
+      protonPlanTitle: res.planTitle,
+      protonIsPaid: res.isPaid,
+      protonFreeOnly: !res.isPaid,
+    });
     const s = readSharedSettings() as any;
     try {
       const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
         username: payload.username,
         countries: (s.protonCountry as string) || undefined,
-        freeOnly: s.protonFreeOnly !== false,
+        freeOnly: !res.isPaid,
         autoPing: s.protonAutoPing !== false,
       });
       if (gen.success) {
@@ -3457,7 +3480,13 @@ ipcMain.handle("logout-proton", async () => {
   try {
     if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
   } catch {}
-  updateSharedSettings({ protonLastServer: undefined });
+  updateSharedSettings({
+    protonLastServer: undefined,
+    protonTier: undefined,
+    protonPlanTitle: undefined,
+    protonIsPaid: false,
+    protonFreeOnly: true,
+  });
   return true;
 });
 
@@ -3468,8 +3497,9 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
     return { success: false, error: "Nenhuma conta ProtonVPN conectada." };
   }
 
+  const isPaid = Boolean(s.protonIsPaid);
   const country = options?.country !== undefined ? options.country : ((s.protonCountry as string) || "");
-  const freeOnly = options?.freeOnly !== undefined ? options.freeOnly : (s.protonFreeOnly !== false);
+  const freeOnly = options?.freeOnly !== undefined ? options.freeOnly : (s.protonFreeOnly !== undefined ? Boolean(s.protonFreeOnly) : !isPaid);
   const autoPing = options?.autoPing !== undefined ? options.autoPing : (s.protonAutoPing !== false);
 
   const gen = await proton.generateOptimalProtonConfig(settingsDir(), {

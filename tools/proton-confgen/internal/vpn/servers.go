@@ -44,8 +44,16 @@ func isEligible(cfg *config.Config, server *api.LogicalServer) bool {
 	if cfg.FreeOnly != (server.Tier == api.TierFree) {
 		return false
 	}
-	if len(cfg.Countries) > 0 && !slices.Contains(cfg.Countries, server.ExitCountry) {
-		return false
+	if len(cfg.Countries) > 0 {
+		if !slices.Contains(cfg.Countries, server.ExitCountry) {
+			return false
+		}
+	} else {
+		// Na seleção automática (sem país explícito), exclui saída brasileira (BR)
+		// para garantir que o gateway do Discord saia por uma região sem bloqueio do Go Live.
+		if server.ExitCountry == "BR" {
+			return false
+		}
 	}
 	// The P2P filter does not apply to Secure Core or Free tier selections.
 	if cfg.P2PServersOnly && !cfg.SecureCoreOnly && !cfg.FreeOnly && server.Features&api.FeatureP2P == 0 {

@@ -18,4 +18,17 @@ describe("controles Proton", () => {
     expect(fnBody).toContain("Rota ${res.server} selecionada!");
     expect(fnBody).toMatch(/rotaEmUso\s*\?\s*`Servidor \$\{res\.server\} conectado!/);
   });
+
+  it("exibe badge de plano Proton e suporta selecao de paises da assinatura", () => {
+    const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    expect(html).toContain('id="protonPlanBadge"');
+
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("populateProtonCountries");
+    expect(source).toContain("América do Sul (menor latência / ping baixo)");
+    expect(source).toContain("Todos os países (A-Z)");
+    expect(source).toContain("AR"); // Argentina
+    expect(source).toContain("CL"); // Chile
+    expect(source).toContain("UY"); // Uruguai
+  });
 });

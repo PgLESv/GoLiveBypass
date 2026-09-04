@@ -81,8 +81,22 @@ declare global {
       }>;
       getVpnMode: () => Promise<'proton' | 'custom'>;
       setVpnMode: (mode: 'proton' | 'custom') => Promise<string>;
-      checkProtonSession: (username?: string) => Promise<{ valid: boolean; username?: string; expiresIn?: string; error?: string }>;
-      loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) => Promise<{ success: boolean; error?: string }>;
+      checkProtonSession: (username?: string) => Promise<{
+        valid: boolean;
+        username?: string;
+        expiresIn?: string;
+        tier?: number;
+        planTitle?: string;
+        isPaid?: boolean;
+        error?: string;
+      }>;
+      loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) => Promise<{
+        success: boolean;
+        tier?: number;
+        planTitle?: string;
+        isPaid?: boolean;
+        error?: string;
+      }>;
       logoutProton: () => Promise<boolean>;
       optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) => Promise<{
         success: boolean;
@@ -103,6 +117,9 @@ declare global {
         country: string;
         freeOnly: boolean;
         autoPing: boolean;
+        tier?: number;
+        planTitle?: string;
+        isPaid?: boolean;
         lastServer?: any;
       }>;
       setProtonSettings: (settings: any) => Promise<boolean>;
@@ -420,6 +437,7 @@ const protonLoginBtnText = document.getElementById('protonLoginBtnText') as HTML
 const protonLoginSpinner = document.getElementById('protonLoginSpinner') as HTMLElement | null;
 
 const protonUserDisplay = document.getElementById('protonUserDisplay') as HTMLElement | null;
+const protonPlanBadge = document.getElementById('protonPlanBadge') as HTMLElement | null;
 const protonDot = document.getElementById('protonDot') as HTMLElement | null;
 const protonLogoutBtn = document.getElementById('protonLogoutBtn') as HTMLButtonElement | null;
 const protonCountrySelect = document.getElementById('protonCountrySelect') as HTMLSelectElement | null;
@@ -431,6 +449,133 @@ const protonServerName = document.getElementById('protonServerName') as HTMLElem
 const protonServerPing = document.getElementById('protonServerPing') as HTMLElement | null;
 const protonServerLoad = document.getElementById('protonServerLoad') as HTMLElement | null;
 const protonFeedback = document.getElementById('protonFeedback') as HTMLElement | null;
+
+const PROTON_ALL_COUNTRIES: string[] = [
+  "AD","AE","AF","AL","AM","AO","AR","AT","AU","AZ","BA","BD","BE","BG","BH",
+  "BN","BO","BT","BY","CA","CD","CH","CI","CL","CM","CN","CO","CR","CU","CZ",
+  "DE","DK","DO","DZ","EC","EE","EG","ER","ES","ET","FI","FR","GA","GE","GH",
+  "GL","GN","GR","GT","HK","HN","HR","HT","HU","ID","IE","IL","IN","IQ","IS",
+  "IT","JM","JO","JP","KE","KG","KH","KM","KR","KW","KZ","LA","LB","LI","LK",
+  "LT","LU","LV","LY","MA","MC","MD","ME","MN","MO","MR","MT","MU","MX","MY",
+  "MZ","NG","NI","NL","NO","NP","NZ","OM","PA","PE","PG","PH","PK","PL","PR",
+  "PS","PT","PY","QA","RO","RS","RU","RW","SA","SD","SE","SG","SI","SK","SN",
+  "SO","SS","SV","SY","TD","TG","TH","TJ","TM","TN","TR","TW","TZ","UA","UG",
+  "UK","US","UY","UZ","VE","VN","XK","YE","ZA","ZW"
+];
+
+function getCountryFlag(code: string): string {
+  if (code === 'UK') code = 'GB';
+  if (code === 'XK') return '🇽🇰';
+  try {
+    const codePoints = code
+      .toUpperCase()
+      .split('')
+      .map((c) => 127397 + c.charCodeAt(0));
+    return String.fromCodePoint(...codePoints);
+  } catch {
+    return '🌐';
+  }
+}
+
+function getCountryName(code: string, displayNames: Intl.DisplayNames): string {
+  const norm = code === 'UK' ? 'GB' : code;
+  try {
+    return displayNames.of(norm) || code;
+  } catch {
+    return code;
+  }
+}
+
+let currentPopulatedIsPaid: boolean | null = null;
+
+function populateProtonCountries(isPaid: boolean, selectedCountry = '') {
+  if (!protonCountrySelect) return;
+  if (currentPopulatedIsPaid === isPaid && protonCountrySelect.options.length > 4) {
+    if (selectedCountry !== undefined && selectedCountry !== protonCountrySelect.value) {
+      protonCountrySelect.value = selectedCountry;
+    }
+    return;
+  }
+  currentPopulatedIsPaid = isPaid;
+
+  let displayNames: Intl.DisplayNames;
+  try {
+    displayNames = new Intl.DisplayNames(['pt-BR'], { type: 'region' });
+  } catch {
+    displayNames = { of: (c: string) => c } as any;
+  }
+
+  protonCountrySelect.innerHTML = '';
+
+  if (!isPaid) {
+    // Servidores gratuitos disponíveis em contas Free
+    const freeOptions = [
+      { value: '', label: 'Automático · menor ping (Free)' },
+      { value: 'US', label: `${getCountryFlag('US')} Estados Unidos · recomendado` },
+      { value: 'NL', label: `${getCountryFlag('NL')} Holanda` },
+      { value: 'JP', label: `${getCountryFlag('JP')} Japão` },
+      { value: 'PL', label: `${getCountryFlag('PL')} Polônia` },
+      { value: 'RO', label: `${getCountryFlag('RO')} Romênia` },
+    ];
+    for (const opt of freeOptions) {
+      const el = document.createElement('option');
+      el.value = opt.value;
+      el.textContent = opt.label;
+      protonCountrySelect.appendChild(el);
+    }
+  } else {
+    // Opções completas para contas com assinatura (Plus, Unlimited, Family)
+    const autoOpt = document.createElement('option');
+    autoOpt.value = '';
+    autoOpt.textContent = 'Automático · menor ping (recomendado)';
+    protonCountrySelect.appendChild(autoOpt);
+
+    const southAmerica = ['AR', 'CL', 'UY', 'CO', 'PE', 'EC', 'PY', 'BO'];
+    const northAmerica = ['US', 'CA', 'MX'];
+    const europe = ['PT', 'ES', 'GB', 'DE', 'FR', 'NL', 'IT', 'CH', 'SE', 'NO', 'IE', 'BE', 'AT', 'PL', 'FI', 'DK'];
+    const asiaOceania = ['JP', 'SG', 'AU', 'NZ', 'KR', 'HK', 'TW'];
+
+    const addGroup = (label: string, codes: string[]) => {
+      const group = document.createElement('optgroup');
+      group.label = label;
+      for (const code of codes) {
+        const el = document.createElement('option');
+        el.value = code;
+        const flag = getCountryFlag(code);
+        const name = getCountryName(code, displayNames);
+        let extra = '';
+        if (code === 'AR') extra = ' · menor latência (~45ms)';
+        else if (code === 'CL') extra = ' (~70ms)';
+        else if (code === 'UY') extra = ' (~50ms)';
+        el.textContent = `${flag} ${name}${extra}`;
+        group.appendChild(el);
+      }
+      protonCountrySelect.appendChild(group);
+    };
+
+    addGroup('América do Sul (menor latência / ping baixo)', southAmerica);
+    addGroup('América do Norte', northAmerica);
+    addGroup('Europa', europe);
+    addGroup('Ásia e Oceania', asiaOceania);
+
+    // Todos os países disponíveis em ordem alfabética
+    const allGroup = document.createElement('optgroup');
+    allGroup.label = 'Todos os países (A-Z)';
+    const sortedAll = PROTON_ALL_COUNTRIES
+      .map(code => ({ code, name: getCountryName(code, displayNames), flag: getCountryFlag(code) }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+    for (const item of sortedAll) {
+      const el = document.createElement('option');
+      el.value = item.code;
+      el.textContent = `${item.flag} ${item.name} (${item.code})`;
+      allGroup.appendChild(el);
+    }
+    protonCountrySelect.appendChild(allGroup);
+  }
+
+  protonCountrySelect.value = selectedCountry || '';
+}
 
 let currentVpnMode: 'proton' | 'custom' = 'proton';
 let isProtonAuthenticated = false;
@@ -528,19 +673,27 @@ tabCustom?.addEventListener('click', () => switchVpnMode('custom'));
 async function refreshProtonState() {
   try {
     const s = await window.api.getProtonSettings();
-    if (protonCountrySelect) {
-      protonCountrySelect.value = s.country || '';
-    }
+    const isPaid = s.isPaid ?? false;
+    populateProtonCountries(isPaid, s.country || '');
 
     if (s.username) {
       if (protonUsername) protonUsername.value = s.username;
       const chk = await window.api.checkProtonSession(s.username);
       if (chk.valid) {
         isProtonAuthenticated = true;
+        const paidStatus = chk.isPaid ?? isPaid;
+        populateProtonCountries(paidStatus, s.country || '');
+
         if (protonAuthForm) protonAuthForm.hidden = true;
         if (protonConnectedView) protonConnectedView.hidden = false;
         if (protonUserDisplay) protonUserDisplay.textContent = `Conta: ${s.username}`;
         if (protonDot) protonDot.style.background = '#22c55e';
+
+        if (protonPlanBadge) {
+          protonPlanBadge.textContent = chk.planTitle || (paidStatus ? 'Proton Plus' : 'Proton Free');
+          protonPlanBadge.classList.toggle('proton-plan-badge--free', !paidStatus);
+          protonPlanBadge.hidden = false;
+        }
 
         if (s.lastServer?.server && protonServerBadge && protonServerName && protonServerPing && protonServerLoad) {
           protonServerName.textContent = s.lastServer.server;
@@ -561,11 +714,13 @@ async function refreshProtonState() {
     }
 
     isProtonAuthenticated = false;
+    if (protonPlanBadge) protonPlanBadge.hidden = true;
     if (protonAuthForm) protonAuthForm.hidden = false;
     if (protonConnectedView) protonConnectedView.hidden = true;
   } catch (err) {
     console.error('Falha ao verificar sessão Proton:', err);
     isProtonAuthenticated = false;
+    if (protonPlanBadge) protonPlanBadge.hidden = true;
     if (protonAuthForm) protonAuthForm.hidden = false;
     if (protonConnectedView) protonConnectedView.hidden = true;
   }
@@ -640,6 +795,7 @@ proton2FAConfirmBtn?.addEventListener('click', () => {
 if (protonLogoutBtn) {
   protonLogoutBtn.addEventListener('click', async () => {
     await window.api.logoutProton();
+    if (protonPlanBadge) protonPlanBadge.hidden = true;
     setProtonFeedback('');
     await refreshProtonState();
     await atualizarStatusWgConf();

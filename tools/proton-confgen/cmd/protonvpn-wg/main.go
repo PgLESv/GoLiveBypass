@@ -65,17 +65,34 @@ func run() error {
 			}
 			return fmt.Errorf("sessão expirada ou não encontrada")
 		}
+		vpnClient := vpn.NewClient(cfg, session)
+		tier := 0
+		planTitle := "Proton Free"
+		isPaid := false
+		if acc, err := vpnClient.GetAccountSettings(); err == nil && acc != nil {
+			tier = acc.VPN.MaxTier
+			if acc.VPN.PlanTitle != "" {
+				planTitle = acc.VPN.PlanTitle
+			} else if tier >= api.TierPlus {
+				planTitle = "Proton Plus"
+			}
+			isPaid = tier >= api.TierPlus
+		}
+
 		if cfg.JSONOutput {
 			data, _ := json.Marshal(map[string]any{
 				"success":   true,
 				"valid":     true,
 				"username":  cfg.Username,
 				"expiresIn": timeUntilExpiry.String(),
+				"tier":      tier,
+				"planTitle": planTitle,
+				"isPaid":    isPaid,
 			})
 			fmt.Println(string(data))
 			return nil
 		}
-		fmt.Printf("Sessão válida para %s (expira em %s)\n", cfg.Username, timeUntilExpiry.String())
+		fmt.Printf("Sessão válida para %s (%s, tier %d, expira em %s)\n", cfg.Username, planTitle, tier, timeUntilExpiry.String())
 		return nil
 	}
 
@@ -87,20 +104,36 @@ func run() error {
 		fmt.Println("Authentication successful!")
 	}
 
+	vpnClient := vpn.NewClient(cfg, session)
+
 	if cfg.LoginOnly {
+		tier := 0
+		planTitle := "Proton Free"
+		isPaid := false
+		if acc, err := vpnClient.GetAccountSettings(); err == nil && acc != nil {
+			tier = acc.VPN.MaxTier
+			if acc.VPN.PlanTitle != "" {
+				planTitle = acc.VPN.PlanTitle
+			} else if tier >= api.TierPlus {
+				planTitle = "Proton Plus"
+			}
+			isPaid = tier >= api.TierPlus
+		}
+
 		if cfg.JSONOutput {
 			data, _ := json.Marshal(map[string]any{
-				"success":  true,
-				"username": cfg.Username,
+				"success":   true,
+				"username":  cfg.Username,
+				"tier":      tier,
+				"planTitle": planTitle,
+				"isPaid":    isPaid,
 			})
 			fmt.Println(string(data))
 			return nil
 		}
-		fmt.Printf("Login successful for %s!\n", cfg.Username)
+		fmt.Printf("Login successful for %s (%s)!\n", cfg.Username, planTitle)
 		return nil
 	}
-
-	vpnClient := vpn.NewClient(cfg, session)
 
 	switch {
 	case cfg.ListConfigs:

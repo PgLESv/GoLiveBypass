@@ -78,8 +78,8 @@ func (s *SessionStore) Save(session *api.Session, username string, duration time
 	return nil
 }
 
-// Load retrieves a saved session from disk
-func (s *SessionStore) Load(username string) (*api.Session, time.Duration, error) {
+// LoadSaved retrieves a saved session with metadata from disk
+func (s *SessionStore) LoadSaved(username string) (*SavedSession, time.Duration, error) {
 	data, err := os.ReadFile(s.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -94,8 +94,8 @@ func (s *SessionStore) Load(username string) (*api.Session, time.Duration, error
 		return nil, 0, fmt.Errorf("failed to unmarshal session: %w", err)
 	}
 
-	// Check if session is for the same user
-	if savedSession.Username != username {
+	// Check if session is for the same user (if username is specified)
+	if username != "" && savedSession.Username != username {
 		return nil, 0, nil
 	}
 
@@ -110,7 +110,16 @@ func (s *SessionStore) Load(username string) (*api.Session, time.Duration, error
 	// Calculate time until expiration
 	timeUntilExpiry := savedSession.ExpiresAt.Sub(now)
 
-	return savedSession.Session, timeUntilExpiry, nil
+	return &savedSession, timeUntilExpiry, nil
+}
+
+// Load retrieves a saved session from disk
+func (s *SessionStore) Load(username string) (*api.Session, time.Duration, error) {
+	saved, expiry, err := s.LoadSaved(username)
+	if err != nil || saved == nil {
+		return nil, 0, err
+	}
+	return saved.Session, expiry, nil
 }
 
 // Delete removes the saved session

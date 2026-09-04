@@ -47,17 +47,20 @@ func NewClient(cfg *config.Config) *Client {
 
 // CheckSession checks if a saved session exists and is valid.
 func (c *Client) CheckSession() (*api.Session, time.Duration, error) {
-	savedSession, timeUntilExpiry, err := c.sessionStore.Load(c.config.Username)
+	saved, timeUntilExpiry, err := c.sessionStore.LoadSaved(c.config.Username)
 	if err != nil {
 		return nil, 0, err
 	}
-	if savedSession == nil {
+	if saved == nil || saved.Session == nil {
 		return nil, 0, fmt.Errorf("no saved session found")
 	}
-	if !VerifySession(c.httpClient, c.config.APIURL, savedSession) {
+	if c.config.Username == "" && saved.Username != "" {
+		c.config.Username = saved.Username
+	}
+	if !VerifySession(c.httpClient, c.config.APIURL, saved.Session) {
 		return nil, 0, fmt.Errorf("saved session expired or invalid")
 	}
-	return savedSession, timeUntilExpiry, nil
+	return saved.Session, timeUntilExpiry, nil
 }
 
 // handleSessionRefresh attempts to refresh a session and save it if successful
@@ -91,15 +94,19 @@ func (c *Client) handleSessionRefresh(savedSession *api.Session, reason string) 
 
 // tryExistingSession attempts to use an existing saved session
 func (c *Client) tryExistingSession() (*api.Session, error) {
-	savedSession, timeUntilExpiry, err := c.sessionStore.Load(c.config.Username)
+	saved, timeUntilExpiry, err := c.sessionStore.LoadSaved(c.config.Username)
 	if err != nil {
 		fmt.Printf("Warning: Failed to load saved session: %v\n", err)
 		return nil, err
 	}
 
-	if savedSession == nil {
+	if saved == nil || saved.Session == nil {
 		return nil, nil
 	}
+	if c.config.Username == "" && saved.Username != "" {
+		c.config.Username = saved.Username
+	}
+	savedSession := saved.Session
 
 	// Determine what to do with the saved session
 	switch {
@@ -112,7 +119,9 @@ func (c *Client) tryExistingSession() (*api.Session, error) {
 		return c.handleSessionRefresh(savedSession, reason)
 
 	case VerifySession(c.httpClient, c.config.APIURL, savedSession):
-		fmt.Printf("Using saved session (expires in %s)\n", timeutil.HumanizeDuration(timeUntilExpiry))
+		if !c.config.JSONOutput {
+			fmt.Printf("Using saved session (expires in %s)\n", timeutil.HumanizeDuration(timeUntilExpiry))
+		}
 		return savedSession, nil
 
 	default:
@@ -124,13 +133,13 @@ func (c *Client) tryExistingSession() (*api.Session, error) {
 
 // Authenticate performs the full authentication flow
 func (c *Client) Authenticate() (*api.Session, error) {
-	if err := c.ensureUsername(); err != nil {
-		return nil, err
-	}
-
 	// Try existing session unless clearing or disabled
 	if session := c.handleExistingSession(); session != nil {
 		return session, nil
+	}
+
+	if err := c.ensureUsername(); err != nil {
+		return nil, err
 	}
 
 	if err := c.ensurePassword(); err != nil {

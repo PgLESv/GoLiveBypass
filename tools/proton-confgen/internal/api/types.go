@@ -43,6 +43,18 @@ type ErrorDetails struct {
 	HumanVerificationMethods []string `json:"HumanVerificationMethods"`
 }
 
+// VPNSettingsResponse represents the response from GET /vpn/v2
+type VPNSettingsResponse struct {
+	Code int `json:"Code"`
+	VPN  struct {
+		PlanName   string `json:"PlanName"`
+		PlanTitle  string `json:"PlanTitle"`
+		MaxTier    int    `json:"MaxTier"`
+		MaxConnect int    `json:"MaxConnect"`
+	} `json:"VPN"`
+	Subscribed int `json:"Subscribed"`
+}
+
 // VPNInfo represents VPN certificate information
 type VPNInfo struct {
 	Code                 int    `json:"Code"`
