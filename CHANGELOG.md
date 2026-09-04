@@ -4,12 +4,12 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [2.0.0] - Unreleased
+## [2.0.0] - 2026-09-04
 
 ### Destaques
 
 - **WireGuard por aplicativo:** Windows usa WireSock/WFP para encaminhar somente o Discord (`Discord.exe`, `Discord` e `Update.exe`) pelo túnel. O restante do computador permanece na rede normal.
-- **Namespace dedicado no Linux:** a GUI e o standalone iniciam o Discord dentro de `discord-vpn`, com a interface WireGuard isolada do restante do sistema.
+- **Namespace dedicado no Linux:** a GUI inicia o Discord dentro de `discord-vpn`, com a interface WireGuard isolada do restante do sistema.
 - **Discord vanilla no Windows/Linux:** a GUI 2.0.0 não substitui nem injeta o `app.asar` do Discord. Ativar e desativar reinicia o cliente para aplicar ou remover o túnel com segurança.
 - **ProtonVPN integrado:** login com sessão persistente, geração de configuração WireGuard, seleção automática por menor ping, suporte a 2FA e importação de configurações `.conf` próprias.
 - **Privacidade na GUI:** endereço de e-mail Proton desfocado por padrão durante compartilhamento de tela e revelado apenas sob interação do usuário.
@@ -21,7 +21,7 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   está disponível somente pela GUI. A portabilidade da solução WireGuard por aplicativo para
   essas duas variantes ainda está em andamento e elas voltarão após validação própria.
 - O perfil WireGuard gratuito integrado é compartilhado; degradação sob carga pode afetar uploads e anexos. Uma configuração privada é recomendada para uso intenso.
-- O macOS ainda usa o mecanismo legado de PAC/injeção até existir uma implementação de VPN por aplicativo equivalente.
+- **macOS temporariamente indisponível:** a GUI não usa mais PAC/injeção e aguarda uma implementação de VPN por aplicativo equivalente.
 - Depois de otimizar a rota ProtonVPN, é necessário sair e entrar novamente na chamada para que a nova rota seja usada pelo Discord.
 
 
@@ -54,7 +54,7 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
     explícita em vez de simplesmente faltar.
   - **Windows**: lido via `wg.exe` (wireguard-tools) quando presente no PATH; sem ele, o
     report mostra `indisponivel` com o motivo em vez de omitir o campo.
-  - **macOS**: fora do escopo — ainda usa o mecanismo legado de PAC/Tor, sem interface WireGuard
+  - **macOS (na série 1.1.12)**: fora do escopo — ainda usava o mecanismo legado de PAC/Tor, sem interface WireGuard
     nenhuma para vigiar.
   - Testado com `tests/wgstats.test.ts` (parsing do dump, handshake nunca, endpoint `(none)`,
     dump incompleto/vazio) e ao vivo nesta máquina via `--status --json` real.

@@ -34,16 +34,16 @@ useSeoMeta({
           </div>
           <div class="faq-list">
             <FaqAccordion id="which-path" question="Qual opção devo instalar?">
-              <p>Use a <NuxtLink to="/downloads">GUI</NuxtLink> se quiser uma janela para ativar o bypass. Use o instalador de terminal se preferir acompanhar os comandos. Se você usa Vencord ou Equicord, escolha o plugin. Se usa o Discord puro, escolha o standalone.</p>
+              <p>Na versão 2.0.0, use somente a <NuxtLink to="/downloads">GUI WireGuard</NuxtLink>. Plugin, standalone e instaladores de terminal estão pausados.</p>
             </FaqAccordion>
             <FaqAccordion id="mod" question="Posso usar o standalone com Vencord ou Equicord?">
-              <p>Não é o caminho recomendado. O standalone ocupa o lugar do mod dentro do Discord e pode remover outros plugins. Quem já usa Vencord ou Equicord deve instalar o plugin correspondente.</p>
+              <p>Não na 2.0.0. Plugin e standalone estão temporariamente indisponíveis durante a portabilidade para WireGuard.</p>
             </FaqAccordion>
             <FaqAccordion id="linux-appimage" question="Como abro o AppImage no Linux?">
               <p>Depois de baixar, dê permissão de execução com <code>chmod +x GoLiveBypass-*.AppImage</code> e abra o arquivo. Se o sistema não tiver FUSE, consulte a orientação de execução alternativa na documentação do Linux.</p>
             </FaqAccordion>
             <FaqAccordion id="macos-permission" question="O macOS bloqueou o aplicativo. O que faço?">
-              <p>Abra o aplicativo com o botão direito e escolha <strong>Abrir</strong>. Se o bloqueio continuar, vá em Privacidade e Segurança. Na primeira ativação, o macOS também pode pedir autorização em Administração de Apps para permitir a alteração do Discord.</p>
+              <p>O suporte macOS está temporariamente indisponível na 2.0.0; a GUI não usa mais injeção nem altera o Discord.</p>
             </FaqAccordion>
           </div>
         </section>

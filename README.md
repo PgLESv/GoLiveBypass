@@ -17,7 +17,7 @@ Você não precisa usar todas as opções. Escolha uma delas:
 
 | Variante | É para você se... | O que fazer |
 |---|---|---|
-| **[GUI](#-versão-200-interface-gráfica-com-wireguard-por-aplicativo)** | quer ativar e desativar com poucos cliques, sem terminal | baixe o aplicativo para Windows, macOS ou Linux |
+| **[GUI](#-versão-200-interface-gráfica-com-wireguard-por-aplicativo)** | quer ativar e desativar com poucos cliques, sem terminal | baixe o aplicativo para Windows ou Linux |
 | **[Standalone](#modo-standalone-só-o-discord-sem-equicord-e-sem-vencord)** | usa o Discord puro e não quer instalar Equicord/Vencord | temporariamente indisponível na 2.0.0 |
 | **[Plugin](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop)** | já usa Equicord, Vencord ou Vesktop | temporariamente indisponível na 2.0.0 |
 
@@ -52,7 +52,7 @@ Criamos um aplicativo completo que faz todo o trabalho de forma **100% automáti
 |---|---|---|
 | **Windows** | WireSock/WFP filtra `Discord.exe`, `Discord`, `Update.exe` e seus processos relacionados | Continua na conexão normal |
 | **Linux** | Network namespace `discord-vpn` com interface WireGuard dedicada | Continua na conexão normal |
-| **macOS** | Mecanismo legado de PAC/injeção até existir um equivalente de VPN por aplicativo | Continua na conexão normal |
+| **macOS** | Temporariamente indisponível até existir um túnel WireGuard por aplicativo | — |
 
 O túnel cobre o processo do Discord inteiro — gateway, login, voz, vídeo e anexos — evitando a divergência de IP que motivou a migração. A mídia não é roteada por um proxy SOCKS separado.
 
@@ -60,38 +60,33 @@ O túnel cobre o processo do Discord inteiro — gateway, login, voz, vídeo e a
 1. Vá na **[última release](https://github.com/bezumiya/GoLiveBypass/releases/latest)** aqui no GitHub.
 2. Baixe o arquivo da sua plataforma, na lista no fim da página:
    - **Windows:** `GoLiveBypass-*.exe` (portátil, roda direto sem instalar)
-   - **macOS (Apple Silicon):** `GoLiveBypass.dmg`, ou o `GoLiveBypass.zip` se preferir
+   - **Linux:** `GoLiveBypass-*.AppImage`
 3. Abra o arquivo que você acabou de baixar.
 
-O programa **não é assinado**. O sistema avisa na primeira vez. Se preferir não correr esse risco, use a [instalação por comando](#um-comando-só), que é o mesmo bypass sem executável.
+O programa **não é assinado**. O sistema avisa na primeira vez. Na 2.0.0, a GUI é a única variante disponível; os instaladores CLI permanecem pausados.
 
 **Windows (SmartScreen):** **Mais informações → Executar assim mesmo**.
 
 #### macOS
 
-Dois avisos do sistema, e nenhum dos dois é o GoLiveBypass “quebrado”.
-
-**1. Abrir o app (Gatekeeper).** Clique com o **botão direito** no GoLiveBypass → **Abrir** → **Abrir**. Se o macOS só mostrar que não é possível abrir, vá em **Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir mesmo assim**.
-
-**2. Deixar o app mexer no Discord (Administração de Apps).** Se você já usou o Vencord, sabe qual é essa tela: o macOS não deixa um programa alterar o `Discord.app` até você autorizar. É **a mesma permissão**. Na primeira vez que você clicar em Ativar, o sistema bloqueia a escrita; o GoLiveBypass tenta abrir **Ajustes do Sistema → Privacidade e Segurança → Administração de Apps**. Ative o GoLiveBypass (ou arraste o app para a lista) e clique em Ativar de novo.
-
-**Depois de uma atualização do Discord.** No Mac o instalador troca o `.app` inteiro e a injeção some. Abra o GoLiveBypass e ative de novo. (No Windows o standalone tenta adiantar isso sozinho; na GUI do Mac isso não existe.)
+O suporte macOS está temporariamente indisponível na 2.0.0. A GUI não usa mais injeção ou PAC;
+o suporte será retomado quando houver um túnel WireGuard por aplicativo confiável.
 
 ### Como Usar
-1. O aplicativo vai detectar o seu Discord automaticamente (no Mac, em `/Applications` ou `~/Applications`, inclusive PTB e Canary).
+1. O aplicativo vai detectar o seu Discord automaticamente.
 2. Clique em **"Ativar Bypass"**.
 3. O Discord vai reiniciar automaticamente com o Go Live desbloqueado. Ao desativar, ele também reinicia para sair do túnel.
-4. Pode fechar a janela sem medo: o app fica na **bandeja** do Windows (junto do relógio) ou na **barra de menus** do Mac. Clique no ícone de lá para reabrir, ativar/desativar ou **Sair** — sair por esse ícone é o que reverte tudo ao normal.
-5. Se quiser que ele já abra com o PC (direto escondido, sem janela pulando na tela), marque **"Iniciar com o Windows"** ou **"Iniciar com o Mac"** na janela ou no menu do ícone.
+4. Pode fechar a janela sem medo: o app fica na bandeja. Use **Sair** no ícone para encerrar o túnel.
+5. Se quiser que ele já abra com o PC, marque **"Iniciar com o sistema"**.
 
-> **Dica Importante:** Se a sua transmissão ficar com a tela preta ou não carregar de primeira, recarregue o Discord: **Ctrl + R** no Windows, **Cmd + R** no Mac.
+> **Dica Importante:** Se a sua transmissão ficar com a tela preta ou não carregar de primeira, recarregue o Discord com **Ctrl + R**.
 
 
 ## 🐧 Interface Gráfica para Linux (AppImage)
 
 A mesma interface gráfica do Windows, **agora para Linux**, empacotada como **AppImage** (roda em qualquer distro: Debian, Ubuntu, Fedora, Arch e derivadas).
 
-Assim como a versão Windows, ela é **portátil**: ativa o GoLiveBypass ao clicar e fica na **bandeja** do sistema — fechar a janela só a esconde, e o **Sair** pelo ícone da bandeja é o que reverte tudo ao normal. Por baixo, ela chama o [modo standalone](#modo-standalone-só-o-discord-sem-equicord-e-sem-vencord) (POSIX, funciona em qualquer shell), então toda a lógica de detecção — Discord nativo, flatpak, bootstrap novo, snap — é a mesma dos scripts, com o progresso aparecendo na tela.
+Assim como a versão Windows, ela é **portátil** e usa o namespace WireGuard diretamente. O standalone CLI continua separado e indisponível na 2.0.0.
 
 ### Como Baixar e Instalar
 1. Vá na **[última release](https://github.com/bezumiya/GoLiveBypass/releases/latest)**.
@@ -122,7 +117,7 @@ chmod +x GoLiveBypass-*.AppImage
 ## Índice
 
 **Quero instalar agora**
-- [**GUI (Windows, macOS e Linux)**](#escolha-sua-variante) — 1 clique para ativar/desativar, sem terminal
+- [**GUI (Windows e Linux)**](#escolha-sua-variante) — 1 clique para ativar/desativar, sem terminal
 - [**Standalone**](#modo-standalone-só-o-discord-sem-equicord-e-sem-vencord) — Discord puro, sem Equicord/Vencord
 - [**Plugin**](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop) — para Equicord, Vencord e Vesktop
 - [Interface Gráfica 2.0.0](#-versão-200-interface-gráfica-com-wireguard-por-aplicativo) — detalhes da GUI
@@ -155,6 +150,8 @@ chmod +x GoLiveBypass-*.AppImage
 
 > **Temporariamente indisponível na 2.0.0.** O plugin está pausado enquanto a arquitetura
 > WireGuard por aplicativo é portada e testada nessa variante.
+
+Na 2.0.0 esta variante permanece desativada. Use somente a GUI WireGuard.
 
 <p align="center">
   <img src="assets/instalacao.gif" alt="O instalador acha o Equicord, instala o plugin, compila e o Go Live volta a funcionar" width="720">
@@ -307,6 +304,9 @@ O instalador já deixa o plugin **ativado e configurado**. Depois que ele termin
 
 > **Temporariamente indisponível na 2.0.0.** O standalone CLI está pausado durante a
 > portabilidade da nova solução WireGuard. Esta seção fica como referência da versão anterior.
+
+Não execute os comandos desta seção na 2.0.0: o CLI retorna aviso e código de erro até ser
+portado e validado para WireGuard.
 
 Se você não usa nenhum mod e não quer instalar um, existe o **modo standalone**. Ele instala o bypass direto no Discord.
 

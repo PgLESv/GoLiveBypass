@@ -6,7 +6,7 @@ import type { Platform } from '~/components/PlatformTabs.vue'
 useSeoMeta({
   title: 'Downloads',
   description:
-    'Baixe a GUI do GoLiveBypass para Windows, macOS e Linux ou escolha a instalação por terminal, standalone e plugin.',
+    'Baixe a GUI WireGuard do GoLiveBypass para Windows ou Linux.',
   ogTitle: 'Downloads — GoLiveBypass',
   ogDescription: 'Escolha a GUI ou copie o comando de instalação para a sua plataforma.',
   ogUrl: 'https://golivebypass.dev/downloads',
@@ -42,7 +42,7 @@ onMounted(() => {
       <div class="release-banner__copy">
         <span class="release-banner__label"><span class="status-dot" aria-hidden="true"></span> Release estável</span>
         <h2>GoLiveBypass <code>v{{ release.version }}</code></h2>
-        <p>Uma versão para cada sistema desktop. O download abre o arquivo oficial na release correspondente.</p>
+        <p>A GUI 2.0.0 é a única variante disponível nesta release.</p>
       </div>
       <a class="text-link" :href="githubReleasePageUrl" target="_blank" rel="noopener noreferrer">
         Ver release no GitHub
@@ -56,7 +56,7 @@ onMounted(() => {
           <span class="eyebrow">INTERFACE GRÁFICA</span>
           <h2 id="gui-title">Baixe a GUI</h2>
         </div>
-        <p>Escolhemos uma sugestão com base no seu navegador. As três plataformas continuam disponíveis.</p>
+        <p>Escolhemos uma sugestão com base no seu navegador. Windows e Linux estão disponíveis.</p>
       </div>
 
       <PlatformTabs v-model="selectedPlatform" />
@@ -81,20 +81,9 @@ onMounted(() => {
       </div>
 
       <div v-else-if="selectedPlatform === 'macos'" id="platform-panel-macos" class="platform-panel" role="tabpanel" aria-labelledby="platform-tab-macos">
-        <DownloadCard
-          icon="apple"
-          kicker="MACOS"
-          title="Aplicativo para macOS"
-          description="Use o instalador DMG ou escolha o ZIP para abrir o mesmo aplicativo no macOS."
-          :meta="`GoLiveBypass.dmg ou GoLiveBypass.zip · release ${release.channel}`"
-          primary-label="Baixar DMG"
-          :primary-href="downloads.macDmg"
-          secondary-label="Baixar ZIP"
-          :secondary-href="downloads.macZip"
-        />
         <div class="platform-note">
           <BaseIcon name="lock" :size="17" />
-          <p>O macOS pode pedir autorização em Privacidade e Segurança antes de permitir que o aplicativo altere o Discord.</p>
+          <p>macOS está temporariamente indisponível. A 2.0.0 não usa injeção nem PAC.</p>
         </div>
       </div>
 
@@ -123,45 +112,14 @@ onMounted(() => {
           <span class="eyebrow">INSTALAÇÃO POR COMANDO</span>
           <h2 id="command-title">Copie e cole no terminal.</h2>
         </div>
-        <p>Terminal, standalone e plugin não são downloads de aplicativo. Cada caminho baixa o instalador oficial e oferece uma versão com TUI e outra sem TUI.</p>
+        <p>Os instaladores de terminal, standalone e plugin estão temporariamente fora de serviço.</p>
       </div>
 
-      <PlatformTabs
-        v-model="commandPlatform"
-        id-prefix="command-platform"
-        aria-label="Escolha o sistema operacional para os comandos"
-      />
-
-      <div v-if="commandPlatform !== 'macos'" :id="`command-platform-panel-${commandPlatform}`" class="command-path-grid" role="tabpanel" :aria-labelledby="`command-platform-tab-${commandPlatform}`">
-        <CommandPathCard
-          icon="code"
-          kicker="VENCORD / EQUICORD"
-          title="Plugin do Discord"
-          description="Use quando você já usa Vencord ou Equicord. A TUI detecta o mod e guia a instalação; o modo direto instala com Equicord sem abrir o menu."
-          :platform="commandPlatform === 'windows' ? 'Windows · PowerShell' : 'Linux · shell POSIX'"
-          :tui-command="activeTerminalCommands.plugin.tui"
-          :direct-command="activeTerminalCommands.plugin.direct"
-          :direct-note="activeTerminalCommands.plugin.directNote"
-          tone="discord"
-        />
-        <CommandPathCard
-          icon="route"
-          kicker="DISCORD PURO"
-          title="Standalone"
-          description="Use somente no Discord sem mod. O script é o instalador com TUI; o arquivo JavaScript é baixado por ele e não precisa ser baixado separadamente."
-          :platform="commandPlatform === 'windows' ? 'Windows · PowerShell' : 'Linux · shell POSIX'"
-          :tui-command="activeTerminalCommands.standalone.tui"
-          :direct-command="activeTerminalCommands.standalone.direct"
-          :direct-note="activeTerminalCommands.standalone.directNote"
-          tone="success"
-        />
-      </div>
-
-      <div v-else :id="`command-platform-panel-${commandPlatform}`" class="info-note command-platform-unavailable" role="tabpanel" :aria-labelledby="`command-platform-tab-${commandPlatform}`">
+      <div class="info-note command-platform-unavailable" role="status">
         <span class="icon-frame icon-frame--muted"><BaseIcon name="apple" :size="18" /></span>
         <div>
-          <strong>No macOS, use a GUI.</strong>
-          <p>O README documenta os instaladores de terminal para Windows e Linux. No macOS, baixe a GUI acima para ativar o bypass sem comandos.</p>
+          <strong>Use a GUI 2.0.0.</strong>
+          <p>Plugin, standalone e instaladores de terminal estão pausados durante a portabilidade para WireGuard.</p>
         </div>
       </div>
 
@@ -169,7 +127,7 @@ onMounted(() => {
         <span class="icon-frame icon-frame--muted"><BaseIcon name="lock" :size="17" /></span>
         <div>
           <strong>O comando roda os scripts oficiais do repositório.</strong>
-          <p>O modo TUI abre o menu interativo. O modo sem TUI usa as flags de automação. Se preferir instalar o plugin manualmente, o <a :href="downloads.plugin" target="_blank" rel="noopener noreferrer">ZIP do plugin</a> continua disponível como caminho avançado.</p>
+          <p>Não execute os scripts antigos; eles não fazem parte da release 2.0.0.</p>
         </div>
       </div>
     </section>

@@ -200,13 +200,13 @@ onMounted(() => {
           <span class="eyebrow">CAMINHO AVANÇADO</span>
           <h2 id="install-plugin-title">Plugin manual para Vencord e Equicord</h2>
         </div>
-        <p>O instalador por comando acima é o caminho recomendado. Use este fluxo apenas se quiser baixar o ZIP e fazer cada etapa manualmente.</p>
+        <p>Este caminho está temporariamente indisponível na 2.0.0. Use a GUI WireGuard.</p>
       </div>
       <div class="plugin-layout">
         <div class="prose-block">
           <h3>Passo a passo</h3>
           <ol class="numbered-list numbered-list--plain">
-            <li><span>01</span><p>Baixe o <a :href="downloads.plugin" target="_blank" rel="noopener noreferrer">ZIP do plugin</a> e extraia a pasta <code>goLiveBypass</code>.</p></li>
+            <li><span>01</span><p>O ZIP do plugin não é distribuído na 2.0.0.</p></li>
             <li><span>02</span><p>Copie-a para <code>src/userplugins/goLiveBypass</code> dentro do seu clone do Vencord ou Equicord. A pasta <code>userplugins</code> fica ao lado de <code>plugins</code>.</p></li>
             <li><span>03</span><p>Na raiz do mod, rode <code>pnpm install</code> e <code>pnpm build</code>.</p></li>
             <li><span>04</span><p>Feche o Discord, rode <code>pnpm inject</code> e abra o Discord novamente. No Vesktop, aponte o campo <strong>Vencord Location</strong> para a pasta <code>dist</code> em vez de usar <code>pnpm inject</code>.</p></li>
@@ -216,7 +216,7 @@ onMounted(() => {
           <BaseIcon name="alert" :size="20" />
           <div>
             <strong>Não misture os caminhos.</strong>
-            <p>O standalone ocupa o lugar do mod e pode remover outros plugins. Se Vencord ou Equicord já estiver instalado, use o instalador do plugin ou este fluxo manual — nunca o standalone.</p>
+            <p>Não execute este fluxo durante a portabilidade. O plugin e o standalone estão pausados.</p>
             <a class="text-link" :href="githubReleasePageUrl" target="_blank" rel="noopener noreferrer">Ver release e checksums <BaseIcon name="external" :size="15" /></a>
           </div>
         </div>
