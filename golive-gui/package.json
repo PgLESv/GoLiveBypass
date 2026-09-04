@@ -1,7 +1,7 @@
 {
   "name": "golive-gui",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "desktopName": "com.golivebypass.gui.desktop",
   "description": "Devolve o Go Live e a camera do Discord para contas que cairam no bloqueio regional brasileiro",
   "author": "bezumiya",
@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "vite",
     "compile": "node scripts/sync-bypass.mjs && npm run build:proton && tsc && vite build",
-    "build:proton": "cd ../tools/proton-confgen && go build -o build/proton-confgen ./cmd/protonvpn-wg && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o build/proton-confgen.exe ./cmd/protonvpn-wg",
+    "build:proton": "node scripts/build-proton.mjs",
     "build": "npm run compile && electron-builder --publish never",
     "build:win": "npm run compile && electron-builder --win --x64 --publish never",
     "build:mac": "npm run compile && electron-builder --mac --arm64 --publish never",

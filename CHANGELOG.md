@@ -4,6 +4,15 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.1] - 2026-09-04
+
+### Corrigido
+- **Autenticação ProtonVPN: "this version of the app is no longer supported" (code 2028)** — o
+  `proton-confgen` enviava o header `x-pm-appversion: linux-vpn@4.17.2` para a API da Proton, que
+  descontinuou a série v4 legado. Atualizado para `linux-vpn-cli@5.6.10` acompanhado do cabeçalho
+  `x-pm-apiversion: 3` (arquitetura v5 do cliente oficial Proton Linux). O erro se manifestava como
+  falha imediata com código 2028 ao tentar autenticar a conta Proton na GUI.
+
 ## [2.0.0] - 2026-09-04
 
 ### Destaques
@@ -23,7 +32,6 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - O perfil WireGuard gratuito integrado é compartilhado; degradação sob carga pode afetar uploads e anexos. Uma configuração privada é recomendada para uso intenso.
 - **macOS temporariamente indisponível:** a GUI não usa mais PAC/injeção e aguarda uma implementação de VPN por aplicativo equivalente.
 - Depois de otimizar a rota ProtonVPN, é necessário sair e entrar novamente na chamada para que a nova rota seja usada pelo Discord.
-
 
 ## [1.1.12] - Unreleased
 
