@@ -5,9 +5,6 @@ export default defineNuxtConfig({
     strict: true,
     typeCheck: true,
   },
-  nitro: {
-    preset: 'static',
-  },
   app: {
     head: {
       htmlAttrs: {
