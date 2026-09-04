@@ -16,6 +16,12 @@
 #   ./golivebypass-standalone.sh --check-update
 #   ./golivebypass-standalone.sh --update
 
+# A variante standalone/CLI esta temporariamente fora do ar durante a portabilidade
+# do novo sistema WireGuard por aplicativo. O aviso aparece antes de qualquer menu ou acao.
+printf '\n[AVISO] O standalone CLI esta temporariamente indisponivel.\n' >&2
+printf '       Estamos portando o novo sistema WireGuard para esta variante.\n' >&2
+printf '       Use a GUI 2.0.0 de teste enquanto isso; ela e a variante mantida no momento.\n\n' >&2
+
 # So construcoes POSIX: roda em dash, bash, zsh, ksh e busybox ash.
 set -eu
 SCRIPT_PATH="${SCRIPT_PATH:-$0}"

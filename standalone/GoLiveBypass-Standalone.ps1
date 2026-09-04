@@ -35,6 +35,12 @@ $StandaloneRepoApi = 'https://api.github.com/repos/bezumiya/GoLiveBypass/release
 $StandaloneRepoRoot = 'https://raw.githubusercontent.com/bezumiya/GoLiveBypass'
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }
 
+Write-Host ''
+Write-Host '  [AVISO] O standalone CLI esta temporariamente indisponivel.' -ForegroundColor Yellow
+Write-Host '          Estamos portando o novo sistema WireGuard para esta variante.' -ForegroundColor DarkGray
+Write-Host '          Use a GUI 2.0.0 de teste enquanto isso; ela e a variante mantida no momento.' -ForegroundColor DarkGray
+Write-Host ''
+
 # "Executar com o PowerShell" no menu de contexto do Explorer (ou duplo clique num .ps1
 # associado a isso) spawna powershell.exe -File sem -NoExit: a janela fecha sozinha ao sair,
 # mesmo com erro. Sem pausa aqui a pessoa nunca le a mensagem (o .bat ja tem "pause" pra
