@@ -2860,7 +2860,7 @@ ipcMain.handle("test-proxy", async (_event, proxyRaw: unknown) => {
 });
 
 // ------------------------------------------------------------------ diagnostico / modo dev
-const ISSUE_REPO = "bezumiya/GoLiveBypass";
+const ISSUE_REPO = "PgLESv/GoLiveBypass";
 // A label "gui" precisa existir no repo (criar uma vez no GitHub). Sem ela o form ainda abre;
 // a API de reports usa ISSUE_LABELS no servidor.
 const ISSUE_LABELS = ["bug", "gui"];

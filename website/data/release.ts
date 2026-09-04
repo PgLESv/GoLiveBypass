@@ -9,7 +9,7 @@ export type ReleaseAssetKey =
   | 'standaloneSha'
 
 export const release = {
-  owner: 'bezumiya',
+  owner: 'PgLESv',
   repo: 'GoLiveBypass',
   tag: 'v2.1.0',
   version: '2.1.0',

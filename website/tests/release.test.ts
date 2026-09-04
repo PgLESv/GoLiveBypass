@@ -10,14 +10,14 @@ import { terminalCommands } from '../data/install'
 describe('release downloads', () => {
   it('monta um asset direto da release configurada', () => {
     expect(githubReleaseAssetUrl(release.assets.plugin)).toBe(
-      'https://github.com/bezumiya/GoLiveBypass/releases/download/v2.1.0/goLiveBypass-vencord.zip',
+      'https://github.com/PgLESv/GoLiveBypass/releases/download/v2.1.0/goLiveBypass-vencord.zip',
     )
   })
 
   it('codifica nomes de arquivo sem chamar a API do GitHub', () => {
     expect(githubReleaseAssetUrl('arquivo de teste.zip')).toContain('arquivo%20de%20teste.zip')
     expect(githubRawUrl('installer/golivebypass-installer.sh')).toBe(
-      'https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main/installer/golivebypass-installer.sh',
+      'https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/golivebypass-installer.sh',
     )
   })
 
