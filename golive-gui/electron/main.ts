@@ -375,6 +375,7 @@ function statusLabel(status: string) {
   if (status === "ACTIVE") return "ativo";
   if (status === "OTHER_MOD") return "outro mod detectado";
   if (status === "NOT_FOUND") return "Discord não encontrado";
+  if (status === "UNSUPPORTED") return "não suportado nesta plataforma";
   return "inativo";
 }
 
@@ -539,13 +540,11 @@ if (!gotLock) {
     // settings compartilhado (Linux) quanto o settings de injecoes existentes
     // (Windows/macOS), inclusive se uma beta anterior deixou autoRevive=false.
     updateSharedSettings({});
-    const recuperacoesMigradas = reescreverSettingsInjetado({});
-    logger.info("recuperacao", "automatica obrigatoria", { injecoesMigradas: recuperacoesMigradas });
+    logger.info("recuperacao", "sistema WireGuard ativo; legado de injecao ignorado", {});
     // Se uma sessao anterior morreu sem o quit limpo (PC desligado, crash), a injecao
     // ficou orfa: reverte agora para o status nao mentir (bug: "Ativo" sem ter ativado).
-    revertOrphanedInjection().catch((error) =>
-      console.error("[restore] falha na reversao de boot:", error),
-    );
+    // O sistema atual usa somente WireGuard por processo. Não reverter nem interpretar
+    // app.asar/_app.asar: esses arquivos podem pertencer ao Discord ou a outro mod.
     // Se o modo salvo e Tor, comeca a subir o daemon JA na abertura. Sem isto ha um impasse:
     // o botao de ativar so libera com o Tor verificado, e o Tor so subia ao ativar ou ao
     // clicar no seletor -- mas quem abre o app com Tor ja selecionado nao clica em nada, e
@@ -597,7 +596,7 @@ if (!gotLock) {
     // verde (relato do beta 1.1.11-beta.2). No Linux nao roda: a ativacao pode
     // pedir elevacao, e prompt no boot e pior que o clique; la a injecao persiste
     // no boot pelo intact-skip do revertOrphanedInjection.
-    if (!IS_LINUX && readSharedSettings().autoInject === true) {
+    if (false && !IS_LINUX && readSharedSettings().autoInject === true) {
       const injetado = getDiscordInstalls().some((install) =>
         withNoAsar(() =>
           diskFs.existsSync(path.join(install.resources, "_app.asar")) &&
@@ -1161,6 +1160,7 @@ async function activateBypass(event: any, proxyAddress: string = "", confirmOver
 }
 
 async function executarAtivacao(event: any, proxyAddress: string, confirmOverride: boolean) {
+  if (isMac) throw new Error("O bypass por WireGuard ainda não está disponível no macOS.");
   const installs = getDiscordInstalls();
   if (installs.length === 0) {
     discordscan.ativacaoSemDiscord("nenhum install encontrado na varredura");
@@ -1298,7 +1298,7 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
   // estiver no disco (quit limpo restaura, e o usuario nao precisa apertar o
   // botao de novo — relato do beta 1.1.11-beta.2). Zerada so no deactivate
   // explicito do usuario.
-  updateSharedSettings({ autoInject: true });
+  updateSharedSettings({ autoInject: false });
   // Ativacao concluiu de verdade: guarda a assinatura para a guarda de duplicada
   // (ver topo da funcao).
   assinaturaUltimaAtivacao = assinatura;
@@ -1316,6 +1316,19 @@ async function deactivateAll() {
   const hadWireSock = IS_WINDOWS && isWireSockActive();
 
   const installs = getDiscordInstalls();
+
+  // O estado atual é exclusivamente o túnel. Nunca restaure ou remova app.asar/_app.asar
+  // durante a desativação; isso eliminava mods do usuário e causava falsos positivos.
+  if (IS_WINDOWS) {
+    if (hadWireSock) {
+      await killDiscord();
+      stopWireSockService();
+      for (const install of installs) startDiscord(install);
+    }
+    clearSessionMarker();
+    return;
+  }
+  if (isMac) return;
 
   // So desfaz o que e nosso. Isto roda ao sair do app, e antes desfazia qualquer injecao:
   // quem tinha Equicord ou Vencord abria este app, fechava, e o mod sumia sem nada avisar.
@@ -1365,8 +1378,11 @@ function getStatus(): string {
   // admin para instalar/iniciar o servico, mas o processo direto sobe e o tunel funciona): a
   // ativacao completava de verdade (Discord envelopado, WireSock rodando), mas a UI nunca via
   // isso e ficava presa mostrando "Ativar" -- exatamente o relato do beta tester.
-  if (IS_WINDOWS && isWireSockActive()) {
-    return "ACTIVE";
+  if (isMac) return "UNSUPPORTED";
+  if (IS_WINDOWS) {
+    const installs = getDiscordInstalls();
+    if (installs.length === 0) return "NOT_FOUND";
+    return isWireSockActive() && discordIsRunning() ? "ACTIVE" : "INACTIVE";
   }
   const installs = getDiscordInstalls();
   if (installs.length === 0) return "NOT_FOUND";
@@ -1463,23 +1479,14 @@ function linuxStatus(): Promise<string> {
         }
         ultimosFlavoursLinux = [...flavours].join(",");
         if (discords.length === 0) return "NOT_FOUND";
-        const anyOurs = discords.some(
-          (d: { state: string }) => d.state === "nosso",
+        const anyRunning = discords.some(
+          (d: { running?: string }) => d.running === "sim",
         );
-        const anyOursRunning = discords.some(
-          (d: { state: string; running?: string }) => d.state === "nosso" && d.running === "sim",
-        );
-        const anyMod = discords.some(
-          (d: { state: string }) => d.state === "outromod",
-        );
-        // O bypass so esta "ativo" de verdade com o cliente aberto: injecao no disco com
-        // nenhum processo vivo e orfa (o boot a reverte), nao um estado ativo.
-        if (anyOursRunning) return "ACTIVE";
-        if (anyOurs && !anyOursRunning) {
-          discordscan.scriptTrace("injeção no disco mas nenhum cliente aberto — considerando inativo");
-          return "INACTIVE";
-        }
-        return "INACTIVE";
+        const netnsAtivo = data?.netns === true;
+        // Fonte de verdade: namespace WireGuard + cliente Discord vivo. O estado do
+        // app.asar/_app.asar é legado e não participa mais do status.
+        if (netnsAtivo && anyRunning) return "ACTIVE";
+        return discords.length > 0 ? "INACTIVE" : "NOT_FOUND";
       } catch {
         discordscan.scriptJsonInvalido(stdout);
         return "NOT_FOUND";
@@ -1557,7 +1564,7 @@ async function linuxActivate(
   }
   // Flag de "estava ativo" (o quit limpo do Linux restaura a injecao; o boot
   // seguinte re-injeta pela flag). Zerada so no deactivate explicito.
-  updateSharedSettings({ autoInject: true });
+  updateSharedSettings({ autoInject: false });
   iniciarWgStatsWatchdog(linuxWgStats);
 }
 

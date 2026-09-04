@@ -261,6 +261,13 @@ async function updateStatus() {
       toggleBtn.disabled = true;
       btnText.innerText = 'Não Disponível';
       statusCard.hidden = false;
+    } else if (status === 'UNSUPPORTED') {
+      statusText.innerText = isMac ? 'Bypass por WireGuard indisponível no macOS' : 'Plataforma não suportada';
+      statusTag.textContent = 'Indisponível';
+      statusTag.classList.add('tag--danger');
+      toggleBtn.disabled = true;
+      btnText.innerText = 'Não Disponível';
+      statusCard.hidden = false;
     } else {
       if (!hasSelectedConf) {
         toggleBtn.disabled = true;

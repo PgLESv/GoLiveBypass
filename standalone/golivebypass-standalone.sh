@@ -1784,7 +1784,9 @@ if [ "$MODE" = "status" ]; then
     if [ "$JSON" -eq 1 ]; then
         route_mode_disk="wireguard"
         tor_addr_disk=""
-        printf '{"routeMode":"%s","torAddr":"%s","wg":%s,"discords":[' "$route_mode_disk" "$tor_addr_disk" "$(wg_stats_json)"
+        netns_json=false
+        if ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then netns_json=true; fi
+        printf '{"routeMode":"%s","torAddr":"%s","netns":%s,"wg":%s,"discords":[' "$route_mode_disk" "$tor_addr_disk" "$netns_json" "$(wg_stats_json)"
         first=1
         printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav detect id; do
             [ "$first" -eq 1 ] || printf ','
