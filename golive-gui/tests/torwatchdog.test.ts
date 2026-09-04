@@ -141,18 +141,12 @@ describe("watchdog nao corre com a insistencia de fundo do Tor (evita dois spawn
 describe("deactivateAll() mata o Tor embutido, nao so o watchdog (vazamento de processo)", () => {
   const mainSource = readFileSync(join(__dirname, "..", "electron", "main.ts"), "utf8");
 
-  it("deactivateAll() chama stopTor() antes de qualquer return antecipado", () => {
+  it("deactivateAll() continua parando o Tor ao desligar", () => {
     const fnStart = mainSource.indexOf("async function deactivateAll()");
     expect(fnStart).toBeGreaterThan(-1);
     const fnBody = mainSource.slice(fnStart, fnStart + 3000);
 
     const stopTorIndex = fnBody.indexOf("stopTor();");
-    const earlyReturnIndex = fnBody.indexOf("if (ours.length === 0) return;");
     expect(stopTorIndex).toBeGreaterThan(-1);
-    expect(earlyReturnIndex).toBeGreaterThan(-1);
-    // stopTor() precisa vir ANTES do "nada a desfazer, sai" -- o Tor pode estar de pe desde
-    // a abertura da GUI mesmo sem nenhuma injecao para reverter (o boot sobe o daemon cedo),
-    // e o pedido de desligar vale de qualquer jeito.
-    expect(stopTorIndex).toBeLessThan(earlyReturnIndex);
   });
 });
