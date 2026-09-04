@@ -19,8 +19,12 @@ REPO="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 PASS=0
 FAIL=0
 
-# Escolhe podman ou docker
-if command -v podman >/dev/null 2>&1; then
+# Escolhe podman ou docker. O env pode forcar um runtime (ex.: um wrapper que chama
+# "podman --security-opt label=disable" para rodar em maquina com SELinux enforcing;
+# mesmo padrao do test-parallel-client-mismatch.sh).
+if [ -n "${RUNTIME:-}" ]; then
+    :
+elif command -v podman >/dev/null 2>&1; then
     RUNTIME=podman
 elif command -v docker >/dev/null 2>&1; then
     RUNTIME=docker
@@ -98,7 +102,12 @@ do
     set -- $spec
     img="$1"; shell="$2"
     for script in installer/golivebypass-installer.sh standalone/golivebypass-standalone.sh; do
-        out="$(run_container "$img" "$shell" "/repo/$script" --help 2>&1 || true)"
+        # O standalone recusa rodar como root sem --real-home (a recusa vem antes do
+        # parsing de args, entao pega ate o --help). O instalador nao tem recusa e
+        # rejeitaria o flag como opcao desconhecida, entao ele so vai no standalone.
+        realhome=""
+        case "$script" in standalone/*) realhome="--real-home /home/testuser" ;; esac
+        out="$(run_container "$img" "$shell" "/repo/$script" $realhome --help 2>&1 || true)"
         if printf '%s' "$out" | grep -q 'GoLiveBypass'; then
             ok "--help $shell $script ($img)"
         else
@@ -120,7 +129,7 @@ for spec in \
 do
     set -- $spec
     img="$1"; shell="$2"
-    out="$(run_container_home "$img" "$FAKE_HOME" "$shell" /repo/standalone/golivebypass-standalone.sh --status 2>&1 || true)"
+    out="$(run_container_home "$img" "$FAKE_HOME" "$shell" /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --status 2>&1 || true)"
     if printf '%s' "$out" | grep -q 'sem nada instalado'; then
         ok "status $shell ($img)"
     else
@@ -141,10 +150,10 @@ do
     img="$1"; shell="$2"
     home="$(mktemp -d)"
     make_fake_home "$home"
-    if run_container_home "$img" "$home" "$shell" /repo/standalone/golivebypass-standalone.sh --yes >/dev/null 2>&1; then
+    if run_container_home "$img" "$home" "$shell" /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --yes >/dev/null 2>&1; then
         if [ -f "$home/.config/discord/app-9.9.9/resources/_app.asar" ] \
            && [ -f "$home/.config/discord/app-9.9.9/resources/app.asar/index.js" ] \
-           && run_container_home "$img" "$home" "$shell" /repo/standalone/golivebypass-standalone.sh --uninstall >/dev/null 2>&1 \
+           && run_container_home "$img" "$home" "$shell" /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --uninstall >/dev/null 2>&1 \
            && [ -f "$home/.config/discord/app-9.9.9/resources/app.asar" ] \
            && [ ! -e "$home/.config/discord/app-9.9.9/resources/_app.asar" ]; then
             ok "ciclo $shell ($img)"
@@ -193,6 +202,12 @@ cat >> "$ELEVATE_HARNESS" <<'H_EOF'
 elevate sh -c "echo elevado > /tmp/fakehome/ok"
 [ -f /tmp/fakehome/ok ] && grep -q "PKEXEC:sh" /tmp/elevate-used
 H_EOF
+# O container roda como uid 1000. Com podman/docker rootless esse uid mapeia para
+# um subuid do host e nao enxerga os arquivos do usuario que chamou a suite
+# (mktemp cria 600/700), derrubando o teste. Abrir as permissoes do harness e da
+# home fake mantem o teste valido em rootful (CI) e rootless (maquina local).
+chmod 644 "$ELEVATE_HARNESS"
+chmod 777 "$ELEVATE_HOME"
 if "$RUNTIME" run --rm -u 1000:1000 \
     -v "$ELEVATE_HARNESS:/t.sh:ro" \
     -v "$ELEVATE_HOME/bin:/tmp/fakebin:ro" \
@@ -229,7 +244,9 @@ do
             bad "sintaxe $shell $script ($img)"
         fi
         # help
-        out="$("$RUNTIME" run --rm -u root -v "$REPO:/repo:ro" "$img" sh -c "$setup $shell /repo/$script --help" 2>&1 || true)"
+        realhome=""
+        case "$script" in standalone/*) realhome="--real-home /home/testuser" ;; esac
+        out="$("$RUNTIME" run --rm -u root -v "$REPO:/repo:ro" "$img" sh -c "$setup $shell /repo/$script $realhome --help" 2>&1 || true)"
         if printf '%s' "$out" | grep -q 'GoLiveBypass'; then
             ok "--help $shell $script ($img)"
         else
@@ -245,14 +262,14 @@ do
         -v "$home:/home/testuser" \
         -e HOME=/home/testuser \
         -e XDG_DATA_HOME=/home/testuser/.local/share \
-        "$img" sh -c "$setup $shell /repo/standalone/golivebypass-standalone.sh --yes" >/dev/null 2>&1 \
+        "$img" sh -c "$setup $shell /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --yes" >/dev/null 2>&1 \
         && [ -f "$home/.config/discord/app-9.9.9/resources/_app.asar" ] \
         && "$RUNTIME" run --rm -u root \
             -v "$REPO:/repo:ro" \
             -v "$home:/home/testuser" \
             -e HOME=/home/testuser \
             -e XDG_DATA_HOME=/home/testuser/.local/share \
-            "$img" sh -c "$setup $shell /repo/standalone/golivebypass-standalone.sh --uninstall" >/dev/null 2>&1 \
+            "$img" sh -c "$setup $shell /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --uninstall" >/dev/null 2>&1 \
         && [ ! -e "$home/.config/discord/app-9.9.9/resources/_app.asar" ]; then
         ok "ciclo $shell ($img)"
     else
@@ -275,7 +292,7 @@ printf 'original asar' > "$home/.config/discord/app-9.9.9/resources/_app.asar"
 mkdir -p "$home/.config/discord/app-9.9.9/resources/app.asar"
 printf '{"name":"discord","main":"index.js"}' > "$home/.config/discord/app-9.9.9/resources/app.asar/package.json"
 printf 'require("/home/user/Equicord/dist/desktop");' > "$home/.config/discord/app-9.9.9/resources/app.asar/index.js"
-if run_container_home "debian:stable-slim" "$home" sh /repo/standalone/golivebypass-standalone.sh --yes >/dev/null 2>&1 \
+if run_container_home "debian:stable-slim" "$home" sh /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --yes >/dev/null 2>&1 \
     && [ -f "$home/.config/discord/app-9.9.9/resources/_app.asar" ]; then
     ok "substituicao de outro mod (debian sh)"
 else
@@ -295,7 +312,7 @@ if "$RUNTIME" run --rm -u root \
         -v "$fp_root/var/lib/flatpak:/var/lib/flatpak" \
         -e HOME=/home/testuser \
         -e XDG_DATA_HOME=/home/testuser/.local/share \
-        debian:stable-slim sh /repo/standalone/golivebypass-standalone.sh --yes >/dev/null 2>&1 \
+        debian:stable-slim sh /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --yes >/dev/null 2>&1 \
     && [ -f "$fp_root/var/lib/flatpak/app/com.discordapp.Discord/current/active/files/discord/resources/_app.asar" ]; then
     ok "instalacao em flatpak do sistema (debian sh)"
 else
@@ -308,7 +325,9 @@ rm -rf "$fp_root" "$home" 2>/dev/null || true
 home="$(mktemp -d)"
 mkdir -p "$home/.config/discord/app-9.9.9/resources"
 printf 'fake' > "$home/.config/discord/app-9.9.9/resources/app.asar"
-out="$(run_container_home "debian:stable-slim" "$home" sh /repo/standalone/golivebypass-standalone.sh --status --json 2>/dev/null)"
+# O || true e de proposito: sem ele, uma falha aqui (ex.: recusa de root) mataria
+# a suite inteira pelo set -eu antes das secoes 8/9; com ele, vira FAIL contado.
+out="$(run_container_home "debian:stable-slim" "$home" sh /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --status --json 2>/dev/null || true)"
 if printf '%s' "$out" | grep -q '"state":"vanilla"'; then
     ok "status --json (debian sh)"
 else
@@ -330,7 +349,7 @@ out="$("$RUNTIME" run --rm -u root \
     -e HOME=/home/testuser \
     -e XDG_DATA_HOME=/home/testuser/.local/share \
     -e PATH=/usr/local/bin:/usr/bin:/bin \
-    debian:stable-slim sh -c 'sh /repo/standalone/golivebypass-standalone.sh --yes >/dev/null 2>&1; sleep 1; echo "I=$(cat /tmp/calls 2>/dev/null | wc -l)"; sh /repo/standalone/golivebypass-standalone.sh --uninstall >/dev/null 2>&1; sleep 1; echo "U=$(cat /tmp/calls 2>/dev/null | wc -l)"' 2>&1)"
+    debian:stable-slim sh -c 'sh /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --yes >/dev/null 2>&1; sleep 1; echo "I=$(cat /tmp/calls 2>/dev/null | wc -l)"; sh /repo/standalone/golivebypass-standalone.sh --real-home /home/testuser --uninstall >/dev/null 2>&1; sleep 1; echo "U=$(cat /tmp/calls 2>/dev/null | wc -l)"' 2>&1)"
 i="$(printf '%s' "$out" | sed -n 's/^I=//p')"
 u="$(printf '%s' "$out" | sed -n 's/^U=//p')"
 if [ "${i:-0}" -ge 1 ] && [ "${u:-0}" -ge 2 ]; then
@@ -387,6 +406,62 @@ H_EOF
         ok "descoberta de checkout $shell ($img)"
     else
         bad "descoberta de checkout $shell ($img)"
+    fi
+    rm -f "$HARNESS"
+    "$RUNTIME" run --rm -u root -v "$home:/h" debian:stable-slim rm -rf /h >/dev/null 2>&1 || true
+    rm -rf "$home" 2>/dev/null || true
+done
+
+echo
+echo "== 9. instalador: parallel_installs nao derruba o script (set -e) =="
+# Simula o caso real que travava o menu: um Discord PURO varrido por ultimo pelo
+# discord_resources fazia o while de parallel_installs sair com status 1, o
+# assignment `parallels="$(parallel_installs)"` falhava e o `set -e` matava o
+# script inteiro sem mensagem (o instalador "nao fazia nada" depois de
+# "Fonte nao encontrado").
+for spec in \
+    "debian:stable-slim sh" \
+    "alpine:latest ash" \
+    "fedora:latest bash" \
+    "ubuntu:latest dash"
+do
+    set -- $spec
+    img="$1"; shell="$2"
+    home="$(mktemp -d)"
+    # Discord puro no .config (primeira secao da varredura)...
+    mkdir -p "$home/.config/discord/app-1.0.155/resources"
+    printf 'original' > "$home/.config/discord/app-1.0.155/resources/app.asar"
+    # ...um cliente paralelo no meio (secao de pacotes: app.asar direto na raiz,
+    # o unico formato que is_parallel_install reconhece - path termina em /vesktop)...
+    mkdir -p "$home/.local/share/vesktop"
+    printf 'original' > "$home/.local/share/vesktop/app.asar"
+    # ...e outro Discord puro por ULTIMO (secao .var/app): era ele que fazia a
+    # funcao sair com 1 quando o usuario so tinha Discord puro.
+    mkdir -p "$home/.var/app/com.discordapp.Discord/config/discord/app-1.0.0/resources"
+    printf 'original' > "$home/.var/app/com.discordapp.Discord/config/discord/app-1.0.0/resources/app.asar"
+
+    HARNESS="$(mktemp)"
+    awk '/^banner$/{exit} {print}' "$REPO/installer/golivebypass-installer.sh" > "$HARNESS"
+    cat >> "$HARNESS" <<'H_EOF'
+saida="$(parallel_installs)"
+[ "$(printf '%s\n' "$saida" | wc -l)" -eq 1 ] || { echo PARALLEL_BAD; exit 1; }
+case "$saida" in *vesktop*) ;; *) echo PARALLEL_BAD; exit 1 ;; esac
+# So com Discord puro (o caso do usuario): sai 0 e lista nada.
+rm -rf /home/testuser/.local/share/vesktop /home/testuser/.var/app
+saida="$(parallel_installs)"
+[ -z "$saida" ] || { echo PARALLEL_BAD; exit 1; }
+echo PARALLEL_OK
+H_EOF
+
+    if "$RUNTIME" run --rm \
+            -v "$HARNESS:/t.sh:ro" \
+            -v "$home:/home/testuser" \
+            -e HOME=/home/testuser \
+            -e XDG_DATA_HOME=/home/testuser/.local/share \
+            "$img" "$shell" /t.sh 2>/dev/null | grep -q PARALLEL_OK; then
+        ok "parallel_installs $shell ($img)"
+    else
+        bad "parallel_installs $shell ($img)"
     fi
     rm -f "$HARNESS"
     "$RUNTIME" run --rm -u root -v "$home:/h" debian:stable-slim rm -rf /h >/dev/null 2>&1 || true
