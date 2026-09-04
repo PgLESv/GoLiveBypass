@@ -16,6 +16,7 @@
 //   BYPASS=/caminho/golivebypass.js node tests/test-manual-proxy-banner-test.cjs
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const vm = require("vm");
 const Module = require("module");
@@ -25,9 +26,15 @@ let failures = 0;
 function ok(name) { console.log("  [OK] " + name); }
 function bad(name, extra) { failures++; console.log("  [FAIL] " + name + (extra ? ": " + extra : "")); }
 
-const BASE = process.env.FAKE_RES_BASE || "/tmp/fake-res-manual-proxy";
+const ownsBase = !process.env.FAKE_RES_BASE;
+const BASE = process.env.FAKE_RES_BASE || fs.mkdtempSync(path.join(os.tmpdir(), "golive-manual-proxy-"));
 const FAKE_RES = BASE + "/resources";
 const MANUAL_PROXY = "socks5://user:pass@1.2.3.4:1080";
+if (ownsBase) {
+  process.once("exit", () => {
+    try { fs.rmSync(BASE, { recursive: true, force: true }); } catch {}
+  });
+}
 fs.mkdirSync(FAKE_RES + "/_app.asar", { recursive: true });
 fs.writeFileSync(FAKE_RES + "/_app.asar/package.json", JSON.stringify({ name: "discord", main: "index.js" }));
 fs.writeFileSync(FAKE_RES + "/_app.asar/index.js", "// discord fake");
@@ -48,6 +55,15 @@ const BrowserWindowStub = { getAllWindows: () => [fakeWin] };
 const appStub = { on: () => {}, whenReady: () => ({ then: () => {} }), setAppPath: () => {} };
 const sessionStub = { defaultSession: { resolveProxy: async () => "DIRECT", setProxy: async () => {}, webRequest: { onBeforeRequest: () => {} }, closeAllConnections: async () => {} } };
 
+function criarProcessoSandbox() {
+  const sandboxProcess = Object.create(process);
+  Object.defineProperties(sandboxProcess, {
+    env: { value: { ...process.env, XDG_DATA_HOME: path.join(BASE, "data") } },
+    argv: { value: ["node", FAKE_RES + "/_app.asar/index.js"] },
+  });
+  return sandboxProcess;
+}
+
 const code = fs.readFileSync(BYPASS, "utf8");
 const sandboxRequire = (name) => {
   if (name === "electron") return { app: appStub, session: sessionStub, BrowserWindow: BrowserWindowStub };
@@ -61,14 +77,13 @@ const sandbox = {
   exports: {},
   __dirname: FAKE_RES,
   __filename: BYPASS,
-  console, process, Buffer,
+  console, process: criarProcessoSandbox(), Buffer,
   setTimeout, clearTimeout, setInterval, clearInterval,
   URL, URLSearchParams, Date,
 };
 sandbox.module.exports = sandbox.exports;
 sandbox.global = sandbox;
 vm.createContext(sandbox);
-Object.defineProperty(sandbox.process, "argv", { value: ["node", FAKE_RES + "/_app.asar/index.js"], writable: false });
 vm.runInContext(code, sandbox, { filename: BYPASS });
 
 const g = sandbox;
@@ -141,12 +156,11 @@ async function testCounterResetsOnSuccess() {
   const sandbox2 = {
     require: sandboxRequire2, module: { exports: {} }, exports: {},
     __dirname: FAKE_RES, __filename: BYPASS,
-    console, process, Buffer, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams, Date,
+    console, process: criarProcessoSandbox(), Buffer, setTimeout, clearTimeout, setInterval, clearInterval, URL, URLSearchParams, Date,
   };
   sandbox2.module.exports = sandbox2.exports;
   sandbox2.global = sandbox2;
   vm.createContext(sandbox2);
-  Object.defineProperty(sandbox2.process, "argv", { value: ["node", FAKE_RES + "/_app.asar/index.js"], writable: false });
   vm.runInContext(code2, sandbox2, { filename: BYPASS });
   const g2 = sandbox2;
 

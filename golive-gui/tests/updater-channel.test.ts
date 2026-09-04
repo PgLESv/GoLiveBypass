@@ -102,4 +102,24 @@ describe("wiring do canal no updater e no workflow", () => {
     expect(workflow).toContain("-c.publish.releaseType=prerelease");
     expect(workflow).toContain("beta-marcar");
   });
+
+  it("o updater nunca usa showMessageBoxSync (bloqueia o watchdog do Tor enquanto o dialogo espera resposta)", () => {
+    // showMessageBoxSync bloqueia a thread JS do processo principal ate a pessoa clicar um
+    // botao -- inclusive o setInterval do watchdog do Tor (main.ts, ver
+    // docs/handoff-2026-09-02-tor-watchdog-gap.md), que fica sem checar o daemon por todo o
+    // tempo que o aviso de atualizacao ficar aberto sem resposta. showMessageBox (assincrono)
+    // nao tem esse problema; main.ts ja usa a versao async em outro lugar (linha ~1162).
+    const updater = fs.readFileSync(path.resolve(process.cwd(), "electron/updater.ts"), "utf8");
+    expect(updater).not.toContain("dialog.showMessageBoxSync(");
+    // Confirma que os 4 usos anteriores viraram await showMessageBox(...) de verdade,
+    // nao so que a string sumiu por outro motivo.
+    const usos = updater.match(/await dialog\.showMessageBox\(/g) ?? [];
+    expect(usos.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("nao consulta releases durante npm run dev", () => {
+    const updater = fs.readFileSync(path.resolve(process.cwd(), "electron/updater.ts"), "utf8");
+    expect(updater).toMatch(/const isDev = !app\.isPackaged;[\s\S]{0,300}if \(isDev\) \{[\s\S]{0,300}return;/);
+    expect(updater).not.toContain("autoUpdater.forceDevUpdateConfig = true");
+  });
 });

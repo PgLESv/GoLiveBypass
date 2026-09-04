@@ -158,7 +158,11 @@ backup_dir="$WORK/backup-test"
 mkdir -p "$backup_dir"
 # Carrega a funcao backup_plugin
 HARNESS="$(mktemp)"
-awk '/^# Auto-update/,/^main_menu/' "$REPO/installer/golivebypass-installer.sh" > "$HARNESS"
+awk '
+    /^# Auto-update via GitHub Releases/ { found=1 }
+    found && /^main_menu\(\) \{/ { exit }
+    found { print }
+' "$REPO/installer/golivebypass-installer.sh" > "$HARNESS"
 printf 'PLUGIN_DIR_NAME="goLiveBypass"\n' >> "$HARNESS"
 
 plugin="$WORK/plugin-src/src/userplugins/goLiveBypass"
@@ -181,7 +185,11 @@ fi
 # --------------------------------------------------------------------------- 7. Compare version com prefxos
 step "7. Compare version com varios formatos"
 HARNESS="$(mktemp)"
-awk '/^# Auto-update/,/^main_menu/' "$REPO/installer/golivebypass-installer.sh" > "$HARNESS"
+awk '
+    /^# Auto-update via GitHub Releases/ { found=1 }
+    found && /^main_menu\(\) \{/ { exit }
+    found { print }
+' "$REPO/installer/golivebypass-installer.sh" > "$HARNESS"
 printf 'PLUGIN_DIR_NAME="goLiveBypass"\n' >> "$HARNESS"
 
 test_cv() {

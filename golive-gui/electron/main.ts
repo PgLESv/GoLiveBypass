@@ -17,7 +17,7 @@ import fs from "fs";
 import { createHash } from "crypto";
 import { execFileSync, execSync, spawn, spawnSync } from "child_process";
 import { bypassCode } from "./bypass";
-import { createTorWatchdog, type TorWatchdog } from "./torwatchdog";
+import { createTorWatchdog, TOR_WATCHDOG_PORT_MS, type TorWatchdog } from "./torwatchdog";
 import { runScript } from "./linux-helper";
 import { setupUpdater, isQuittingForUpdate } from "./updater";
 import * as logger from "./logger";
@@ -25,12 +25,18 @@ import * as discordscan from "./discordscan";
 import * as netevents from "./netevents";
 import * as logsDir from "./logsDir";
 import { submitBugReport } from "./bugreport";
+import { isWireSockActive, startWireSockService, stopWireSockService } from "./wiresock";
+import { getWgStats, iniciarWgStatsWatchdog, pararWgStatsWatchdog, type WgTunnelStats } from "./wgstats";
+import { validateWgConfContent } from "./wg-validator";
+import * as proton from "./proton";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const isMac = process.platform === "darwin";
 const IS_LINUX = process.platform === "linux";
+const IS_WINDOWS = process.platform === "win32";
+const MAIN_WINDOW_WIDTH = 720;
 
 // Cores da barra de titulo (Windows, titleBarOverlay) — casam com os tokens
 // --canvas e --ink do renderer em cada tema.
@@ -50,7 +56,7 @@ function applyTitlebarTheme() {
 // "'--ozone-platform=wayland' is not compatible with Vulkan" (wayland_surface_factory.cc).
 // A janela abre, mas o renderer fica preso em "Verificando..." para sempre (o getStatus
 // via IPC nunca responde). Desligar a aceleracao de hardware (SwiftShader no lugar) resolve
-// — e este app e uma janela fixa de 480px, nao precisa de GPU. Vale para X11 tambem.
+// — e este app e uma janela fixa de 720px, nao precisa de GPU. Vale para X11 tambem.
 if (IS_LINUX) {
   app.disableHardwareAcceleration();
   app.commandLine.appendSwitch("disable-gpu");
@@ -207,7 +213,7 @@ import { getStartup, setStartup, launchedHidden, syncStartupEntry } from "./star
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 480,
+    width: MAIN_WINDOW_WIDTH,
     // A altura e ajustada pelo proprio conteudo: a pagina avisa via IPC 'resize-window'
     // quando o warning do bypass ativo aparece/some, e a janela cresce/encolhe para nao
     // cortar nada (antes o aviso ficava cortado com a altura fixa de 560).
@@ -520,7 +526,7 @@ if (!gotLock) {
 } else {
   app.on("second-instance", () => showWindow());
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     // Logger proprio: arquivo + ring buffer, captura console do main process.
     // O gui.log mora em <settingsDir>/logs/ — pasta estavel, sobrevive a updates.
     try {
@@ -529,6 +535,12 @@ if (!gotLock) {
       logger.patchConsole();
       logger.info("app", "iniciado", { versao: app.getVersion(), plataforma: process.platform });
     } catch {}
+    // Beta 16: esta nao e mais uma preferencia. Corrige na abertura tanto o
+    // settings compartilhado (Linux) quanto o settings de injecoes existentes
+    // (Windows/macOS), inclusive se uma beta anterior deixou autoRevive=false.
+    updateSharedSettings({});
+    const recuperacoesMigradas = reescreverSettingsInjetado({});
+    logger.info("recuperacao", "automatica obrigatoria", { injecoesMigradas: recuperacoesMigradas });
     // Se uma sessao anterior morreu sem o quit limpo (PC desligado, crash), a injecao
     // ficou orfa: reverte agora para o status nao mentir (bug: "Ativo" sem ter ativado).
     revertOrphanedInjection().catch((error) =>
@@ -545,13 +557,31 @@ if (!gotLock) {
         .then((r) => {
           if (!r.ok) console.warn("[tor] nao subiu na abertura:", r.error);
           // Se o Discord ja esta injetado (sessao viva do boot anterior), o watchdog retoma
-          // a vigia — sem ele, um daemon que morreu na sessao antiga seguiria cego.
-          if (sessaoAtiva()) torWatchdogIniciar();
+          // a vigia — sem ele, um daemon que morreu na sessao antiga seguiria cego. O marcador
+          // (session.json) sozinho e fragil: reproduzido ao vivo no laboratorio um Discord
+          // continuava rodando com a injecao no disco (getStatus() === "ACTIVE") sem o
+          // marcador (ausente ou limpo por um quit/deactivate anterior que nao chegou a
+          // encerrar o Discord de fato) -- o boot seguinte via sessaoAtiva()==false, nunca
+          // armava o watchdog, e um Tor morto ficava morto pelo resto da sessao (o Discord
+          // preso recusando o gateway para sempre, sem ninguem ressuscitando o daemon).
+          // getStatus() le o disco (a injecao esta la de verdade?), entao cobre esse caso sem
+          // depender do marcador efêmero.
+          if (sessaoAtiva() || getStatus() === "ACTIVE") torWatchdogIniciar();
         })
         .catch((error) => console.error("[tor] falha ao preparar na abertura:", error));
     } else {
       // Modo nao-tor: nada a vigiar.
       torWatchdogParar();
+    }
+
+    // Mesma logica do watchdog do Tor acima: se a GUI reabriu com o bypass ja ativo (netns/
+    // WireSock de uma sessao anterior sobrevivendo ao restart da janela), o vigia do tunel
+    // precisa retomar aqui — sem isto, so uma ativacao nova (clique) o arma.
+    if (!isMac) {
+      try {
+        const statusInicial = IS_LINUX ? await linuxStatus() : getStatus();
+        if (statusInicial === "ACTIVE") iniciarWgStatsWatchdog(wgStatsProvider);
+      } catch {}
     }
 
     // No login (start com --hidden / wasOpenedAtLogin) sobe so a bandeja; a janela aparece no clique.
@@ -574,7 +604,17 @@ if (!gotLock) {
           isOurInjection(install.resources),
         ),
       );
-      if (!injetado) {
+      if (injetado) {
+        // Bypass ja injetado neste boot (nao passou pelo activateBypass() desta execucao):
+        // assinaturaUltimaAtivacao nasce "" a cada reinicio da GUI, entao sem isto a guarda
+        // de ativacao duplicada (ver "guarda de ativacao duplicada" abaixo, issue #145) fica
+        // cega logo apos QUALQUER reinicio da GUI — uma reativacao identica (mesma proxy/modo,
+        // clique ou re-chamada automatica) nao seria reconhecida como no-op e re-injetaria por
+        // cima de um bypass que ja estava certo, derrubando o gateway/RTC a toa. Reconstroi a
+        // assinatura a partir do que esta salvo no disco (a mesma fonte que activateBypass()
+        // usaria de qualquer forma) para a guarda valer desde o primeiro clique pos-boot.
+        assinaturaUltimaAtivacao = assinaturaAtivacao(String(readSharedSettings().proxy ?? ""));
+      } else {
         const proxySalvo = String(readSharedSettings().proxy ?? "");
         console.log("[boot] autoInject: bypass estava ativo e nao esta injetado, reativando");
         void garantirTor()
@@ -940,7 +980,7 @@ function startDiscord(install: DiscordInstall) {
     if (isMac && install.bundlePath) {
       spawn("open", [install.bundlePath], { stdio: "ignore" }).unref();
     } else if (install.exePath) {
-      spawn(install.exePath, [], { stdio: "ignore" }).unref();
+      spawn(install.exePath, [], { stdio: "ignore", windowsHide: true }).unref();
     }
   } catch {}
 }
@@ -1025,7 +1065,9 @@ function writeInjection(asar: string, proxyAddress: string) {
         proxy: proxyAddress,
         routeMode: readNetMode(),
         torAddr: `127.0.0.1:${torPortaEmUso}`,
-        autoRevive: readAutoRevive(),
+        // Recuperacao e obrigatoria; mantemos a chave para atualizar tambem
+        // instalacoes que ainda tenham um settings.json legado com false.
+        autoRevive: true,
       }),
     );
     diskFs.writeFileSync(
@@ -1053,7 +1095,7 @@ function reescreverSettingsInjetado(patch: Record<string, unknown>): number {
         try {
           atual = JSON.parse(diskFs.readFileSync(settingsPath, "utf8"));
         } catch {}
-        diskFs.writeFileSync(settingsPath, JSON.stringify({ ...atual, ...patch }));
+        diskFs.writeFileSync(settingsPath, JSON.stringify({ ...atual, ...patch, autoRevive: true }));
         return true;
       } catch {
         return false;
@@ -1074,9 +1116,22 @@ function updateInjectedNetSettings(mode: string): number {
   return reescreverSettingsInjetado({ routeMode: mode, torAddr: `127.0.0.1:${torPortaEmUso}` });
 }
 
-// Toggle do revive automatico com o bypass ativo: mesmo caminho do modo de rede.
-function updateInjectedAutoRevive(enabled: boolean): number {
-  return reescreverSettingsInjetado({ autoRevive: enabled });
+// ------------------------------------------------------------------ fila serial: ativar/desativar
+// nunca podem rodar ao mesmo tempo, venha o clique da janela ou da bandeja. Sao ENTRADAS
+// INDEPENDENTES para os mesmos quatro caminhos (activateBypass/deactivateAll/linuxActivate/
+// linuxDeactivate), e nenhuma sabia da outra: o toggle da bandeja e deliberadamente "sempre
+// clicavel" (ver o comentario dele), inclusive com uma ativacao/desativacao ja em voo pela
+// janela. Sem isto, ativar pela janela e desativar pela bandeja quase ao mesmo tempo faziam
+// duas execucoes mexerem no MESMO app.asar/_app.asar ao mesmo tempo -- no Windows/Mac, dois
+// killDiscord()+rename() concorrentes; no Linux, pior ainda, dois processos `sh
+// golivebypass-standalone.sh` independentes com corrida de arquivo real (TOCTOU) sobre os
+// mesmos diretorios. Resultado possivel: nem app.asar nem _app.asar no lugar certo, Discord
+// quebrado sem recuperacao automatica -- corrupcao de estado, a prioridade mais alta do /goal.
+let bypassOpFila: Promise<unknown> = Promise.resolve();
+function serializarBypassOp<T>(fn: () => Promise<T>): Promise<T> {
+  const propria = bypassOpFila.catch(() => {}).then(fn);
+  bypassOpFila = propria.catch(() => {});
+  return propria;
 }
 
 // ------------------------------------------------------------------ guarda de ativacao duplicada
@@ -1097,7 +1152,9 @@ async function activateBypass(event: any, proxyAddress: string = "", confirmOver
     logger.info("ativacao", "ja ha uma ativacao em andamento; aguardando a mesma conclusao");
     return ativacaoCorrente;
   }
-  ativacaoCorrente = executarAtivacao(event, proxyAddress, confirmOverride).finally(() => {
+  ativacaoCorrente = serializarBypassOp(() =>
+    executarAtivacao(event, proxyAddress, confirmOverride),
+  ).finally(() => {
     ativacaoCorrente = null;
   });
   return ativacaoCorrente;
@@ -1123,48 +1180,32 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
     return;
   }
 
-  // Antes de matar o Discord: detecta mods protegidos (Vencord/Equicord). Sobrescrever
-  // o app.asar deles apaga os plugins do user (BetterDiscord, MessageLogger, etc) e
-  // os dados do mod em %APPDATA%/Vencord. A unica saida que convive e o modo plugin
-  // (goLiveBypass-vencord.zip, publicado em todo release), entao oferecemos o caminho
-  // certo e exigimos confirmacao explicita antes de mexer.
-  const protectedMods = installs
-    .map((i) => ({ install: i, mod: detectOtherMod(i.resources, i.flavour) }))
-    .filter((x) => isProtectedMod(x.mod));
+  // Valida que o usuario selecionou uma configuracao WireGuard
+  const s = readSharedSettings() as any;
+  const vpnMode = (s.vpnMode as string) || "proton";
+  const wgConf = path.join(settingsDir(), "wireguard.conf");
 
-  if (protectedMods.length > 0 && !confirmOverride) {
-    const names = Array.from(new Set(protectedMods.map((x) => x.mod!)));
-    const namesStr = names.join(" / ");
-    const installPaths = protectedMods
-      .map((x) => `  - ${x.install.flavour} (${x.install.resources})`)
-      .join("\n");
-    const choice = await dialog.showMessageBox({
-      type: "warning",
-      buttons: ["Cancelar", "Sobrescrever mesmo assim"],
-      defaultId: 0,
-      cancelId: 0,
-      title: "Vencord/Equicord detectado",
-      message: `Detectamos ${namesStr} instalado(a) no seu Discord.`,
-      detail:
-        `Instalar o GoLiveBypass aqui SUBSTITUI o mod: o Vencord/Equicord para de ` +
-        `carregar e os outros plugins dele (BetterDiscord, MessageLogger, etc) param ` +
-        `de funcionar ate voce reinstalar tudo.\n\n` +
-        `Para nao perder nada, instale o GoLiveBypass como userplugin do ` +
-        `${namesStr} - o zip sai em todo release (` +
-        `goLiveBypass-vencord.zip no GitHub Releases) e convive com o mod.\n\n` +
-        `Installations detectadas:\n${installPaths}\n\n` +
-        `Continuar e sobrescrever mesmo assim? (recomendamos cancelar e usar o plugin)`,
-    });
-    if (choice.response !== 1) {
-      // User escolheu Cancelar. Devolve sem fazer nada - o frontend recebe
-      // a mensagem de erro e mostra o card orientando para o plugin.
-      throw new Error(
-        `Cancelado: ${namesStr} detectado. Instale o GoLiveBypass como userplugin ` +
-        `(goLiveBypass-vencord.zip) para nao perder o mod e os plugins dele.`,
-      );
+  if (vpnMode === "proton") {
+    const username = (s.protonUsername as string) || "";
+    if (!username) {
+      throw new Error("Faça login com sua conta ProtonVPN (ou selecione 'Arquivo .conf Customizado') antes de ativar.");
     }
-    // Se chegou aqui, o user confirmou sobrescrever. Segue o fluxo normal.
-    logger.warn("ativacao", `user-confirmou-sobrescrever mod=${namesStr}`);
+    if (!fs.existsSync(wgConf)) {
+      const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
+        username,
+        countries: (s.protonCountry as string) || undefined,
+        freeOnly: s.protonFreeOnly !== false,
+        autoPing: s.protonAutoPing !== false,
+      });
+      if (!gen.success) {
+        throw new Error(gen.error || "Falha ao selecionar servidor ProtonVPN. Verifique sua conexão e credenciais.");
+      }
+      updateSharedSettings({ protonLastServer: gen });
+    }
+  } else {
+    if (!fs.existsSync(wgConf)) {
+      throw new Error("Nenhuma configuração WireGuard (.conf) foi selecionada. Por favor, importe uma configuração antes de ativar.");
+    }
   }
 
   netevents.gatewayConectando("gateway.discord.gg", "desconhecida");
@@ -1173,16 +1214,16 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
   // perde, e o campo continua preenchido na proxima abertura.
   saveProxy(proxyAddress);
 
-  // No modo Tor, garante o Tor embutido de pe ANTES de injetar: o bypass le a porta dele do
-  // settings.json, e a sessao nasce ja roteada (sem o risco de o gateway nascer direto).
+  // Windows envelopa via WireSock (WFP): a rota e a config .conf ja validada acima, e um Tor
+  // embutido nao muda nada nela. So o macOS ainda roda o mecanismo legado de PAC+asar (sem
+  // WireSock/netns equivalente por la) e depende do Tor de pe ANTES de escrever o
+  // settings.json injetado -- por isso a guarda continua, mas so para ele. No Windows isto so
+  // fazia uma ativacao com WireGuard perfeitamente valido falhar por causa de um download de
+  // Tor que nao tinha efeito nenhum na rota.
   const modo = readNetMode();
-  if (modo === "tor") {
-    // Aproveita um Tor que ja exista nesta maquina (o nosso de uma sessao anterior, o servico
-    // do sistema, o Tor Browser) e so baixa quando nao ha nenhum. A porta encontrada e a que
-    // vai escrita no settings.json logo abaixo.
+  if (!IS_WINDOWS && modo === "tor") {
     const tor = await garantirTor();
     if (!tor.ok) throw new Error(`Nao consegui preparar o Tor: ${tor.error ?? "erro desconhecido"}`);
-    // A partir daqui a sessao e tor: o watchdog vigia o daemon e ressuscita se morrer no meio.
     torWatchdogIniciar();
   }
 
@@ -1200,23 +1241,53 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
     const hasOriginal = withNoAsar(() => diskFs.existsSync(originalAsar));
     const hasAsar = withNoAsar(() => diskFs.existsSync(asar));
 
-    if (!hasOriginal && hasAsar) {
-      // Discord intocado: o app.asar atual e o original, entao ele vira _app.asar.
-      await safeRename(asar, originalAsar);
-      writeInjection(asar, proxyAddress);
-    } else if (hasOriginal && !isOurInjection(install.resources)) {
-      // Outro mod ocupa o lugar. O _app.asar ja e o Discord original, entao so o carregador do
-      // outro mod e trocado pelo nosso. Sem isto o botao "Sobrescrever e Ativar" nao fazia nada:
-      // a condicao antiga so injetava em Discord intocado, e aqui ela era falsa.
-      await safeRemove(asar);
-      writeInjection(asar, proxyAddress);
-    } else if (hasOriginal) {
-      // Ja e o nosso: so reescreve, para a proxy nova valer.
-      await safeRemove(asar);
-      writeInjection(asar, proxyAddress);
+    if (IS_WINDOWS) {
+      // Windows envelopa via WireSock (WFP) — o roteamento e por processo, nao por asar, entao
+      // nao ha mais razao para tocar no app.asar de ninguem aqui. So restauramos quando o
+      // _app.asar e sobra de uma versao pre-WireGuard do PROPRIO GoLiveBypass: se hasOriginal
+      // e verdade mas isOurInjection e falso, quem esta ali e Vencord/Equicord (ou outro mod) e
+      // ficava sem chance nenhuma — "hasOriginal" sozinho restaurava por cima e apagava o mod
+      // do usuario a toda ativacao, silenciosamente.
+      if (hasOriginal && isOurInjection(install.resources)) {
+        await safeRemove(asar);
+        await safeRename(originalAsar, asar);
+      }
+    } else {
+      // macOS ainda nao tem um equivalente de Per-App VPN (sem WireSock/netns), entao aqui a
+      // injecao de app.asar continua sendo o mecanismo real — e por isso, ao contrario do
+      // Windows, precisa da guarda de confirmacao antes de sobrescrever um mod protegido.
+      const otherMod = hasOriginal && !isOurInjection(install.resources)
+        ? detectOtherMod(install.resources, install.flavour)
+        : null;
+      if (isProtectedMod(otherMod) && !confirmOverride) {
+        throw new Error(`OUTRO_MOD:${otherMod}:${install.resources}`);
+      }
+
+      if (!hasOriginal && hasAsar) {
+        // Discord intocado: o app.asar atual e o original, entao ele vira _app.asar.
+        await safeRename(asar, originalAsar);
+        writeInjection(asar, proxyAddress);
+      } else if (hasOriginal && !isOurInjection(install.resources)) {
+        // Outro mod ocupa o lugar (confirmado pelo usuario, ou nao-protegido como
+        // Vesktop/Equibop/Legcord — ver isProtectedMod). O _app.asar ja e o Discord original,
+        // entao so o carregador do outro mod e trocado pelo nosso.
+        await safeRemove(asar);
+        writeInjection(asar, proxyAddress);
+      } else if (hasOriginal) {
+        // Ja e o nosso: so reescreve, para a proxy nova valer.
+        await safeRemove(asar);
+        writeInjection(asar, proxyAddress);
+      }
     }
 
     clearBundleQuarantine(install.bundlePath);
+  }
+
+  if (IS_WINDOWS) {
+    await startWireSockService(settingsDir());
+  }
+
+  for (const install of installs) {
     startDiscord(install);
   }
 
@@ -1231,9 +1302,19 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
   // Ativacao concluiu de verdade: guarda a assinatura para a guarda de duplicada
   // (ver topo da funcao).
   assinaturaUltimaAtivacao = assinatura;
+  // So Windows (WireSock) tem tunel WireGuard de verdade aqui — macOS ainda e o mecanismo
+  // legado de PAC/Tor, sem interface wg nenhuma para vigiar.
+  if (IS_WINDOWS) iniciarWgStatsWatchdog(wgStatsProvider);
 }
 
 async function deactivateAll() {
+  stopTor();
+  torWatchdogParar();
+  pararWgStatsWatchdog();
+  // Na arquitetura WireSock o app.asar fica propositalmente vanilla. Guarda o estado antes
+  // de parar o servico: getStatus() deixa de ver o bypass assim que ele desce.
+  const hadWireSock = IS_WINDOWS && isWireSockActive();
+
   const installs = getDiscordInstalls();
 
   // So desfaz o que e nosso. Isto roda ao sair do app, e antes desfazia qualquer injecao:
@@ -1245,13 +1326,24 @@ async function deactivateAll() {
       ) && isOurInjection(install.resources),
   );
 
-  // Decidido antes de matar o Discord: sem isto, quem tem outro mod teria o Discord fechado
-  // para nada, porque nao haveria o que desfazer depois.
-  if (ours.length === 0) return;
+  // No Windows atual nao ha injecao para restaurar, mas o Discord precisa ser reiniciado fora
+  // do filtro WFP. Antes este retorno precoce so parava o WireSock (ou nem isso) e deixava o
+  // processo ja aberto conectado pela rota antiga.
+  if (ours.length === 0) {
+    if (hadWireSock) {
+      await killDiscord();
+      stopWireSockService();
+      for (const install of installs) startDiscord(install);
+      clearSessionMarker();
+    }
+    return;
+  }
 
   for (const install of ours) assertResourcesWritable(install);
 
   await killDiscord();
+
+  if (IS_WINDOWS) stopWireSockService();
 
   for (const install of ours) {
     const asar = path.join(install.resources, "app.asar");
@@ -1263,14 +1355,19 @@ async function deactivateAll() {
     startDiscord(install);
   }
 
-  // Sessao terminou: o watchdog nao tem mais o que vigiar.
-  torWatchdogParar();
-
   // Reverteu (de verdade): a sessao terminou, o marcador nao vale mais.
   clearSessionMarker();
 }
 
 function getStatus(): string {
+  // isWireSockRunning() sozinho (so o servico do Windows) deixava o status "INACTIVE" para
+  // sempre quando startWireSockService cai no fallback sem servico (usuario sem privilegio de
+  // admin para instalar/iniciar o servico, mas o processo direto sobe e o tunel funciona): a
+  // ativacao completava de verdade (Discord envelopado, WireSock rodando), mas a UI nunca via
+  // isso e ficava presa mostrando "Ativar" -- exatamente o relato do beta tester.
+  if (IS_WINDOWS && isWireSockActive()) {
+    return "ACTIVE";
+  }
   const installs = getDiscordInstalls();
   if (installs.length === 0) return "NOT_FOUND";
   return withNoAsar(() => {
@@ -1278,17 +1375,12 @@ function getStatus(): string {
       const asar = path.join(install.resources, "app.asar");
       const originalAsar = path.join(install.resources, "_app.asar");
       if (diskFs.existsSync(originalAsar)) {
-        // Checa se é o nosso bypass
+        // Checa se é o nosso bypass legado
         const indexJs = path.join(asar, "index.js");
         if (diskFs.existsSync(indexJs)) {
           const content = diskFs.readFileSync(indexJs, "utf8");
           if (content.includes("golivebypass.js")) return "ACTIVE";
         }
-        // Outro mod (Vencord/Equicord/Vesktop/Equibop/Legcord). Devolve o nome
-        // para o frontend poder oferecer o caminho de plugin ("instale como
-        // userplugin do Vencord/Equicord em vez de sobrescrever").
-        const mod = detectOtherMod(install.resources, install.flavour);
-        return mod ? `OTHER_MOD:${mod}` : "OTHER_MOD";
       }
     }
     return "INACTIVE";
@@ -1303,6 +1395,35 @@ function getStatus(): string {
 // Flavours (discord/vesktop/equibop/legcord) achados na ultima varredura Linux —
 // exposto no report para mostrar na hora se um cliente paralelo foi visto.
 let ultimosFlavoursLinux = "";
+
+// Handshake/trafego do tunel WireGuard no Linux: le do `--status --json` do script (que ja
+// roda elevado quando precisa), nao de um execSync direto na GUI, que normalmente nao tem
+// privilegio para entrar no namespace de rede sozinha.
+async function linuxWgStats(): Promise<WgTunnelStats> {
+  const semDados: WgTunnelStats = { ok: false, handshakeAgoS: null, rxBytes: null, txBytes: null, endpoint: null };
+  try {
+    const { code, stdout } = await runScript(["--status", "--json"]);
+    if (code !== 0) return { ...semDados, error: `script de status saiu com codigo ${code}` };
+    const data = JSON.parse(stdout);
+    const wg = data?.wg;
+    if (!wg || wg.ok !== true) {
+      return { ...semDados, error: typeof wg?.error === "string" ? wg.error : "sem campo wg no --status" };
+    }
+    return {
+      ok: true,
+      handshakeAgoS: typeof wg.handshakeAgoS === "number" ? wg.handshakeAgoS : null,
+      rxBytes: typeof wg.rxBytes === "number" ? wg.rxBytes : null,
+      txBytes: typeof wg.txBytes === "number" ? wg.txBytes : null,
+      endpoint: null,
+    };
+  } catch (err) {
+    return { ...semDados, error: String((err as Error)?.message ?? err) };
+  }
+}
+
+function wgStatsProvider(): Promise<WgTunnelStats> | WgTunnelStats {
+  return IS_LINUX ? linuxWgStats() : getWgStats();
+}
 
 function linuxStatus(): Promise<string> {
   return runScript(["--status", "--json"])
@@ -1358,7 +1479,6 @@ function linuxStatus(): Promise<string> {
           discordscan.scriptTrace("injeção no disco mas nenhum cliente aberto — considerando inativo");
           return "INACTIVE";
         }
-        if (anyMod) return "OTHER_MOD";
         return "INACTIVE";
       } catch {
         discordscan.scriptJsonInvalido(stdout);
@@ -1389,29 +1509,18 @@ async function linuxActivate(
   proxyAddress: string,
   onChunk: (c: string) => void,
 ) {
-  // No Windows/macOS quem injeta e o processo principal, entao activateBypass reconfere o Tor
-  // e grava a porta certa antes de mexer no Discord. No Linux quem injeta e o script standalone,
-  // que so copia o torAddr que JA estava salvo -- sem isto, o botao podia estar "liberado" (o
-  // Tor da Electron provado numa porta) e o script ainda injetar apontando para a porta antiga,
-  // travando o gateway para sempre com a UI dizendo "Tor pronto". E sem reconferir aqui, nada
-  // impedia a ativacao de proceder com o Tor fora do ar: so o botao da tela travava, e um clique
-  // fora da tela (ou uma corrida de estado) passava direto.
-  const netMode = readNetMode();
-  let torAddr = "";
-  if (netMode === "tor") {
-    const tor = await garantirTor();
-    if (!tor.ok) throw new Error(`Nao consegui preparar o Tor: ${tor.error ?? "erro desconhecido"}`);
-    torAddr = `127.0.0.1:${tor.porta}`;
-  }
-  // O modo que a GUI mostra TEM que chegar ao disco antes de injetar: o default virtual
-  // "tor" do readNetMode() nunca era gravado, o settings.json nascia sem routeMode e o
-  // runtime injetado voltava ao "auto" (pool gratuito) com o Tor de pe (issue #108).
-  updateSharedSettings(netMode === "tor" ? { routeMode: netMode, torAddr } : { routeMode: netMode });
+  // O modo Tor/proxy-gratuita era do mecanismo legado de PAC (o script bootstrapava um Tor
+  // embutido e apontava o proxy manual pra ele antes de injetar no app.asar). O Linux envelopa
+  // via WireGuard netns hoje: a rota e sempre a config .conf ja importada, e nem a GUI nem o
+  // script tem seletor de modo algum na UI. Pedir "tor" aqui so servia pra: (1) baixar/bootstrap
+  // um Tor embutido sem efeito nenhum na rota real, e (2) se isso falhasse, abortar uma
+  // ativacao com WireGuard perfeitamente valido -- e o default de leitura de settings.json
+  // antigo (sem routeMode gravado) e justamente "tor". "auto" e o unico valor que o script
+  // aceita e nunca aciona esse bootstrap.
+  const netMode = "auto";
+  updateSharedSettings({ routeMode: netMode });
 
-  // O modo tambem viaja por argv: o script grava o que veio na flag por cima do arquivo,
-  // imune a escritor antigo/terceiro que regrave o settings.json sem a chave.
   const args = ["--yes", "--net-mode", netMode];
-  if (torAddr !== "") args.push("--tor-addr", torAddr);
   if (proxyAddress.trim() !== "") args.push("--proxy", proxyAddress.trim());
   const { code, stderr } = await runScript(args, onChunk);
   if (code !== 0) {
@@ -1449,6 +1558,7 @@ async function linuxActivate(
   // Flag de "estava ativo" (o quit limpo do Linux restaura a injecao; o boot
   // seguinte re-injeta pela flag). Zerada so no deactivate explicito.
   updateSharedSettings({ autoInject: true });
+  iniciarWgStatsWatchdog(linuxWgStats);
 }
 
 async function linuxDeactivate(onChunk: (c: string) => void) {
@@ -1462,6 +1572,7 @@ async function linuxDeactivate(onChunk: (c: string) => void) {
         "Falha ao desativar (a elevacao provavelmente falhou)",
     );
   }
+  pararWgStatsWatchdog();
   clearSessionMarker();
 }
 
@@ -2106,6 +2217,7 @@ function stopTor() {
 
 let torWatchdog: TorWatchdog | null = null;
 let torWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+let torWatchdogRecuperando = false;
 
 function criarTorWatchdog(): TorWatchdog {
   return createTorWatchdog({
@@ -2121,11 +2233,11 @@ function torWatchdogIniciar() {
   if (torWatchdogTimer !== null) return;
   torWatchdogTimer = setInterval(() => {
     void torWatchdog!.check().then((acao) => {
-      if (acao !== "restart") return;
+      if (acao !== "restart" || torWatchdogRecuperando) return;
       console.warn("[tor] watchdog: daemon morreu/travou na porta em uso; ressuscitando");
       void torWatchdogRecuperar();
     });
-  }, 30_000);
+  }, TOR_WATCHDOG_PORT_MS);
 }
 
 function torWatchdogParar() {
@@ -2137,6 +2249,24 @@ function torWatchdogParar() {
 }
 
 async function torWatchdogRecuperar() {
+  // O poll da porta e curto para uma morte real. Bootstrap do Tor, porem, pode
+  // levar dezenas de segundos; sem esta trava cada tick tentaria spawnar outro
+  // daemon sobre o primeiro e transformaria uma recuperacao em corrida.
+  if (torWatchdogRecuperando) return;
+  // A insistencia de fundo (tentarTorEmFundo) e OUTRO chamador de garantirTor()/spawnTor()
+  // fora do singleton de promessa (garantirTorEmCurso ja se resolveu quando ela comeca a
+  // rodar sozinha). Se o watchdog passou a vigiar exatamente numa janela em que essa
+  // insistencia ja esta tentando (ex.: a GUI reabriu com a injecao ja ativa no disco --
+  // ver o fix do rearranque do watchdog -- mas o garantirTor() do boot falhou e caiu para
+  // background), chamar garantirTor() aqui rodaria em paralelo com ela: dois spawnTor()
+  // concorrentes checam a porta livre ao mesmo tempo e podem spawnar dois tor.exe (o
+  // "Address already in use" da issue #51, so que por um caminho novo). A insistencia de
+  // fundo ja esta cobrindo a recuperacao; o watchdog so precisa esperar o proximo tick.
+  if (torTentandoEmFundo) {
+    console.log("[tor] watchdog: insistencia de fundo ja tentando; aguardando o proximo tick em vez de correr junto");
+    return;
+  }
+  torWatchdogRecuperando = true;
   try {
     // Mata o daemon zumbi ANTES de tentar subir de novo: spawnTor so funciona com a porta
     // livre, e o erro era "Address already in use" (issue #51) quando so ressuscitava por cima.
@@ -2151,6 +2281,8 @@ async function torWatchdogRecuperar() {
     }
   } catch (error) {
     console.error("[tor] watchdog: falha ao recuperar:", error);
+  } finally {
+    torWatchdogRecuperando = false;
   }
 }
 
@@ -2281,7 +2413,9 @@ function updateSharedSettings(patch: Record<string, unknown>) {
     const dir = settingsDir();
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, "settings.json");
-    const novo = { ...readSharedSettings(), ...patch };
+    // O runtime Linux le este arquivo e Windows/mac leem a copia injetada.
+    // A preferencia legada false nunca pode voltar a desligar a recuperacao.
+    const novo = { ...readSharedSettings(), ...patch, autoRevive: true };
     // Tmp + rename: um crash no meio da escrita nao pode deixar um settings.json
     // pela metade, senao o modo se perderia de novo por outro caminho.
     const tmp = `${file}.tmp`;
@@ -2303,8 +2437,11 @@ function saveProxy(proxy: string) {
 // Porta do Tor que o script standalone (Linux) deve usar. So chamada depois de garantirTor()
 // confirmar um tunel de verdade -- sem isto, torAddr no settings.json real fica preso na porta
 // de uma sessao anterior e o gateway trava esperando uma saida que nao existe mais.
+// No Windows/macOS, tambem reescreve o settings.json dentro dos asars injetados existentes
+// para que o Discord ativo aponte para a porta real imediatamente sem precisar de reinjecao.
 function saveTorAddr(addr: string) {
   updateSharedSettings({ torAddr: addr });
+  reescreverSettingsInjetado({ torAddr: addr });
 }
 
 // Modo de rede escolhido (persistido no settings.json junto da proxy): "auto" | "tor" | "free".
@@ -2347,11 +2484,6 @@ export function readAutoUpdate(): boolean {
   }
 }
 
-// Revive automatico do gateway zumbi (issues #145/#149/#153): ligado por padrao.
-export function saveAutoRevive(enabled: boolean) {
-  updateSharedSettings({ autoRevive: enabled });
-}
-
 // Canal de atualizacao: "stable" (padrao) ou "beta" (opt-in dos testadores —
 // recebe as prereleases publicadas; o canal estavel nunca as ve). Consumido pelo
 // updater: Windows le VIVO a cada checagem, Linux le no boot (electron-updater
@@ -2371,17 +2503,6 @@ export function readUpdateChannel(): "stable" | "beta" {
   }
 }
 
-export function readAutoRevive(): boolean {
-  try {
-    const file = path.join(settingsDir(), "settings.json");
-    if (!fs.existsSync(file)) return true;
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    return data.autoRevive !== false;
-  } catch {
-    return true;
-  }
-}
-
 // Detecta Tor disponivel: o embutido (porta dedicada) ou um Tor do sistema (portas classicas).
 
 // IPC de autoUpdate
@@ -2389,15 +2510,6 @@ ipcMain.handle("get-auto-update", () => readAutoUpdate());
 ipcMain.handle("set-auto-update", (_event, enabled: unknown) => {
   saveAutoUpdate(enabled !== false);
   refreshTray().catch(() => {});
-});
-
-// IPC do revive automatico (zumbi: issues #145/#149/#153). No Windows/macOS a copia
-// dentro do asar injetado acompanha o toggle — o runtime le o settings do asar, nao o
-// compartilhado.
-ipcMain.handle("get-auto-revive", () => readAutoRevive());
-ipcMain.handle("set-auto-revive", (_event, enabled: unknown) => {
-  saveAutoRevive(enabled !== false);
-  updateInjectedAutoRevive(enabled !== false);
 });
 
 // IPC do canal de atualizacao (stable | beta). Nao vai para o asar injetado: e
@@ -2782,7 +2894,19 @@ function readLogTail(maxBytes = 48_000): string {
   }
 }
 
-function buildDiagnostic(status: string, extraNote = ""): string {
+async function formatWgTunelDiagnostico(status: string): Promise<string> {
+  if (isMac || status !== "ACTIVE") return "n/a";
+  const s = await wgStatsProvider();
+  if (!s.ok) return `indisponível (${s.error ?? "?"})`;
+  const handshake = s.handshakeAgoS === null ? "nunca" : `há ${s.handshakeAgoS}s`;
+  const trafego =
+    s.rxBytes !== null && s.txBytes !== null
+      ? `rx=${Math.round(s.rxBytes / 1024)}KB tx=${Math.round(s.txBytes / 1024)}KB`
+      : "sem contadores";
+  return `handshake ${handshake} · ${trafego}`;
+}
+
+async function buildDiagnostic(status: string, extraNote = ""): Promise<string> {
   const proxy = maskSecrets(
     readProxyFrom(path.join(settingsDir(), "settings.json")) || "(vazio)",
   );
@@ -2798,6 +2922,9 @@ function buildDiagnostic(status: string, extraNote = ""): string {
     `| routeMode | ${readNetMode()} |`,
     `| proxy | ${proxy} |`,
     `| torPort | ${torPortaEmUso} (verificado=${torVerificado}) |`,
+    // "Carregando infinito" pos-WireGuard costuma ser tunel morto/saturado, nao mais gateway
+    // zumbi de proxy: handshake velho ou trafego zerado com bypass ativo aponta pra isso direto.
+    `| tunelWg | ${await formatWgTunelDiagnostico(status)} |`,
     `| log | \`${logFilePath()}\` |`,
     "",
   ];
@@ -2904,12 +3031,12 @@ ipcMain.handle("stop-log-watch", () => {
   return true;
 });
 
-ipcMain.handle("get-diagnostic", (_event, payload: unknown) => {
+ipcMain.handle("get-diagnostic", async (_event, payload: unknown) => {
   const p = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
   const status = typeof p.status === "string" ? p.status : "UNKNOWN";
   const note = typeof p.note === "string" ? p.note : "";
   return {
-    text: buildDiagnostic(status, note),
+    text: await buildDiagnostic(status, note),
     logPath: logFilePath(),
     apiConfigured: Boolean(readBugReportConfig()),
   };
@@ -2945,6 +3072,7 @@ async function postBugReportToApi(
   status: string,
 ): Promise<{ ok: true; issueUrl: string; issueNumber?: number } | { ok: false; error: string }> {
   const endpoint = `${cfg.baseUrl}/v1/reports`;
+  const wgTunel = !isMac && status === "ACTIVE" ? await wgStatsProvider() : undefined;
   const body = {
     title,
     description,
@@ -2956,6 +3084,12 @@ async function postBugReportToApi(
       electron: process.versions.electron ?? "",
       status,
       routeMode: readNetMode(),
+      // Mesmo raciocinio do submitBugReport: handshake velho/trafego parado com bypass ativo
+      // e o sinal mais direto de tunel morto ou saturado (ver electron/wgstats.ts).
+      wg_handshake_ha_s: wgTunel?.ok ? String(wgTunel.handshakeAgoS ?? "nunca") : "indisponivel",
+      wg_rx_kb: wgTunel?.ok && wgTunel.rxBytes !== null ? String(Math.round(wgTunel.rxBytes / 1024)) : "indisponivel",
+      wg_tx_kb: wgTunel?.ok && wgTunel.txBytes !== null ? String(Math.round(wgTunel.txBytes / 1024)) : "indisponivel",
+      wg_erro: !wgTunel?.ok ? (wgTunel?.error ?? "?") : "",
     },
   };
 
@@ -3018,7 +3152,7 @@ ipcMain.handle("open-bug-report", async (_event, payload: unknown) => {
       : `[GUI] problema com bypass (${status})`;
   const title = titleRaw.slice(0, 180);
 
-  const fullBody = buildDiagnostic(status, note);
+  const fullBody = await buildDiagnostic(status, note);
   clipboard.writeText(fullBody);
 
   // 1) API (log completo, labels no servidor) — se configurada.
@@ -3124,6 +3258,244 @@ ipcMain.handle("get-proxy", () => {
   return "";
 });
 
+async function importWgConfFromPath(chosen: string) {
+  const originalName = path.basename(chosen);
+
+  try {
+    const content = fs.readFileSync(chosen, "utf8");
+    const validation = await validateWgConfContent(content);
+    if (!validation.valid) {
+      return {
+        success: false,
+        error: validation.error || "Arquivo de configuração WireGuard (.conf) inválido.",
+      };
+    }
+
+    const targetDir = settingsDir();
+    fs.mkdirSync(targetDir, { recursive: true });
+    const targetFile = path.join(targetDir, "wireguard.conf");
+    fs.copyFileSync(chosen, targetFile);
+    updateSharedSettings({ wgConfOriginalName: originalName });
+    return {
+      success: true,
+      fileName: originalName,
+      path: targetFile,
+      validation,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: `Erro ao ler o arquivo: ${(err as Error)?.message || String(err)}`,
+    };
+  }
+}
+
+ipcMain.handle("import-wg-conf", async () => {
+  const win = BrowserWindow.getFocusedWindow();
+  const res = await dialog.showOpenDialog(win || (undefined as any), {
+    title: "Selecionar arquivo de configuração WireGuard (.conf)",
+    filters: [{ name: "WireGuard Config (*.conf)", extensions: ["conf"] }],
+    properties: ["openFile"],
+  });
+  if (res.canceled || res.filePaths.length === 0) return null;
+  return importWgConfFromPath(res.filePaths[0]);
+});
+
+ipcMain.handle("import-wg-conf-file", async (_event, filePath: unknown) => {
+  if (typeof filePath !== "string" || !path.isAbsolute(filePath) || path.extname(filePath).toLowerCase() !== ".conf") {
+    return { success: false, error: "Solte um arquivo WireGuard com extensão .conf." };
+  }
+  return importWgConfFromPath(filePath);
+});
+
+ipcMain.handle("test-wg-conf", async () => {
+  const targetFile = path.join(settingsDir(), "wireguard.conf");
+  if (!fs.existsSync(targetFile)) {
+    return {
+      ok: false,
+      error: "Nenhum arquivo de configuração WireGuard (.conf) encontrado.",
+    };
+  }
+
+  try {
+    const content = fs.readFileSync(targetFile, "utf8");
+    const validation = await validateWgConfContent(content);
+    if (!validation.valid) {
+      return {
+        ok: false,
+        error: validation.error || "Arquivo .conf inválido.",
+      };
+    }
+
+    const status = IS_LINUX ? await linuxStatus() : getStatus();
+    let exitInfo: { ip?: string; country?: string } | undefined;
+
+    if (status === "ACTIVE" && IS_LINUX) {
+      try {
+        const out = execSync(
+          "ip netns exec discord-vpn curl -m 3 -s https://cloudflare.com/cdn-cgi/trace",
+          { encoding: "utf8" }
+        );
+        const ipMatch = out.match(/ip=([^\r\n]+)/);
+        const locMatch = out.match(/loc=([^\r\n]+)/);
+        if (ipMatch) {
+          exitInfo = {
+            ip: ipMatch[1],
+            country: locMatch ? locMatch[1] : undefined,
+          };
+        }
+      } catch {}
+    }
+
+    return {
+      ok: true,
+      endpoint: validation.endpoint,
+      resolvedIp: validation.resolvedIp,
+      address: validation.interfaceAddress,
+      dns: validation.dns,
+      exitInfo,
+      active: status === "ACTIVE",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Falha ao testar configuração: ${(err as Error)?.message || String(err)}`,
+    };
+  }
+});
+
+ipcMain.handle("get-wg-conf-name", async () => {
+  const s = readSharedSettings() as any;
+  const vpnMode = (s.vpnMode as string) || "proton";
+  if (vpnMode === "proton") {
+    if (s.protonLastServer?.server) {
+      const ping = s.protonLastServer.pingMs > 0 ? ` (${s.protonLastServer.pingMs}ms)` : "";
+      return `${s.protonLastServer.server}${ping}`;
+    }
+    return s.protonUsername ? `ProtonVPN (${s.protonUsername})` : "";
+  }
+  const targetFile = path.join(settingsDir(), "wireguard.conf");
+  if (fs.existsSync(targetFile)) {
+    if (typeof s.wgConfOriginalName === "string" && s.wgConfOriginalName) {
+      return s.wgConfOriginalName;
+    }
+    return "wireguard.conf";
+  }
+  return "";
+});
+
+ipcMain.handle("get-vpn-mode", async () => {
+  const s = readSharedSettings() as any;
+  return (s.vpnMode as string) || "proton";
+});
+
+ipcMain.handle("set-vpn-mode", async (_event, mode: "proton" | "custom") => {
+  updateSharedSettings({ vpnMode: mode });
+  return mode;
+});
+
+ipcMain.handle("get-proton-settings", async () => {
+  const s = readSharedSettings() as any;
+  return {
+    vpnMode: (s.vpnMode as string) || "proton",
+    username: (s.protonUsername as string) || "",
+    country: (s.protonCountry as string) || "",
+    freeOnly: s.protonFreeOnly !== false,
+    autoPing: s.protonAutoPing !== false,
+    lastServer: s.protonLastServer,
+  };
+});
+
+ipcMain.handle("set-proton-settings", async (_event, settings: any) => {
+  updateSharedSettings({
+    protonUsername: settings.username,
+    protonCountry: settings.country,
+    protonFreeOnly: settings.freeOnly !== false,
+    protonAutoPing: settings.autoPing !== false,
+  });
+  return true;
+});
+
+ipcMain.handle("check-proton-session", async (_event, username?: string) => {
+  const s = readSharedSettings() as any;
+  const user = username || (s.protonUsername as string) || "";
+  if (!user) return { valid: false, error: "Usuário não especificado" };
+  return await proton.checkProtonSession(settingsDir(), user);
+});
+
+ipcMain.handle("login-proton", async (_event, payload: { username: string; password?: string; twoFactorCode?: string }) => {
+  const res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode);
+  if (res.success) {
+    updateSharedSettings({ protonUsername: payload.username });
+    const s = readSharedSettings() as any;
+    try {
+      const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
+        username: payload.username,
+        countries: (s.protonCountry as string) || undefined,
+        freeOnly: s.protonFreeOnly !== false,
+        autoPing: s.protonAutoPing !== false,
+      });
+      if (gen.success) {
+        updateSharedSettings({ protonLastServer: gen });
+      }
+    } catch (err) {
+      logger.warn("proton", "erro ao gerar rota inicial apos login", { erro: String(err) });
+    }
+  }
+  return res;
+});
+
+ipcMain.handle("logout-proton", async () => {
+  const sessionFile = proton.getProtonSessionFile(settingsDir());
+  try {
+    if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
+  } catch {}
+  updateSharedSettings({ protonLastServer: undefined });
+  return true;
+});
+
+ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) => {
+  const s = readSharedSettings() as any;
+  const username = (s.protonUsername as string) || "";
+  if (!username) {
+    return { success: false, error: "Nenhuma conta ProtonVPN conectada." };
+  }
+
+  const country = options?.country !== undefined ? options.country : ((s.protonCountry as string) || "");
+  const freeOnly = options?.freeOnly !== undefined ? options.freeOnly : (s.protonFreeOnly !== false);
+  const autoPing = options?.autoPing !== undefined ? options.autoPing : (s.protonAutoPing !== false);
+
+  const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
+    username,
+    countries: country || undefined,
+    freeOnly,
+    autoPing,
+  });
+
+  if (gen.success) {
+    updateSharedSettings({
+      protonCountry: country,
+      protonFreeOnly: freeOnly,
+      protonAutoPing: autoPing,
+      protonLastServer: gen,
+    });
+
+    const status = IS_LINUX ? await linuxStatus() : getStatus();
+    if (status === "ACTIVE") {
+      logger.info("proton", "bypass ativo, recarregando túnel com novo servidor ótimo", { server: gen.server });
+      if (IS_WINDOWS) {
+        stopWireSockService();
+        await startWireSockService(settingsDir());
+      } else if (IS_LINUX) {
+        await runScript(["--deactivate"]);
+        await runScript(["--activate"]);
+      }
+    }
+  }
+
+  return gen;
+});
+
 // O modo que o runtime VAI ler. No Linux e o settings compartilhado; no Windows/mac
 // e o settings.json DENTRO do asar injetado — o arquivo compartilhado la e so a
 // preferencia da GUI, e o report dizia "tor" com o runtime rodando free (issue #121).
@@ -3152,34 +3524,6 @@ function readRuntimeRouteMode(): string {
   return "";
 }
 
-// O autoRevive que o runtime VAI ler (mesma fonte do readRuntimeRouteMode: o
-// settings.json dentro do asar injetado no Windows/mac, o compartilhado no Linux).
-// O report precisa dizer se o toggle estava ligado NO RUNTIME — um report sem
-// nenhum gw.revive com a GUI ligada e o runtime desligado e drift de settings.
-function readRuntimeAutoRevive(): boolean {
-  if (IS_LINUX) {
-    return readSharedSettings().autoRevive !== false;
-  }
-  for (const install of getDiscordInstalls()) {
-    const nosso = withNoAsar(() => {
-      if (!diskFs.existsSync(path.join(install.resources, "_app.asar"))) return false;
-      return isOurInjection(install.resources);
-    });
-    if (!nosso) continue;
-    try {
-      const data = withNoAsar(() =>
-        JSON.parse(
-          diskFs.readFileSync(path.join(install.resources, "app.asar", "settings.json"), "utf8"),
-        ),
-      );
-      return data?.autoRevive !== false;
-    } catch {
-      return true;
-    }
-  }
-  return true;
-}
-
 ipcMain.handle("report-bug", async (_event, payload: unknown) => {
   const p = (payload ?? {}) as { title?: string; description?: string; includeLogs?: boolean };
   const netMode = readNetMode();
@@ -3197,9 +3541,12 @@ ipcMain.handle("report-bug", async (_event, payload: unknown) => {
     torAtivo = torVerificado && (await portaViva(torPortaEmUso));
     torPorta = torPortaEmUso;
   } catch {}
+  // Snapshot do tunel WireGuard NA HORA do report — nao mac (mecanismo legado la, sem
+  // interface wg) e so quando o bypass esta de fato ativo (senao so registraria "sem peer").
+  const wgTunel = !isMac && statusBypass === "ACTIVE" ? await wgStatsProvider() : undefined;
   return submitBugReport(
     { title: String(p.title ?? ""), description: String(p.description ?? ""), includeLogs: !!p.includeLogs },
-    { netMode, routeModeDisco, autoRevive: readRuntimeAutoRevive(), statusBypass, torAtivo, torPorta, installsFlavours: ultimosFlavoursLinux },
+    { netMode, routeModeDisco, statusBypass, torAtivo, torPorta, installsFlavours: ultimosFlavoursLinux, wgTunel },
   );
 });
 
@@ -3211,7 +3558,7 @@ ipcMain.on("resize-window", (_event, height: unknown) => {
   if (!mainWindow || mainWindow.isDestroyed() || !Number.isFinite(h) || h <= 0) return;
   const [, contentH] = mainWindow.getContentSize();
   if (Math.abs(contentH - h) < 2) return;
-  mainWindow.setContentSize(480, h);
+  mainWindow.setContentSize(MAIN_WINDOW_WIDTH, h);
 });
 
 // O renderer avisa quando o tema muda para o overlay da barra de titulo

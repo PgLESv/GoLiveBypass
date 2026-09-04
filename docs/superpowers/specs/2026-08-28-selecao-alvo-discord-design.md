@@ -65,7 +65,7 @@ Descobre instalações e pergunta **só quando >1**:
   OutroMod/confirm por alvo permanece dentro do loop.
 - **standalone .sh**: mesma função (`list_patch_targets`) sobre `FOUND` — o .sh
   já detecta paralelos e flatpaks; o filtro seleciona linhas de `$FOUND`/`$lista`
-  antes do `while` de Install (~1301) e de Uninstall (~1241). O Discord reaberto
+  antes do `while` de Install (~1301) e de Uninstall (~linha correspondente). O Discord reaberto
   no fim vira o primeiro **selecionado**.
 - **installer .ps1**: no fluxo Install, antes de `Invoke-Injection` (~843):
   alvos = oficiais (`Get-DiscordResources`) + paralelos (detecção nova, igual ao

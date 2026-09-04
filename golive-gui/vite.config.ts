@@ -8,8 +8,8 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: {
-        main: path.resolve(__dirname, 'index.html'),
-        logs: path.resolve(__dirname, 'logs.html'),
+        main: path.resolve(import.meta.dirname, 'index.html'),
+        logs: path.resolve(import.meta.dirname, 'logs.html'),
       },
     },
   },
@@ -17,6 +17,9 @@ export default defineConfig({
     electron([
       {
         entry: 'electron/main.ts',
+        onstart(options) {
+          options.startup()
+        },
         vite: {
           build: {
             rollupOptions: {

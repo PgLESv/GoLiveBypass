@@ -9,7 +9,6 @@ const { theme, applyTheme } = useTheme()
 const selectedMode = ref<NetworkMode>('tor')
 const startupEnabled = ref(false)
 const autoUpdateEnabled = ref(true)
-const autoReviveEnabled = ref(true)
 const betaEnabled = ref(false)
 const settingsOpen = ref(false)
 const manualProxy = ref('')
@@ -231,13 +230,6 @@ watch(settingsOpen, async (open: boolean) => {
           <span>Avisar sobre atualizações</span>
         </label>
         <p class="gui-viewer__settings-hint">Avisa quando sai uma versão nova do GoLiveBypass.</p>
-
-        <label class="gui-viewer__settings-switch">
-          <input v-model="autoReviveEnabled" type="checkbox" />
-          <span class="gui-viewer__switch-track" aria-hidden="true"><span class="gui-viewer__switch-thumb"></span></span>
-          <span>Reviver gateway travado automaticamente</span>
-        </label>
-        <p class="gui-viewer__settings-hint">Reconecta um gateway travado sem recarregar durante uma transmissão.</p>
 
         <label class="gui-viewer__settings-switch">
           <input v-model="betaEnabled" type="checkbox" />

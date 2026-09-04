@@ -26,6 +26,17 @@ describe("extrairSegredosDaProxy", () => {
   it("proxy seca sem credenciais tambem vira segredo", () => {
     expect(extrairSegredosDaProxy("203.0.113.7:1080")).toEqual(["203.0.113.7:1080"]);
   });
+
+  it("extrai a senha inteira mesmo com @ nao codificado dentro dela", () => {
+    // Espelha PROXY_RE (standalone/golivebypass.js): credenciais sao gulosas
+    // ate o ULTIMO @ antes do host, entao uma senha como "p@ss" nao pode
+    // cortar a extracao no primeiro @ dela.
+    const s = extrairSegredosDaProxy("socks5://user:p@ss@1.2.3.4:1080");
+    expect(s).toContain("user");
+    expect(s).toContain("p@ss");
+    expect(s).not.toContain("p"); // fragmento truncado do bug antigo
+    expect(s).toContain("1.2.3.4:1080");
+  });
 });
 
 describe("l1Padroes", () => {
@@ -49,6 +60,14 @@ describe("l1Padroes", () => {
     expect(l1Padroes("GET https://gateway.discord.gg/?v=9&enc=abc HTTP")).toBe(
       "GET https://gateway.discord.gg/?<params> HTTP",
     );
+  });
+
+  it("mascara e-mail e caminhos com o nome local da pessoa", () => {
+    expect(l1Padroes("contato maria.silva@example.com em /home/maria/projeto")).toBe(
+      "contato <email> em /home/<usuario>/projeto",
+    );
+    expect(l1Padroes("C:\\Users\\Maria\\AppData\\Local")).toBe("C:\\Users\\<usuario>\\AppData\\Local");
+    expect(l1Padroes("nome: Maria usuario=luan123")).toBe("nome:<usuario> usuario=<usuario>");
   });
 });
 

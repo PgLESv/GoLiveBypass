@@ -1,0 +1,156 @@
+#!/usr/bin/env node
+
+import assert from "node:assert/strict";
+import {
+    STREAM_NATIVE_GRACE_MS,
+    evaluateStreamClaim,
+    initialStreamClaimState,
+    isStrictManualTor,
+    shouldReplaceActiveExit
+} from "../goLiveBypass/stability.ts";
+
+let passed = 0;
+function test(name, fn) {
+    fn();
+    passed++;
+    process.stdout.write(`ok ${passed} - ${name}\n`);
+}
+
+test("UI sem Live permanece idle", () => {
+    const result = evaluateStreamClaim(
+        { now: 1_000, senderClaimed: false, nativeStreamCount: 0 },
+        { claimSince: 10, warned: true }
+    );
+    assert.equal(result.status, "idle");
+    assert.deepEqual(result.state, initialStreamClaimState());
+});
+
+test("store ausente falha fechado", () => {
+    const state = initialStreamClaimState();
+    const result = evaluateStreamClaim(
+        { now: 40_000, senderClaimed: true, nativeStreamCount: null }, state
+    );
+    assert.equal(result.status, "unknown");
+    assert.equal(result.warn, false);
+});
+
+test("conexao nativa durante aquecimento prova saude", () => {
+    let result = evaluateStreamClaim(
+        { now: 1_000, senderClaimed: true, nativeStreamCount: 0 }, initialStreamClaimState()
+    );
+    result = evaluateStreamClaim(
+        { now: 20_000, senderClaimed: true, nativeStreamCount: 1 }, result.state
+    );
+    assert.equal(result.status, "healthy");
+    assert.deepEqual(result.state, initialStreamClaimState());
+});
+
+test("nao acusa erro 2001 antes de 30 segundos", () => {
+    const first = evaluateStreamClaim(
+        { now: 1_000, senderClaimed: true, nativeStreamCount: 0 }, initialStreamClaimState()
+    );
+    const result = evaluateStreamClaim(
+        { now: 1_000 + STREAM_NATIVE_GRACE_MS - 1, senderClaimed: true, nativeStreamCount: 0 }, first.state
+    );
+    assert.equal(result.status, "warming");
+    assert.equal(result.warn, false);
+});
+
+test("UI verde sem conexao nativa madura acusa uma vez", () => {
+    const first = evaluateStreamClaim(
+        { now: 1_000, senderClaimed: true, nativeStreamCount: 0 }, initialStreamClaimState()
+    );
+    const failed = evaluateStreamClaim(
+        { now: 1_000 + STREAM_NATIVE_GRACE_MS, senderClaimed: true, nativeStreamCount: 0 }, first.state
+    );
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.warn, true);
+
+    const repeated = evaluateStreamClaim(
+        { now: 60_000, senderClaimed: true, nativeStreamCount: 0 }, failed.state
+    );
+    assert.equal(repeated.status, "failed-known");
+    assert.equal(repeated.warn, false);
+});
+
+test("cura tardia limpa o bloqueio", () => {
+    const result = evaluateStreamClaim(
+        { now: 60_000, senderClaimed: true, nativeStreamCount: 2 },
+        { claimSince: 1_000, warned: true }
+    );
+    assert.equal(result.status, "healthy");
+    assert.deepEqual(result.state, initialStreamClaimState());
+});
+
+const tor = proxy => /127\.0\.0\.1:(?:9050|9060)$/.test(proxy);
+
+test("Tor manual e estrito", () => {
+    assert.equal(isStrictManualTor({ proxy: "socks5://127.0.0.1:9060" }, tor), true);
+});
+
+test("Tor automatico nao inventa modo estrito", () => {
+    assert.equal(isStrictManualTor("auto", tor), false);
+});
+
+test("proxy manual ignora primeiro falso negativo", () => {
+    assert.equal(shouldReplaceActiveExit({
+        failed: true, missedBeats: 1, maxMissedBeats: 2
+    }), false);
+});
+
+test("proxy manual troca apos morte confirmada", () => {
+    assert.equal(shouldReplaceActiveExit({
+        failed: true, missedBeats: 2, maxMissedBeats: 2
+    }), true);
+});
+
+test("proxy gratuita tambem ignora primeiro falso negativo", () => {
+    assert.equal(shouldReplaceActiveExit({
+        failed: true, missedBeats: 1, maxMissedBeats: 2
+    }), false);
+});
+
+test("proxy gratuita troca apos morte confirmada", () => {
+    assert.equal(shouldReplaceActiveExit({
+        failed: true, missedBeats: 2, maxMissedBeats: 2
+    }), true);
+});
+
+test("fuzz de 50000 amostras nunca avisa com dado desconhecido ou stream nativa", () => {
+    let seed = 0x169b13;
+    const random = () => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return seed / 0x1_0000_0000;
+    };
+
+    let state = initialStreamClaimState();
+    for (let i = 0; i < 50_000; i++) {
+        const claimedOptions = [false, true, null];
+        const countOptions = [0, 1, 2, null];
+        const senderClaimed = claimedOptions[Math.floor(random() * claimedOptions.length)];
+        const nativeStreamCount = countOptions[Math.floor(random() * countOptions.length)];
+        const result = evaluateStreamClaim({
+            now: 1_000 + i * 1_001,
+            senderClaimed,
+            nativeStreamCount
+        }, state);
+
+        if (senderClaimed !== true || nativeStreamCount === null || nativeStreamCount > 0)
+            assert.equal(result.warn, false);
+        state = result.state;
+    }
+});
+
+test("fuzz de 50000 batimentos preserva a ativa ate o teto", () => {
+    for (let misses = 0; misses < 50_000; misses++) {
+        const max = 1 + (misses % 17);
+        const actual = shouldReplaceActiveExit({
+            failed: true,
+            missedBeats: misses % 23,
+            maxMissedBeats: max
+        });
+        assert.equal(actual, (misses % 23) >= max);
+    }
+});
+
+process.stdout.write(`1..${passed}\n`);

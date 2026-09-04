@@ -29,6 +29,7 @@
 
 ;
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const vm = require("vm");
 const Module = require("module");
@@ -38,8 +39,14 @@ let failures = 0;
 function ok(name) { console.log("  [OK] " + name); }
 function bad(name, extra) { failures++; console.log("  [FAIL] " + name + (extra ? ": " + extra : "")); }
 
-const BASE = process.env.FAKE_RES_BASE || "/tmp/fake-res-beta2";
+const ownsBase = !process.env.FAKE_RES_BASE;
+const BASE = process.env.FAKE_RES_BASE || fs.mkdtempSync(path.join(os.tmpdir(), "golive-cold-tor-"));
 const FAKE_RES = BASE + "/resources";
+if (ownsBase) {
+  process.once("exit", () => {
+    try { fs.rmSync(BASE, { recursive: true, force: true }); } catch {}
+  });
+}
 fs.mkdirSync(FAKE_RES + "/_app.asar", { recursive: true });
 fs.writeFileSync(FAKE_RES + "/_app.asar/package.json", JSON.stringify({ name: "discord", main: "index.js" }));
 fs.writeFileSync(FAKE_RES + "/_app.asar/index.js", "// discord fake");
@@ -62,6 +69,11 @@ const appStub = { on: () => {}, whenReady: () => ({ then: () => {} }), setAppPat
 const sessionStub = { defaultSession: { resolveProxy: async () => "DIRECT", setProxy: async () => {}, webRequest: { onBeforeRequest: () => {} }, closeAllConnections: async () => {} } };
 
 const code = fs.readFileSync(BYPASS, "utf8");
+const sandboxProcess = Object.create(process);
+Object.defineProperties(sandboxProcess, {
+  env: { value: { ...process.env, XDG_DATA_HOME: path.join(BASE, "data") } },
+  argv: { value: ["node", FAKE_RES + "/_app.asar/index.js"] },
+});
 const sandboxRequire = (name) => {
   if (name === "electron") return { app: appStub, session: sessionStub, BrowserWindow: BrowserWindowStub };
   if (name === "original-fs") return require("fs");
@@ -74,18 +86,21 @@ const sandbox = {
   exports: {},
   __dirname: FAKE_RES,
   __filename: BYPASS,
-  console, process, Buffer,
+  console, process: sandboxProcess, Buffer,
   setTimeout, clearTimeout, setInterval, clearInterval,
   URL, URLSearchParams, Date,
 };
 sandbox.module.exports = sandbox.exports;
 sandbox.global = sandbox;
 vm.createContext(sandbox);
-Object.defineProperty(sandbox.process, "argv", { value: ["node", FAKE_RES + "/_app.asar/index.js"], writable: false });
 vm.runInContext(code, sandbox, { filename: BYPASS });
 
 const g = sandbox;
 const sandboxRef = sandbox;
+// TOR_BOOT_STALL_MS eh "const" no topo do arquivo: nao vira propriedade do objeto de contexto
+// (o mesmo motivo pelo qual coldTorHoldSince, um "let", precisa de vm.runInContext abaixo em
+// vez de g.coldTorHoldSince). runInContext consegue ler porque reusa o escopo lexical do topo.
+const TOR_BOOT_STALL_MS = vm.runInContext("TOR_BOOT_STALL_MS", sandboxRef);
 
 function scriptParses(name, script) {
   try {
@@ -199,12 +214,84 @@ function testNoOldHoldNoOp() {
   }
 }
 
+async function testEscalateTorBootBannerWaitsForThreshold() {
+  // Arranque frio recente (bem antes de TOR_BOOT_STALL_MS): escalateTorBootBanner nao deve
+  // mexer em nada ainda -- so o texto otimista original vale nesta janela.
+  executedScripts.length = 0;
+  g._testMarkColdTorHold(0);
+  g.escalateTorBootBanner();
+  await new Promise(r => setTimeout(r, 10));
+  if (executedScripts.length === 0) {
+    ok("escalateTorBootBanner nao faz nada antes de TOR_BOOT_STALL_MS");
+  } else {
+    bad("escalateTorBootBanner mexeu no banner antes do prazo de estouro");
+  }
+}
+
+async function testEscalateTorBootBannerFiresOnceAfterThreshold() {
+  // Arranque frio ha mais que TOR_BOOT_STALL_MS: o aviso otimista precisa virar acionavel,
+  // dizendo que a GUI (dona do Tor) provavelmente fechou -- e so uma vez por arranque frio.
+  executedScripts.length = 0;
+  g._testMarkColdTorHold(TOR_BOOT_STALL_MS);
+  g.escalateTorBootBanner();
+  await new Promise(r => setTimeout(r, 10));
+  if (executedScripts.length !== 1) return bad("escalateTorBootBanner deveria injetar 1 script apos o prazo", "injetou " + executedScripts.length);
+  const s = executedScripts[0];
+  scriptParses("escalateTorBootBanner", s);
+  if (s.includes("golivebypass-tor-wait-text") && s.includes("golivebypass-tor-wait-icon")) {
+    ok("escalateTorBootBanner mira o texto/icone do banner existente, sem recriar o elemento");
+  } else {
+    bad("escalateTorBootBanner nao mirou os ids esperados");
+  }
+  if (s.includes("fechado ou travado")) ok("aviso escalado explica a causa provavel (GUI fechada/travada)");
+  else bad("aviso escalado sem explicacao acionavel");
+
+  // Segunda chamada no mesmo arranque frio: nao deve repetir a injecao (torBootStallShown).
+  executedScripts.length = 0;
+  g.escalateTorBootBanner();
+  await new Promise(r => setTimeout(r, 10));
+  if (executedScripts.length === 0) {
+    ok("escalateTorBootBanner so injeta uma vez por arranque frio");
+  } else {
+    bad("escalateTorBootBanner repetiu a injecao no mesmo arranque frio");
+  }
+}
+
+async function testEscalateTorBootBannerResetsOnRecovery() {
+  // Depois de escalar, uma saida real chega (settleExit) e zera coldTorHoldSince -- um NOVO
+  // arranque frio (proximo boot) precisa poder escalar de novo, sem ficar preso por um flag
+  // que sobrou do arranque anterior.
+  executedScripts.length = 0;
+  g._testMarkColdTorHold(TOR_BOOT_STALL_MS);
+  g.escalateTorBootBanner();
+  await new Promise(r => setTimeout(r, 10));
+  if (executedScripts.length !== 1) return bad("pre-condicao: deveria ter escalado uma vez");
+
+  const origProbe = g.probe;
+  g.probe = async () => ({ proxy: "socks5://127.0.0.1:9060", ms: 5 });
+  g.settleExit("socks5://127.0.0.1:9060");
+  await new Promise(r => setTimeout(r, 30));
+  g.probe = origProbe;
+
+  executedScripts.length = 0;
+  g._testMarkColdTorHold(TOR_BOOT_STALL_MS);
+  g.escalateTorBootBanner();
+  await new Promise(r => setTimeout(r, 10));
+  if (executedScripts.length === 1) {
+    ok("escalateTorBootBanner escala de novo apos um novo arranque frio (flag resetado por settleExit)");
+  } else {
+    bad("escalateTorBootBanner nao escalou de novo apos recuperacao + novo arranque frio", "injetou " + executedScripts.length);
+  }
+}
+
 function testConstants() {
   const src = fs.readFileSync(BYPASS, "utf8");
   if (/TOR_HOLD_BUDGET_MS = 90_000/.test(src)) ok("TOR_HOLD_BUDGET_MS aumentado para 90s");
   else bad("TOR_HOLD_BUDGET_MS nao esta em 90_000");
   if (/MIDIA_RECENTE_MS = 20 \* 60_000/.test(src)) ok("MIDIA_RECENTE_MS aumentado para 20min");
   else bad("MIDIA_RECENTE_MS nao esta em 20 * 60_000");
+  if (/TOR_BOOT_STALL_MS = 3 \* 60_000/.test(src)) ok("TOR_BOOT_STALL_MS definido (3min)");
+  else bad("TOR_BOOT_STALL_MS nao esta definido como esperado");
 }
 
 
@@ -266,6 +353,12 @@ async function testTorBootBannerGivesUpIfAlreadyResolved() {
     await testTorBootBannerGivesUpIfAlreadyResolved();
     console.log("\n== settleExit sem arranque frio pendente eh no-op ==");
     testNoOldHoldNoOp();
+    console.log("\n== escalateTorBootBanner espera o prazo (issue: GUI/Tor mortos e ninguem avisa) ==");
+    await testEscalateTorBootBannerWaitsForThreshold();
+    console.log("\n== escalateTorBootBanner escala uma vez apos o prazo ==");
+    await testEscalateTorBootBannerFiresOnceAfterThreshold();
+    console.log("\n== escalateTorBootBanner reseta apos recuperacao e escala de novo num novo arranque frio ==");
+    await testEscalateTorBootBannerResetsOnRecovery();
     console.log("\n== constantes ajustadas ==");
     testConstants();
   } catch (e) {

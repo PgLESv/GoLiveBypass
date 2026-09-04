@@ -508,6 +508,9 @@ function readOverTls(socket: Socket, host: string, path: string, timeoutMs = PRO
 
         tls.setEncoding("latin1");
         tls.on("error", () => finish(null));
+        // Fechamento limpo do host sem dado nao gera erro TLS: sem escutar o close,
+        // o retorno ficava preso ate o timer de timeout estourar.
+        tls.on("close", () => finish(body || null));
         tls.on("data", (chunk: string) => {
             body += chunk;
             if (body.length > 65536) finish(body);
@@ -701,22 +704,51 @@ function userpluginSource() {
     return { projectRoot, target };
 }
 
+function resolveWindowsPnpm(): string {
+    const userProfile = process.env.USERPROFILE ?? process.env.HOME;
+    const candidates = [
+        process.env.APPDATA ? join(process.env.APPDATA, "npm", "pnpm.cmd") : undefined,
+        userProfile ? join(userProfile, "AppData", "Roaming", "npm", "pnpm.cmd") : undefined,
+        process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "pnpm", "pnpm.cmd") : undefined,
+        process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "pnpm", "pnpm.exe") : undefined,
+        process.env.ProgramW6432 ? join(process.env.ProgramW6432, "nodejs", "pnpm.cmd") : undefined,
+        process.env.ProgramFiles ? join(process.env.ProgramFiles, "nodejs", "pnpm.cmd") : undefined,
+        process.env["ProgramFiles(x86)"] ? join(process.env["ProgramFiles(x86)"], "nodejs", "pnpm.cmd") : undefined
+    ].filter((value): value is string => typeof value === "string" && value.length > 0);
+    return candidates.find(candidate => existsSync(candidate)) ?? "pnpm.cmd";
+}
+
 function rebuildUserplugin(projectRoot: string) {
-    // O spawn direto de .cmd falha no Electron/Node no Windows. O mesmo comando
-    // funciona no terminal porque ele passa pelo cmd.exe; fazemos isso
-    // explicitamente aqui para o updater ter o mesmo comportamento.
-    // No Windows, .cmd deve ser executado pelo shell (sem isso o Electron pode
-    // criar o processo, mas não aguardar corretamente o batch do pnpm). Esta é
-    // a forma suportada pelo Node para arquivos .cmd/.bat.
+    // O processo Electron pode herdar um PATH diferente do terminal interativo.
+    // No Windows, localizamos o shim real do pnpm e chamamos o cmd.exe por caminho
+    // absoluto; `call` aguarda tanto .cmd quanto .exe e repassa o exit code.
     const windows = process.platform === "win32";
-    const command = windows ? "pnpm.cmd" : "pnpm";
-    const args = windows ? ["build"] : ["build"];
+    const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+    const pnpm = windows ? resolveWindowsPnpm() : "pnpm";
+    const command = windows
+        ? (process.env.ComSpec && existsSync(process.env.ComSpec)
+            ? process.env.ComSpec
+            : join(windowsRoot, "System32", "cmd.exe"))
+        : pnpm;
+    const args = windows ? ["/d", "/s", "/c", "call", pnpm, "build"] : ["build"];
+    const env = { ...process.env };
+    if (windows) {
+        const nodeDirs = [
+            dirname(pnpm),
+            process.env.ProgramW6432 ? join(process.env.ProgramW6432, "nodejs") : undefined,
+            process.env.ProgramFiles ? join(process.env.ProgramFiles, "nodejs") : undefined,
+            join(windowsRoot, "System32")
+        ].filter((value): value is string => typeof value === "string" && value.length > 0);
+        const currentPath = env.Path ?? env.PATH ?? "";
+        env.Path = [...new Set([...nodeDirs, currentPath].filter(Boolean))].join(";");
+    }
     try {
         execFileSync(command, args, {
             cwd: projectRoot,
+            env,
             stdio: "pipe",
             windowsHide: true,
-            shell: windows,
+            shell: false,
             timeout: USERPLUGIN_BUILD_TIMEOUT_MS
         });
     } catch (error) {
@@ -1651,6 +1683,7 @@ async function stopRouter() {
 // Chamado pelo boot e pelo renderer ao ativar o plugin; a trava faz as duas chamadas
 // dividirem uma unica subida em vez de duas.
 let enabling: Promise<{ success: boolean; }> | null = null;
+let enableSeq = 0;
 
 export function enable(_?: IpcMainInvokeEvent) {
     enabling ??= enableOnce().finally(() => { enabling = null; });
@@ -1658,6 +1691,7 @@ export function enable(_?: IpcMainInvokeEvent) {
 }
 
 async function enableOnce() {
+    const seq = ++enableSeq;
     migrateLegacyPool();
     if (scope !== "off") return { success: true as const };
 
@@ -1675,6 +1709,8 @@ async function enableOnce() {
             log("nao consegui ler a regra de proxy do sistema; nao vou arriscar ligar o roteador as cegas");
             return { success: false as const };
         }
+
+        if (seq !== enableSeq) return { success: false as const };
 
         const discordRule = rules[0];
         if (typeof discordRule !== "string" || discordRule.trim() === "") {
@@ -1695,6 +1731,11 @@ async function enableOnce() {
         // depois, com o gateway segurado pelo roteador em vez de a abertura inteira travada.
         const started = await startRouter(routesLogin() ? "login" : "gateway");
         if (!started) return { success: false as const };
+
+        if (seq !== enableSeq) {
+            await stopRouter();
+            return { success: false as const };
+        }
 
         chooseExit();
         startHeartbeat();
@@ -1752,11 +1793,25 @@ async function installPacWithScope(next: Scope) {
 }
 
 export async function shutdown(_: IpcMainInvokeEvent) {
+    ++enableSeq;
+    enabling = null;
+    retries = 0;
     await stopRouter();
     settleExit(null);
     // Drenados os que esperavam, a proxima ativacao precisa segurar o gateway de novo ate
     // existir saida -- sem esta linha ela sairia direta sem esperar nada.
     exitSettled = false;
+    // choosing/hunting sao mutexes de PROMESSA (guardam "ja tem uma busca em voo", nao um
+    // booleano) -- um toggle rapido desligar->ligar no switch do plugin (sem debounce)
+    // podia fazer a reativacao reaproveitar calada uma busca ainda em andamento de ANTES
+    // do shutdown (chooseExit()/sharedFreeExit() so comecam busca nova quando o campo esta
+    // null). A sessao nova ficava dependendo do tempo de uma busca que nao reflete mais a
+    // configuracao/intencao atual, em vez de comecar do zero. As promessas orfas ainda
+    // terminam sozinhas (seus proprios .finally ja zeram o campo se ele nao tiver sido
+    // reatribuido por uma busca nova) -- zerar aqui so garante que a proxima ativacao nunca
+    // espera uma busca que nasceu antes dela.
+    choosing = null;
+    hunting = null;
     return { success: true as const };
 }
 

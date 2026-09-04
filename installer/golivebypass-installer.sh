@@ -50,7 +50,7 @@ unset -f _local_probe 2>/dev/null || true
 
 
 REPO_RAW="https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main"
-PLUGIN_FILES="goLiveBypass/index.tsx goLiveBypass/native.ts goLiveBypass/manifest.json"
+PLUGIN_FILES="goLiveBypass/index.tsx goLiveBypass/native.ts goLiveBypass/stability.ts goLiveBypass/manifest.json"
 PLUGIN_DIR_NAME="goLiveBypass"
 EQUICORD_GIT="https://github.com/Equicord/Equicord"
 VENCORD_GIT="https://github.com/Vendicated/Vencord"
@@ -2137,6 +2137,11 @@ installed_plugin_version() {
 # Em caso de formato malformado, devolve -1 (assume desatualizado).
 compare_version() {
     local installed="$1" latest="$2"
+    # A API/manifest normalmente ja entregam sem o prefixo, mas arquivos
+    # antigos e testes locais podem conservar o "v" da tag. Normalizar antes
+    # da igualdade e do sort evita update fantasma e downgrade invertido.
+    case "$installed" in [vV]*) installed=${installed#?} ;; esac
+    case "$latest" in [vV]*) latest=${latest#?} ;; esac
     # Sem informacao do GitHub: considera "sem atualizacao" (0). Sem isso, a
     # falta de rede (que zera latest) mostraria "atualizacao disponivel".
     [ -n "$latest" ] || { echo "0"; return; }
@@ -2144,13 +2149,41 @@ compare_version() {
     [ -n "$installed" ] || { echo "-1"; return; }
     [ "$installed" = "$latest" ] && { echo "0"; return; }
 
-    local lowest
-    lowest=$(printf '%s\n%s\n' "$installed" "$latest" | sort -V | head -1)
-    if [ "$lowest" = "$latest" ]; then
-        echo "1"   # installed > latest (mais antigo no sort = menor versao)
-    else
-        echo "-1"  # installed < latest
+    local installed_core="${installed%%-*}" installed_pre="" latest_core="${latest%%-*}" latest_pre=""
+    case "$installed" in *-*) installed_pre="${installed#*-}" ;; esac
+    case "$latest" in *-*) latest_pre="${latest#*-}" ;; esac
+
+    if [ "$installed_core" != "$latest_core" ]; then
+        local lowest
+        lowest=$(printf '%s
+%s
+' "$installed_core" "$latest_core" | sort -V | head -1)
+        if [ "$lowest" = "$latest_core" ]; then
+            echo "1"   # installed > latest
+        else
+            echo "-1"  # installed < latest
+        fi
+        return
     fi
+
+    # Mesma versao base: um sufixo de pre-release (-beta.N) sempre conta como
+    # mais antigo que a mesma base sem sufixo, nunca como um componente extra
+    # (sort -V sozinho, sem separar o sufixo, tratava beta.N como mais novo).
+    if [ -n "$installed_pre" ] && [ -z "$latest_pre" ]; then echo "-1"; return; fi
+    if [ -z "$installed_pre" ] && [ -n "$latest_pre" ]; then echo "1"; return; fi
+    if [ -n "$installed_pre" ] && [ -n "$latest_pre" ]; then
+        local lowest_pre
+        lowest_pre=$(printf '%s
+%s
+' "$installed_pre" "$latest_pre" | sort -V | head -1)
+        if [ "$lowest_pre" = "$latest_pre" ]; then
+            echo "1"
+        else
+            echo "-1"
+        fi
+        return
+    fi
+    echo "0"
 }
 
 # Faz backup do plugin atual antes de sobrescrever. Mantem so os 3 mais recentes
@@ -2467,23 +2500,29 @@ main_menu() {
     if tui_is_interactive; then
         local tui_choice
         tui_choice="$(tui_menu "O que voce quer fazer?" \
-            "Instalar ou atualizar o GoLiveBypass" \
+            "Instalar o GoLiveBypass" \
+            "Verificar atualizacoes do plugin" \
+            "Atualizar o plugin" \
             "Remover so o plugin (o mod continua)" \
             "Restaurar tudo (remove o plugin e desfaz a injecao)" \
             "Sair")"
         case "$tui_choice" in
             1) do_install "$root" ;;
-            2) do_uninstall ;;
-            3) do_restore_everything ;;
+            2) do_check_update ;;
+            3) do_update ;;
+            4) do_uninstall ;;
+            5) do_restore_everything ;;
             *) printf '  %sAte mais.%s\n' "$C_DIM" "$C_OFF" ;;
         esac
         return
     fi
 
     printf '  %sO que voce quer fazer?%s\n\n' "$C_BOLD" "$C_OFF"
-    printf '    %s[1] Instalar ou atualizar o GoLiveBypass%s\n' "$C_GREEN" "$C_OFF"
-    printf '    %s[2] Remover so o plugin (o mod continua)%s\n' "$C_YELLOW" "$C_OFF"
-    printf '    %s[3] Restaurar tudo (remove o plugin e desfaz a injecao)%s\n' "$C_RED" "$C_OFF"
+    printf '    %s[1] Instalar o GoLiveBypass%s\n' "$C_GREEN" "$C_OFF"
+    printf '    %s[2] Verificar atualizacoes do plugin%s\n' "$C_CYAN" "$C_OFF"
+    printf '    %s[3] Atualizar o plugin%s\n' "$C_GREEN" "$C_OFF"
+    printf '    %s[4] Remover so o plugin (o mod continua)%s\n' "$C_YELLOW" "$C_OFF"
+    printf '    %s[5] Restaurar tudo (remove o plugin e desfaz a injecao)%s\n' "$C_RED" "$C_OFF"
     printf '    [0] Sair\n\n'
 
     local choice
@@ -2491,8 +2530,10 @@ main_menu() {
     read -r choice
     case "$choice" in
         1) do_install "$root" ;;
-        2) do_uninstall ;;
-        3) do_restore_everything ;;
+        2) do_check_update ;;
+        3) do_update ;;
+        4) do_uninstall ;;
+        5) do_restore_everything ;;
         *) printf '  %sAte mais.%s\n' "$C_DIM" "$C_OFF" ;;
     esac
 }

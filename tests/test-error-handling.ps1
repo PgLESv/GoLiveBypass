@@ -52,6 +52,8 @@ Set-Content -LiteralPath $tempInstaller -Value $truncatedInstaller -Encoding UTF
 
 # Salva referencia para Test-ShouldReport do instalador
 $installerShouldReport = ${function:Test-ShouldReport}
+$installerWaitAntesDeFechar = ${function:Wait-AntesDeFechar}
+$installerTestJanela = ${function:Test-JanelaTransitoria}
 
 # Carrega funcoes do standalone
 $standaloneContent = Get-Content -LiteralPath $standalonePath -Raw
@@ -63,6 +65,8 @@ Set-Content -LiteralPath $tempStandalone -Value $truncatedStandalone -Encoding U
 . $tempStandalone
 
 $standaloneShouldReport = ${function:Test-ShouldReport}
+$standaloneWaitAntesDeFechar = ${function:Wait-AntesDeFechar}
+$standaloneTestJanela = ${function:Test-JanelaTransitoria}
 
 $pass = 0
 $fail = 0
@@ -206,6 +210,55 @@ try {
 } finally {
     $env:LOCALAPPDATA = $origLocalAppData
 }
+
+Write-Host "`n========================================================" -ForegroundColor Cyan
+Write-Host " 3. Wait-AntesDeFechar / Test-JanelaTransitoria" -ForegroundColor Cyan
+Write-Host "========================================================" -ForegroundColor Cyan
+# Relato: no Windows 10 sem winget, o instalador falha e a janela "fecha sozinha" antes da
+# pessoa ler o erro -- "Executar com o PowerShell" no Explorer spawna powershell.exe -File
+# sem -NoExit. O .bat ja tem "pause" pra isso, mas quem roda so o .ps1 baixado direto (o
+# link do README salva so o .ps1) nao passa por ele. Estes testes cobrem a parte
+# deterministica (sem depender de bloquear em leitura de stdin, que nao e seguro forcar
+# aqui): a deteccao devolve false neste ambiente (sem pai explorer.exe) e -Yes pula a
+# checagem sem nem chamar Test-JanelaTransitoria. O caminho que de fato imprime o aviso e
+# tenta ler Enter foi verificado manualmente (nao automatizado, para nao arriscar travar a
+# suite se algum ambiente de CI conectar um stdin que nunca fecha).
+foreach ($par in @(
+    @{ nome = 'instalador'; wait = $installerWaitAntesDeFechar; janela = $installerTestJanela },
+    @{ nome = 'standalone'; wait = $standaloneWaitAntesDeFechar; janela = $standaloneTestJanela }
+)) {
+    $Yes = $false
+    Assert-Equal (& $par.janela) $false "Test-JanelaTransitoria ($($par.nome)) devolve false sem pai explorer.exe (ambiente de teste)"
+
+    # Sem pai explorer.exe: Wait-AntesDeFechar precisa retornar sem tentar ler nada.
+    & $par.wait
+    Assert-Equal $true $true "Wait-AntesDeFechar ($($par.nome)) retorna sem bloquear quando nao e janela transitoria"
+
+    # -Yes precisa pular a checagem de janela ANTES de chamar Test-JanelaTransitoria --
+    # confirma substituindo a deteccao por uma que sempre explode; se Wait-AntesDeFechar
+    # ainda assim chamar Test-JanelaTransitoria, o teste falha com excecao.
+    $Yes = $true
+    Set-Item "function:Test-JanelaTransitoria" { throw 'Test-JanelaTransitoria nao deveria ser chamada com -Yes' }
+    try {
+        & $par.wait
+        Assert-Equal $true $true "Wait-AntesDeFechar ($($par.nome)) com -Yes nao chama Test-JanelaTransitoria"
+    } catch {
+        Assert-Equal $false $true "Wait-AntesDeFechar ($($par.nome)) com -Yes nao chama Test-JanelaTransitoria ($($_.Exception.Message))"
+    }
+    $Yes = $false
+    # Restaura a deteccao real (nao remove): a proxima iteracao do loop tambem chama
+    # Wait-AntesDeFechar, que resolve Test-JanelaTransitoria pelo nome em tempo de execucao.
+    Set-Item "function:Test-JanelaTransitoria" $par.janela
+}
+
+# Confirma que os pontos de saida de sucesso e encerramento normal do standalone chamam Wait-AntesDeFechar
+Assert-Equal ($standaloneContent.Trim().EndsWith("Wait-AntesDeFechar")) $true "Standalone tem Wait-AntesDeFechar no encerramento normal do script"
+Assert-Equal ($standaloneContent -match 'Show-Status;\s*Wait-AntesDeFechar;\s*return') $true "Standalone chama Wait-AntesDeFechar antes de retornar de Show-Status"
+Assert-Equal ($standaloneContent -match 'Invoke-StandaloneCheckUpdate;\s*Wait-AntesDeFechar;\s*return') $true "Standalone chama Wait-AntesDeFechar antes de retornar de CheckUpdate"
+Assert-Equal ($standaloneContent -match 'Invoke-StandaloneUpdate;\s*Wait-AntesDeFechar;\s*return') $true "Standalone chama Wait-AntesDeFechar antes de retornar de Update"
+
+# Confirma que a saida apos instalar dependencias via winget no instalador chama Wait-AntesDeFechar
+Assert-Equal ($installerContent -match 'Feche este terminal[\s\S]*?Wait-AntesDeFechar[\s\S]*?exit 0') $true "Instalador chama Wait-AntesDeFechar antes de sair apos instalar dependencias"
 
 # Cleanup temp files
 Remove-Item -LiteralPath $tempInstaller, $tempStandalone -Force -ErrorAction SilentlyContinue

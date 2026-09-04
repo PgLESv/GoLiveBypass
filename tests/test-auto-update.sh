@@ -156,6 +156,13 @@ test_compare ""      "1.1.8" "-1" "instalado vazio"
 test_compare "1.1.8" ""      "0"  "latest vazio"
 test_compare "1.9.0" "1.10.0" "-1" "10 > 9 (sort -V)"
 test_compare "1.10.0" "1.9.0" "1"  "1.10 > 1.9"
+test_compare "v1.1.8" "1.1.8" "0"  "prefixo v no instalado"
+test_compare "1.1.8" "v1.1.8" "0"  "prefixo v no latest"
+test_compare "1.1.8" "v1.1.7" "1"  "downgrade com prefixo v"
+test_compare "1.1.12-beta.13" "1.1.12" "-1" "beta -> release estavel correspondente (sort -V separando pre-release)"
+test_compare "1.1.12" "1.1.12-beta.13" "1"  "release estavel nao faz downgrade para beta da mesma versao"
+test_compare "1.1.12-beta.1" "1.1.12-beta.2" "-1" "beta 1 -> beta 2"
+test_compare "1.1.12-beta.2" "1.1.12-beta.1" "1"  "beta 2 -> beta 1"
 
 # --------------------------------------------------------------------------- 7. installed_plugin_version
 echo

@@ -24,7 +24,7 @@ const { createServer, connect } = require("net");
 const { connect: connectTls } = require("tls");
 const { request } = require("https");
 const fs = require("original-fs");
-const { join, dirname, basename } = require("path");
+const { join, dirname, basename, resolve } = require("path");
 
 const DISCORD_HOST = "discord.com";
 const GEO_HOST = "cloudflare.com";
@@ -47,7 +47,7 @@ const POOL_SIZE = 5;
 const MAX_CANDIDATES = 80;
 const MIN_UPTIME = 90;
 const MAX_LISTED_TIMEOUT = 1500;
-const TOR_PORTS = [9052, 9150, 9050, 9250];
+const TOR_PORTS = [9060, 9052, 9150, 9050, 9250];
 const TOR_PORT_TIMEOUT_MS = 400;
 // Quanto uma conexao de gateway espera por uma saida antes de sair direta. Segurar para sempre
 // travaria o login; soltar na hora perderia a corrida em toda abertura fria.
@@ -96,6 +96,11 @@ const TOR_RELAY_TIMEOUT_MS = 30_000;
 // e longo o bastante para nao virar carga na saida gratuita, que costuma limitar conexoes.
 const HEARTBEAT_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 4000;
+
+// Uma saida manual pode ser legitimamente mais lenta que uma gratuita. Aplicar os 4s do
+// pote a ela transforma latencia em "morte" e abre a exata troca de gateway que as #170/#171
+// mostraram ser destrutiva no retorno do viewer. Ela so muda depois de dois testes deste prazo.
+const MANUAL_HEARTBEAT_TIMEOUT_MS = 12_000;
 
 // Quantos batimentos seguidos uma saida pode errar antes de sair do pote. Cortar no primeiro
 // seria cruel com saida gratuita congestionada, que erra um e volta; nunca cortar deixaria o
@@ -212,6 +217,15 @@ const quarentena = new Map();     // proxy -> ate quando fica evitada
 
 function quarentenar(proxy, motivo) {
     if (proxy === null) return;
+    // O modo Tor tem exatamente uma saida autorizada. Marcar esse endereco como
+    // evitado depois de uma rajada nao cria alternativa alguma e contradiz a
+    // garantia "so Tor, nunca direta"; no proximo caminho que consulte a
+    // quarentena, poderia transformar uma oscilacao recuperavel em ausencia de
+    // rota. A rajada continua diagnosticada, mas o Tor unico e preservado.
+    if (routeMode === "tor") {
+        log(safeProxy(proxy) + " poupada da quarentena por ser a saida unica do modo tor (" + motivo + ")");
+        return;
+    }
     if (proxy === manualProxy()) {
         log(safeProxy(proxy) + " poupada da quarentena por ser a saida configurada (" + motivo + ")");
         return;
@@ -266,6 +280,14 @@ let reloading = false;         // single-flight
 // banner some e a janela recarrega sozinha em vez de esperar o proprio Discord perceber e
 // tentar de novo por conta propria (que pode demorar mais que so tentar na hora).
 let coldTorHoldSince = 0;
+
+// O banner de arranque frio promete "menos de um minuto". Verdadeiro para o bootstrap do Tor
+// em si, mas nao cobre o caso em que o PROCESSO da GUI (dono do Tor e do watchdog que o
+// ressuscita) fechou ou travou -- o runtime injetado no Discord nao tem como subir Tor
+// sozinho, entao sem isto a pessoa fica lendo "deve sumir sozinho" para sempre. Passado este
+// prazo (bem alem do bootstrap normal, generoso o bastante para nao confundir uma rede lenta
+// com o processo morto) o aviso vira acionavel: dizer para reabrir a GUI, nao so o Discord.
+let torBootStallShown = false;
 
 // Falhas seguidas do probe da saida MANUAL (nao do trafego vivo -- so a checagem de fundo em
 // chooseExit). Uma falha isolada pode ser um blip; falhas repetidas em toda abertura sao o
@@ -361,17 +383,16 @@ const routeMode = typeof settings.routeMode === "string" ? settings.routeMode : 
 const TOR_ADDR = typeof settings.torAddr === "string" && settings.torAddr !== ""
     ? settings.torAddr
     : "127.0.0.1:9050";
-// Revive automatico do gateway zumbi (issues #145/#149/#153): close 4000 para o cliente
-// renascer com RESUME, escalando para reload. Ligado por default e conservador por
-// desenho (nunca em call/midia recente, teto de 2 tentativas por 30min); a GUI pode desligar.
-const autoRevive = settings.autoRevive !== false;
+// Recuperacao do gateway zumbi e do RTC da stream e obrigatoria. Ela continua
+// conservadora por desenho: as guardas de midia/call, o teto e os cooldowns
+// decidem QUANDO agir; settings.json nunca pode desarmar a protecao critica.
 
 // Primeira linha do log: o modo EFETIVO que este runtime vai usar. Sem ela, um settings.json
 // regravado sem routeMode (escritor antigo, terceiro, versao anterior) deixava o runtime no
 // "auto" enquanto a GUI jurava tor -- e o log nao tinha como provar o contrario (issue #108).
 log("modo de roteamento: " + routeMode +
     (typeof settings.routeMode === "string" ? " (settings.json)" : " (padrao: settings.json sem routeMode)"));
-if (!autoRevive) log("revive automatico do gateway: desligado (settings.json)");
+log("recuperacao automatica obrigatoria: gateway e RTC (guardas de midia ativas)");
 
 // O trecho antes do @ e opcional e casado com ganancia, para a senha poder conter @ e : sem
 // precisar de escape: quem recebe um endereco pronto da AWS costuma cola-lo como veio.
@@ -425,6 +446,11 @@ function safeProxy(value) {
 }
 
 function manualProxy() {
+    // A GUI preserva o texto do campo ao trocar de modo para a pessoa poder
+    // voltar a "Personalizado" sem redigitar a credencial. Preservar o TEXTO
+    // nao pode preservar a PRECEDENCIA: Tor e Gratuitas sao escolhas
+    // explicitas e nao podem herdar uma proxy manual de uma sessao anterior.
+    if (routeMode !== "auto") return "";
     const raw = settings.proxy;
     if (typeof raw !== "string" || raw.trim() === "") return "";
 
@@ -441,7 +467,11 @@ function manualProxy() {
 // reposicao de reserva e a troca proativa por RTT: sao mecanismos pensados para saida
 // GRATUITA, que morre sem avisar e precisa de troca em segundo plano. Numa saida privada,
 // entrar neles so custa (ver trySwapByRtt e stockReserves).
-const usingManualProxy = typeof settings.proxy === "string" && settings.proxy.trim() !== "" && parseProxy(settings.proxy) !== null;
+const hasConfiguredManualProxy = typeof settings.proxy === "string" && settings.proxy.trim() !== "" && parseProxy(settings.proxy) !== null;
+const usingManualProxy = routeMode === "auto" && hasConfiguredManualProxy;
+if (hasConfiguredManualProxy && !usingManualProxy) {
+    log("proxy personalizada salva ignorada: modo " + routeMode + " foi escolhido explicitamente");
+}
 
 // A saida ativa e uma das portas configuradas pela pessoa? Comparacao por string falha
 // para range: manualProxy() sorteia uma porta nova a cada chamada, entao a mesma saida
@@ -628,6 +658,9 @@ function readOverTls(socket, host, path, timeoutMs) {
 
         tls.setEncoding("latin1");
         tls.on("error", () => finish(null));
+        // Fechamento limpo do host sem dado nao gera erro TLS: sem escutar o close,
+        // o retorno ficava preso ate o timer de timeout estourar.
+        tls.on("close", () => finish(body || null));
         tls.on("data", chunk => {
             body += chunk;
             if (body.length > 65536) finish(body);
@@ -848,8 +881,10 @@ function parseProxyScrape(body) {
 async function fetchFreeProxies() {
     // Se o usuario configurou um range multiplexado, usamos ele como nosso "pool publico" privado.
     // Isso impede que ao falhar a porta principal o app vaze para uma proxy publica aleatoria.
+    // O range so e uma saida manual no modo Personalizado. Tor/Gratuitas
+    // mantem o texto salvo para a UI, mas nao podem reusar suas portas.
     const raw = settings.proxy;
-    if (typeof raw === "string" && raw.trim() !== "") {
+    if (usingManualProxy && typeof raw === "string" && raw.trim() !== "") {
         const match = PROXY_RE.exec(raw.trim());
         if (match !== null && match[5] !== undefined) {
             const portStart = Number(match[4]);
@@ -1127,7 +1162,7 @@ async function chooseExit() {
         // gateway ja nasce roteado; o batimento valida a cada 30s, e se ela estiver morta
         // o trafego vivo cai para reserva/cache/lista antes de ir direto.
         log("usando a saida que voce configurou: " + safeProxy(manual));
-        probe(manual, 2500).then(ok => {
+        probe(manual, MANUAL_HEARTBEAT_TIMEOUT_MS).then(ok => {
             if (ok === null) {
                 log("a saida que voce configurou nao respondeu ao probe em segundo plano: " + safeProxy(manual));
                 manualProxyFalhasSeguidas++;
@@ -1183,6 +1218,7 @@ function settleExit(proxy) {
     // primeiro nunca chega a marcar gatewayWentDirectAt (modo tor nunca vaza).
     if (proxy !== null && coldTorHoldSince !== 0) {
         coldTorHoldSince = 0;
+        torBootStallShown = false;
         hideTorBootBanner();
         maybeReloadAfterColdHold();
     }
@@ -1348,6 +1384,31 @@ let gatewayConnCount = 0;
 let ultimaMidiaEm = 0;
 const MIDIA_RECENTE_MS = 20 * 60_000;
 
+// Uma stream nativa de discord_voice e prova mais forte de chamada/Live que o
+// websocket *.discord.media. Em sessoes longas de viewer esse websocket pode
+// sumir da instrumentacao apesar de o decoder continuar recebendo video; foi
+// exatamente o que a #178 registrou. Centralizar a marca evita que cada
+// mecanismo automatico invente uma definicao diferente de "sem midia".
+function marcarMidiaProtegida() {
+    ultimaMidiaEm = Date.now();
+}
+
+function midiaProtegidaRecentemente(janelaMs) {
+    const janela = typeof janelaMs === "number" ? janelaMs : MIDIA_RECENTE_MS;
+    return ultimaMidiaEm > 0 && Date.now() - ultimaMidiaEm < janela;
+}
+
+// Trocar a rota do gateway enquanto uma call/Live esta de pe e uma corrida
+// perigosa: o Chromium pode reavaliar a sessao no mesmo instante em que o
+// addon discord_voice renegocia o RTC. A troca nao e necessaria para uma
+// saida que ainda responde; se ela depois morrer, a troca de emergencia pelo
+// primeiro batimento perdido continua disponivel. A janela e a mesma usada
+// para impedir reload automatico no meio de uma chamada e cobre a ocorrencia
+// real de 01/09 (a Live estava aberta ha ~19min quando a troca por RTT ocorreu).
+function midiaRecenteParaTrocaProativa() {
+    return midiaProtegidaRecentemente(MIDIA_RECENTE_MS);
+}
+
 // Um Ctrl+R (ou a nossa propria recarga) comeca uma sessao NOVA: o gateway que nascer depois
 // dela e o primeiro dela, nao uma reconexao no meio de nada. Sem zerar aqui, o aviso voltava
 // justamente para quem seguiu o conselho dele -- recarregou por causa do aviso e levou o mesmo
@@ -1365,9 +1426,18 @@ function watchReloads() {
                 return; // janela morrendo
             }
             if (!CLIENT_URL_RE.test(url)) return;
-            if (gatewayConnCount === 0) return;
-
-            log("a janela do Discord recarregou: contagem de reconexao zerada");
+            // A navegacao de verdade comecou: libera o mutex de reload (reloadPorRevive() e o
+            // unico dos tres chamadores de win.webContents.reload() que nao tinha um probe
+            // assincrono proprio para resetar sozinho -- ver reloadPorRevive()). Redundante e
+            // inofensivo para os outros dois caminhos, que ja resetam no proprio .finally().
+            reloading = false;
+            // Invalida qualquer resultado assíncrono do documento anterior,
+            // inclusive quando a conexão ainda não chegou a ser contada.
+            gatewayProbeEpoca++;
+            gatewayProbeBloqueadoAte = new WeakMap();
+            if (gatewayConnCount > 0) {
+                log("a janela do Discord recarregou: contagem de reconexao zerada");
+            }
             gatewayConnCount = 0;
             // Reload = sessao nova de verdade: o estado do zumbi/revive expira junto
             // (o banner era DOM do documento antigo e ja morreu com ele).
@@ -1377,8 +1447,31 @@ function watchReloads() {
             zumbiUltimaAcao = null;
             revivePendenteEm = 0;
             reviveFecharEm = 0;
+            reviveFecharOrigem = '';
+            // O documento e as conexoes nativas antigas morreram. Nenhuma
+            // tentativa RTC pode atravessar a fronteira do reload e agir sobre
+            // sockets da sessao nova.
+            videoNativoPendente = null;
+            videoNativoTentativas.length = 0;
+            videoNativoOrcamentoChave = '';
+            videoNativoBloqueadoGeracao = '';
+            videoNativoBloqueadoEm = 0;
+            videoNativoUltimaAcaoEm = 0;
+            videoBannerAtivo = false;
+            voiceProbeUltimaAssinatura = '';
+            voiceUltimaGeracaoLogada = '';
+            viewerNativoUltimaSaudavelGeracao = '';
+            viewerNativoUltimaSaudavelEm = 0;
         });
     });
+}
+// Precisa existir antes de o main original criar a primeira BrowserWindow. Se
+// fosse instalado dentro de start(), os awaits do roteador/PAC poderiam perder
+// a janela e todo reset de sessao daquela execucao.
+try {
+    watchReloads();
+} catch (error) {
+    log("nao consegui observar as recargas da janela: " + error.message);
 }
 
 // Telemetria de sessao para o log: contagens acumuladas (a rotacao do arquivo
@@ -1425,10 +1518,12 @@ function instalarVoiceShim() {
         connections: [],
         seen: new WeakMap(),
         modules: new WeakSet(),
-        demandKnown: false,
-        demandActive: false,
-        demandAt: 0,
-        demandChangedAt: 0,
+        demands: {
+            sender: { known: false, active: false, at: 0, changedAt: 0, epoch: 0 },
+            viewer: { known: false, active: false, at: 0, changedAt: 0, epoch: 0 },
+        },
+        desktopSource: null,
+        desktopSourceEpoch: 0,
         retry: 0,
     };
     window.__goliveVoiceShim = state;
@@ -1465,11 +1560,51 @@ function instalarVoiceShim() {
         return typeof value === 'number' && Number.isFinite(value) ? value : null;
     }
 
-    // O discord_voice 0.0.84 manteve getStats no wrapper JS, mas removeu o
-    // metodo correspondente do objeto nativo. A API viva e
-    // getFilteredStats(2, callback): o filtro 2 devolve outbound + screenshare.
-    // Normalizamos so campos confirmados; nenhuma string/SSRC sai do preload.
-    function normalizeStats(raw) {
+    function firstFinite(obj, names) {
+        if (!obj || typeof obj !== 'object') return null;
+        for (var i = 0; i < names.length; i++) {
+            var value = finite(obj[names[i]]);
+            if (value !== null) return value;
+        }
+        return null;
+    }
+
+    // Resume o "transport" (nivel de rede, comum as duas direcoes) numa
+    // impressao curta que muda só quando chega confirmacao nova de entrega.
+    // Nunca inclui localAddress nem o id do receiverReport (identificadores);
+    // so numeros de contagem/qualidade, que sozinhos nao reidentificam nada.
+    // So rtt + receiverReports: sao os dois unicos campos que só avancam com
+    // confirmacao vinda do outro lado. packetsSent/packetsReceived ficaram de
+    // fora de proposito -- sao contagem local (o SO conta como "enviado" um
+    // pacote UDP mesmo se o firewall/NAT descartar antes de sair da maquina,
+    // e o lado de entrada segue vivo mesmo com a nossa saida bloqueada), entao
+    // incluir os dois mascarava exatamente o travamento que essa funcao existe
+    // para revelar (medido ao vivo: com saida UDP bloqueada de proposito,
+    // packetsReceived/packetsSent continuavam subindo a cada amostra mesmo com
+    // rtt e receiverReports parados byte a byte).
+    function transportFingerprint(transport) {
+        if (!transport || typeof transport !== 'object') return null;
+        var reports = Array.isArray(transport.receiverReports) ? transport.receiverReports : [];
+        var reportSig = '';
+        for (var i = 0; i < reports.length; i++) {
+            var r = reports[i];
+            if (!r || typeof r !== 'object') continue;
+            reportSig += (finite(r.bitrate) || 0) + '.' + (finite(r.fractionLost) || 0) + ';';
+        }
+        return [finite(transport.rtt), reportSig].join('|');
+    }
+
+    // getFilteredStats usa bitmask: 1 = transport (rtt/receiverReports, nivel
+    // de rede abaixo do RTP), 2 = outbound/screenshare, 4 = inbound. Pedimos 7
+    // para medir as tres. targetMediaBitrate e diagnostico, nao guarda: em
+    // 01/09 o Discord manteve esse campo em zero mesmo com a demanda remota
+    // positiva e o viewer preso no loading. O transport resolve um caso mais
+    // sutil: framesEncoded/fps_out sobem mesmo quando o pacote e descartado
+    // antes de sair da maquina (firewall/NAT do sender) porque medem so o
+    // encoder local. rtt/receiverReports so avancam com confirmacao real de
+    // entrega vinda do outro lado; congelados por muito tempo com o encoder
+    // "saudavel" e o sinal de que o sender esta mandando no vazio.
+    function normalizeStats(raw, role) {
         var parsed = raw;
         try {
             if (typeof parsed === 'string') parsed = JSON.parse(parsed);
@@ -1479,6 +1614,61 @@ function instalarVoiceShim() {
         if (!parsed || typeof parsed !== 'object') {
             return { ok: false, reason: 'formato', shape: shape(parsed, 0, new WeakSet()) };
         }
+        var transportRtt = parsed.transport ? finite(parsed.transport.rtt) : null;
+        var transportSig = transportFingerprint(parsed.transport);
+
+        if (role === 'viewer') {
+            var inbound = Array.isArray(parsed.inbound) ? parsed.inbound : [];
+            var videos = [];
+            for (var ui = 0; ui < inbound.length; ui++) {
+                var user = inbound[ui];
+                if (!user || typeof user !== 'object') continue;
+                if (Array.isArray(user.videos)) {
+                    for (var uvi = 0; uvi < user.videos.length; uvi++) {
+                        if (user.videos[uvi] && typeof user.videos[uvi] === 'object') videos.push(user.videos[uvi]);
+                    }
+                } else if (user.video && typeof user.video === 'object') {
+                    videos.push(user.video);
+                }
+            }
+            if (videos.length === 0) {
+                return {
+                    ok: true, direction: 'inbound', videoPresent: false,
+                    framesDecoded: null, decodeFrameRate: null, renderFrameRate: null,
+                    bytesReceived: null, packetsReceived: null, mediaBitrate: null,
+                    width: null, height: null,
+                    transportRtt: transportRtt, transportSig: transportSig,
+                };
+            }
+            var inboundVideo = videos[0];
+            for (var ivi = 1; ivi < videos.length; ivi++) {
+                var atual = firstFinite(inboundVideo, ['framesDecoded', 'bytesReceived', 'packetsReceived']) || 0;
+                var candidato = firstFinite(videos[ivi], ['framesDecoded', 'bytesReceived', 'packetsReceived']) || 0;
+                if (candidato > atual) inboundVideo = videos[ivi];
+            }
+            var framesDecoded = firstFinite(inboundVideo, ['framesDecoded', 'decodedFrames', 'framesRendered']);
+            var decodeFrameRate = firstFinite(inboundVideo, ['decodeFrameRate', 'decodedFrameRate']);
+            var renderFrameRate = firstFinite(inboundVideo, ['renderFrameRate', 'frameRate']);
+            var bytesReceived = firstFinite(inboundVideo, ['bytesReceived', 'payloadBytesReceived']);
+            var packetsReceived = firstFinite(inboundVideo, ['packetsReceived']);
+            if (framesDecoded === null && decodeFrameRate === null && renderFrameRate === null &&
+                bytesReceived === null && packetsReceived === null) {
+                return { ok: false, reason: 'campos-inbound', shape: shape(parsed, 0, new WeakSet()) };
+            }
+            return {
+                ok: true, direction: 'inbound', videoPresent: true,
+                framesDecoded: framesDecoded,
+                decodeFrameRate: decodeFrameRate,
+                renderFrameRate: renderFrameRate,
+                bytesReceived: bytesReceived,
+                packetsReceived: packetsReceived,
+                mediaBitrate: firstFinite(inboundVideo, ['mediaBitrate', 'totalBitrate']),
+                width: finite(inboundVideo.width),
+                height: finite(inboundVideo.height),
+                transportRtt: transportRtt, transportSig: transportSig,
+            };
+        }
+
         var outbound = parsed.outbound;
         var video = outbound && outbound.video;
         if ((!video || typeof video !== 'object') && outbound && Array.isArray(outbound.videos)) {
@@ -1497,9 +1687,6 @@ function instalarVoiceShim() {
             try { captureKeys = Object.keys(screenshare); } catch (e) { captureKeys = []; }
             for (var ci = 0; ci < captureKeys.length; ci++) {
                 var captureKey = captureKeys[ci];
-                // pipewireFrames/x11Frames sao os campos atuais no Linux. O
-                // padrao tambem aceita os backends equivalentes de Win/macOS,
-                // mas exclui contadores de descarte/falha/saida.
                 if (!/frames$/i.test(captureKey) || /(drop|fail|encode|sent|receive)/i.test(captureKey)) continue;
                 var captureValue = finite(screenshare[captureKey]);
                 if (captureValue === null) continue;
@@ -1509,16 +1696,16 @@ function instalarVoiceShim() {
             if (captureFound) captureFrames = captureTotal;
         }
         if (!video || typeof video !== 'object') {
-            return { ok: false, reason: 'sem-video', shape: shape(parsed, 0, new WeakSet()) };
+            return { ok: false, reason: 'sem-video-outbound', shape: shape(parsed, 0, new WeakSet()) };
         }
         var inputFrameRate = finite(video.inputFrameRate);
         var framesEncoded = finite(video.framesEncoded);
         var encodeFrameRate = finite(video.encodeFrameRate);
         if ((captureFrames === null && inputFrameRate === null) || framesEncoded === null || encodeFrameRate === null) {
-            return { ok: false, reason: 'campos', shape: shape(parsed, 0, new WeakSet()) };
+            return { ok: false, reason: 'campos-outbound', shape: shape(parsed, 0, new WeakSet()) };
         }
         return {
-            ok: true,
+            ok: true, direction: 'outbound', videoPresent: true,
             captureFrames: captureFrames,
             inputFrameRate: inputFrameRate,
             framesEncoded: framesEncoded,
@@ -1528,13 +1715,54 @@ function instalarVoiceShim() {
             width: Array.isArray(video.substreams) && video.substreams[0] ? finite(video.substreams[0].width) : null,
             height: Array.isArray(video.substreams) && video.substreams[0] ? finite(video.substreams[0].height) : null,
             suspended: video.suspended === true,
+            transportRtt: transportRtt, transportSig: transportSig,
         };
     }
 
     function updateProgress(rec, stats) {
         var now = Date.now();
-        if (!rec.progress) {
+        // Idade do transporte e comum as duas direcoes e vive fora de
+        // rec.progress (que e trocado inteiro se a direcao muda). So avanca
+        // quando rtt/packets/receiverReports realmente mudam -- nao com o
+        // simples fato de a amostra ter rodado de novo.
+        var transportHa = -1;
+        if (stats.transportSig !== null && typeof stats.transportSig !== 'undefined') {
+            if (typeof rec.transportSig !== 'string' || rec.transportSig !== stats.transportSig) {
+                rec.transportSig = stats.transportSig;
+                rec.transportAt = now;
+            }
+            transportHa = now - (rec.transportAt || now);
+        }
+        if (stats.direction === 'inbound') {
+            if (!rec.progress || rec.progress.direction !== 'inbound') {
+                rec.progress = { direction: 'inbound', videoValue: null, videoAt: rec.createdAt };
+            }
+            var videoValue = stats.framesDecoded;
+            if (videoValue === null) videoValue = stats.bytesReceived;
+            if (videoValue === null) videoValue = stats.packetsReceived;
+            if (stats.videoPresent && ((videoValue !== null && videoValue > (rec.progress.videoValue || 0)) ||
+                (stats.decodeFrameRate !== null && stats.decodeFrameRate > 0) ||
+                (stats.renderFrameRate !== null && stats.renderFrameRate > 0))) rec.progress.videoAt = now;
+            rec.progress.videoValue = videoValue;
+            return {
+                statsOk: true, direction: 'inbound', videoPresent: stats.videoPresent,
+                framesDecoded: stats.framesDecoded,
+                decodeFrameRate: stats.decodeFrameRate,
+                renderFrameRate: stats.renderFrameRate,
+                bytesReceived: stats.bytesReceived,
+                packetsReceived: stats.packetsReceived,
+                mediaBitrate: stats.mediaBitrate,
+                width: stats.width,
+                height: stats.height,
+                videoHa: now - rec.progress.videoAt,
+                transportRtt: stats.transportRtt,
+                transportHa: transportHa,
+                sampleHa: 0,
+            };
+        }
+        if (!rec.progress || rec.progress.direction !== 'outbound') {
             rec.progress = {
+                direction: 'outbound',
                 inputValue: stats.captureFrames,
                 outputValue: stats.framesEncoded,
                 inputAt: now,
@@ -1549,7 +1777,7 @@ function instalarVoiceShim() {
             rec.progress.outputValue = stats.framesEncoded;
         }
         return {
-            statsOk: true,
+            statsOk: true, direction: 'outbound', videoPresent: true,
             captureFrames: stats.captureFrames,
             framesEncoded: stats.framesEncoded,
             inputFrameRate: stats.inputFrameRate,
@@ -1561,12 +1789,67 @@ function instalarVoiceShim() {
             suspended: stats.suspended,
             entradaHa: now - rec.progress.inputAt,
             saidaHa: now - rec.progress.outputAt,
+            transportRtt: stats.transportRtt,
+            transportHa: transportHa,
             sampleHa: 0,
         };
     }
 
+    // A chamada de fonte serve apenas para classificar o papel da conexao como
+    // transmissor. Nao guardamos sourceId, callbacks nem opcoes: replay/clear
+    // nao curou receiver ausente e clearDesktopSource removeu o video ao vivo.
+    function hookDesktopSource(rec) {
+        if (!rec || !rec.conn || rec.desktopHooked) return;
+        rec.desktopHooked = true;
+        var setters = ['setDesktopSource', 'setDesktopSourceWithOptions'];
+        for (var si = 0; si < setters.length; si++) {
+            (function (name) {
+                var original;
+                try { original = rec.conn[name]; } catch (e) { return; }
+                if (typeof original !== 'function') return;
+                try {
+                    rec.conn[name] = function () {
+                        var result = original.apply(this, arguments);
+                        rec.isDesktopSource = true;
+                        state.desktopSourceEpoch++;
+                        state.desktopSource = {
+                            rec: rec,
+                            method: name,
+                            active: true,
+                            configuredAt: Date.now(),
+                            epoch: state.desktopSourceEpoch,
+                        };
+                        return result;
+                    };
+                } catch (e) { }
+            })(setters[si]);
+        }
+        try {
+            var originalClear = rec.conn.clearDesktopSource;
+            if (typeof originalClear === 'function') {
+                rec.conn.clearDesktopSource = function () {
+                    var result = originalClear.apply(this, arguments);
+                    if (state.desktopSource && state.desktopSource.rec === rec) {
+                        state.desktopSource.active = false;
+                    }
+                    return result;
+                };
+            }
+        } catch (e) { }
+    }
+
     function registerConnection(kind, creator, options, conn) {
         if (!conn || (typeof conn !== 'object' && typeof conn !== 'function')) return conn;
+        // O cliente usa createOwnStream... apenas para quem TRANSMITE. Quem
+        // assiste usa createVoice... mesmo com context=stream. O campo
+        // estrutural streamUserId existe nas duas variantes de stream e nao
+        // existe na voice default; inspecionamos apenas a presenca, nunca o ID.
+        var isStream = kind === 'stream';
+        try {
+            if (!isStream && options && typeof options === 'object' &&
+                Object.prototype.hasOwnProperty.call(options, 'streamUserId')) isStream = true;
+        } catch (e) { }
+        if (isStream) kind = 'stream';
         var existing = state.seen.get(conn);
         if (existing) {
             if (kind === 'stream') existing.kind = 'stream';
@@ -1584,11 +1867,22 @@ function instalarVoiceShim() {
         state.seen.set(conn, rec);
         state.connections.push(rec);
         if (state.connections.length > 24) state.connections.shift();
+        hookDesktopSource(rec);
         try {
             if (typeof conn.destroy === 'function') {
                 var originalDestroy = conn.destroy;
                 conn.destroy = function () {
                     rec.destroyedAt = Date.now();
+                    if (state.desktopSource && state.desktopSource.rec === rec) {
+                        state.desktopSource.active = false;
+                    }
+                    if (rec.kind === 'stream') {
+                        var role = rec.isDesktopSource ? 'sender' : 'viewer';
+                        if (state.demands && state.demands[role]) {
+                            state.demands[role].active = false;
+                            state.demands[role].changedAt = Date.now();
+                        }
+                    }
                     return originalDestroy.apply(this, arguments);
                 };
             }
@@ -1671,8 +1965,17 @@ function instalarVoiceShim() {
             var joined = Array.prototype.map.call(args, function (value) {
                 return typeof value === 'string' ? value : '';
             }).join(' ');
-            var marker = 'Remote media sink wants:';
+            // Sender: pedido REMOTO para o nosso outbound. Viewer: pedido
+            // LOCAL da tela de Go Live para o inbound. Misturar os dois torna
+            // o viewer falsamente sem demanda, pois seu outbound fica em zero.
+            var marker = 'Go Live Media sink wants:';
+            var role = 'viewer';
             var at = joined.indexOf(marker);
+            if (at < 0) {
+                marker = 'Remote media sink wants:';
+                role = 'sender';
+                at = joined.indexOf(marker);
+            }
             if (at < 0) return;
             var payload = JSON.parse(joined.slice(at + marker.length).trim());
             var positive = false;
@@ -1693,10 +1996,17 @@ function instalarVoiceShim() {
                 }
             }
             var now = Date.now();
-            if (!state.demandKnown || state.demandActive !== positive) state.demandChangedAt = now;
-            state.demandKnown = true;
-            state.demandActive = positive;
-            if (positive) state.demandAt = now;
+            var demand = state.demands[role];
+            if (!demand.known || demand.active !== positive) {
+                demand.changedAt = now;
+                // Uma transicao para demanda positiva e uma nova intencao de
+                // assistir/transmitir. O main usa somente este contador local
+                // para renovar o teto de uma nova Live, nunca payload ou ID.
+                if (positive) demand.epoch++;
+            }
+            demand.known = true;
+            demand.active = positive;
+            if (positive) demand.at = now;
         } catch (e) { }
     }
 
@@ -1732,7 +2042,7 @@ function instalarVoiceShim() {
                 if (done) return;
                 done = true;
                 if (timer !== null) clearTimeout(timer);
-                var normalized = normalizeStats(raw);
+                var normalized = normalizeStats(raw, rec.isDesktopSource ? 'sender' : 'viewer');
                 if (!normalized.ok) {
                     resolve({ statsOk: false, reason: normalized.reason, statsShape: normalized.shape });
                     return;
@@ -1742,20 +2052,28 @@ function instalarVoiceShim() {
             timer = setTimeout(function () { finish({}); }, 2500);
             try {
                 var returned = filtered
-                    ? method.call(rec.conn, 2, function (raw) { finish(raw); })
+                    ? method.call(rec.conn, 7, function (raw) { finish(raw); })
                     : method.call(rec.conn, function (raw) { finish(raw); });
                 if (returned && typeof returned.then === 'function') returned.then(finish, function () { finish({}); });
             } catch (e) { finish({}); return; }
         });
     }
 
+    function demandSummary(demand, now) {
+        return {
+            known: demand.known,
+            active: demand.active,
+            demandHa: demand.at > 0 ? now - demand.at : -1,
+            changedHa: demand.changedAt > 0 ? now - demand.changedAt : -1,
+            epoch: demand.epoch,
+        };
+    }
+
     window.__goliveVoiceDemandaResumo = function () {
         var now = Date.now();
         return {
-            known: state.demandKnown,
-            active: state.demandActive,
-            demandHa: state.demandAt > 0 ? now - state.demandAt : -1,
-            changedHa: state.demandChangedAt > 0 ? now - state.demandChangedAt : -1,
+            sender: demandSummary(state.demands.sender, now),
+            viewer: demandSummary(state.demands.viewer, now),
         };
     };
 
@@ -1767,6 +2085,7 @@ function instalarVoiceShim() {
                     id: rec.id,
                     kind: rec.kind,
                     creator: rec.creator,
+                    role: rec.isDesktopSource ? 'sender' : 'viewer',
                     createdHa: now - rec.createdAt,
                     destroyed: rec.destroyedAt > 0,
                     optionShape: rec.optionShape,
@@ -1774,55 +2093,332 @@ function instalarVoiceShim() {
                 };
             });
         })).then(function (connections) {
+            var source = state.desktopSource;
+            var sourceReady = !!(source && source.active && source.rec &&
+                !source.rec.destroyedAt);
             return {
                 installed: state.installed,
                 voiceHooked: state.voiceHooked,
                 instanceId: state.instanceId,
-                demandKnown: state.demandKnown,
-                demandActive: state.demandActive,
-                demandHa: state.demandAt > 0 ? Date.now() - state.demandAt : -1,
+                demands: {
+                    sender: demandSummary(state.demands.sender, Date.now()),
+                    viewer: demandSummary(state.demands.viewer, Date.now()),
+                },
+                sourceReady: sourceReady,
+                sourceMethod: sourceReady ? source.method : '',
+                sourceKind: sourceReady ? source.rec.kind : '',
+                sourceEpoch: sourceReady ? source.epoch : 0,
                 connections: connections,
             };
         });
-    };
-
-    // A decisao e feita no main. Aqui so executamos o nivel explicitamente
-    // pedido, sempre em conexoes classificadas pelo factory exato; unknown
-    // jamais entra na lista de destruicao.
-    window.__goliveVoiceRecuperar = function (level) {
-        if (level !== 1 && level !== 2) return { ok: false, level: 0, streams: 0, voices: 0 };
-        var active = state.connections.filter(function (rec) {
-            return !rec.destroyedAt && rec.conn && (rec.kind === 'stream' || rec.kind === 'voice');
-        });
-        var targets = [];
-        var latestStream = null;
-        for (var i = active.length - 1; i >= 0; i--) {
-            if (!latestStream && active[i].kind === 'stream') latestStream = active[i];
-        }
-        if (latestStream) targets.push(latestStream);
-        if (level === 2) {
-            for (var j = active.length - 1; j >= 0; j--) {
-                if (active[j].kind === 'voice') { targets.push(active[j]); break; }
-            }
-        }
-        var streams = 0, voices = 0;
-        for (var ti = 0; ti < targets.length; ti++) {
-            var target = targets[ti];
-            try {
-                if (typeof target.conn.destroy !== 'function') continue;
-                target.conn.destroy();
-                if (!target.destroyedAt) target.destroyedAt = Date.now();
-                if (target.kind === 'stream') streams++;
-                else if (target.kind === 'voice') voices++;
-            } catch (e) { }
-        }
-        return { ok: level === 1 ? streams > 0 : voices > 0, level: level, streams: streams, voices: voices };
     };
 
     installNativeHook();
 }
 const SHIM_VOICE_SRC = '(' + instalarVoiceShim.toString() + ')();';
 // === voice shim: fim ===
+
+// === worker shim (beta 11, issues #164/#163) ===
+// O gateway e o RTC do Discord nascem em Dedicated Workers. Preload de sessao
+// aceita apenas frame/service-worker e nao cobre esse contexto; envolver
+// window.Worker tambem nao e seguro (isolamento de mundo, XHR sincrono e module
+// workers). Por isso o main pausa cada target novo via CDP Target.setAutoAttach,
+// injeta este codigo antes do primeiro byte do bundle e sempre libera o target.
+//
+// Este shim roda no escopo do worker (self, sem window). O main consulta e age
+// diretamente no sessionId CDP exato; nenhum dado/controle atravessa o renderer.
+function instalarWorkerShim() {
+    if (typeof self === 'undefined' || self.__goliveWorkerShim) return;
+    self.__goliveWorkerShim = true;
+
+    var workerId = (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
+    var geracao = 0;
+    var opCounts = {};
+    var cliEnvios = [];
+    var gw = {
+        estado: 'nenhum', ws: null, srvEm: 0, cliEm: 0, abertoEm: 0,
+        srvFrames: 0, srvBytes: 0, srvBytesDesdeAtividade: 0,
+        cliEnvios: 0, dispatches: 0, dispatchEm: 0, intentEm: 0,
+        activityEm: 0, op4Em: 0, subs: 0,
+    };
+    var midia = new Set();
+    var midiaMeta = new Map();
+    var midiaSeq = 0;
+    var midiaAbertaEm = 0;
+    var midiaFechouEm = 0;
+    var pcs = new Set();
+
+    function idade(agora, em) { return em > 0 ? agora - em : -1; }
+    function resumo() {
+        var agora = Date.now();
+        return {
+            origem: 'worker', workerId: workerId,
+            geracao: geracao, estado: gw.estado,
+            srvHa: idade(agora, gw.srvEm), cliHa: idade(agora, gw.cliEm),
+            abertoHa: idade(agora, gw.abertoEm),
+            srvFrames: gw.srvFrames, srvBytes: gw.srvBytes,
+            srvBytesDesdeAtividade: gw.srvBytesDesdeAtividade,
+            cliEnvios: gw.cliEnvios, dispatches: gw.dispatches,
+            dispatchHa: idade(agora, gw.dispatchEm),
+            intentHa: idade(agora, gw.intentEm),
+            activityHa: idade(agora, gw.activityEm),
+            op4Ha: idade(agora, gw.op4Em), subs: gw.subs,
+            opCounts: Object.assign({}, opCounts), infladorOk: false,
+            midia: midia.size, midiaAberta: midia.size > 0,
+            midiaOpenHa: idade(agora, midiaAbertaEm),
+            midiaCloseHa: idade(agora, midiaFechouEm),
+            midiaSockets: Array.from(midia).map(function (ws) {
+                var meta = midiaMeta.get(ws);
+                if (!meta) return null;
+                return {
+                    id: meta.id, createdHa: agora - meta.createdAt,
+                    openHa: meta.openedAt ? agora - meta.openedAt : -1,
+                    readyState: ws.readyState,
+                    kind: meta.kind || '',
+                };
+            }).filter(function (item) { return item !== null; }),
+            pcs: pcs.size,
+        };
+    }
+    self.__goliveWorkerResumo = resumo;
+
+    function publicar(logar) {
+        var atual = resumo();
+        if (logar) {
+            try { console.warn('GLB_WORKER_GW ' + JSON.stringify(atual)); } catch (e) { }
+        }
+    }
+
+    function fecharMidia(id) {
+        var alvo = null;
+        midia.forEach(function (ws) {
+            var meta = midiaMeta.get(ws);
+            if (meta && meta.id === id) alvo = ws;
+        });
+        if (!alvo || alvo.readyState !== 1) return false;
+        try { alvo.close(4000, 'golive-stream-revive'); return true; } catch (e) { return false; }
+    }
+    self.__goliveWorkerFecharMidia = fecharMidia;
+    self.__goliveWorkerFecharGateway = function (geracaoEsperada) {
+        if (Number(geracaoEsperada) !== geracao) return false;
+        var ws = gw.ws;
+        if (!ws || ws.readyState !== 1) return false;
+        try { ws.close(4000, 'golive-revive'); return true; } catch (e) { return false; }
+    };
+
+    function opDeBinario(dados) {
+        try {
+            var u;
+            if (dados instanceof ArrayBuffer) u = new Uint8Array(dados);
+            else if (dados && typeof dados.byteLength === 'number') {
+                u = new Uint8Array(dados.buffer, dados.byteOffset || 0, dados.byteLength);
+            } else return -1;
+            if (u.length < 8 || u[0] !== 131) return -1;
+            var p = -1;
+            if (u[1] === 104) p = 3;
+            else if (u[1] === 105) p = 6;
+            else if (u[1] === 116) {
+                // ETF MAP_EXT do cliente atual: #{<<"op">> => inteiro, ...}.
+                // Exige a chave literal como primeiro par; nao percorre termos
+                // arbitrarios nem tenta adivinhar mapas fora desse formato.
+                if (u.length < 15 || u[6] !== 109) return -1;
+                var tamChave = (u[7] * 16777216) + (u[8] * 65536) + (u[9] * 256) + u[10];
+                if (tamChave !== 2 || u[11] !== 111 || u[12] !== 112) return -1;
+                p = 13;
+            } else return -1;
+            var op = -1;
+            if (u[p] === 97) op = u[p + 1];
+            else if (u[p] === 98) op = (u[p + 1] * 16777216) + (u[p + 2] * 65536) + (u[p + 3] * 256) + u[p + 4];
+            return op === 1 || op === 4 || op === 14 ||
+                op === 18 || op === 19 || op === 20 || op === 21 || op === 22 || op === 37 ? op : -1;
+        } catch (e) { return -1; }
+    }
+
+    function registrarEnvio(agora) {
+        cliEnvios.push(agora);
+        while (cliEnvios.length > 0 && cliEnvios[0] < agora - 30000) cliEnvios.shift();
+        if (cliEnvios.length >= 3) {
+            gw.activityEm = agora;
+            gw.srvBytesDesdeAtividade = 0;
+        }
+    }
+
+    var OriginalWebSocket = self.WebSocket;
+    if (typeof OriginalWebSocket === 'function') {
+        function GoliveWorkerWebSocket(url, protocolos) {
+            var ws = protocolos === undefined ? new OriginalWebSocket(url) : new OriginalWebSocket(url, protocolos);
+            try {
+                var alvo = String(url);
+                var ehMidia = false;
+                var ehGw = false;
+                try { ehMidia = /(^|\.)discord\.media$/.test(new URL(alvo).hostname); } catch (e) { }
+                try { ehGw = /(^|\.)gateway(-[a-z0-9-]+)?\.discord\.gg$/.test(new URL(alvo).hostname); } catch (e) { }
+                if (ehMidia) {
+                    var meta = { id: ++midiaSeq, createdAt: Date.now(), openedAt: 0, kind: '' };
+                    midia.add(ws);
+                    midiaMeta.set(ws, meta);
+                    ws.addEventListener('open', function () {
+                        meta.openedAt = Date.now();
+                        midiaAbertaEm = meta.openedAt;
+                        publicar(true);
+                    });
+                    ws.addEventListener('close', function () {
+                        midia.delete(ws);
+                        midiaMeta.delete(ws);
+                        midiaFechouEm = Date.now();
+                        publicar(true);
+                    });
+                    try {
+                        var originalSend = ws.send;
+                        ws.send = function (dados) {
+                            try {
+                                if (typeof dados === 'string' && dados.charCodeAt(0) === 123) {
+                                    var p = JSON.parse(dados);
+                                    if (p && p.op === 0 && p.d) {
+                                        // Prove de Go Live e so o array de streams (entradas
+                                        // reais de transmissao). video:true sozinho e atributo
+                                        // de camera em call de voz: marca-lo como stream faria
+                                        // o revive fechar o socket da chamada (issue #186).
+                                        if (Array.isArray(p.d.streams) && p.d.streams.length > 0) {
+                                            meta.kind = 'stream';
+                                        } else if (p.d.server_id && p.d.channel_id) {
+                                            meta.kind = 'voice';
+                                        }
+                                    }
+                                }
+                            } catch (e) { }
+                            return originalSend.apply(this, arguments);
+                        };
+                        ws.addEventListener('message', function (ev) {
+                            try {
+                                if (typeof ev.data === 'string' && ev.data.charCodeAt(0) === 123) {
+                                    var p = JSON.parse(ev.data);
+                                    // So classifica enquanto ainda nao ha prova forte (o IDENTIFY
+                                    // acima, unica fonte que decide entre streams[] e
+                                    // server_id+channel_id). Sem este "so se meta.kind === ''",
+                                    // um op 5 (mensagem do servidor, chega varias vezes durante a
+                                    // vida do socket) podia REBAIXAR um socket ja provado 'stream'
+                                    // de volta para 'voice' -- socketMidiaDaStream() exclui todo
+                                    // socket 'voice' do close direcionado, entao o socket certo
+                                    // ficava permanentemente inelegivel para a recuperacao RTC,
+                                    // sem nunca ser reavaliado. Prova forte, uma vez estabelecida,
+                                    // nao pode ser desfeita por um sinal mais fraco e recorrente.
+                                    if (meta.kind === '') {
+                                        if (p && (p.op === 12 || p.op === 15)) meta.kind = 'stream';
+                                        else if (p && p.op === 5) meta.kind = 'voice';
+                                    }
+                                }
+                            } catch (e) { }
+                        });
+                    } catch (e) { }
+                }
+                if (ehGw) {
+                    var minhaGeracao = ++geracao;
+                    gw.estado = 'conectando';
+                    gw.ws = ws;
+                    gw.srvEm = 0; gw.cliEm = 0; gw.abertoEm = 0;
+                    gw.srvFrames = 0; gw.srvBytes = 0; gw.srvBytesDesdeAtividade = 0;
+                    gw.cliEnvios = 0; gw.dispatches = 0; gw.dispatchEm = 0;
+                    gw.intentEm = 0; gw.activityEm = 0; gw.op4Em = 0; gw.subs = 0;
+                    opCounts = {};
+                    cliEnvios = [];
+                    function atual() { return geracao === minhaGeracao && gw.ws === ws; }
+                    ws.addEventListener('open', function () {
+                        if (!atual()) return;
+                        gw.estado = 'aberta';
+                        gw.abertoEm = Date.now();
+                        publicar(true);
+                    });
+                    ws.addEventListener('close', function () {
+                        if (!atual()) return;
+                        gw.estado = 'fechada';
+                        gw.ws = null;
+                        publicar(true);
+                    });
+                    ws.addEventListener('message', function (ev) {
+                        if (!atual()) return;
+                        var agora = Date.now();
+                        var pedaco = ev.data;
+                        var tamanho = 0;
+                        gw.srvEm = agora;
+                        gw.srvFrames++;
+                        if (typeof pedaco === 'string') {
+                            tamanho = pedaco.length;
+                            try {
+                                var pacote = JSON.parse(pedaco);
+                                if (pacote && pacote.op === 0) {
+                                    gw.dispatches++;
+                                    gw.dispatchEm = agora;
+                                }
+                            } catch (e) { }
+                        } else if (pedaco && typeof pedaco.size === 'number') tamanho = pedaco.size;
+                        else if (pedaco && typeof pedaco.byteLength === 'number') tamanho = pedaco.byteLength;
+                        gw.srvBytes += tamanho;
+                        gw.srvBytesDesdeAtividade += tamanho;
+                    });
+                    var enviar = ws.send.bind(ws);
+                    ws.send = function (dados) {
+                        if (atual()) {
+                            var agora = Date.now();
+                            var op = -1;
+                            gw.cliEm = agora;
+                            gw.cliEnvios++;
+                            registrarEnvio(agora);
+                            if (typeof dados === 'string') {
+                                try { op = JSON.parse(dados).op; } catch (e) { }
+                            } else if (dados && (dados instanceof ArrayBuffer || typeof dados.byteLength === 'number')) {
+                                op = opDeBinario(dados);
+                            } else if (dados && typeof dados.arrayBuffer === 'function') {
+                                dados.arrayBuffer().then(function (ab) {
+                                    var opAsync = opDeBinario(ab);
+                                    if (atual() && (opAsync === 4 || opAsync === 18 || opAsync === 20)) {
+                                        gw.op4Em = Date.now();
+                                        gw.intentEm = gw.op4Em;
+                                        publicar(false);
+                                    }
+                                }, function () { });
+                            }
+                            if (typeof op === 'number' && op >= 0) {
+                                opCounts[op] = (opCounts[op] || 0) + 1;
+                                if (op !== 1 && op !== 19 && op !== 21) gw.intentEm = agora;
+                                if (op === 4 || op === 18 || op === 20) gw.op4Em = agora;
+                                if (op === 14 || op === 37) gw.subs++;
+                            }
+                        }
+                        return enviar(dados);
+                    };
+                    publicar(false);
+                }
+            } catch (e) { }
+            return ws;
+        }
+        GoliveWorkerWebSocket.prototype = OriginalWebSocket.prototype;
+        GoliveWorkerWebSocket.CONNECTING = 0; GoliveWorkerWebSocket.OPEN = 1;
+        GoliveWorkerWebSocket.CLOSING = 2; GoliveWorkerWebSocket.CLOSED = 3;
+        self.WebSocket = GoliveWorkerWebSocket;
+    }
+
+    var OriginalRTCPeerConnection = self.RTCPeerConnection;
+    if (typeof OriginalRTCPeerConnection === 'function') {
+        function GoliveWorkerRTCPeerConnection(cfg, cert) {
+            var pc = new OriginalRTCPeerConnection(cfg, cert);
+            try {
+                pcs.add(pc);
+                if (typeof pc.close === 'function') {
+                    var fechar = pc.close.bind(pc);
+                    pc.close = function () { pcs.delete(pc); return fechar(); };
+                }
+                publicar(false);
+            } catch (e) { }
+            return pc;
+        }
+        GoliveWorkerRTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
+        self.RTCPeerConnection = GoliveWorkerRTCPeerConnection;
+    }
+
+    publicar(true);
+}
+const SHIM_WORKER_SRC = '(' + instalarWorkerShim.toString() + ')();';
 
 // === gateway: probe no renderer + pill + REVIVE automatico (issues #145/#149/#153) ===
 // A beta.3 provou com logs (issues #149/#150) que o zumbi de aplicacao e
@@ -1868,6 +2464,8 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "  if (window.__goliveGwShim) return;" +
     "  window.__goliveGwShim = true;" +
     "  var midia = new Set();" +
+    "  var midiaMeta = new Map();" +
+    "  var midiaSeq = 0;" +
     "  var geracao = 0;" +
     "  var opCounts = {};" +
     "  var gw = { estado: 'nenhum', srvEm: 0, cliEm: 0, op1Em: 0, subs: 0, srvFrames: 0," +
@@ -1879,6 +2477,17 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "  var cliEnvios = [];" +
     "  var textoPendente = '';" +
     "  var midiaAbertaEm = 0, midiaFechouEm = 0;" +
+    // Reassiste somente a Live que ESTAVA visivel quando o gateway caiu. Isto
+    // diferencia uma perda real de sinalizacao do usuario que escolheu parar
+    // de assistir; sem esse snapshot local, nunca clicamos em nada.
+    "  var reassistirPendenteEm = 0, reassistirTentou = false, reassistirCanceladaPeloUsuario = false;" +
+    // O snapshot da Live e feito no fechamento do gateway, mas a pessoa pode
+    // decidir parar de assistir durante a reconexao. Qualquer gesto real dela
+    // dentro dessa curta janela vence a automacao. O clique sintetico abaixo
+    // (button.click) nao e trusted, portanto nao cancela a propria cura.
+    "  function cancelarReassistirPorUsuario(ev) { if (reassistirPendenteEm && ev && ev.isTrusted) { reassistirPendenteEm=0; reassistirTentou=true; reassistirCanceladaPeloUsuario=true; } }" +
+    "  window.addEventListener('pointerdown', cancelarReassistirPorUsuario, true);" +
+    "  window.addEventListener('keydown', cancelarReassistirPorUsuario, true);" +
     "  window.__goliveGwResumo = function () {" +
     "    var agora = Date.now();" +
     "    return { estado: gw.estado," +
@@ -1898,20 +2507,53 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "      srvBytes: gw.srvBytes," +
     "      srvBytesDesdeAtividade: gw.srvBytesDesdeAtividade," +
     "      midiaAberta: midia.size > 0," +
+    "      midiaSockets: Array.from(midia).map(function(w){" +
+    "        var m = midiaMeta.get(w), agora2 = Date.now();" +
+    "        return m ? { id:m.id, createdHa:agora2-m.createdAt," +
+    "          openHa:m.openedAt ? agora2-m.openedAt : -1, readyState:w.readyState, kind:m.kind||'' } : null;" +
+    "      }).filter(function(m){return !!m;})," +
     "      infladorOk: !!inflador };" +
     "  };" +
     "  window.__goliveMidiaAberta = function () { return midia.size > 0; };" +
-    "  window.__goliveMidiaFechar = function () {" +
-    "    var fechados = 0;" +
-    "    midia.forEach(function (w) {" +
-    "      try { if (w.readyState === 1) { w.close(4000, 'golive-revive-voz'); fechados++; } } catch (e) { }" +
-    "    });" +
-    "    return fechados;" +
+    "  window.__goliveMidiaFecharId = function (id) {" +
+    "    var alvo = null;" +
+    "    midia.forEach(function (w) { var m=midiaMeta.get(w); if(m && m.id===id) alvo=w; });" +
+    "    if (!alvo || alvo.readyState !== 1) return { ok:false, id:id, reason:'ausente' };" +
+    "    try { alvo.close(4000, 'golive-stream-revive'); return { ok:true, id:id }; }" +
+    "    catch (e) { return { ok:false, id:id, reason:'close' }; }" +
     "  };" +
     "  window.__goliveGwFechar = function () {" +
     "    var ws = gw.ws;" +
     "    if (!ws || ws.readyState !== 1) return false;" +
     "    try { ws.close(4000, 'golive-revive'); return true; } catch (e) { return false; }" +
+    "  };" +
+    "  function videoEstavaSaudavel() {" +
+    "    try { var v=window.__goliveVideoResumo?window.__goliveVideoResumo():null;" +
+    "      return !!(v&&v.visible===true&&v.frameHa>=0&&v.frameHa<=30000); } catch (e) { return false; }" +
+    "  }" +
+    "  function botaoReassistir() {" +
+    "    var nomes=['Assista à transmissão','Watch Stream']; var lista=[];" +
+    "    try { lista=Array.prototype.slice.call(document.querySelectorAll('button')); } catch (e) { return null; }" +
+    "    for (var i=0;i<lista.length;i++) { var b=lista[i], texto=(b.textContent||'').trim();" +
+    "      if (nomes.indexOf(texto)>=0&&b.disabled!==true&&b.offsetParent!==null) return b; }" +
+    "    return null;" +
+    "  }" +
+    // Chamada pelo processo principal apos o gateway voltar. Uma tentativa e
+    // suficiente: se o Discord nao recriar a stream, o banner manual continua
+    // sendo a saida segura; repetir cliques viraria loop e violaria a intencao.
+    "  window.__goliveReassistirAposGateway = function () {" +
+    "    var agora=Date.now();" +
+    "    if (reassistirCanceladaPeloUsuario) { reassistirCanceladaPeloUsuario=false; return 'cancelada_usuario'; }" +
+    "    if (!reassistirPendenteEm) return 'nenhuma';" +
+    "    if (agora-reassistirPendenteEm>45000) { reassistirPendenteEm=0; return 'expirada'; }" +
+    // O tile antigo pode sobreviver alguns segundos ao READY. Enquanto ainda
+    // ha frames, espera em vez de concluir cedo: se o Discord removê-lo logo
+    // depois, a mesma janela ainda pode encontrar o botao e reassistir.
+    "    if (videoEstavaSaudavel()) return 'aguardar';" +
+    "    if (reassistirTentou) { reassistirPendenteEm=0; return 'tentada'; }" +
+    "    var botao=botaoReassistir(); if (!botao) return 'aguardar';" +
+    "    reassistirTentou=true; reassistirPendenteEm=0;" +
+    "    try { botao.click(); return 'clicou'; } catch (e) { return 'falhou'; }" +
     "  };" +
     // ATIVIDADE POR GAP: 3+ envios em 30s = usuario pedindo algo. Heartbeats sao
     // ~41s apart, entao 2 heartbeats + uma presenca solta nao fecha 3 em 30s.
@@ -1923,11 +2565,10 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "      gw.srvBytesDesdeAtividade = 0;" +
     "    }" +
     "  }" +
-    // SNIFF do op em frames BINARIOS (issues #159/#160/#161, beta 8): o cliente
-    // manda etf — 131 + tupla, com o op como PRIMEIRO elemento (inteiro pequeno
-    // 97+1byte ou inteiro 98+4bytes BE). Interessa o op 4 (VOICE_STATE_UPDATE):
-    // e o pedido de entrar em voz/stream. Parse defensivo — formato estranho
-    // devolve -1 e nao registra nada (nunca falso op4).
+    // SNIFF do op em frames BINARIOS. Clientes antigos mandavam 131+tupla; o
+    // Discord atual manda ETF MAP_EXT #{<<"op">> => inteiro, ...}. Interessa o
+    // inicio de voz (4), criar Live (18) e assistir Live (20). Parse defensivo:
+    // formato estranho devolve -1, sem varrer payload nem produzir falso op.
     "  function opDeBinario(dados) {" +
     "    try {" +
     "      var u;" +
@@ -1935,14 +2576,20 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "      else if (typeof dados.byteLength === 'number') { u = new Uint8Array(dados.buffer, dados.byteOffset || 0, dados.byteLength); }" +
     "      else { return -1; }" +
     "      if (u.length < 8 || u[0] !== 131) return -1;" +
-    "      var p;" +
+    "      var p = -1;" +
     "      if (u[1] === 104) { p = 3; }" +
     "      else if (u[1] === 105) { p = 6; }" +
-    "      else { return -1; }" +
+    "      else if (u[1] === 116) {" +
+    "        if (u.length < 15 || u[6] !== 109) return -1;" +
+    "        var z = (u[7] * 16777216) + (u[8] * 65536) + (u[9] * 256) + u[10];" +
+    "        if (z !== 2 || u[11] !== 111 || u[12] !== 112) return -1;" +
+    "        p = 13;" +
+    "      } else { return -1; }" +
     "      var op = -1;" +
     "      if (u[p] === 97) { op = u[p + 1]; }" +
     "      else if (u[p] === 98) { op = (u[p + 1] * 16777216) + (u[p + 2] * 65536) + (u[p + 3] * 256) + u[p + 4]; }" +
-    "      if (op < 0 || op > 20) return -1;" +
+    "      if (op !== 1 && op !== 4 && op !== 14 && op !== 18 && op !== 19 &&" +
+    "          op !== 20 && op !== 21 && op !== 22 && op !== 37) return -1;" +
     "      return op;" +
     "    } catch (e) { return -1; }" +
     "  }" +
@@ -1996,28 +2643,30 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "          textoPendente += decod.decode(r.value, { stream: true });" +
     "          try { processarTextoPendente(); } catch (e) { }" +
     "          passo();" +
-    "        }, function () { if (token === infladorToken) falhaInflador(); });" +
+    "        }, function () { if (token === infladorToken) falhaInflador(token); });" +
     "      })();" +
     "    } catch (e) { inflador = null; }" +
     "  }" +
-    "  function falhaInflador() {" +
+    "  function falhaInflador(tokenEsperado) {" +
+    "    if (typeof tokenEsperado === 'number' && tokenEsperado !== infladorToken) return;" +
     "    infladorToken++;" +
     "    if (infladorResyncs < 3) { infladorResyncs++; iniciarInflador(); }" +
     "    else { inflador = null; }" +
     "  }" +
-    "  function inflarBinario(pedaco) {" +
+    "  function inflarBinario(pedaco, geracaoEsperada) {" +
     "    if (!inflador) return;" +
     "    if (typeof pedaco.arrayBuffer === 'function') {" +
-    "      pedaco.arrayBuffer().then(function (buf) { escreverInflador(buf); }, function () { falhaInflador(); });" +
+    "      pedaco.arrayBuffer().then(function (buf) { if (geracao === geracaoEsperada) escreverInflador(buf); }, function () { if (geracao === geracaoEsperada) falhaInflador(infladorToken); });" +
     "    } else {" +
     "      escreverInflador(pedaco);" +
     "    }" +
     "  }" +
     "  function escreverInflador(bytes) {" +
     "    if (!inflador) return;" +
+    "    var token = infladorToken;" +
     "    try {" +
-    "      inflador.writer.write(bytes).then(null, function () { falhaInflador(); });" +
-    "    } catch (e) { falhaInflador(); }" +
+    "      inflador.writer.write(bytes).then(null, function () { falhaInflador(token); });" +
+    "    } catch (e) { falhaInflador(token); }" +
     "  }" +
     // RTC (beta 10): envolver o RTCPeerConnection para enxergar o que TOCA — o
     // audio de Go Live vem por RTC/UDP (nao pelo gateway), entao "escuto a stream
@@ -2025,6 +2674,53 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     // inbound por kind (audio vs video) e mostra se o usuario e quem transmite.
     "  var pcs = new Set();" +
     "  var rtc = { audioBytes: -1, videoBytes: -1, audioEm: 0, videoEm: 0, videoTrack: false, enviando: false };" +
+    // O addon discord_voice pode conservar a mesma conexao nativa quando o
+    // viewer sai e volta a assistir. Nesse caso seus contadores ainda podem
+    // carregar frames da Live anterior e fingir que o video novo esta sano.
+    // A pagina, porem, sempre anexa um MediaStream novo ao elemento DirectVideo.
+    // Observamos somente uma geracao local opaca + frames realmente apresentados.
+    // nunca exportamos ids de track/stream, URL ou qualquer identificador do Discord.
+    "  var visualSeq = 0, visualRegistros = new WeakMap(), visualSelecionado = null;" +
+    "  function visualVisivel(video) {" +
+    "    try {" +
+    "      if (!video || !video.isConnected || !video.srcObject) return false;" +
+    "      var r = video.getBoundingClientRect(); var s = getComputedStyle(video);" +
+    "      return r.width >= 32 && r.height >= 32 && s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;" +
+    "    } catch (e) { return false; }" +
+    "  }" +
+    "  function vigiarVisual(video) {" +
+    "    if (!video) return null;" +
+    "    var rec = visualRegistros.get(video);" +
+    "    if (!rec) { rec = { fonte: null, geracao: 0, anexadoEm: 0, frameEm: 0, tempo: -1, quadroArmado: false }; visualRegistros.set(video, rec); }" +
+    "    var fonte = null; try { fonte = video.srcObject || null; } catch (e) { }" +
+    "    if (fonte !== rec.fonte) { rec.fonte = fonte; rec.geracao = fonte ? ++visualSeq : 0; rec.anexadoEm = fonte ? Date.now() : 0; rec.frameEm = 0; rec.tempo = -1; rec.quadroArmado = false; }" +
+    "    if (fonte && !rec.quadroArmado && typeof video.requestVideoFrameCallback === 'function') {" +
+    "      rec.quadroArmado = true;" +
+    "      var geracaoQuadro = rec.geracao; var quadro = function () {" +
+    "        if (rec.geracao !== geracaoQuadro || !rec.fonte) return;" +
+    "        rec.frameEm = Date.now();" +
+    "        try { video.requestVideoFrameCallback(quadro); } catch (e) { rec.quadroArmado = false; }" +
+    "      };" +
+    "      try { video.requestVideoFrameCallback(quadro); } catch (e) { rec.quadroArmado = false; }" +
+    "    }" +
+    "    try { if (fonte && Number.isFinite(video.currentTime)) { var tempo = video.currentTime; if (rec.tempo >= 0 && tempo > rec.tempo) rec.frameEm = Date.now(); rec.tempo = tempo; } } catch (e) { }" +
+    "    return rec;" +
+    "  }" +
+    "  window.__goliveVideoResumo = function () {" +
+    "    var lista = []; try { lista = Array.prototype.slice.call(document.querySelectorAll('video')); } catch (e) { }" +
+    "    var escolhido = null, escolhidoRec = null, areaMaior = -1;" +
+    "    for (var i = 0; i < lista.length; i++) {" +
+    "      var video = lista[i], rec = vigiarVisual(video); if (!rec || !visualVisivel(video) || rec.geracao <= 0) continue;" +
+    "      var area = 0; try { var caixa = video.getBoundingClientRect(); area = caixa.width * caixa.height; } catch (e) { }" +
+    "      if (area > areaMaior || (area === areaMaior && (!escolhidoRec || rec.geracao > escolhidoRec.geracao))) { escolhido = video; escolhidoRec = rec; areaMaior = area; }" +
+    "    }" +
+    "    visualSelecionado = escolhidoRec; var agora = Date.now();" +
+    "    if (!escolhido || !escolhidoRec) return { generation: 0, visible: false, attachedHa: -1, frameHa: -1, readyState: 0 };" +
+    "    return { generation: escolhidoRec.geracao, visible: true," +
+    "      attachedHa: escolhidoRec.anexadoEm ? agora - escolhidoRec.anexadoEm : -1," +
+    "      frameHa: escolhidoRec.frameEm ? agora - escolhidoRec.frameEm : -1," +
+    "      readyState: Number.isFinite(escolhido.readyState) ? escolhido.readyState : 0 };" +
+    "  };" +
     "  window.__goliveRtcResumo = function () {" +
     "    var lista = Array.from(pcs);" +
     "    var promessas = lista.map(function (pc) {" +
@@ -2064,7 +2760,10 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "    var pc = new OriginalRTCPeerConnection(cfg, cert);" +
     "    try {" +
     "      pcs.add(pc);" +
-    "      pc.addEventListener('close', function () { pcs.delete(pc); });" +
+    "      if (typeof pc.close === 'function') {" +
+    "        var fecharPc = pc.close.bind(pc);" +
+    "        pc.close = function () { pcs.delete(pc); return fecharPc(); };" +
+    "      }" +
     "    } catch (e) { }" +
     "    return pc;" +
     "  }" +
@@ -2074,33 +2773,73 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "  function GoliveWebSocket(url, protocolos) {" +
     "    var ws = protocolos === undefined ? new OriginalWebSocket(url) : new OriginalWebSocket(url, protocolos);" +
     "    try {" +
-    "      var alvo = String(url);" +
+"      var alvo = String(url);" +
     "      var ehMidia = false, ehGw = false;" +
     "      try { ehMidia = /(^|\\.)discord\\.media$/.test(new URL(alvo).hostname); } catch (e) { }" +
     "      try { ehGw = /(^|\\.)gateway(-[a-z0-9-]+)?\\.discord\\.gg$/.test(new URL(alvo).hostname); } catch (e) { }" +
     "      if (ehMidia) {" +
-    "        midia.add(ws);" +
-    "        ws.addEventListener('open', function () { midiaAbertaEm = Date.now(); });" +
-    "        ws.addEventListener('close', function () { midia.delete(ws); midiaFechouEm = Date.now(); });" +
+    "        var metaMidia = { id:++midiaSeq, createdAt:Date.now(), openedAt:0, kind:'' };" +
+    "        midia.add(ws); midiaMeta.set(ws, metaMidia);" +
+    "        ws.addEventListener('open', function () { metaMidia.openedAt=Date.now(); midiaAbertaEm=metaMidia.openedAt; });" +
+    "        ws.addEventListener('close', function () { midia.delete(ws); midiaMeta.delete(ws); midiaFechouEm=Date.now(); });" +
+    "        try {" +
+    "          var originalMidiaSend = ws.send;" +
+    "          ws.send = function (dados) {" +
+    "            try {" +
+    "              if (typeof dados === 'string' && dados.charCodeAt(0) === 123) {" +
+    "                var p = JSON.parse(dados);" +
+    "                if (p && p.op === 0 && p.d) {" +
+    // Prova de Go Live e so o array de streams; video:true sozinho e camera
+    // em call de voz e nao pode virar alvo de close direcionado (#186).
+    "                  if (Array.isArray(p.d.streams) && p.d.streams.length > 0) {" +
+    "                    metaMidia.kind = 'stream';" +
+    "                  } else if (p.d.server_id && p.d.channel_id) {" +
+    "                    metaMidia.kind = 'voice';" +
+    "                  }" +
+    "                }" +
+    "              }" +
+    "            } catch (e) { }" +
+    "            return originalMidiaSend.apply(this, arguments);" +
+    "          };" +
+    "          ws.addEventListener('message', function (ev) {" +
+    "            try {" +
+    "              if (typeof ev.data === 'string' && ev.data.charCodeAt(0) === 123) {" +
+    "                var p = JSON.parse(ev.data);" +
+    // So classifica enquanto ainda nao ha prova forte do IDENTIFY acima (streams[] ou
+    // server_id+channel_id): sem isto um op 5 recorrente podia rebaixar um socket ja
+    // provado 'stream' de volta para 'voice', tirando-o do close direcionado para sempre.
+    "                if (metaMidia.kind === '') {" +
+    "                  if (p && (p.op === 12 || p.op === 15)) metaMidia.kind = 'stream';" +
+    "                  else if (p && p.op === 5) metaMidia.kind = 'voice';" +
+    "                }" +
+    "              }" +
+    "            } catch (e) { }" +
+    "          });" +
+    "        } catch (e) { }" +
     "      }" +
     "      if (ehGw) {" +
     // Contadores por GERACAO (o cliente recria o ws a cada reconexao): intencao,
     // atividade e volume so significam dentro da mesma conexao.
     "        geracao++;" +
+    "        var minhaGeracao = geracao;" +
     "        gw.estado = 'conectando';" +
     "        gw.srvEm = 0; gw.cliEm = 0; gw.op1Em = 0; gw.subs = 0; gw.srvFrames = 0;" +
     "        gw.dispatches = 0; gw.dispatchEm = 0; gw.intentEm = 0; gw.abertoEm = 0;" +
     "        gw.activityEm = 0; gw.srvBytes = 0; gw.srvBytesDesdeAtividade = 0; gw.op4Em = 0;" +
     "        gw.ws = ws;" +
+    "        function atual() { return geracao === minhaGeracao && gw.ws === ws; }" +
     "        opCounts = {};" +
     "        cliEnvios = [];" +
     "        textoPendente = '';" +
     "        infladorResyncs = 0;" +
     "        infladorToken++;" +
     "        iniciarInflador();" +
-    "        ws.addEventListener('open', function () { gw.estado = 'aberta'; gw.abertoEm = Date.now(); });" +
-    "        ws.addEventListener('close', function () { gw.estado = 'fechada'; gw.ws = null; });" +
+    "        ws.addEventListener('open', function () { if (!atual()) return; gw.estado = 'aberta'; gw.abertoEm = Date.now(); });" +
+    "        ws.addEventListener('close', function () { if (!atual()) return;" +
+    "          if (videoEstavaSaudavel()) { reassistirPendenteEm=Date.now(); reassistirTentou=false; reassistirCanceladaPeloUsuario=false; }" +
+    "          gw.estado = 'fechada'; gw.ws = null; });" +
     "        ws.addEventListener('message', function (ev) {" +
+    "          if (!atual()) return;" +
     "          var agora = Date.now();" +
     "          gw.srvEm = agora; gw.srvFrames++;" +
     "          var pedaco = ev.data;" +
@@ -2111,10 +2850,10 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "            try { processarTextoPendente(); } catch (e) { }" +
     "          } else if (pedaco && typeof pedaco.size === 'number') {" +
     "            tam = pedaco.size;" +
-    "            inflarBinario(pedaco);" +
+    "            inflarBinario(pedaco, minhaGeracao);" +
     "          } else if (pedaco && pedaco.byteLength) {" +
     "            tam = pedaco.byteLength;" +
-    "            inflarBinario(pedaco);" +
+    "            inflarBinario(pedaco, minhaGeracao);" +
     "          }" +
     "          gw.srvBytes += tam;" +
     "          gw.srvBytesDesdeAtividade += tam;" +
@@ -2123,6 +2862,7 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     // histograma fica vazio MESMO — o sniff de op (etf) e o gap de envios que cobrem.
     "        var enviar = ws.send.bind(ws);" +
     "        ws.send = function (dados) {" +
+    "          if (!atual()) return enviar(dados);" +
     "          var agora = Date.now();" +
     "          gw.cliEm = agora;" +
     "          registrarEnvio(agora);" +
@@ -2132,16 +2872,25 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "              opCounts[op] = (opCounts[op] || 0) + 1;" +
     "              if (op === 1) { gw.op1Em = agora; }" +
     "              else {" +
-    "                gw.intentEm = agora;" +
-    "                if (op === 4) { gw.op4Em = agora; }" +
+    "                if (op !== 19 && op !== 21) gw.intentEm = agora;" +
+    "                if (op === 4 || op === 18 || op === 20) { gw.op4Em = agora; }" +
     "                if (op === 14 || op === 37) gw.subs++;" +
     "              }" +
     "            } catch (e) { }" +
     "          } else if (dados && (dados instanceof ArrayBuffer || typeof dados.byteLength === 'number')) {" +
-    "            if (opDeBinario(dados) === 4) { gw.op4Em = agora; }" +
+    "            var opBin = opDeBinario(dados);" +
+    "            if (opBin >= 0) {" +
+    "              opCounts[opBin] = (opCounts[opBin] || 0) + 1;" +
+    "              if (opBin !== 1 && opBin !== 19 && opBin !== 21) gw.intentEm = agora;" +
+    "              if (opBin === 4 || opBin === 18 || opBin === 20) gw.op4Em = agora;" +
+    "              if (opBin === 14 || opBin === 37) gw.subs++;" +
+    "            }" +
     "          } else if (dados && typeof dados.arrayBuffer === 'function') {" +
     "            dados.arrayBuffer().then(function (ab) {" +
-    "              if (opDeBinario(ab) === 4) { gw.op4Em = Date.now(); }" +
+    "              var opAsync = opDeBinario(ab);" +
+    "              if (atual() && (opAsync === 4 || opAsync === 18 || opAsync === 20)) {" +
+    "                gw.op4Em = Date.now(); gw.intentEm = gw.op4Em;" +
+    "              }" +
     "            }, function () { });" +
     "          }" +
     "          return enviar(dados);" +
@@ -2156,18 +2905,19 @@ const SHIM_GATEWAY_SRC = "(function(){" +
     "  window.WebSocket = GoliveWebSocket;" +
     "})();";
 
-// O MESMO shim, gravado em arquivo e registrado como PRELOAD de sessao: o preload
-// roda antes de qualquer script da pagina em TODA janela/frame — sem CDP e sem
-// corrida (issue #163: CDP falhou, o fallback do did-finish-load chegou depois do
-// gateway conectar, e a sessao inteira ficou cega por 17 minutos). Preload e o
-// vetor primario; CDP e o fallback do did-finish-load ficam como reforco — o shim
-// se auto-guarda (__goliveGwShim), entao injecao dupla e inofensiva.
+// Workers sao consultados e controlados diretamente pelo sessionId CDP no main.
+// Nao existe bridge no renderer: isso isola BrowserWindows e elimina TOCTOU/ACK falso.
+
+// Shim de FRAME gravado em arquivo e registrado como preload de sessao. Ele
+// conserva a instrumentacao nativa de voz e serve de fallback/diagnostico no
+// renderer; com contextIsolation nao substitui o WebSocket do mundo principal.
+// Dedicated workers sao cobertos separadamente pelo auto-attach CDP acima.
 const SHIM_FILE = join(HERE, "golive-shim.js");
-const SHIM_ALL_SRC = SHIM_GATEWAY_SRC + "\n" + SHIM_VOICE_SRC;
+const SHIM_PRELOAD_SRC = SHIM_VOICE_SRC;
 
 function registrarPreloadShim() {
     try {
-        fs.writeFileSync(SHIM_FILE, SHIM_ALL_SRC);
+        fs.writeFileSync(SHIM_FILE, SHIM_PRELOAD_SRC);
     } catch (error) {
         log("nao consegui gravar o arquivo do shim: " + error.message);
         return;
@@ -2176,7 +2926,7 @@ function registrarPreloadShim() {
         const s = require("electron").session.defaultSession;
         if (typeof s.registerPreloadScript === "function") {
             s.registerPreloadScript({ type: "frame", id: "golive-shim", filePath: SHIM_FILE });
-            log("gw.shim | preload do shim registrado na sessao (registerPreloadScript)");
+            log("gw.shim | preload do shim registrado na sessao (registerPreloadScript frame)");
         } else if (typeof s.setPreloads === "function") {
             const atuais = typeof s.getPreloads === "function" ? s.getPreloads() : [];
             if (atuais.indexOf(SHIM_FILE) === -1) s.setPreloads(atuais.concat([SHIM_FILE]));
@@ -2232,6 +2982,13 @@ let zumbiUltimaAcao = null;      // 'fechar' | 'reload'
 let revivePendenteEm = 0;        // reconexao provocada pelo NOSSO close (TTL: fora da rajada/recorrencia)
 let reviveFecharEm = 0;          // quando fechamos o ws (auto-cura se o cliente NAO renascer)
 let reviveFecharGeracao = 0;     // geracao na hora do close
+let reviveFecharOrigem = '';     // frame ou worker alvo na hora do close
+let gatewayProbeRodando = false;
+let gatewayProbeRepetir = false;
+let gatewayProbeEpoca = 0;
+let gatewayProbeBloqueadoAte = new WeakMap();
+const workerInstrumentacoes = new WeakMap();
+const midiaCompostaPorWebContents = new WeakMap();
 
 // Alarme re-escopado: "silente" = servidor INTEIRO calado (nem ACK de heartbeat) com o ws
 // constando aberto — morte de rede real, o cliente renasce sozinho e o banner antecipa.
@@ -2240,6 +2997,8 @@ let reviveFecharGeracao = 0;     // geracao na hora do close
 // funcionando: sem decompress, dispatch e indistinguivel de heartbeat e o caso nao dispara.
 const GW_SERVIDOR_SILENCIOSO_MS = 3 * 60_000;
 const GW_PROBE_CHECAGEM_MS = 60_000;
+const GW_PROBE_TIMEOUT_MS = 8_000;
+const GW_PROBE_COOLDOWN_TIMEOUT_MS = 5 * 60_000;
 // Deixa READY/RESUMED assentar apos abrir a conexao.
 const GW_ZUMBI_AQUECIMENTO_MS = 2 * 60_000;
 // Cliente mandando heartbeat (intervalo ~41s).
@@ -2263,28 +3022,50 @@ const GW_STREAM_JANELA_MS = 90_000;
 // Guarda de SAIDA: um ws de midia que fechou ha pouco + op 4 = o usuario SAINDO
 // de voz/stream (ou a stream acabando) — nesses casos nenhuma midia nova abre.
 const GW_STREAM_LEAVE_MS = 15_000;
-// RTC nativo do transmissor (issue #164): o preload do Discord vive no mundo
-// isolado 999. O main junta sua telemetria de discord_voice com a demanda e os
-// websockets observados no mundo principal; dado ausente nunca vira acao.
+// RTC nativo (issue #164): o preload do Discord vive no mundo isolado 999. O
+// main junta stats outbound/inbound do discord_voice com os websockets do mundo
+// principal; dado ausente ou socket sem pareamento nunca vira acao.
 const VOICE_ISOLATED_WORLD_ID = 999;
 const VOICE_PROBE_MS = 5_000;
 const VOICE_PROBE_LOG_MS = 30_000;
-const VOICE_STREAM_AQUECIMENTO_MS = 20_000;
+// Uma Live que ja tem demanda, socket RTC pareado e amostra inbound atual, mas
+// nao entrega um unico quadro, nao deve ficar "aquecendo" por um minuto. Um
+// segundo e a evidencia minima; como o poll roda a cada 5s, a primeira tentativa
+// acontece em ate ~6s tanto no primeiro attach quanto numa reentrada (#181/#183).
+// O restante dos gates continua fail-closed: sem demanda, stats ou pareamento,
+// nao ha close nenhum.
+const VOICE_STREAM_AQUECIMENTO_MS = 1_000;
+// Depois de um viewer que comprovadamente decodificava video, uma NOVA
+// conexao RTC sem frame tambem usa a mesma janela curta. Mantemos as constantes
+// nomeadas para que os testes documentem explicitamente ambos os caminhos.
+const VOICE_VIEWER_REENTRADA_AQUECIMENTO_MS = 1_000;
+const VOICE_VIEWER_REENTRADA_SAIDA_PARADA_MS = 1_000;
+const VOICE_VIEWER_REENTRADA_JANELA_MS = 10 * 60_000;
 const VOICE_DEMANDA_GRACA_MS = 15_000;
+// O viewer pode trocar o pixelCount para zero ao exibir o erro 2012, embora
+// continue com a tela da Live aberta. O ultimo pedido local positivo ainda e
+// evidencia de intencao por uma janela curta, suficiente para a primeira cura.
+const VOICE_VIEWER_DEMANDA_RECENTE_MS = 120_000;
 const VOICE_ENTRADA_VIVA_MS = 15_000;
 const VOICE_SAIDA_PARADA_MS = 20_000;
+// O sender ainda so conclui encoder congelado aos 20s. No viewer, uma entrada
+// sem quadro e o proprio sintoma: com os gates estritos acima, tentar o socket
+// da stream depois de 1s e melhor que exibir Error 2012 por 60s.
+const VOICE_VIEWER_SAIDA_PARADA_MS = 1_000;
 const VOICE_SAMPLE_MAX_MS = 10_000;
 const VOICE_SAIDA_SUCESSO_MS = 8_000;
 const VOICE_SUCESSO_SUSTENTADO_MS = 10_000;
-// No ensaio ao vivo, destroy(stream) iniciou uma reconstrução tardia: a stream
-// sumiu na hora, voice/midia fecharam entre 25-50s e a nova stream codificou em
-// ~80s. Aos 60s distinguimos "voz ainda presa" de "teardown ja em curso".
-const VOICE_NIVEL1_ESPERA_MS = 60_000;
-const VOICE_RECONSTRUCAO_GRACA_MS = 45_000;
-const VOICE_NOVA_GERACAO_GRACA_MS = 30_000;
-const VOICE_NIVEL2_ESPERA_MS = 45_000;
+// Sem demanda remota positiva, captura viva + encoder zero e apenas o estado
+// ocioso da Live. Com demanda positiva, a captura viva e a saida parada provam
+// o travamento mesmo se targetMediaBitrate continuar zero (repro ao vivo em
+// 01/09). A cura fecha apenas o websocket RTC criado junto da conexao stream;
+// a voz principal permanece aberta.
+const VOICE_SOCKET_PAREAMENTO_MS = 15_000;
+const VOICE_NIVEL1_ESPERA_MS = 30_000;
+const VOICE_NOVA_GERACAO_GRACA_MS = 20_000;
+const VOICE_SEM_DEMANDA_ESPERA_MS = 60_000;
 const VOICE_ACAO_COOLDOWN_MS = 30_000;
-const VOICE_TENTATIVAS = 2;
+const VOICE_TENTATIVAS = 1;
 const VOICE_JANELA_MS = 30 * 60_000;
 // Teto de tentativas da escada na janela.
 const GW_ZUMBI_TENTATIVAS = 2;
@@ -2425,16 +3206,32 @@ function showZumbiBanner() {
     mostrarBannerFixo('golivebypass-zumbi', ZUMBI_BANNER_TEXT, '#f0b232');
 }
 
-// Recuperacao do VIDEO DE SAIDA do transmissor (issue #164). O probe da beta
-// 10 observava RTCPeerConnection no Chromium e era cego (pcs=0): o Discord
-// desktop usa discord_voice. Agora a primeira acao destroi somente a conexao
-// stream nativa; se ela nao renascer saudavel, o nivel 2 destroi tambem voice e
-// fecha os ws de midia. Nunca ha reload automatico.
+function hideZumbiBanner() {
+    if (!zumbiBannerAtivo) return;
+    zumbiBannerAtivo = false;
+    const win = clientWindow();
+    if (win === null) return;
+    const script = "(function(){ var el = document.getElementById('golivebypass-zumbi'); " +
+        "if (el) { el.style.opacity = '0'; setTimeout(function(){ el.remove(); }, 250); } })();";
+    win.webContents.executeJavaScript(script).catch(() => { });
+}
+
+// Recuperacao do RTC da STREAM (issue #164). A escada so considera o sender
+// travado quando ha demanda remota positiva, captura viva e encoder parado.
+// Reconecta somente o websocket criado junto da stream; nunca fecha a voz
+// principal, nunca toca no gateway e nunca chama reload automaticamente.
 let videoNativoTentativas = [];
+// O teto e por sessao logica de Live, nao pelo uptime inteiro do Discord.
+// A chave nunca usa stream ID/URL: sender = fonte selecionada; viewer = nova
+// intencao positiva de assistir. A reconexao causada pelo nosso close(4000)
+// conserva ambas, portanto nao vira loop de tentativas.
+let videoNativoOrcamentoChave = '';
 let videoNativoUltimaAcaoEm = 0;
 let videoNativoPendente = null;
 let videoNativoBloqueadoGeracao = '';
 let videoNativoBloqueadoEm = 0;
+let viewerNativoUltimaSaudavelGeracao = '';
+let viewerNativoUltimaSaudavelEm = 0;
 let videoBannerAtivo = false;
 let voiceProbeRodando = false;
 let voiceProbeUltimoLogEm = 0;
@@ -2443,9 +3240,9 @@ let voiceHookLogado = false;
 let voiceUltimaGeracaoLogada = '';
 let voiceIsolatedAvisado = false;
 
-const VIDEO_BANNER_TEXT = "GoLiveBypass: confirmamos que a captura continua ativa, mas o " +
-    "Discord parou de enviar os quadros da transmissao. A recuperacao automatica sem reload " +
-    "foi esgotada; use \"Reiniciar agora\" somente se quiser reconstruir a call inteira.";
+const VIDEO_BANNER_TEXT = "GoLiveBypass: a conexao RTC da transmissao nao entregou video. " +
+    "Tentamos renegociar somente a stream sem derrubar sua call, mas o video nao voltou. " +
+    "Reiniciar o renderer e a unica recuperacao confirmada para este estado.";
 
 function showVideoBanner() {
     videoBannerAtivo = true;
@@ -2486,39 +3283,464 @@ function geracaoNativa(voice, stream) {
     return String(voice.instanceId || 'legacy') + ':' + String(stream.id);
 }
 
-// Funcao pura e fail-closed. Todas as guardas precisam concordar: stream exata,
-// midia aberta, espectador positivo visto desde essa geracao, captura viva e
-// saida sem progredir por 20s. Uma renegociacao normal de 3s apenas envelhece
-// saidaHa por 3s e nunca chega perto do limiar.
+// Uma conexao discord_voice pode sobreviver a uma nova entrada do viewer. A
+// geracao da pagina completa essa identidade apenas para quem recebe a Live:
+// ela e um contador opaco local, sem stream id, track id nem URL do Discord.
+function visualViewerAtivo(ctx, stream) {
+    const visual = ctx && ctx.visual;
+    return !!(stream && stream.role === 'viewer' && visual &&
+        Number.isInteger(visual.generation) && visual.generation > 0);
+}
+
+function geracaoViewerNativa(ctx, stream) {
+    const nativa = geracaoNativa(ctx && ctx.voice, stream);
+    if (!nativa) return '';
+    return visualViewerAtivo(ctx, stream) ? nativa + '@v' + ctx.visual.generation : nativa;
+}
+
+function visualViewerRenderizado(ctx, stream) {
+    const visual = ctx && ctx.visual;
+    if (!visualViewerAtivo(ctx, stream) || visual.visible !== true || visual.readyState < 2) return false;
+    return typeof visual.frameHa === 'number' && Number.isFinite(visual.frameHa) &&
+        visual.frameHa >= 0 && visual.frameHa <= VOICE_SAIDA_SUCESSO_MS;
+}
+
+function viewerReentradaAposSaude(ctx, stream) {
+    if (!stream || stream.role !== 'viewer') return false;
+    if (!ctx || typeof ctx.viewerSaudavelGeracao !== 'string' || ctx.viewerSaudavelGeracao === '') return false;
+    if (typeof ctx.viewerSaudavelHa !== 'number' || ctx.viewerSaudavelHa < 0 ||
+        ctx.viewerSaudavelHa > VOICE_VIEWER_REENTRADA_JANELA_MS) return false;
+    return ctx.viewerSaudavelGeracao !== geracaoViewerNativa(ctx, stream);
+}
+
+function demandaRtcDaStream(ctx, stream) {
+    const raiz = ctx && ctx.demanda;
+    if (!raiz || !stream) return null;
+    let demanda = raiz;
+    if (stream.role === 'viewer' && raiz.viewer) demanda = raiz.viewer;
+    else if (stream.role === 'sender' && raiz.sender) demanda = raiz.sender;
+    if (!demanda || demanda.known !== true) return demanda || null;
+    if (stream.role === 'viewer' && demanda.active !== true &&
+        typeof demanda.demandHa === 'number' && demanda.demandHa >= 0 &&
+        demanda.demandHa <= VOICE_VIEWER_DEMANDA_RECENTE_MS) {
+        return { ...demanda, active: true, recentOnly: true };
+    }
+    return demanda;
+}
+
+function chaveOrcamentoRtc(ctx, stream) {
+    const voice = ctx && ctx.voice;
+    if (!voice || !stream || !Number.isInteger(voice.instanceId) || voice.instanceId <= 0) return '';
+    const demanda = demandaRtcDaStream(ctx, stream);
+    if (!demanda || !Number.isInteger(demanda.epoch) || demanda.epoch <= 0) return '';
+    const streamId = Number.isInteger(stream.id) ? stream.id : 0;
+    if (stream.role === 'sender') {
+        // Nem toda versao do discord_voice expoe setDesktopSource no objeto
+        // que chegou ao nosso hook. Quando ele existe, a fonte e o marcador
+        // mais preciso de uma Live nova. Quando nao existe, a transicao local
+        // de demanda remota ainda distingue uma nova sessao da reconexao que
+        // o nosso close(4000) provoca: esta ultima mantem a demanda positiva.
+        if (Number.isInteger(voice.sourceEpoch) && voice.sourceEpoch > 0) {
+            return 'sender:' + voice.instanceId + ':stream:' + streamId + ':fonte:' + voice.sourceEpoch;
+        }
+        return 'sender:' + voice.instanceId + ':stream:' + streamId + ':demanda:' + demanda.epoch;
+    }
+    if (stream.role === 'viewer') {
+        return 'viewer:' + voice.instanceId + ':stream:' + streamId + ':demanda:' + demanda.epoch;
+    }
+    return '';
+}
+
+function renovarOrcamentoRtc(ctx, stream) {
+    const chave = chaveOrcamentoRtc(ctx, stream);
+    // Telemetria antiga/incompleta nao recebe privilegio de reiniciar a
+    // escada: conserva o teto atual e falha fechado.
+    if (chave === '' || chave === videoNativoOrcamentoChave) return;
+    // Se ha tentativa de recuperacao pendente em voo, adiar a renovacao da chave:
+    // sobrescrever videoNativoOrcamentoChave agora sem limpar tentativas impediria
+    // a renovacao definitiva apos a tentativa terminar, travando a escada.
+    if (videoNativoPendente !== null) return;
+    const anterior = videoNativoOrcamentoChave;
+    videoNativoOrcamentoChave = chave;
+    videoNativoTentativas.length = 0;
+    videoNativoUltimaAcaoEm = 0;
+    videoNativoBloqueadoGeracao = '';
+    videoNativoBloqueadoEm = 0;
+    hideVideoBanner(ctx.win);
+    if (anterior !== '') {
+        log('gw.revive | rtc stream: nova sessao logica; teto de recuperacao renovado');
+    }
+}
+
+// Pareia os dois mundos pelo protocolo quando ele ja prova o papel do socket;
+// sem essa prova, usa idade de criacao. Em call normal o socket da voz e antigo;
+// ao abrir uma Live, o socket RTC e a conexao nativa de stream nascem em poucos
+// segundos. Ambiguidade ou delta acima de 15s falha fechado.
+function socketMidiaDaStream(ctx, stream) {
+    const sockets = ctx && ctx.midia && Array.isArray(ctx.midia.midiaSockets)
+        ? ctx.midia.midiaSockets.filter(s => s && s.readyState === 1 && typeof s.id === 'number' &&
+            typeof s.createdHa === 'number' && Number.isFinite(s.createdHa))
+        : [];
+    if (!stream || typeof stream.createdHa !== 'number' || sockets.length === 0) return null;
+    // 1. Identificacao direta protocolar: sockets explicitamente provados como stream
+    const streamsMarcados = sockets.filter(s => s.kind === 'stream');
+    if (streamsMarcados.length === 1) return streamsMarcados[0];
+    if (streamsMarcados.length > 1) {
+        let maisNovo = streamsMarcados[0];
+        for (let i = 1; i < streamsMarcados.length; i++) {
+            if (streamsMarcados[i].createdHa < maisNovo.createdHa) maisNovo = streamsMarcados[i];
+        }
+        return maisNovo;
+    }
+
+    // 2. Protecao: descartar sockets explicitamente provados como voz principal
+    const candidatas = sockets.filter(s => s.kind !== 'voice');
+    if (candidatas.length === 0) return null;
+
+    // Sem classificacao protocolar, uma call com Live normalmente tem voz base
+    // + stream. Um unico socket sem papel provado continua ambiguo: parear por
+    // proximidade poderia fechar a voz. Esta guarda NAO vale para kind=stream:
+    // apos RTCControlSocket.reconnect o socket da voz pode nao aparecer neste
+    // contexto, mas o IDENTIFY/midia ja provou cirurgicamente que o unico aberto
+    // pertence a Live (issue #186).
+    if (voiceNativaAtiva(ctx && ctx.voice) && sockets.length < 2) return null;
+
+    // 3. Fallback original: pareamento temporal estrito por delta de criacao
+    let melhor = null;
+    let melhorDelta = Infinity;
+    let empate = false;
+    for (const socket of candidatas) {
+        const delta = Math.abs(socket.createdHa - stream.createdHa);
+        if (delta < melhorDelta) {
+            melhor = socket;
+            melhorDelta = delta;
+            empate = false;
+        } else if (delta === melhorDelta) {
+            empate = true;
+        }
+    }
+    if (empate || melhorDelta > VOICE_SOCKET_PAREAMENTO_MS) return null;
+    return melhor;
+}
+
+// Funcao pura e fail-closed. Viewer: conexao stream + demanda positiva, mas
+// video inbound ausente/parado por 60s. Transmissor: demanda remota positiva,
+// captura viva e encoder parado por 20s. targetMediaBitrate nao participa do
+// veredito: o Discord pode deixa-lo em zero mesmo com um viewer real esperando.
 function avaliarRtcNativo(ctx) {
     if (!ctx || !ctx.voice || ctx.voice.installed !== true || ctx.voice.voiceHooked !== true) return null;
     if (!ctx.midia || ctx.midia.midiaAberta !== true) return null;
-    if (!ctx.demanda || ctx.demanda.known !== true || ctx.demanda.active !== true) return null;
     const stream = streamNativaAtiva(ctx.voice);
-    if (!stream || stream.createdHa < VOICE_STREAM_AQUECIMENTO_MS) return null;
-    if (ctx.demanda.demandHa < 0 || ctx.demanda.demandHa > stream.createdHa + VOICE_DEMANDA_GRACA_MS) return null;
+    const reentradaRapida = viewerReentradaAposSaude(ctx, stream);
+    const aquecimento = reentradaRapida ? VOICE_VIEWER_REENTRADA_AQUECIMENTO_MS : VOICE_STREAM_AQUECIMENTO_MS;
+    if (!stream || stream.createdHa < aquecimento) return null;
+    const demanda = demandaRtcDaStream(ctx, stream);
+    if (!demanda || demanda.known !== true || demanda.active !== true) return null;
+    if (demanda.demandHa < 0 || demanda.demandHa > stream.createdHa + VOICE_DEMANDA_GRACA_MS) return null;
     const stats = stream.stats;
     if (!stats || stats.statsOk !== true) return null;
-    if (stats.sampleHa < 0 || stats.sampleHa > VOICE_SAMPLE_MAX_MS) return null;
+    if (typeof stats.sampleHa !== 'number' || !Number.isFinite(stats.sampleHa) ||
+        stats.sampleHa < 0 || stats.sampleHa > VOICE_SAMPLE_MAX_MS) return null;
+    if (!socketMidiaDaStream(ctx, stream)) return null;
+    if (stream.role === 'viewer' && stats.direction === 'inbound') {
+        const esperaVideo = reentradaRapida ? VOICE_VIEWER_REENTRADA_SAIDA_PARADA_MS : VOICE_VIEWER_SAIDA_PARADA_MS;
+        if (typeof stats.videoHa !== 'number' || stats.videoHa < esperaVideo) return null;
+        const tipo = stats.videoPresent === true ? 'video-parado' : 'video-ausente';
+        return reentradaRapida ? 'viewer-reentrada-' + tipo : 'viewer-' + tipo;
+    }
+    if (stream.role !== 'sender' || stats.direction !== 'outbound') return null;
     if (stats.entradaHa < 0 || stats.entradaHa > VOICE_ENTRADA_VIVA_MS) return null;
     if (!(typeof stats.captureFrames === 'number' || stats.inputFrameRate > 0)) return null;
     if (typeof stats.framesEncoded !== 'number' || typeof stats.encodeFrameRate !== 'number') return null;
     if (stats.saidaHa < VOICE_SAIDA_PARADA_MS) return null;
-    return 'video-nativo-travado';
+    return 'sender-video-parado';
 }
 
 function rtcNativoSaudavel(ctx, geracaoAnterior) {
     const stream = streamNativaAtiva(ctx && ctx.voice);
-    if (!stream || geracaoNativa(ctx.voice, stream) === geracaoAnterior) return null;
+    if (!stream) return null;
     const stats = stream.stats;
-    if (!ctx.demanda || ctx.demanda.known !== true || ctx.demanda.active !== true) return null;
+    const demanda = demandaRtcDaStream(ctx, stream);
+    if (!demanda || demanda.known !== true || demanda.active !== true) return null;
     if (!ctx.midia || ctx.midia.midiaAberta !== true) return null;
-    if (ctx.demanda.demandHa < 0 || ctx.demanda.demandHa > stream.createdHa + VOICE_DEMANDA_GRACA_MS) return null;
-    if (!stats || stats.statsOk !== true || stats.sampleHa > VOICE_SAMPLE_MAX_MS) return null;
+    if (demanda.demandHa < 0 || demanda.demandHa > stream.createdHa + VOICE_DEMANDA_GRACA_MS) return null;
+    if (!stats || stats.statsOk !== true || typeof stats.sampleHa !== 'number' ||
+        !Number.isFinite(stats.sampleHa) || stats.sampleHa < 0 || stats.sampleHa > VOICE_SAMPLE_MAX_MS) return null;
+    if (stream.role === 'viewer' && stats.direction === 'inbound') {
+        if (stats.videoPresent !== true || typeof stats.videoHa !== 'number' ||
+            stats.videoHa < 0 || stats.videoHa > VOICE_SAIDA_SUCESSO_MS) return null;
+        // Bytes de um burst pre-DAVE e o numero 0 sao evidencia de que o track
+        // existe, nao de que o video foi entregue. So um frame realmente
+        // decodificado/renderizado pode preservar a memoria de stream saudavel.
+        if (!((typeof stats.framesDecoded === 'number' && Number.isFinite(stats.framesDecoded) && stats.framesDecoded > 0) ||
+            (typeof stats.decodeFrameRate === 'number' && Number.isFinite(stats.decodeFrameRate) && stats.decodeFrameRate > 0) ||
+            (typeof stats.renderFrameRate === 'number' && Number.isFinite(stats.renderFrameRate) && stats.renderFrameRate > 0))) return null;
+        // O addon mede a conexao e pode manter frames da Live anterior depois
+        // de o DirectVideo entrar no erro 2012. Quando o resumo visual existe,
+        // so a apresentacao de um frame novo confirma a cura. Sem o resumo
+        // (renderer antigo/indisponivel), mantemos o criterio legado para nao
+        // transformar falha de observacao em fechamento destrutivo.
+        if (ctx.visual !== undefined && ctx.visual !== null && !visualViewerRenderizado(ctx, stream)) return null;
+        return stream;
+    }
+    if (stream.role !== 'sender' || stats.direction !== 'outbound') return null;
     if (stats.entradaHa < 0 || stats.entradaHa > VOICE_ENTRADA_VIVA_MS) return null;
     if (stats.saidaHa < 0 || stats.saidaHa > VOICE_SAIDA_SUCESSO_MS) return null;
     if (!(stats.encodeFrameRate > 0) || typeof stats.framesEncoded !== 'number') return null;
     return stream;
+}
+
+// Depois de reconectar o RTC da stream, a demanda pode zerar por alguns segundos
+// enquanto o sink renegocia. Isso pausa a escada; demanda ausente por 60s
+// encerra a observacao sem escalar e sem declarar sucesso.
+function decidirDemandaRecuperacao(demanda) {
+    if (!demanda || demanda.known !== true) return 'encerrar';
+    if (demanda.active === true) return 'continuar';
+    if (typeof demanda.changedHa !== 'number' || !Number.isFinite(demanda.changedHa) ||
+        demanda.changedHa < VOICE_SEM_DEMANDA_ESPERA_MS) return 'aguardar';
+    return 'encerrar';
+}
+
+function numeroResumo(valor, fallback, maximo) {
+    if (typeof valor !== 'number' || !Number.isFinite(valor)) return fallback;
+    if (valor < -1) return fallback;
+    return Math.min(valor, maximo);
+}
+
+function contadorResumo(valor, maximo) {
+    return typeof valor === 'number' && Number.isFinite(valor) && valor >= 0
+        ? Math.min(valor, maximo) : 0;
+}
+
+// O renderer entrega somente estado visual agregado. Validar e copiar esse
+// pequeno contrato impede que objetos, IDs ou valores inesperados atravessem
+// a fronteira do contexto da pagina para a decisao de recuperacao.
+function normalizarResumoVisual(valor) {
+    if (!valor || typeof valor !== 'object') return null;
+    if (!Number.isInteger(valor.generation) || valor.generation < 0 || valor.generation > 1_000_000_000) return null;
+    if (typeof valor.visible !== 'boolean') return null;
+    if (!Number.isInteger(valor.readyState) || valor.readyState < 0 || valor.readyState > 4) return null;
+    return {
+        generation: valor.generation,
+        visible: valor.visible,
+        attachedHa: numeroResumo(valor.attachedHa, -1, 7 * 24 * 60 * 60_000),
+        frameHa: numeroResumo(valor.frameHa, -1, 7 * 24 * 60 * 60_000),
+        readyState: valor.readyState,
+    };
+}
+
+// Resultado de Runtime.evaluate nunca e confiado por referencia: copia somente
+// escalares conhecidos, limita contadores/arrays e elimina URL/payload/token.
+function normalizarResumoInstrumentado(valor, origem, sessaoId, instaladoEm) {
+    if (!valor || typeof valor !== 'object') return null;
+    const estados = new Set(['nenhum', 'conectando', 'aberta', 'fechada']);
+    if (!estados.has(valor.estado)) return null;
+    if (!Number.isInteger(valor.geracao) || valor.geracao < 0 || valor.geracao > 1_000_000_000) return null;
+    const sockets = Array.isArray(valor.midiaSockets) ? valor.midiaSockets.slice(0, 16).map(item => {
+        if (!item || !Number.isInteger(item.id) || item.id <= 0 || item.id > 1_000_000_000) return null;
+        if (!Number.isInteger(item.readyState) || item.readyState < 0 || item.readyState > 3) return null;
+        return {
+            id: item.id,
+            createdHa: numeroResumo(item.createdHa, -1, 7 * 24 * 60 * 60_000),
+            openHa: numeroResumo(item.openHa, -1, 7 * 24 * 60 * 60_000),
+            readyState: item.readyState,
+            kind: typeof item.kind === 'string' && (item.kind === 'stream' || item.kind === 'voice') ? item.kind : '',
+        };
+    }).filter(Boolean) : [];
+    const opCounts = {};
+    if (valor.opCounts && typeof valor.opCounts === 'object') {
+        for (const op of ['0', '1', '4', '14', '18', '19', '20', '21', '22', '37']) {
+            const n = valor.opCounts[op];
+            if (typeof n === 'number' && Number.isFinite(n) && n >= 0) opCounts[op] = Math.min(n, 1_000_000_000);
+        }
+    }
+    const workerId = origem === 'worker' && typeof valor.workerId === 'string' &&
+        /^[a-z0-9-]{3,80}$/.test(valor.workerId) ? valor.workerId : '';
+    if (origem === 'worker' && workerId === '') return null;
+    return {
+        origem, workerId,
+        geracao: valor.geracao,
+        estado: valor.estado,
+        srvHa: numeroResumo(valor.srvHa, -1, 7 * 24 * 60 * 60_000),
+        cliHa: numeroResumo(valor.cliHa, -1, 7 * 24 * 60 * 60_000),
+        abertoHa: numeroResumo(valor.abertoHa, -1, 7 * 24 * 60 * 60_000),
+        srvFrames: contadorResumo(valor.srvFrames, 1_000_000_000),
+        srvBytes: contadorResumo(valor.srvBytes, Number.MAX_SAFE_INTEGER),
+        srvBytesDesdeAtividade: contadorResumo(valor.srvBytesDesdeAtividade, Number.MAX_SAFE_INTEGER),
+        cliEnvios: contadorResumo(valor.cliEnvios, 1_000_000_000),
+        dispatches: contadorResumo(valor.dispatches, 1_000_000_000),
+        dispatchHa: numeroResumo(valor.dispatchHa, -1, 7 * 24 * 60 * 60_000),
+        intentHa: numeroResumo(valor.intentHa, -1, 7 * 24 * 60 * 60_000),
+        activityHa: numeroResumo(valor.activityHa, -1, 7 * 24 * 60 * 60_000),
+        op4Ha: numeroResumo(valor.op4Ha, -1, 7 * 24 * 60 * 60_000),
+        subs: contadorResumo(valor.subs, 1_000_000_000),
+        opCounts,
+        infladorOk: origem === 'frame' && valor.infladorOk === true,
+        midia: sockets.length,
+        midiaAberta: ((origem === 'frame' || origem === 'network') && valor.midiaAberta === true) ||
+            sockets.some(socket => socket.readyState === 0 || socket.readyState === 1),
+        midiaOpenHa: numeroResumo(valor.midiaOpenHa, -1, 7 * 24 * 60 * 60_000),
+        midiaCloseHa: numeroResumo(valor.midiaCloseHa, -1, 7 * 24 * 60 * 60_000),
+        midiaSockets: sockets,
+        pcs: contadorResumo(valor.pcs, 1000),
+        _workerSessionId: origem === 'worker' ? sessaoId : '',
+        _workerInstaladoEm: origem === 'worker' ? instaladoEm : 0,
+    };
+}
+
+function idadeMaisNova(atual, nova) {
+    if (typeof nova !== 'number' || nova < 0) return atual;
+    if (typeof atual !== 'number' || atual < 0) return nova;
+    return Math.min(atual, nova);
+}
+
+function prioridadeEstado(estado) {
+    if (estado === 'aberta') return 3;
+    if (estado === 'conectando') return 2;
+    if (estado === 'fechada') return 1;
+    return 0;
+}
+
+// O payload binario exposto por Network.webSocketFrame* vem em base64. Aceita
+// as duas formas observadas (tupla antiga e MAP_EXT atual com chave <<"op">>);
+// todo formato diferente falha fechado. Esta copia roda no main (Buffer), separada
+// do parser defensivo que e embutido no shim do renderer/worker.
+function opEtfCdp(payloadBase64) {
+    try {
+        if (typeof payloadBase64 !== 'string' || payloadBase64.length === 0 ||
+            payloadBase64.length > 4 * 1024 * 1024) return -1;
+        const u = Buffer.from(payloadBase64, 'base64');
+        if (u.length < 8 || u[0] !== 131) return -1;
+        let p = -1;
+        if (u[1] === 104) p = 3;
+        else if (u[1] === 105) p = 6;
+        else if (u[1] === 116) {
+            if (u.length < 15 || u[6] !== 109) return -1;
+            const tamChave = (u[7] * 16777216) + (u[8] * 65536) + (u[9] * 256) + u[10];
+            if (tamChave !== 2 || u[11] !== 111 || u[12] !== 112) return -1;
+            p = 13;
+        } else return -1;
+        let op = -1;
+        if (u[p] === 97) op = u[p + 1];
+        else if (u[p] === 98) {
+            op = (u[p + 1] * 16777216) + (u[p + 2] * 65536) +
+                (u[p + 3] * 256) + u[p + 4];
+        }
+        return op === 1 || op === 4 || op === 14 ||
+            op === 18 || op === 19 || op === 20 || op === 21 || op === 22 || op === 37 ? op : -1;
+    } catch { return -1; }
+}
+
+function comporResumoInstrumentado(win, resumoFrame, resumosWorker) {
+    const wc = win && win.webContents;
+    if (!wc) return null;
+    const fontes = [];
+    const local = normalizarResumoInstrumentado(resumoFrame, 'frame', '', 0);
+    if (local) fontes.push(local);
+    if (Array.isArray(resumosWorker)) fontes.push(...resumosWorker.filter(Boolean));
+    if (fontes.length === 0) return null;
+
+    // Network e o observador universal e enxerga o mesmo socket que um shim
+    // eventualmente capturou. Quando ha uma fonte JS com geracao, ela e mais
+    // rica/acionavel e elimina somente a DUPLICATA Network da eleicao do
+    // gateway; a telemetria de midia de todas as fontes continua nas guardas.
+    const temFonteJs = fontes.some(item => item.origem !== 'network' && item.geracao > 0);
+    const fontesGateway = temFonteJs ? fontes.filter(item => item.origem !== 'network') : fontes;
+    const candidatas = fontesGateway.filter(item => item.geracao > 0);
+    let escolhida = null;
+    for (const fonte of candidatas) {
+        if (!escolhida || prioridadeEstado(fonte.estado) > prioridadeEstado(escolhida.estado) ||
+            (prioridadeEstado(fonte.estado) === prioridadeEstado(escolhida.estado) &&
+                ((fonte.origem === 'frame' && escolhida.origem !== 'frame') ||
+                    (fonte.origem === 'worker' && escolhida.origem === 'worker' &&
+                        fonte._workerInstaladoEm > escolhida._workerInstaladoEm)))) escolhida = fonte;
+    }
+    if (!escolhida) escolhida = local || fontes[0];
+    const composto = Object.assign({}, escolhida);
+    composto.gatewayAmbiguo = fontesGateway.filter(item => item.geracao > 0 && item.estado === 'aberta').length > 1;
+    composto.midiaAberta = false;
+    composto.midiaOpenHa = -1;
+    composto.midiaCloseHa = -1;
+    composto.midiaSockets = [];
+
+    let registro = midiaCompostaPorWebContents.get(wc);
+    if (!registro) {
+        registro = { proximoId: -1, idsPorChave: new Map(), alvos: new Map() };
+        midiaCompostaPorWebContents.set(wc, registro);
+    }
+    const chavesAtivas = new Set();
+    registro.alvos.clear();
+    for (const fonte of fontes) {
+        if (fonte.midiaAberta) composto.midiaAberta = true;
+        composto.midiaOpenHa = idadeMaisNova(composto.midiaOpenHa, fonte.midiaOpenHa);
+        composto.midiaCloseHa = idadeMaisNova(composto.midiaCloseHa, fonte.midiaCloseHa);
+        for (const socket of fonte.midiaSockets) {
+            if (fonte.origem === 'frame') {
+                composto.midiaSockets.push(Object.assign({}, socket));
+                continue;
+            }
+            const chave = fonte._workerSessionId + ':' + socket.id;
+            chavesAtivas.add(chave);
+            let id = registro.idsPorChave.get(chave);
+            if (id === undefined) {
+                id = registro.proximoId--;
+                registro.idsPorChave.set(chave, id);
+            }
+            registro.alvos.set(id, { sessionId: fonte._workerSessionId, socketId: socket.id });
+            composto.midiaSockets.push(Object.assign({}, socket, { id }));
+        }
+    }
+    for (const chave of registro.idsPorChave.keys()) {
+        if (!chavesAtivas.has(chave)) registro.idsPorChave.delete(chave);
+    }
+    composto.midia = composto.midiaSockets.length;
+    return composto;
+}
+
+function consultarResumoInstrumentado(win) {
+    const wc = win && win.webContents;
+    if (!wc) return Promise.resolve(null);
+    const pagina = Promise.resolve().then(() => wc.executeJavaScript(
+        'window.__goliveGwResumo ? window.__goliveGwResumo() : null', true)).catch(() => null);
+    const controle = workerInstrumentacoes.get(wc);
+    const workers = controle ? controle.consultar() : Promise.resolve([]);
+    return Promise.all([pagina, workers]).then(([frame, resumos]) => comporResumoInstrumentado(win, frame, resumos));
+}
+
+function fecharGatewayInstrumentado(win, resumo) {
+    const wc = win && win.webContents;
+    if (!wc || !resumo || resumo.gatewayAmbiguo === true || resumo.estado !== 'aberta') return Promise.resolve(false);
+    if (resumo.origem === 'worker') {
+        const controle = workerInstrumentacoes.get(wc);
+        if (!controle || !resumo._workerSessionId) return Promise.resolve(false);
+        return controle.fecharGateway(resumo._workerSessionId, resumo.geracao);
+    }
+    // O CDP Network observa sockets que o JS nao expoe, mas esta versao do
+    // Chromium nao implementa Network.closeWebSocket. Nunca simular ACK nem
+    // escolher outro socket: a escada conservadora decide o fallback.
+    if (resumo.origem === 'network') return Promise.resolve(false);
+    const geracao = JSON.stringify(Number(resumo.geracao));
+    return Promise.resolve().then(() => wc.executeJavaScript(
+        '(function(g){var r=window.__goliveGwResumo?window.__goliveGwResumo():null;' +
+        'return !!(r&&r.estado==="aberta"&&r.geracao===g&&window.__goliveGwFechar&&window.__goliveGwFechar());})(' + geracao + ')', true))
+        .then(Boolean, () => false);
+}
+
+function fecharMidiaInstrumentada(win, id) {
+    const wc = win && win.webContents;
+    if (!wc || !Number.isInteger(id)) return Promise.resolve({ ok: false, id, reason: 'id' });
+    if (id >= 0) {
+        return Promise.resolve().then(() => wc.executeJavaScript(
+            'window.__goliveMidiaFecharId ? window.__goliveMidiaFecharId(' + id + ') : null', true))
+            .then(resultado => resultado && resultado.ok === true ? resultado : { ok: false, id, reason: 'ausente' },
+                () => ({ ok: false, id, reason: 'close' }));
+    }
+    const registro = midiaCompostaPorWebContents.get(wc);
+    const alvo = registro && registro.alvos.get(id);
+    const controle = workerInstrumentacoes.get(wc);
+    if (!alvo || !controle) return Promise.resolve({ ok: false, id, reason: 'ausente' });
+    return controle.fecharMidia(alvo.sessionId, alvo.socketId)
+        .then(ok => ok ? { ok: true, id } : { ok: false, id, reason: 'sem-ack' });
 }
 
 function executarVoiceIsolado(win, code) {
@@ -2530,31 +3752,41 @@ function executarVoiceIsolado(win, code) {
 }
 
 function consultarRtcNativo(win) {
+    const wc = win && win.webContents;
+    if (!wc || (typeof wc.isDestroyed === 'function' && wc.isDestroyed())) {
+        return Promise.resolve({ win, voice: null, demanda: null, midia: null, visual: null });
+    }
     const voice = executarVoiceIsolado(win,
         'window.__goliveVoiceResumo ? window.__goliveVoiceResumo() : null');
-    const pagina = win.webContents.executeJavaScript(
+    const pagina = Promise.resolve().then(() => wc.executeJavaScript(
         "({demanda:window.__goliveVoiceDemandaResumo?window.__goliveVoiceDemandaResumo():null," +
-        "midia:window.__goliveGwResumo?window.__goliveGwResumo():null})", true);
-    return Promise.all([voice, pagina]).then(([voiceResumo, paginaResumo]) => ({
+        "midia:window.__goliveGwResumo?window.__goliveGwResumo():null," +
+        "visual:window.__goliveVideoResumo?window.__goliveVideoResumo():null})", true)).catch(() => null);
+    const controle = workerInstrumentacoes.get(wc);
+    const workers = controle ? controle.consultar() : Promise.resolve([]);
+    return Promise.all([voice, pagina, workers]).then(([voiceResumo, paginaResumo, resumosWorker]) => ({
         win,
         voice: voiceResumo,
         demanda: paginaResumo && paginaResumo.demanda,
-        midia: paginaResumo && paginaResumo.midia,
+        midia: comporResumoInstrumentado(win, paginaResumo && paginaResumo.midia, resumosWorker),
+        visual: normalizarResumoVisual(paginaResumo && paginaResumo.visual),
     }));
 }
 
 function falharRecuperacaoNativa(ctx, motivo) {
     const stream = streamNativaAtiva(ctx && ctx.voice);
-    videoNativoBloqueadoGeracao = stream ? geracaoNativa(ctx.voice, stream) :
+    videoNativoBloqueadoGeracao = stream ? geracaoViewerNativa(ctx, stream) :
         (videoNativoPendente ? videoNativoPendente.geracao : '');
     videoNativoBloqueadoEm = Date.now();
     videoNativoPendente = null;
-    log("gw.zumbi | video nativo confirmado mas acao manual (" + motivo + ")");
+    log("gw.zumbi | rtc da stream nao recuperou; acao manual (" + motivo + ")");
     if (!videoBannerAtivo) showVideoBanner();
 }
 
-function iniciarRecuperacaoNativa(ctx, nivel, geracaoAnterior) {
+function iniciarRecuperacaoNativa(ctx, nivel, geracaoAnterior, sinal) {
     const agora = Date.now();
+    const stream = streamNativaAtiva(ctx.voice);
+    renovarOrcamentoRtc(ctx, stream);
     while (videoNativoTentativas.length > 0 && videoNativoTentativas[0] < agora - VOICE_JANELA_MS) {
         videoNativoTentativas.shift();
     }
@@ -2562,39 +3794,36 @@ function iniciarRecuperacaoNativa(ctx, nivel, geracaoAnterior) {
         falharRecuperacaoNativa(ctx, 'teto_tentativas');
         return;
     }
-    const stream = streamNativaAtiva(ctx.voice);
-    const geracao = stream ? geracaoNativa(ctx.voice, stream) : String(geracaoAnterior || '');
+    const socket = socketMidiaDaStream(ctx, stream);
+    if (!stream || !socket) {
+        falharRecuperacaoNativa(ctx, 'socket_stream_ambiguo');
+        return;
+    }
+    const geracao = stream ? geracaoViewerNativa(ctx, stream) : String(geracaoAnterior || '');
     videoNativoTentativas.push(agora);
     videoNativoUltimaAcaoEm = agora;
-    const tentativa = { nivel, geracao, inicioEm: agora, sucessoEm: 0, renasceuEm: 0, confirmada: false };
+    const tentativa = {
+        nivel, geracao, socketId: socket.id, role: stream.role || 'unknown',
+        sinal: sinal || '', inicioEm: agora, sucessoEm: 0, renasceuEm: 0, confirmada: false,
+    };
     videoNativoPendente = tentativa;
     sessaoRevives++;
-    log("gw.revive | video nativo: nivel=" + nivel +
-        (nivel === 1 ? " destruindo somente a stream nativa" : " reconstruindo voice+stream sem reload") +
-        " entrada_ha=" + idadeSeg(stream && stream.stats ? stream.stats.entradaHa : -1) +
-        " saida_ha=" + idadeSeg(stream && stream.stats ? stream.stats.saidaHa : -1));
-    executarVoiceIsolado(ctx.win,
-        'window.__goliveVoiceRecuperar ? window.__goliveVoiceRecuperar(' + nivel + ') : null')
+    log("gw.revive | rtc stream: nivel=" + nivel + " fechando somente socket=" + socket.id +
+        " papel=" + tentativa.role + " sinal=" + tentativa.sinal);
+    fecharMidiaInstrumentada(ctx.win, socket.id)
         .then(resultado => {
             if (videoNativoPendente !== tentativa) return;
             if (!resultado || resultado.ok !== true) {
-                falharRecuperacaoNativa(ctx, 'acao_nativa_indisponivel');
+                falharRecuperacaoNativa(ctx, 'socket_stream_indisponivel');
                 return;
             }
             tentativa.confirmada = true;
-            log("gw.revive | video nativo: nivel=" + nivel + " executado" +
-                " streams=" + Number(resultado.streams || 0) + " voices=" + Number(resultado.voices || 0));
-            if (nivel !== 2) return;
-            // A associacao URL -> stream nao e inequivoca, portanto o nivel 1
-            // nao toca ws algum. No nivel 2, ja assumimos o corte breve de voz e
-            // fechamos todos os discord.media para o controlador reconstruir.
-            ctx.win.webContents.executeJavaScript('window.__goliveMidiaFechar ? window.__goliveMidiaFechar() : 0')
-                .then(n => log("gw.revive | video nativo: nivel=2 fechou " + Number(n || 0) + " ws de midia"))
-                .catch(error => log("gw.revive | video nativo: falhei ao fechar midia: " + error.message));
+            log("gw.revive | rtc stream: nivel=" + nivel + " socket=" + socket.id +
+                " fechado; voz principal preservada");
         })
         .catch(error => {
             if (videoNativoPendente === tentativa) {
-                falharRecuperacaoNativa(ctx, 'mundo_isolado: ' + error.message);
+                falharRecuperacaoNativa(ctx, 'close_stream: ' + error.message);
             }
         });
 }
@@ -2607,7 +3836,7 @@ function acompanharRecuperacaoNativa(ctx) {
     if (streamSaudavel) {
         if (pendente.sucessoEm === 0) pendente.sucessoEm = agora;
         if (agora - pendente.sucessoEm >= VOICE_SUCESSO_SUSTENTADO_MS) {
-            log("gw.revive | video nativo: sucesso nivel=" + pendente.nivel +
+            log("gw.revive | rtc stream: sucesso nivel=" + pendente.nivel +
                 " geracao_nova=" + streamSaudavel.id + " por=" +
                 Math.round((agora - pendente.sucessoEm) / 1000) + "s");
             videoNativoPendente = null;
@@ -2623,45 +3852,35 @@ function acompanharRecuperacaoNativa(ctx) {
     // assentar. Destrui-lo imediatamente repetiria a corrida que queremos
     // curar; uma geracao realmente nova ganha seu proprio aquecimento.
     const streamAtualAgora = streamNativaAtiva(ctx.voice);
-    if (streamAtualAgora && geracaoNativa(ctx.voice, streamAtualAgora) !== pendente.geracao) {
+    if (streamAtualAgora && geracaoViewerNativa(ctx, streamAtualAgora) !== pendente.geracao) {
         if (!pendente.renasceuEm) {
             pendente.renasceuEm = agora;
-            log("gw.revive | video nativo: geracao nova nasceu; aguardando encoder aquecer");
+            log("gw.revive | rtc stream: geracao nova nasceu; aguardando video aquecer");
         }
         if (agora - pendente.renasceuEm < VOICE_NOVA_GERACAO_GRACA_MS) return true;
     }
 
-    // Se o espectador saiu durante a tentativa, nao ha mais problema a curar e
-    // sobretudo nao escalamos para destruir a call inteira.
-    if (ctx.demanda && ctx.demanda.known === true && ctx.demanda.active !== true &&
-        ctx.demanda.changedHa >= 15_000) {
-        log("gw.revive | video nativo: tentativa cancelada, demanda do espectador terminou");
-        videoNativoPendente = null;
-        return true;
-    }
-
-    const prazo = pendente.nivel === 1 ? VOICE_NIVEL1_ESPERA_MS : VOICE_NIVEL2_ESPERA_MS;
-    if (agora - pendente.inicioEm < prazo) return true;
-    if (pendente.nivel === 1) {
-        const streamAtual = streamNativaAtiva(ctx.voice);
-        const voiceAtual = voiceNativaAtiva(ctx.voice);
-        const teardownEmCurso = !streamAtual && (!voiceAtual || !ctx.midia || ctx.midia.midiaAberta !== true);
-        if (teardownEmCurso) {
-            if (!pendente.teardownEm) {
-                pendente.teardownEm = agora;
-                log("gw.revive | video nativo: nivel=1 iniciou teardown; aguardando o Discord reconstruir sozinho");
-            }
-            if (agora - pendente.teardownEm < VOICE_RECONSTRUCAO_GRACA_MS) return true;
-            falharRecuperacaoNativa(ctx, 'reconstrucao_nao_renasceu');
-            return true;
+    const demandaAtualStream = demandaRtcDaStream(ctx, streamAtualAgora);
+    const decisaoDemanda = decidirDemandaRecuperacao(demandaAtualStream);
+    if (decisaoDemanda === 'aguardar') {
+        if (!pendente.semDemandaLogada && demandaAtualStream && demandaAtualStream.changedHa >= 15_000) {
+            pendente.semDemandaLogada = true;
+            log("gw.revive | rtc stream: demanda caiu durante a recuperacao; aguardando sem escalar");
         }
-        log("gw.revive | video nativo: nivel=1 nao curou em " + Math.round(prazo / 1000) + "s; subindo ao nivel=2");
-        const geracaoAnterior = pendente.geracao;
-        videoNativoPendente = null;
-        iniciarRecuperacaoNativa(ctx, 2, geracaoAnterior);
         return true;
     }
-    falharRecuperacaoNativa(ctx, 'nivel2_sem_cura');
+    if (decisaoDemanda === 'encerrar') {
+        log("gw.revive | rtc stream: observacao encerrada apos 60s sem demanda; sem escalada");
+        videoNativoPendente = null;
+        return true;
+    }
+    pendente.semDemandaLogada = false;
+
+    if (agora - pendente.inicioEm < VOICE_NIVEL1_ESPERA_MS) return true;
+    // Teste de fogo 01/09: repetir close(4000) no socket substituto recria o
+    // WebSocket, mas conserva a mesma stream nativa congelada em fps_out=0.
+    // Uma segunda acao so prolonga a pane e pode competir com a outra ponta.
+    falharRecuperacaoNativa(ctx, 'nivel1_sem_cura_confirmada');
     return true;
 }
 
@@ -2672,29 +3891,57 @@ function processarRtcNativo(ctx) {
     }
     if (acompanharRecuperacaoNativa(ctx)) return;
     const stream = streamNativaAtiva(ctx.voice);
-    if (videoNativoBloqueadoEm > 0 && (agora - videoNativoBloqueadoEm >= VOICE_JANELA_MS ||
-        (stream && geracaoNativa(ctx.voice, stream) !== videoNativoBloqueadoGeracao))) {
-        videoNativoBloqueadoGeracao = '';
-        videoNativoBloqueadoEm = 0;
-        hideVideoBanner(ctx.win);
+    renovarOrcamentoRtc(ctx, stream);
+    if (videoNativoBloqueadoEm > 0) {
+        const recuperouTarde = rtcNativoSaudavel(ctx, videoNativoBloqueadoGeracao);
+        if (recuperouTarde) {
+            log("gw.revive | rtc stream: recuperacao tardia comprovada; removendo aviso");
+            videoNativoBloqueadoGeracao = '';
+            videoNativoBloqueadoEm = 0;
+            hideVideoBanner(ctx.win);
+        } else if (agora - videoNativoBloqueadoEm >= VOICE_JANELA_MS ||
+            (stream && geracaoViewerNativa(ctx, stream) !== videoNativoBloqueadoGeracao)) {
+            videoNativoBloqueadoGeracao = '';
+            videoNativoBloqueadoEm = 0;
+            hideVideoBanner(ctx.win);
+        }
     }
-    if (avaliarRtcNativo(ctx) !== 'video-nativo-travado') return;
-    if (stream && geracaoNativa(ctx.voice, stream) === videoNativoBloqueadoGeracao) return;
-    if (!autoRevive) {
-        falharRecuperacaoNativa(ctx, 'autoRevive_desligado');
+    // A leitura de saude e pura; ela vence a via rapida da reentrada. Assim um
+    // video que acabou de nascer e ja decodifica nao e fechado por uma amostra
+    // de 1s, mas dec=0/fps_dec=0 tambem nao pode apagar a memoria anterior.
+    const saudavelAtual = rtcNativoSaudavel(ctx, '');
+    const ctxComHistorico = {
+        ...ctx,
+        viewerSaudavelGeracao: viewerNativoUltimaSaudavelGeracao,
+        viewerSaudavelHa: viewerNativoUltimaSaudavelEm > 0 ? agora - viewerNativoUltimaSaudavelEm : -1,
+    };
+    const sinal = saudavelAtual ? null : avaliarRtcNativo(ctxComHistorico);
+    if (saudavelAtual && saudavelAtual.role === 'viewer') {
+        // A memoria so nasce de frames realmente recentes e fica para a proxima
+        // reentrada. Na #183, atualizar aqui antes da avaliacao fazia uma
+        // stream nova com dec=0/fps_dec=0 apagar a ultima stream boa.
+        viewerNativoUltimaSaudavelGeracao = geracaoViewerNativa(ctx, saudavelAtual);
+        viewerNativoUltimaSaudavelEm = agora;
+    }
+    if (!sinal) {
         return;
     }
+    if (stream && geracaoViewerNativa(ctx, stream) === videoNativoBloqueadoGeracao) return;
     if (videoNativoUltimaAcaoEm > 0 && agora - videoNativoUltimaAcaoEm < VOICE_ACAO_COOLDOWN_MS) return;
-    iniciarRecuperacaoNativa(ctx, 1);
+    iniciarRecuperacaoNativa(ctx, 1, '', sinal);
 }
 
 function logRtcNativo(ctx) {
     const agora = Date.now();
     const stream = streamNativaAtiva(ctx.voice);
     const stats = stream && stream.stats;
+    const socket = socketMidiaDaStream(ctx, stream);
+    const demanda = demandaRtcDaStream(ctx, stream);
     const assinatura = [
         !!(ctx.voice && ctx.voice.voiceHooked), stream ? stream.id : 0,
-        !!(ctx.demanda && ctx.demanda.active), stats ? !!stats.statsOk : false,
+        !!(demanda && demanda.active), stats ? !!stats.statsOk : false,
+        stream ? stream.role : '', stats ? stats.direction : '',
+        stats ? stats.videoPresent : '', socket ? socket.id : 0,
         videoNativoPendente ? videoNativoPendente.nivel : 0,
     ].join(':');
     if (assinatura === voiceProbeUltimaAssinatura && agora - voiceProbeUltimoLogEm < VOICE_PROBE_LOG_MS) return;
@@ -2702,13 +3949,23 @@ function logRtcNativo(ctx) {
     voiceProbeUltimoLogEm = agora;
     log("voice.probe | hook=" + (ctx.voice && ctx.voice.voiceHooked ? "sim" : "nao") +
         " stream=" + (stream ? stream.id : "nenhuma") +
-        " demanda=" + (ctx.demanda && ctx.demanda.known ? (ctx.demanda.active ? "sim" : "nao") : "?") +
-        " demanda_ha=" + idadeSeg(ctx.demanda ? ctx.demanda.demandHa : -1) +
+        " papel=" + (stream ? (stream.role || "?") : "?") +
+        " socket=" + (socket ? socket.id : "?") +
+        " fonte=" + (ctx.voice && ctx.voice.sourceReady ? "sim" : "nao") +
+        " demanda=" + (demanda && demanda.known ? (demanda.active ? (demanda.recentOnly ? "recente" : "sim") : "nao") : "?") +
+        " demanda_ha=" + idadeSeg(demanda ? demanda.demandHa : -1) +
         " entrada_ha=" + idadeSeg(stats ? stats.entradaHa : -1) +
         " saida_ha=" + idadeSeg(stats ? stats.saidaHa : -1) +
+        " video=" + (stats && stats.direction === 'inbound' ? (stats.videoPresent ? "sim" : "nao") : "?") +
+        " video_ha=" + idadeSeg(stats ? stats.videoHa : -1) +
         " fps_in=" + (stats && typeof stats.inputFrameRate === 'number' ? Math.round(stats.inputFrameRate) : "?") +
         " fps_out=" + (stats && typeof stats.encodeFrameRate === 'number' ? Math.round(stats.encodeFrameRate) : "?") +
+        " fps_dec=" + (stats && typeof stats.decodeFrameRate === 'number' ? Math.round(stats.decodeFrameRate) : "?") +
         " frames=" + (stats && typeof stats.framesEncoded === 'number' ? Math.round(stats.framesEncoded) : "?") +
+        " dec=" + (stats && typeof stats.framesDecoded === 'number' ? Math.round(stats.framesDecoded) : "?") +
+        " target=" + (stats && typeof stats.targetMediaBitrate === 'number' ? Math.round(stats.targetMediaBitrate) : "?") +
+        " rtt=" + (stats && typeof stats.transportRtt === 'number' ? Math.round(stats.transportRtt) : "?") +
+        " feedback_ha=" + idadeSeg(stats ? stats.transportHa : -1) +
         " stats=" + (stats && stats.statsOk ? "ok" : (stats && stats.reason ? stats.reason : "?")));
 }
 
@@ -2734,11 +3991,19 @@ function checarRtcNativo() {
             return;
         }
         voiceIsolatedAvisado = false;
+        // webRequest marca o handshake, mas uma Live longa pode manter o mesmo
+        // websocket de *.discord.media por dezenas de minutos. Alem disso, no
+        // viewer o socket pode deixar de aparecer ao shim enquanto discord_voice
+        // ainda decodifica video normalmente (#178). Uma stream nativa ativa e
+        // portanto sinal autoritativo para manter a guarda de reload/troca viva.
+        const stream = streamNativaAtiva(escolhido.voice);
+        if ((escolhido.midia && escolhido.midia.midiaAberta === true) || stream !== null) {
+            marcarMidiaProtegida();
+        }
         if (!voiceHookLogado && escolhido.voice.voiceHooked === true) {
             voiceHookLogado = true;
             log("voice.hook | discord_voice interceptado no preload isolado");
         }
-        const stream = streamNativaAtiva(escolhido.voice);
         const geracao = stream ? geracaoNativa(escolhido.voice, stream) : '';
         if (stream && geracao !== voiceUltimaGeracaoLogada) {
             voiceUltimaGeracaoLogada = geracao;
@@ -2752,19 +4017,35 @@ function checarRtcNativo() {
 }
 
 function idadeSeg(ha) {
-    return ha < 0 ? "?" : Math.round(ha / 1000) + "s";
+    return typeof ha !== 'number' || !Number.isFinite(ha) || ha < 0 ? "?" : Math.round(ha / 1000) + "s";
 }
 
 function reloadPorRevive(motivo) {
     if (reloading) return;
     const win = clientWindow();
     if (win === null) return;
+    // So LIA o mutex antes desta linha (nunca escrevia): maybeReloadAfterDirect() e
+    // maybeReloadAfterColdHold() (que escrevem o mesmo `reloading`) viam sempre false e podiam
+    // disparar um SEGUNDO win.webContents.reload() na mesma janela enquanto este ainda estava
+    // navegando -- dois reloads concorrentes interrompendo um ao outro, alcancavel de verdade
+    // numa sessao com Tor caindo e gateway zumbi ao mesmo tempo (a mesma rede ruim motiva os
+    // dois gatilhos). watchReloads() zera de volta assim que a navegacao de verdade comeca
+    // (did-start-loading), o mesmo sinal que ja limpa o resto do estado de revive/zumbi.
+    reloading = true;
     log("gw.revive | recarregando a janela (" + motivo + ")");
     win.webContents.reload();
 }
 
 function vigiarZumbi(resumo, win) {
     const agora = Date.now();
+    if (resumo.gatewayAmbiguo === true) {
+        if (!zumbiBannerAtivo) {
+            log('gw.zumbi | mais de um gateway aberto no mesmo webContents; somente diagnostico');
+            zumbiBannerAtivo = true;
+            showZumbiBanner();
+        }
+        return;
+    }
     const decisao = decidirRevive({
         agora,
         midiaAberta: resumo.midiaAberta === true,
@@ -2784,11 +4065,6 @@ function vigiarZumbi(resumo, win) {
         }
         return;
     }
-    if (!autoRevive) {
-        // Flag desligada: deteccao e log continuam, acao fica sendo do usuario (banner).
-        if (!zumbiBannerAtivo) { zumbiBannerAtivo = true; showZumbiBanner(); }
-        return;
-    }
     zumbiTentativaEm.push(agora);
     zumbiUltimaAcaoEm = agora;
     zumbiUltimaAcao = decisao.acao;
@@ -2798,12 +4074,16 @@ function vigiarZumbi(resumo, win) {
             " (dispatches=" + resumo.dispatches + " intent_ha=" + idadeSeg(resumo.intentHa) + ")");
         reviveFecharEm = agora;
         reviveFecharGeracao = resumo.geracao;
+        reviveFecharOrigem = String(resumo.origem || 'frame') + ':' + String(resumo.workerId || '');
         revivePendenteEm = agora;
-        win.webContents.executeJavaScript('window.__goliveGwFechar ? window.__goliveGwFechar() : false')
+        fecharGatewayInstrumentado(win, resumo)
             .then(ok => {
                 if (ok !== true) log("gw.revive | nao consegui fechar o ws (shim ausente ou ws nao aberto)");
             })
             .catch(error => log("gw.revive | falhei ao fechar o ws: " + error.message));
+        setTimeout(() => {
+            if (reviveFecharEm === agora) checarGatewaySilente();
+        }, GW_REVIVE_RENASCE_MS + 500);
     } else {
         log("gw.revive | nivel=2: o close nao curou (dispatches=" + resumo.dispatches + "), recarregando a janela");
         reviveFecharEm = 0;
@@ -2812,14 +4092,36 @@ function vigiarZumbi(resumo, win) {
 }
 
 function checarGatewaySilente() {
+    if (gatewayProbeRodando) {
+        gatewayProbeRepetir = true;
+        return Promise.resolve(false);
+    }
     const janelas = janelasCliente();
-    if (janelas.length === 0) return;
-    const polls = janelas.map(win =>
-        win.webContents.executeJavaScript('window.__goliveGwResumo ? window.__goliveGwResumo() : null', true)
-            .then(resumo => ({ win, resumo }))
-            .catch(() => ({ win, resumo: null })),
-    );
-    Promise.all(polls).then(resultados => {
+    if (janelas.length === 0) return Promise.resolve(false);
+    gatewayProbeRodando = true;
+    const epoca = gatewayProbeEpoca;
+    const inicio = Date.now();
+    const polls = janelas.map(win => {
+        const wc = win.webContents;
+        const bloqueadoAte = gatewayProbeBloqueadoAte.get(wc) || 0;
+        if (bloqueadoAte > inicio) return Promise.resolve({ win, resumo: null, ignorado: true });
+        const consulta = consultarResumoInstrumentado(win);
+        return prazoCdp(consulta, GW_PROBE_TIMEOUT_MS, 'probe renderer')
+            .then(resumo => ({ win, resumo, ignorado: false }))
+            .catch(error => {
+                if (String(error && error.message || error).indexOf('excedeu') !== -1) {
+                    gatewayProbeBloqueadoAte.set(wc, Date.now() + GW_PROBE_COOLDOWN_TIMEOUT_MS);
+                    log('gw.probe | timeout no renderer id=' + (wc.id || '?') +
+                        '; janela em cooldown por ' + Math.round(GW_PROBE_COOLDOWN_TIMEOUT_MS / 60000) + 'min');
+                }
+                return { win, resumo: null, ignorado: false };
+            });
+    });
+    return Promise.allSettled(polls).then(concluidos => {
+        if (epoca !== gatewayProbeEpoca) return false;
+        const resultados = concluidos
+            .filter(item => item.status === 'fulfilled')
+            .map(item => item.value);
         const agora = Date.now();
         // Escolhe o resumo mais util: janela com gateway de preferencia (a #154
         // provou que pode haver mais de uma janela de cliente, nem toda com shim).
@@ -2835,10 +4137,13 @@ function checarGatewaySilente() {
         if (resumo === null) {
             // Silencio diagnosticavel: a #154 passou 3 minutos sem NENHUMA linha de
             // probe porque o resumo ausente era engolido aqui.
-            log("gw.probe | estado=sem-shim: nenhuma janela do cliente respondeu ao probe");
-            return;
+            if (resultados.some(r => r.ignorado !== true)) {
+                log("gw.probe | estado=sem-shim: nenhuma janela do cliente respondeu ao probe");
+            }
+            return false;
         }
         log("gw.probe | estado=" + resumo.estado +
+            " origem=" + (resumo.origem || "frame") +
             " srv_ha=" + idadeSeg(resumo.srvHa) +
             " cli_ha=" + idadeSeg(resumo.cliHa) +
             " subs=" + resumo.subs +
@@ -2858,28 +4163,31 @@ function checarGatewaySilente() {
         // Auto-cura do nivel 1: fechamos o ws e o cliente NAO renasceu a conexao —
         // o close nao surtiu; sobe direto pro reload (a cura que sempre funciona).
         if (reviveFecharEm > 0) {
-            if (resumo.geracao !== reviveFecharGeracao || resumo.estado === 'aberta') {
+            const origemAtual = String(resumo.origem || 'frame') + ':' + String(resumo.workerId || '');
+            if (resumo.estado === 'aberta' &&
+                (resumo.geracao !== reviveFecharGeracao || origemAtual !== reviveFecharOrigem)) {
                 reviveFecharEm = 0; // renasceu: a escada segue do ponto certo
-            } else if ((resumo.estado === 'fechada' || resumo.estado === 'nenhum') &&
-                agora - reviveFecharEm > GW_REVIVE_RENASCE_MS) {
+                reviveFecharOrigem = '';
+            } else if (agora - reviveFecharEm > GW_REVIVE_RENASCE_MS) {
                 log("gw.revive | o ws nao renasceu apos o close, subindo direto pro reload");
                 reviveFecharEm = 0;
+                reviveFecharOrigem = '';
                 zumbiTentativaEm.push(agora);
                 zumbiUltimaAcaoEm = agora;
                 zumbiUltimaAcao = 'reload';
                 sessaoRevives++;
                 reloadPorRevive("ws nao renasceu apos o close");
-                return;
+                return true;
             }
         }
         const sinal = avaliarSinalGw(resumo, agora);
         if (sinal === 'zumbi') {
             vigiarZumbi(resumo, winResumo);
-            return;
+            return true;
         }
         if (sinal === 'silente') {
             if (!zumbiBannerAtivo) { zumbiBannerAtivo = true; showZumbiBanner(); }
-            return;
+            return true;
         }
         // Recuperacao: remover o banner e creditar a escada. O credito so vale com a
         // conexao SOBREVIVENDO ao aquecimento com dado fluindo — senao o READY da
@@ -2887,7 +4195,7 @@ function checarGatewaySilente() {
         const servidorFalando = resumo.estado === 'aberta' && resumo.srvHa >= 0 && resumo.srvHa < GW_SERVIDOR_SILENCIOSO_MS;
         const dadoFluindo = resumo.dispatchHa >= 0 && resumo.dispatchHa < 60_000;
         if (zumbiBannerAtivo && servidorFalando && (dadoFluindo || resumo.infladorOk !== true)) {
-            zumbiBannerAtivo = false;
+            hideZumbiBanner();
             log("gateway voltou a responder: banner de sessao muda removido");
         }
         if (zumbiTentativaEm.length > 0 && servidorFalando && dadoFluindo &&
@@ -2900,6 +4208,16 @@ function checarGatewaySilente() {
         // A midia nativa e observada por checarRtcNativo() em um intervalo
         // proprio de 5s. O antigo RTCPeerConnection do Chromium continua no
         // shim apenas como diagnostico legado, mas nao participa de decisoes.
+        return true;
+    }).catch(error => {
+        log('gw.probe | falha interna: ' + error.message);
+        return false;
+    }).finally(() => {
+        gatewayProbeRodando = false;
+        if (gatewayProbeRepetir) {
+            gatewayProbeRepetir = false;
+            setTimeout(() => { checarGatewaySilente(); }, 0);
+        }
     });
 }
 
@@ -2908,14 +4226,359 @@ function checarGatewaySilente() {
 // roda antes do primeiro script da pagina, a unica forma garantida de envolver o
 // WebSocket antes do cliente do gateway nascer. O pill vai no did-finish-load
 // (DOM pronto) e reinjeta a cada recarga.
+function prazoCdp(promessa, ms, rotulo) {
+    return new Promise((resolver, rejeitar) => {
+        let encerrado = false;
+        const timer = setTimeout(() => {
+            if (encerrado) return;
+            encerrado = true;
+            rejeitar(new Error(rotulo + " excedeu " + ms + "ms"));
+        }, ms);
+        Promise.resolve(promessa).then(valor => {
+            if (encerrado) return;
+            encerrado = true;
+            clearTimeout(timer);
+            resolver(valor);
+        }, error => {
+            if (encerrado) return;
+            encerrado = true;
+            clearTimeout(timer);
+            rejeitar(error);
+        });
+    });
+}
+
 function injetarInstrumentacao(wc) {
-    try {
-        wc.debugger.attach('1.3');
-        wc.debugger.sendCommand('Page.enable').catch(() => { });
-        wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: SHIM_ALL_SRC }).catch(() => { });
-    } catch (error) {
-        log("nao consegui prender o shim do gateway: " + error.message);
+    const workerShimSrc = SHIM_WORKER_SRC;
+    const paginaShimSrc = SHIM_GATEWAY_SRC + '\n' + SHIM_VOICE_SRC;
+    const depurador = wc.debugger;
+    const targets = new Map();
+    const anexos = new Set();
+    let workersInjetados = 0;
+    let cdpAtivo = false;
+    let rearmando = false;
+    let consultaRodando = null;
+    let limiteLogado = false;
+    // Fonte primaria de telemetria do gateway. O dominio Network pertence ao
+    // Chromium e recebe o websocket mesmo quando o Discord o cria por uma
+    // abstracao nativa, antes do preload, ou fora dos workers JS enumeraveis.
+    // requestId so tem significado junto do sessionId CDP e nunca sai desta
+    // closure/webContents.
+    const rede = {
+        geracao: 0, gateway: null, midia: new Map(),
+        midiaAbertaEm: 0, midiaFechouEm: 0, cliEnvios: [],
+    };
+
+    const comandoCdp = (metodo, parametros, sessaoId) => {
+        try {
+            // Enfileira no CDP ainda dentro de web-contents-created; adiar para
+            // microtask reabriria uma corrida com o primeiro Worker do bundle.
+            return Promise.resolve(depurador.sendCommand(metodo, parametros || {}, sessaoId));
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    };
+    const avaliarWorker = (sessaoId, expressao, ms) => prazoCdp(comandoCdp('Runtime.evaluate', {
+        expression: expressao, returnByValue: true, silent: true,
+    }, sessaoId), ms, 'Runtime.evaluate worker').then(resultado => {
+        if (resultado && resultado.exceptionDetails) throw new Error('worker recusou Runtime.evaluate');
+        return resultado && resultado.result ? resultado.result.value : undefined;
+    });
+    const liberarWorker = (sessaoId, tentativa) => {
+        const n = tentativa || 1;
+        return prazoCdp(comandoCdp('Runtime.runIfWaitingForDebugger', {}, sessaoId), 2000,
+            'release worker tentativa ' + n).catch(error => {
+                if (n < 3) {
+                    return new Promise(resolve => setTimeout(resolve, 100 * n))
+                        .then(() => liberarWorker(sessaoId, n + 1));
+                }
+                log('gw.worker | CRITICO: falha ao liberar worker apos 3 tentativas: ' + error.message);
+                return comandoCdp('Target.detachFromTarget', { sessionId: sessaoId }).catch(() => { });
+            });
+    };
+
+    const chaveRede = (sessaoId, requestId) => String(sessaoId || 'root') + ':' + String(requestId || '');
+    const idadeRede = (agora, em) => em > 0 ? agora - em : -1;
+    const resumoRede = () => {
+        const agora = Date.now();
+        const gw = rede.gateway;
+        return {
+            origem: 'network', workerId: '', geracao: rede.geracao,
+            estado: gw ? gw.estado : 'nenhum',
+            srvHa: idadeRede(agora, gw && gw.srvEm),
+            cliHa: idadeRede(agora, gw && gw.cliEm),
+            abertoHa: idadeRede(agora, gw && gw.abertoEm),
+            srvFrames: gw ? gw.srvFrames : 0,
+            srvBytes: gw ? gw.srvBytes : 0,
+            srvBytesDesdeAtividade: gw ? gw.srvBytesDesdeAtividade : 0,
+            cliEnvios: gw ? gw.cliEnvios : 0,
+            dispatches: gw ? gw.dispatches : 0,
+            dispatchHa: idadeRede(agora, gw && gw.dispatchEm),
+            intentHa: idadeRede(agora, gw && gw.intentEm),
+            activityHa: idadeRede(agora, gw && gw.activityEm),
+            op4Ha: idadeRede(agora, gw && gw.op4Em),
+            subs: gw ? gw.subs : 0,
+            opCounts: gw ? Object.assign({}, gw.opCounts) : {},
+            infladorOk: false,
+            midia: rede.midia.size, midiaAberta: rede.midia.size > 0,
+            midiaOpenHa: idadeRede(agora, rede.midiaAbertaEm),
+            midiaCloseHa: idadeRede(agora, rede.midiaFechouEm),
+            // Network nao oferece close por requestId neste Chromium. Nao
+            // fabricar ids acionaveis preserva o fail-closed do revive RTC.
+            midiaSockets: [], pcs: 0,
+        };
+    };
+    const limparSessaoRede = sessaoId => {
+        const prefixo = String(sessaoId || 'root') + ':';
+        for (const chave of rede.midia.keys()) {
+            if (chave.startsWith(prefixo)) rede.midia.delete(chave);
+        }
+        if (rede.gateway && rede.gateway.sessionId === String(sessaoId || '')) {
+            rede.gateway.estado = 'fechada';
+        }
+    };
+    const eventoRede = (metodo, parametros, sessaoId) => {
+        if (!parametros || !parametros.requestId) return;
+        const sid = String(sessaoId || '');
+        const chave = chaveRede(sid, parametros.requestId);
+        if (metodo === 'Network.webSocketCreated') {
+            let host = '';
+            try { host = new URL(String(parametros.url || '')).hostname; } catch { return; }
+            if (/(^|\.)gateway(-[a-z0-9-]+)?\.discord\.gg$/.test(host)) {
+                rede.geracao++;
+                rede.cliEnvios = [];
+                rede.gateway = {
+                    chave, sessionId: sid, requestId: String(parametros.requestId), estado: 'conectando',
+                    criadoEm: Date.now(), abertoEm: 0, srvEm: 0, cliEm: 0,
+                    srvFrames: 0, srvBytes: 0, srvBytesDesdeAtividade: 0,
+                    cliEnvios: 0, dispatches: 0, dispatchEm: 0,
+                    intentEm: 0, activityEm: 0, op4Em: 0, subs: 0, opCounts: {},
+                };
+            } else if (/(^|\.)discord\.media$/.test(host)) {
+                // Limite defensivo por janela; conexoes fechadas saem no
+                // evento correspondente e extras ainda deixam a guarda ativa.
+                if (rede.midia.size < 64) rede.midia.set(chave, { sessionId: sid, criadoEm: Date.now() });
+            }
+            return;
+        }
+        const gw = rede.gateway && rede.gateway.chave === chave ? rede.gateway : null;
+        if (metodo === 'Network.webSocketHandshakeResponseReceived') {
+            if (gw) { gw.estado = 'aberta'; gw.abertoEm = Date.now(); }
+            const media = rede.midia.get(chave);
+            if (media) { media.abertoEm = Date.now(); rede.midiaAbertaEm = media.abertoEm; }
+            return;
+        }
+        if (metodo === 'Network.webSocketFrameSent' && gw) {
+            const agora = Date.now();
+            const resposta = parametros.response || {};
+            const payload = typeof resposta.payloadData === 'string' ? resposta.payloadData : '';
+            let op = -1;
+            gw.cliEm = agora;
+            gw.cliEnvios++;
+            rede.cliEnvios.push(agora);
+            while (rede.cliEnvios.length > 0 && rede.cliEnvios[0] < agora - 30_000) rede.cliEnvios.shift();
+            if (rede.cliEnvios.length >= 3) {
+                gw.activityEm = agora;
+                gw.srvBytesDesdeAtividade = 0;
+            }
+            if (resposta.opcode === 1) {
+                try { op = JSON.parse(payload).op; } catch { }
+            } else if (resposta.opcode === 2) op = opEtfCdp(payload);
+            if (op === 1 || op === 4 || op === 14 || op === 18 || op === 19 ||
+                op === 20 || op === 21 || op === 22 || op === 37) {
+                gw.opCounts[op] = (gw.opCounts[op] || 0) + 1;
+                if (op !== 1 && op !== 19 && op !== 21) gw.intentEm = agora;
+                if (op === 4 || op === 18 || op === 20) gw.op4Em = agora;
+                if (op === 14 || op === 37) gw.subs++;
+            }
+            return;
+        }
+        if (metodo === 'Network.webSocketFrameReceived' && gw) {
+            const agora = Date.now();
+            const resposta = parametros.response || {};
+            const payload = typeof resposta.payloadData === 'string' ? resposta.payloadData : '';
+            let tamanho = 0;
+            try {
+                tamanho = resposta.opcode === 2
+                    ? Buffer.byteLength(payload, 'base64') : Buffer.byteLength(payload, 'utf8');
+            } catch { }
+            gw.srvEm = agora;
+            gw.srvFrames++;
+            gw.srvBytes += tamanho;
+            gw.srvBytesDesdeAtividade += tamanho;
+            if (resposta.opcode === 1) {
+                try {
+                    const pacote = JSON.parse(payload);
+                    if (pacote && pacote.op === 0) { gw.dispatches++; gw.dispatchEm = agora; }
+                } catch { }
+            }
+            return;
+        }
+        if (metodo === 'Network.webSocketClosed') {
+            if (gw) gw.estado = 'fechada';
+            if (rede.midia.delete(chave)) rede.midiaFechouEm = Date.now();
+        }
+    };
+
+    const controle = {
+        consultar() {
+            if (!cdpAtivo) return Promise.resolve([]);
+            if (consultaRodando) return consultaRodando;
+            const probes = Array.from(targets.entries()).map(([sessionId, meta]) =>
+                avaliarWorker(sessionId, 'self.__goliveWorkerResumo ? self.__goliveWorkerResumo() : null', 2500)
+                    .then(valor => normalizarResumoInstrumentado(valor, 'worker', sessionId, meta.instaladoEm))
+                    .catch(error => {
+                        if (!meta.falhaLogada) {
+                            meta.falhaLogada = true;
+                            log('gw.worker | probe falhou em target ativo: ' + error.message);
+                        }
+                        return null;
+                    }));
+            consultaRodando = Promise.allSettled(probes)
+                .then(resultados => {
+                    const saida = resultados.filter(item => item.status === 'fulfilled').map(item => item.value).filter(Boolean);
+                    const resumo = normalizarResumoInstrumentado(resumoRede(), 'network', '', 0);
+                    if (resumo) saida.push(resumo);
+                    return saida;
+                })
+                .finally(() => { consultaRodando = null; });
+            return consultaRodando;
+        },
+        fecharGateway(sessionId, geracao) {
+            if (!cdpAtivo || !targets.has(sessionId) || !Number.isInteger(geracao)) return Promise.resolve(false);
+            return avaliarWorker(sessionId,
+                'self.__goliveWorkerFecharGateway ? self.__goliveWorkerFecharGateway(' + JSON.stringify(geracao) + ') : false', 2500)
+                .then(valor => valor === true, () => false);
+        },
+        fecharMidia(sessionId, socketId) {
+            if (!cdpAtivo || !targets.has(sessionId) || !Number.isInteger(socketId)) return Promise.resolve(false);
+            return avaliarWorker(sessionId,
+                'self.__goliveWorkerFecharMidia ? self.__goliveWorkerFecharMidia(' + JSON.stringify(socketId) + ') : false', 2500)
+                .then(valor => valor === true, () => false);
+        },
+    };
+    workerInstrumentacoes.set(wc, controle);
+
+    depurador.on('message', (_evento, metodo, parametros, sessaoMensagem) => {
+        if (metodo.startsWith('Network.webSocket')) {
+            eventoRede(metodo, parametros, sessaoMensagem);
+            return;
+        }
+        if (!parametros || !parametros.sessionId) return;
+        const sessaoId = parametros.sessionId;
+        if (metodo === 'Target.detachedFromTarget') {
+            anexos.delete(sessaoId);
+            targets.delete(sessaoId);
+            limparSessaoRede(sessaoId);
+            return;
+        }
+        if (metodo !== 'Target.attachedToTarget') return;
+        anexos.add(sessaoId);
+        const info = parametros.targetInfo || {};
+        const ehWorker = info.type === 'worker' || info.type === 'shared_worker';
+        if (!ehWorker) {
+            comandoCdp('Network.enable', {}, sessaoId).catch(() => { });
+            liberarWorker(sessaoId, 1).catch(() => { });
+            return;
+        }
+        if (targets.size >= 32) {
+            if (!limiteLogado) {
+                limiteLogado = true;
+                log('gw.worker | limite de 32 targets atingido; extras ficam sem telemetria');
+            }
+            liberarWorker(sessaoId, 1).catch(() => { });
+            return;
+        }
+        comandoCdp('Network.enable', {}, sessaoId).catch(() => { });
+        avaliarWorker(sessaoId, workerShimSrc, 4000)
+            .then(() => {
+                if (!anexos.has(sessaoId)) return;
+                targets.set(sessaoId, { instaladoEm: Date.now(), falhaLogada: false });
+                workersInjetados++;
+                log('gw.worker | shim injetado ' +
+                    (parametros.waitingForDebugger === true ? 'antes do start' : 'tardiamente') +
+                    ' n=' + workersInjetados + ' tipo=' + info.type);
+            })
+            .catch(error => log('gw.worker | falha ao injetar: ' + error.message))
+            .finally(() => { liberarWorker(sessaoId, 1).catch(() => { }); });
+    });
+    depurador.on('detach', (_evento, motivo) => {
+        cdpAtivo = false;
+        targets.clear();
+        anexos.clear();
+        rede.gateway = null;
+        rede.midia.clear();
+        midiaCompostaPorWebContents.delete(wc);
+        try {
+            if (!wc.isDestroyed()) log('gw.worker | debugger desacoplado: ' + motivo + '; acoes em worker desativadas');
+        } catch { return; }
+        if (!wc.isDevToolsOpened()) setTimeout(() => { armarCdp(); }, 1000);
+    });
+
+    function armarCdp() {
+        if (rearmando || wc.isDestroyed()) return;
+        rearmando = true;
+        try {
+            if (!depurador.isAttached()) depurador.attach('1.3');
+            cdpAtivo = true;
+        } catch (error) {
+            cdpAtivo = false;
+            rearmando = false;
+            log('gw.worker | debugger indisponivel: ' + error.message);
+            return;
+        }
+        comandoCdp('Target.setAutoAttach', {
+            autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
+            filter: [
+                { type: 'worker', exclude: false },
+                { type: 'shared_worker', exclude: false },
+                { exclude: true },
+            ],
+        }).catch(error => {
+            log('gw.worker | filtro de auto-attach indisponivel, usando compatibilidade: ' + error.message);
+            return comandoCdp('Target.setAutoAttach', {
+                autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
+            });
+        }).then(() => log('gw.worker | auto-attach armado antes dos novos workers'))
+            .catch(error => {
+                cdpAtivo = false;
+                log('gw.worker | auto-attach indisponivel: ' + error.message);
+            }).finally(() => { rearmando = false; });
+        comandoCdp('Network.enable').catch(error => log('gw.network | Network.enable falhou: ' + error.message));
+        comandoCdp('Page.enable').catch(error => log('gw.shim | Page.enable falhou: ' + error.message));
+        comandoCdp('Page.addScriptToEvaluateOnNewDocument', { source: paginaShimSrc })
+            .catch(error => log('gw.shim | preload CDP da pagina falhou: ' + error.message));
     }
+    wc.on('devtools-closed', () => { setTimeout(() => { armarCdp(); }, 250); });
+    wc.once('destroyed', () => {
+        cdpAtivo = false;
+        targets.clear();
+        workerInstrumentacoes.delete(wc);
+        midiaCompostaPorWebContents.delete(wc);
+    });
+    armarCdp();
+    // Fallback no mundo principal. dom-ready e mais cedo que did-finish-load,
+    // mas nao garante preceder os scripts da pagina; a garantia dos workers e
+    // o auto-attach pausado acima.
+    wc.on('dom-ready', () => {
+        try {
+            let url = '';
+            try { url = wc.getURL(); } catch { return; }
+            if (!CLIENT_URL_RE.test(url)) return;
+            wc.executeJavaScript('({ gateway: !!window.__goliveGwShim, voice: !!window.__goliveVoiceShim })')
+                .then(shims => {
+                    let fonte = '';
+                    if (!shims || shims.gateway !== true) fonte += SHIM_GATEWAY_SRC + '\n';
+                    if (!shims || shims.voice !== true) fonte += SHIM_VOICE_SRC;
+                    if (fonte === '') return;
+                    log("gw.shim | fallback no dom-ready (gateway=" + !!(shims && shims.gateway) +
+                        " voice=" + !!(shims && shims.voice) + ")");
+                    return wc.executeJavaScript(fonte);
+                })
+                .then(() => { wc.executeJavaScript(REVIVE_SRC).catch(() => { }); })
+                .catch(() => { });
+        } catch { }
+    });
     wc.on('did-finish-load', () => {
         try {
             let url = '';
@@ -2934,7 +4597,8 @@ function injetarInstrumentacao(wc) {
                     if (!shims || shims.voice !== true) fonte += SHIM_VOICE_SRC;
                     if (fonte === '') return;
                     log("gw.shim | shim ausente neste documento, reinjetando no did-finish-load" +
-                        " (gateway=" + !!(shims && shims.gateway) + " voice=" + !!(shims && shims.voice) + ")");
+                        " (gateway=" + !!(shims && shims.gateway) +
+                        " voice=" + !!(shims && shims.voice) + ")");
                     return wc.executeJavaScript(fonte);
                 })
                 .then(() => { wc.executeJavaScript(REVIVE_SRC).catch(() => { }); })
@@ -2977,7 +4641,10 @@ function markGatewayRouted() {
         const comMidia = Date.now() - ultimaMidiaEm < MIDIA_RECENTE_MS;
         log("gateway reconectou no meio da sessao (recorrencia " + (gatewayConnCount - 1) + ")"
             + (comMidia ? ": avisando na tela" : ", sem chamada em andamento"));
-        if (comMidia) showReconnectWarning(gatewayConnCount - 1);
+        if (comMidia) {
+            showReconnectWarning(gatewayConnCount - 1);
+            agendarReassistirViewer();
+        }
         else autoReloadForCleanEngine(gatewayConnCount - 1);
     }
     agendarEstat();
@@ -2990,6 +4657,43 @@ const WARN_BANNER_TEXT = "GoLiveBypass: o gateway reconectou no meio da sessao. 
     "sua transmissao travou (ficou so o audio), clique em \"Reiniciar agora\" abaixo (ou " +
     "Ctrl+R) -- isso sai da chamada de voz.";
 
+// Uma queda total de gateway pode fazer o Discord abandonar a inscricao da
+// Live, apesar de a chamada voltar. O shim so permite este clique quando viu
+// video com frames recentes NO fechamento do gateway; por isso nao reassiste
+// uma Live que a pessoa parou voluntariamente. O botao pode levar alguns
+// segundos para aparecer depois do READY, entao esperamos no maximo 15s e
+// fazemos uma tentativa unica. Sem prova/botao/localizacao conhecida, falha
+// fechado e preserva o aviso manual normal.
+const REASSISTIR_TENTATIVAS = 15;
+const REASSISTIR_INTERVALO_MS = 1_000;
+const reassistirPorWebContents = new WeakMap();
+
+function agendarReassistirViewer() {
+    const win = clientWindow();
+    const wc = win && win.webContents;
+    if (!wc || reassistirPorWebContents.has(wc)) return;
+    const estado = { tentativa: 0, timer: null };
+    reassistirPorWebContents.set(wc, estado);
+    const tentar = () => {
+        if (reassistirPorWebContents.get(wc) !== estado || wc.isDestroyed()) return;
+        wc.executeJavaScript(
+            "window.__goliveReassistirAposGateway?window.__goliveReassistirAposGateway():'nenhuma'", true,
+        ).then(resultado => {
+            const acao = typeof resultado === 'string' ? resultado : 'nenhuma';
+            if (acao === 'aguardar' && estado.tentativa++ < REASSISTIR_TENTATIVAS - 1) {
+                estado.timer = setTimeout(tentar, REASSISTIR_INTERVALO_MS);
+                return;
+            }
+            reassistirPorWebContents.delete(wc);
+            if (acao === 'clicou') log("gw.reassistir | Live visivel caiu com o gateway; clique unico enviado");
+            else if (acao === 'expirada' || acao === 'tentada' || acao === 'falhou' || acao === 'cancelada_usuario') {
+                log("gw.reassistir | sem nova tentativa automatica (" + acao + ")");
+            }
+        }).catch(() => { reassistirPorWebContents.delete(wc); });
+    };
+    tentar();
+}
+
 // Reconexao do gateway SEM midia recente (nem call, nem live): o motor de midia
 // (WASM) pode ter ficado stale com o gateway morto — e a PROXIMA tentativa de
 // transmitir que pega o "RTC connecting" eterno (issue #129: usuario no tor com
@@ -2999,19 +4703,60 @@ const WARN_BANNER_TEXT = "GoLiveBypass: o gateway reconectou no meio da sessao. 
 // manual continua valendo ai). Resguardos: saida comprovadamente viva (probe) e
 // no maximo 1 reload a cada 3 min, para o ws flapado nao virar loop de reload.
 let ultimoAutoReloadMidia = 0;
+const RELOAD_VALIDACAO_MIDIA_TIMEOUT_MS = 3_000;
+
+// Entre a reconexao e o fim do probe da saida (ate alguns segundos), o usuario
+// pode entrar numa call/Live. Reconsulta discord_voice no ultimo instante para
+// que a decisao nao dependa de uma marca velha. Falha fechada: o reload e so
+// uma conveniencia preventiva; interromper uma chamada real e um dano maior.
+function validarMidiaAntesDoReload(win) {
+    if (midiaProtegidaRecentemente(MIDIA_RECENTE_MS)) {
+        return Promise.resolve({ protegida: true, motivo: "marca_recente" });
+    }
+    return prazoCdp(consultarRtcNativo(win), RELOAD_VALIDACAO_MIDIA_TIMEOUT_MS, "validacao de midia antes do reload")
+        .then(ctx => {
+            const stream = streamNativaAtiva(ctx && ctx.voice);
+            if (stream !== null) {
+                marcarMidiaProtegida();
+                return { protegida: true, motivo: "stream_nativa_" + (stream.role || "ativa") };
+            }
+            if (ctx && ctx.midia && ctx.midia.midiaAberta === true) {
+                marcarMidiaProtegida();
+                return { protegida: true, motivo: "websocket_midia" };
+            }
+            // Sem um hook nativo pronto, a ausencia de stream nao e observavel.
+            // Nao transformar telemetria ausente em permissao para derrubar a call.
+            if (!ctx || !ctx.voice || ctx.voice.installed !== true || ctx.voice.voiceHooked !== true) {
+                return { protegida: true, motivo: "estado_nativo_indisponivel" };
+            }
+            return {
+                protegida: midiaProtegidaRecentemente(MIDIA_RECENTE_MS),
+                motivo: "marca_atualizada"
+            };
+        })
+        .catch(() => ({ protegida: true, motivo: "validacao_nativa_falhou" }));
+}
+
 function autoReloadForCleanEngine(recorrencias) {
     if (reloading) return;
     if (Date.now() - ultimoAutoReloadMidia < 3 * 60_000) return;
     const exit = chosenExit;
     if (exit === null) return;
-    probe(exit, 2500).then(ok => {
+    probe(exit, 2500).then(async ok => {
         if (ok === null) {
             log("saida " + safeProxy(exit) + " nao respondeu, adiando o reload limpo");
             return;
         }
-        ultimoAutoReloadMidia = Date.now();
         const win = clientWindow();
         if (win === null) return;
+        const midia = await validarMidiaAntesDoReload(win);
+        if (midia.protegida) {
+            log("reconexao protegida: reload automatico cancelado (" + midia.motivo + ")");
+            showReconnectWarning(recorrencias);
+            return;
+        }
+        if (reloading) return;
+        ultimoAutoReloadMidia = Date.now();
         log("reconexao sem midia: recarregando a janela para limpar o motor de midia (recorrencia " + recorrencias + ")");
         win.webContents.reload();
     }).catch(() => { });
@@ -3128,6 +4873,7 @@ function showTorBootBanner(limiteMs) {
         "box-shadow:0 8px 24px rgba(0,0,0,.45);" +
         "opacity:0;transform:translateY(8px);transition:opacity .2s ease,transform .2s ease;';\n" +
         "  var icon = document.createElement('div');\n" +
+        "  icon.id = 'golivebypass-tor-wait-icon';\n" +
         "  icon.textContent = '\u23F3';\n" +
         "  icon.style.cssText = 'font-size:18px;line-height:1;flex-shrink:0;margin-top:1px;';\n" +
         "  var body = document.createElement('div');\n" +
@@ -3136,6 +4882,7 @@ function showTorBootBanner(limiteMs) {
         "  title.textContent = 'GoLiveBypass';\n" +
         "  title.style.cssText = 'font-weight:600;margin-bottom:3px;color:#fff;';\n" +
         "  var text = document.createElement('div');\n" +
+        "  text.id = 'golivebypass-tor-wait-text';\n" +
         "  text.style.cssText = 'color:#d8dadf;';\n" +
         "  text.textContent = " + JSON.stringify(TOR_WAIT_BANNER_TEXT) + ";\n" +
         "  body.appendChild(title);\n" +
@@ -3147,6 +4894,45 @@ function showTorBootBanner(limiteMs) {
         "})();";
 
     win.webContents.executeJavaScript(script).catch(error => log("falhei ao mostrar aviso de espera do Tor: " + error.message));
+}
+
+// Passado este prazo desde coldTorHoldSince, o Tor quase certamente ja teria terminado o
+// bootstrap sozinho (ver TOR_HOLD_BUDGET_MS e o log real de bootstrap da GUI, que fecha em
+// segundos) -- se o gateway ainda esta seguro aqui, o cenario mais provavel e o PROCESSO da
+// GUI ter fechado ou travado (o runtime injetado no Discord nunca sobe Tor sozinho; so
+// detecta). Generoso o bastante para nao confundir uma rede/maquina lenta com o processo
+// morto, curto o bastante para a pessoa nao passar a sessao inteira lendo "menos de um
+// minuto".
+const TOR_BOOT_STALL_MS = 3 * 60_000;
+
+const TOR_BOOT_STALL_TEXT = "GoLiveBypass: o Tor esta demorando bem mais que o normal (" +
+    Math.round(TOR_BOOT_STALL_MS / 60_000) + "+ min parado). O mais provavel agora e o " +
+    "aplicativo GoLiveBypass (o da bandeja) ter fechado ou travado -- ele que liga o Tor. " +
+    "Feche-o e abra de novo; so reiniciar o Discord nao resolve isto.";
+
+// Chamada do beat() a cada 30s enquanto o modo tor segue sem saida (ver beat()): esta funcao
+// decide sozinha se ja passou tempo suficiente para escalar, entao o chamador nao precisa
+// medir nada. So injeta o script uma vez por arranque frio (torBootStallShown).
+function escalateTorBootBanner() {
+    if (torBootStallShown) return;
+    if (coldTorHoldSince === 0) return;
+    if (Date.now() - coldTorHoldSince < TOR_BOOT_STALL_MS) return;
+
+    const win = clientWindow();
+    if (win === null) return; // sem janela ainda, o proximo beat() tenta de novo
+
+    torBootStallShown = true;
+    const script = "(function(){\n" +
+        "  var el = document.getElementById('golivebypass-tor-wait');\n" +
+        "  if (!el) return;\n" +
+        "  el.style.borderLeftColor = '#f0b232';\n" +
+        "  var icon = document.getElementById('golivebypass-tor-wait-icon');\n" +
+        "  if (icon) icon.textContent = '\u26A0\uFE0F';\n" +
+        "  var text = document.getElementById('golivebypass-tor-wait-text');\n" +
+        "  if (text) text.textContent = " + JSON.stringify(TOR_BOOT_STALL_TEXT) + ";\n" +
+        "})();";
+
+    win.webContents.executeJavaScript(script).catch(error => log("falhei ao escalar aviso de espera do Tor: " + error.message));
 }
 
 function hideTorBootBanner() {
@@ -3273,8 +5059,9 @@ function _testMarkGatewayDirect() {
 // start() inteiro (que sobe roteador local, instala PAC etc. -- pesado demais para o
 // sandbox). Inofensivo em producao: so seta o mesmo timestamp que o start() setaria ao
 // nao achar Tor no arranque.
-function _testMarkColdTorHold() {
-    coldTorHoldSince = Date.now();
+function _testMarkColdTorHold(msAgo) {
+    coldTorHoldSince = Date.now() - (msAgo || 0);
+    torBootStallShown = false;
 }
 
 // Exposto para a bateria de testes: marca "o gateway acabou de rotear" sem depender de uma
@@ -3375,7 +5162,14 @@ function currentExit() {
 // gratuita). Em vez de cair para direto — que e o IP bloqueado, e o "carregando para sempre" —
 // procura uma saida nova agora. Cooldown e dedupe: uma busca por vez, e nunca antes de 30s
 // depois da ultima, senao uma saida ruim derrubaria a API de saidas num loop.
-function refreshExit() {
+function refreshExit(manualConfirmedDead = false) {
+    // Um erro isolado ao abrir o tunel nao autoriza substituir uma rota escolhida pela pessoa:
+    // era este caminho que mandava a sessao manual para Tor/gratuitas e reconectava o gateway
+    // no meio da Live. checkPool libera a troca somente depois dos dois batimentos completos.
+    if (usingManualProxy && !manualConfirmedDead) {
+        log("saida manual falhou no trafego vivo; mantendo ate morte confirmada em " + MAX_MISSED_BEATS + " batimentos");
+        return Promise.resolve(null);
+    }
     if (refreshingExit !== null) return refreshingExit;
     if (Date.now() - lastRefreshAt < REFRESH_COOLDOWN_MS) return Promise.resolve(null);
 
@@ -3401,6 +5195,24 @@ function refreshExit() {
             }
         }
         if (fresh !== null) {
+            // Esta busca roda em segundo plano (sem await no chamador) e pode resolver DEPOIS
+            // de uma troca sincrona ja ter acontecido no meio do caminho (a rajada de 3+
+            // reconexoes do gateway chama trocarPara() sincronamente enquanto este refresh
+            // ainda esta probando candidatas). Sem isto, settleExit() sozinho sobrescrevia
+            // chosenExit calado: sem soltar o log estruturado de troca (fica so "saida nova
+            // encontrada", sem dizer o que foi substituido) e sem limpar
+            // missedBeats/rttLentoSeguidas da saida nova, que podiam carregar contagem de
+            // falha de uma ativacao anterior dela.
+            const antiga = chosenExit;
+            if (antiga !== null && antiga !== fresh) {
+                missedBeats.delete(fresh);
+                rttLentoSeguidas.delete(fresh);
+                gatewayReconexoes.length = 0;
+                const vida = lastExitAt === 0 ? "?" : Math.round((Date.now() - lastExitAt) / 1000) + "s";
+                log("saida.trocada | de=" + safeProxy(antiga) + " para=" + safeProxy(fresh) +
+                    " motivo=refresh em segundo plano" +
+                    " vida_da_antiga=" + vida);
+            }
             settleExit(fresh);
             log("saida nova encontrada: " + safeProxy(fresh));
         } else {
@@ -3445,7 +5257,7 @@ async function tryReturnToManual() {
     const manual = manualProxy();
     if (manual === null || manual === "") return;
 
-    const ok = await probe(manual, HEARTBEAT_TIMEOUT_MS);
+    const ok = await probe(manual, MANUAL_HEARTBEAT_TIMEOUT_MS);
     if (ok === null) return;
 
     // Troca silenciosa: NAO chama trocarPara() para nao disparar o banner amarelo de
@@ -3489,6 +5301,12 @@ async function beat() {
             if (tor !== null) {
                 settleExit(tor);
                 log("modo tor: Tor respondeu de novo em " + TOR_ADDR + ", religando a rota");
+            } else {
+                // Ainda sem Tor: se isto ja vem de um arranque frio ha tempo demais, a causa
+                // provavel virou "a GUI fechou", nao "o bootstrap esta lento" -- ver
+                // escalateTorBootBanner. Sem custo quando nao ha arranque frio pendente ou
+                // quando o prazo ainda nao estourou (ela mesma decide e sai cedo).
+                escalateTorBootBanner();
             }
             return;
         }
@@ -3501,6 +5319,10 @@ async function beat() {
     } finally {
         beating = false;
     }
+}
+
+function ativaMortaConfirmada(active, live, dead) {
+    return active !== null && !live.includes(active) && dead.includes(active);
 }
 
 async function checkPool() {
@@ -3535,7 +5357,7 @@ async function checkPool() {
 
     const beats = await Promise.all(targets.map(async proxy => ({
         proxy: proxy,
-        ok: await probe(proxy, HEARTBEAT_TIMEOUT_MS) !== null
+        ok: await probe(proxy, isManualAddress(proxy) ? MANUAL_HEARTBEAT_TIMEOUT_MS : HEARTBEAT_TIMEOUT_MS) !== null
     })));
 
     const dead = [];
@@ -3558,7 +5380,11 @@ async function checkPool() {
             savePool();
         }
 
-        for (const proxy of dead) missedBeats.delete(proxy);
+        for (const proxy of dead) {
+            missedBeats.delete(proxy);
+            rttLentoSeguidas.delete(proxy);
+            rttEma.delete(proxy);
+        }
     }
 
     const live = beats.filter(entry => entry.ok).map(entry => entry.proxy);
@@ -3567,28 +5393,35 @@ async function checkPool() {
     // por probe, mas tem prova viva de que funciona.
     if (active !== null && !targets.includes(active) && !live.includes(active)) live.push(active);
 
-    // A ativa e trocada no primeiro erro, nao no segundo: trocar nao custa nada -- socket que ja
-    // esta de pe continua no tunel antigo, so conexao nova nasce pela reserva -- e a proxima
-    // conexao do gateway pode ser a reconexao que decide a transmissao.
+    // Uma falha de probe e um sinal, nao uma morte: perda momentanea, circuito ocupado e
+    // congestionamento da saida gratuita sao comuns. O proprio pote so aposenta a saida em
+    // MAX_MISSED_BEATS batimentos, entao a ativa precisa obedecer ao mesmo limite. Trocar no
+    // primeiro erro reconectava o gateway no meio da Live por um falso negativo — exatamente o
+    // mecanismo que #170/#171 expuseram.
     if (active !== null && !live.includes(active)) {
-        const reserve = live.find(proxy => proxy !== active);
-        if (reserve === undefined) {
-            // Nada vivo. Comeca a busca agora, em vez de esperar a proxima conexao descobrir:
-            // o refreshExit ja tem dedupe e cooldown, entao chamar daqui nao duplica trabalho.
-            log(safeProxy(active) + " perdeu o batimento e nao ha reserva viva");
-            refreshExit().catch(error => log("a busca por saida nova falhou: " + error.message));
-            return;
-        }
+        if (!ativaMortaConfirmada(active, live, dead)) {
+            const misses = missedBeats.get(active) || 1;
+            log(safeProxy(active) + " falhou no batimento " + misses + "/" + MAX_MISSED_BEATS + ", mantendo ate confirmar morte");
+        } else {
+            const reserve = live.find(proxy => proxy !== active);
+            if (reserve === undefined) {
+                // Nada vivo. Comeca a busca agora, em vez de esperar a proxima conexao descobrir:
+                // o refreshExit ja tem dedupe e cooldown, entao chamar daqui nao duplica trabalho.
+                log(safeProxy(active) + " perdeu o batimento e nao ha reserva viva");
+                refreshExit(true).catch(error => log("a busca por saida nova falhou: " + error.message));
+                return;
+            }
 
-        // Emergencia (a ativa morreu): troca direto, sem cooldown.
-        // No modo "tor" nao existe reserva que valha a pena: o Tor e a escolha explicita e
-        // trocar para gratuita violaria o pedido. Segura — o refresh continua tentando o Tor.
-        if (routeMode === "tor") {
-            log("modo tor: o Tor caiu, segurando o gateway (sem saida direta)");
-            refreshExit().catch(error => log("a busca pelo Tor falhou: " + error.message));
-            return;
+            // Emergencia (a ativa morreu): troca direto, sem cooldown.
+            // No modo "tor" nao existe reserva que valha a pena: o Tor e a escolha explicita e
+            // trocar para gratuita violaria o pedido. Segura — o refresh continua tentando o Tor.
+            if (routeMode === "tor") {
+                log("modo tor: o Tor caiu, segurando o gateway (sem saida direta)");
+                refreshExit().catch(error => log("a busca pelo Tor falhou: " + error.message));
+                return;
+            }
+            trocarPara(reserve, "perdeu o batimento");
         }
-        trocarPara(reserve, "perdeu o batimento");
     } else if (active !== null) {
         // A ativa esta viva no probe. Mesmo viva, pode estar lenta demais para o gateway
         // (RTT EMA alto): trocar antes de o websocket sofrer.
@@ -3618,6 +5451,17 @@ function trySwapByRtt(active, live) {
     // voz/video do Discord (WASM) nao sobrevive a isso com a Live no ar: o video cai pra
     // sempre (so audio) mesmo trocando para uma saida boa. Nao vale o risco por causa de RTT.
     if (usingManualProxy) return null;
+
+    // A mesma protecao vale para gratuitas: RTT alto e um sinal de qualidade, nao de morte.
+    // Trocar enquanto a midia esta aberta pode disparar a corrida de renegociacao do
+    // viewer/sender (a ocorrencia de 01/09 fechou o RTC 11s depois de uma troca por RTT).
+    // A saida continua sendo monitorada; se morrer de verdade, checkPool troca por
+    // emergencia sem passar por este bloqueio.
+    if (midiaRecenteParaTrocaProativa()) {
+        rttLentoSeguidas.delete(active);
+        log(safeProxy(active) + " com RTT alto, troca proativa suspensa: midia recente");
+        return null;
+    }
 
     const ema = rttEma.get(active);
     if (ema === undefined || ema < RTT_TROCA_MS) {
@@ -3787,7 +5631,9 @@ async function openThroughPool(target) {
     // precisar seria pedir uma reavaliacao a toa. No modo tor o prazo e o folgado
     // (TOR_RELAY_TIMEOUT_MS): construcao de circuito do Tor nao pode ser abortada.
     const tAtiva = Date.now();
-    const prazoTunel = routeMode === "tor" ? TOR_RELAY_TIMEOUT_MS : RELAY_TIMEOUT_MS;
+    const prazoTunel = routeMode === "tor"
+        ? TOR_RELAY_TIMEOUT_MS
+        : isManualAddress(active) ? MANUAL_HEARTBEAT_TIMEOUT_MS : RELAY_TIMEOUT_MS;
     const direto = await openTunnel(active, target.host, target.port, prazoTunel);
     if (direto !== null) {
         markGatewayRouted();
@@ -3796,6 +5642,14 @@ async function openThroughPool(target) {
     }
 
     log(safeProxy(active) + " nao entregou " + target.host);
+
+    // A abertura falha uma vez antes de um proxy lento recuperar com facilidade. Nao deixa
+    // esta unica tentativa trocar a saida manual nem abrir DIRECT; o batimento decide a morte
+    // confirmada e so entao checkPool chama refreshExit(true).
+    if (isManualAddress(active)) {
+        log("saida manual preservada apos falha unica; aguardando " + MAX_MISSED_BEATS + " batimentos antes de trocar");
+        return null;
+    }
 
     // As reservas correm todas juntas em vez de uma por vez: enfileiradas, o prazo de cada uma
     // somava com o gateway ja reconectando, e o Chromium desiste do roteador antes disso.
@@ -4077,23 +5931,71 @@ function patchNewerSiblings(currentResources) {
 
 // ------------------------------------------------------------------ entrada
 
-// O Discord oficial carrega o app com require.main.filename apontando para o index.js do stub.
-// Os clientes paralelos (Vesktop, Equibop, Legcord) passam o app como argumento e o
-// require.main.filename vira "electron" — o argv[1] e o caminho confiavel nos dois casos.
-// argv[1] aponta para o diretorio app.asar; require.main.filename para o index.js dentro dele.
-const injectorPath = process.argv[1] || require.main.filename;
-const stubDir = fs.existsSync(injectorPath) && fs.statSync(injectorPath).isDirectory() ? injectorPath : dirname(injectorPath);
-const resourcesDir = join(stubDir, "..");
+// Este arquivo e carregado pelo index.js do stub, mas fica fora do app.asar no Linux.
+// Nao usar process.argv[1] cegamente: ao iniciar o Discord com uma flag (por exemplo
+// --remote-debugging-port=9222 ou --url), argv[1] e a flag, nao o caminho do app. Isso
+// fazia o runtime procurar ../_app.asar relativo a ~/.local/share/GoLiveBypass e matar o
+// processo antes de abrir a janela — o laboratorio E2E descobriu a regressao em beta.13.
+function caminhoAppStub(value) {
+    if (typeof value !== "string" || value === "" || value.startsWith("-")) return null;
+
+    let resolvido;
+    try {
+        resolvido = resolve(value);
+        if (!fs.existsSync(resolvido)) return null;
+        const info = fs.statSync(resolvido);
+        if (info.isDirectory()) {
+            if (basename(resolvido) === "app.asar") return resolvido;
+            if (basename(resolvido) === "resources" && fs.existsSync(join(resolvido, "app.asar"))) {
+                return join(resolvido, "app.asar");
+            }
+            return null;
+        }
+        if (basename(resolvido) === "index.js" && basename(dirname(resolvido)) === "app.asar") {
+            return dirname(resolvido);
+        }
+    } catch {
+        return null;
+    }
+    return null;
+}
+
+function acharAppStub() {
+    const candidatos = [];
+    // Quando o script esta dentro do proprio resources (e tambem no sandbox dos testes),
+    // este e o caminho mais simples. O runtime externo do Linux continua usando os sinais
+    // do chamador abaixo.
+    const appLocal = join(HERE, "app.asar");
+    if (fs.existsSync(join(HERE, "_app.asar"))) return appLocal;
+
+    // Quando este modulo e required pelo stub, module.parent e o sinal mais direto e nao
+    // depende de como o Electron montou require.main.
+    if (module.parent && module.parent.filename) candidatos.push(module.parent.filename);
+    if (require.main && require.main.filename) candidatos.push(require.main.filename);
+    // Clientes paralelos podem colocar o app no argv; flags e caminhos inexistentes sao
+    // descartados pelo helper. Tambem aceitamos o argumento --app-path=/... usado por
+    // alguns wrappers Electron.
+    for (const argumento of process.argv.slice(1)) {
+        candidatos.push(argumento);
+        if (argumento.startsWith("--app-path=")) candidatos.push(argumento.slice("--app-path=".length));
+    }
+
+    for (const candidato of candidatos) {
+        const app = caminhoAppStub(candidato);
+        if (app && fs.existsSync(join(dirname(app), "_app.asar"))) return app;
+    }
+    return null;
+}
+
+const injectorPath = acharAppStub();
+if (!injectorPath) {
+    throw new Error("nao achei o app.asar injetado no chamador do GoLiveBypass");
+}
+const resourcesDir = dirname(injectorPath);
 const asarPath = join(resourcesDir, "_app.asar");
 
 async function start() {
     log("--- abrindo ---");
-
-    // O preload do shim tem que estar registrado ANTES de o Discord criar as
-    // janelas: o nosso whenReady corre antes do handler dele (o require do main
-    // original acontece depois do require do bypass), e o registro aqui no topo
-    // e sincrono — sem corrida (issue #163).
-    registrarPreloadShim();
 
     if (settings.enabled === false) {
         log("desligado em settings.json, nao vou mexer em nada");
@@ -4132,13 +6034,6 @@ async function start() {
     // gateway (reconexao) e contado numa janela. Rajada de reconexoes = a saida nao esta
     // aguentando o trafego vivo, mesmo passando no probe. Acima do limite, troca forcada
     // para a reserva mais rapida — o sinal mais confiavel que temos.
-    // Zera a contagem de reconexao quando a janela recarrega: dali em diante e sessao nova.
-    try {
-        watchReloads();
-    } catch (error) {
-        log("nao consegui observar as recargas da janela: " + error.message);
-    }
-
     // O callback e obrigatorio (sem ele a request pendura para sempre); nao modificamos nada.
     try {
         session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
@@ -4148,7 +6043,7 @@ async function start() {
             if (details.resourceType === "webSocket") {
                 try {
                     if (new URL(details.url).hostname.endsWith(".discord.media")) {
-                        ultimaMidiaEm = Date.now();
+                        marcarMidiaProtegida();
                     }
                 } catch {
                     // url estranha; ignora
@@ -4185,7 +6080,7 @@ async function start() {
                     // Segunda reconexao na janela: ja e sinal de saida agonizante. Dispara o
                     // refresh em segundo plano — quando a rajada fechar (3+), ha candidato
                     // novo para trocar em vez de so a sauda velha do pool.
-                    if (gatewayReconexoes.length === RECONEXAO_LIMITE - 1) {
+                    if (gatewayReconexoes.length === RECONEXAO_LIMITE - 1 && routeMode !== "tor") {
                         log("gw.rajada_antecipada | n=" + gatewayReconexoes.length + "/180s");
                         refreshExit().catch(error => log("a busca antecipada falhou: " + error.message));
                     }
@@ -4197,6 +6092,21 @@ async function start() {
                         const minD = deltas.length ? Math.min(...deltas) : 0;
                         const medD = deltas.length ? Math.round(deltas.reduce((a, b) => a + b, 0) / deltas.length) : 0;
 
+                        // No modo Tor a rajada e informativa: so existe uma saida e
+                        // detectTor/watchdog ja cuidam da morte real do daemon. Fazer
+                        // refresh e quarentena aqui apenas acrescentava probes durante
+                        // o bootstrap do circuito e registrava falsamente que o Tor
+                        // unico deveria ser evitado. Preserva a saida e abre uma janela
+                        // nova de diagnostico sem trocar nem bloquear nada.
+                        if (routeMode === "tor") {
+                            log("gw.rajada_tor | n=" + gatewayReconexoes.length + "/180s" +
+                                " intervalo_min=" + minD + "ms intervalo_med=" + medD + "ms" +
+                                " informativa: saida unica preservada, sem refresh/quarentena");
+                            gatewayReconexoes.length = 0;
+                            callback({});
+                            return;
+                        }
+
                         const emaAtual = rttEma.get(chosenExit) ?? Infinity;
                         // Cooldown + reserva que preste: trocar entre saidas ruins em cascata
                         // so renasce o gateway a toa; sem reserva melhor, a atual vai para a
@@ -4206,21 +6116,28 @@ async function start() {
                             .filter(proxy => proxy !== chosenExit)
                             .sort((a, b) => (rttEma.get(a) ?? Infinity) - (rttEma.get(b) ?? Infinity))[0];
                         const emaAlvo = alvo === undefined ? Infinity : (rttEma.get(alvo) ?? Infinity);
-                        const podeTrocar = alvo !== undefined && trocaProativaPode() && emaAlvo <= emaAtual * SWAP_RESERVA_RAZAO;
+                        const midiaProtegida = midiaRecenteParaTrocaProativa();
+                        const cooldownOk = trocaProativaPode();
+                        const podeTrocar = alvo !== undefined && !midiaProtegida && cooldownOk &&
+                            emaAlvo <= emaAtual * SWAP_RESERVA_RAZAO;
                         log("gw.rajada_limite | n=" + gatewayReconexoes.length + "/180s" +
                             " intervalo_min=" + minD + "ms intervalo_med=" + medD + "ms" +
                             " ema_atual=" + (emaAtual === Infinity ? "?" : Math.round(emaAtual) + "ms") +
                             " ema_alvo=" + (emaAlvo === Infinity ? "?" : Math.round(emaAlvo) + "ms") +
                             " troca=" + (podeTrocar ? "sim" : "nao") +
-                            " motivo=" + (alvo === undefined ? "sem_reserva" : !trocaProativaPode() ? "cooldown" : "reserva_pior"));
+                            " motivo=" + (alvo === undefined ? "sem_reserva" : midiaProtegida ? "midia_recente" : !cooldownOk ? "cooldown" : "reserva_pior"));
                         if (podeTrocar) {
                             const antiga = chosenExit;
                             trocarPara(alvo, RECONEXAO_LIMITE + "+ reconexoes do gateway na janela");
                             quarentenar(antiga, "rajada de reconexoes");
                         } else {
                             gatewayReconexoes.length = 0;
-                            quarentenar(chosenExit, RECONEXAO_LIMITE + "+ reconexoes sem troca util");
-                            log(safeProxy(chosenExit) + " com " + RECONEXAO_LIMITE + "+ reconexoes do gateway sem troca util (cooldown ou reserva pior), em quarentena");
+                            if (!midiaProtegida) {
+                                quarentenar(chosenExit, RECONEXAO_LIMITE + "+ reconexoes sem troca util");
+                                log(safeProxy(chosenExit) + " com " + RECONEXAO_LIMITE + "+ reconexoes do gateway sem troca util (cooldown ou reserva pior), em quarentena");
+                            } else {
+                                log(safeProxy(chosenExit) + " preservada: rajada durante midia recente, sem troca/quarentena proativa");
+                            }
                         }
                     }
                 }
@@ -4266,6 +6183,14 @@ try {
 }
 
 app.whenReady().then(() => {
+    // O preload do shim precisa estar registrado ANTES de o Discord criar as
+    // janelas (issue #169: registrar dentro do start() async chegava tarde e a
+    // janela nascia sem o shim — "shim ausente neste documento"). O nosso
+    // whenReady roda ANTES do handler do Discord (registramos o .then antes do
+    // require dele), entao registrar aqui, sincronamente, garante que o preload
+    // de sessao esta no ar quando a primeira janela for criada.
+    registrarPreloadShim();
+
     // Nada aguarda isto de proposito: o Discord carrega em paralelo, e o gateway que chegar
     // antes da saida espera no roteador em vez de segurar a abertura inteira.
     start().catch(error => log("falhei ao preparar o bypass: " + error.message));

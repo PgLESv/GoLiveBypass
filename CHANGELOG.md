@@ -4,43 +4,598 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.0] - Unreleased
+
+### Destaques
+
+- **WireGuard por aplicativo:** Windows usa WireSock/WFP para encaminhar somente o Discord (`Discord.exe`, `Discord` e `Update.exe`) pelo túnel. O restante do computador permanece na rede normal.
+- **Namespace dedicado no Linux:** a GUI e o standalone iniciam o Discord dentro de `discord-vpn`, com a interface WireGuard isolada do restante do sistema.
+- **Discord vanilla no Windows/Linux:** a GUI 2.0.0 não substitui nem injeta o `app.asar` do Discord. Ativar e desativar reinicia o cliente para aplicar ou remover o túnel com segurança.
+- **ProtonVPN integrado:** login com sessão persistente, geração de configuração WireGuard, seleção automática por menor ping, suporte a 2FA e importação de configurações `.conf` próprias.
+- **Privacidade na GUI:** endereço de e-mail Proton desfocado por padrão durante compartilhamento de tela e revelado apenas sob interação do usuário.
+- **Diagnóstico de túnel:** logs e reports registram estado do handshake e volume de tráfego sem incluir o endpoint privado da VPN.
+
+### Compatibilidade e limites conhecidos
+
+- **Plugin Equicord/Vencord e standalone CLI temporariamente fora de serviço:** a versão 2.0.0
+  está disponível somente pela GUI. A portabilidade da solução WireGuard por aplicativo para
+  essas duas variantes ainda está em andamento e elas voltarão após validação própria.
+- O perfil WireGuard gratuito integrado é compartilhado; degradação sob carga pode afetar uploads e anexos. Uma configuração privada é recomendada para uso intenso.
+- O macOS ainda usa o mecanismo legado de PAC/injeção até existir uma implementação de VPN por aplicativo equivalente.
+- Depois de otimizar a rota ProtonVPN, é necessário sair e entrar novamente na chamada para que a nova rota seja usada pelo Discord.
+
+
 ## [1.1.12] - Unreleased
 
 ### Adicionado
-- **Recuperação nativa do vídeo de saída do Go Live** (próxima beta,
-  [#164](https://github.com/bezumiya/GoLiveBypass/issues/164)): o teste ao vivo
-  no Linux mostrou por que o gatilho RTC da beta 10 era cego: o Discord desktop
-  não cria a Live em `window.RTCPeerConnection`; ela vive no addon
-  `discord_voice`. No travamento reproduzido, a demanda do espectador continuou
-  positiva e a captura avançou de 2.760 para 3.667 quadros em 15s (~60 fps), mas
-  `framesEncoded`, bitrate e resolução ficaram exatamente em zero. O novo preload:
-  - envolve de forma transparente e idempotente
-    `createVoiceConnectionWithOptions`/`createOwnStreamConnectionWithOptions`,
-    classifica `voice` vs `stream` pelo factory exato e nunca age sobre
-    `unknown`;
-  - usa a API realmente implementada nesta versão do addon,
-    `getFilteredStats(2, callback)` (o `getStats` do wrapper JS está stale), e
-    reduz o JSON a captura, FPS, quadros codificados, bitrate, resolução e idades
-    de progressão — sem IDs, endpoints, tokens ou stats brutos no log;
-  - combina as conexões do mundo isolado do preload (world 999) com
-    `Remote media sink wants` e os ws `discord.media` do mundo principal;
-  - só confirma o zumbi com stream aquecida + mídia aberta + demanda positiva +
-    captura viva há <15s + saída congelada por ≥20s. A renegociação normal de
-    ~3s observada ao vivo não chega ao limiar, e dado incompleto falha fechado.
-  - nível 1 chama `destroy()` **somente na stream nativa**. No ensaio, isso
-    iniciou uma reconstrução tardia do próprio Discord: voice e mídia fecharam
-    depois, um documento/preload novo nasceu, a call e a Live foram refeitas e a
-    geração nova estabilizou em ~60 fps, 1920×1088, com dois receptores — sem
-    Ctrl+R manual e sem o nível 2 conseguir/precisar agir. A escada agora espera
-    60s pelo teardown, mais 45s quando ele já começou, e dá 30s de aquecimento a
-    uma geração nova; sucesso exige 10s de progressão contínua, nunca um pulso.
-    Só se voice/mídia continuarem presas após o prazo o nível 2 destrói voice +
-    stream e fecha `discord.media`; não existe reload automático nosso.
-  - telemetria nova: `voice.hook`, `voice.conn`, `voice.probe` e
-    `gw.revive | video nativo ...`. O standalone é a fonte e a GUI recebe o
-    mesmo código via `sync-bypass`; testes novos cobrem transparência, privacidade,
-    filtro nativo, mundo isolado, detector, níveis e colisão de geração após o
-    reload interno.
+- **Diagnóstico real do túnel WireGuard nos logs e nos reports (`electron/wgstats.ts`)**: pós
+  migração para WireGuard, a causa mais provável de "Discord carregando infinito" deixou de
+  ser o gateway zumbi do proxy legado e passou a ser o próprio túnel — o endpoint gratuito
+  embutido é compartilhado e pode saturar, ou o handshake pode nunca ter completado. Não havia
+  visibilidade nenhuma disso: um report de "travou" não dava pra diferenciar "túnel morto" de
+  "túnel lento" de "outra coisa qualquer". Agora `wg show <iface> dump` é lido (handshake mais
+  recente, bytes rx/tx) e:
+  - Um vigia (45s de intervalo, sem opt-out — mesmo espírito do `torWatchdog`) loga
+    `wg.stats`/`wg.handshake.velho` durante toda sessão ativa, incluindo a taxa de
+    transferência entre amostras — dá pra ver no ring buffer se o túnel estava degradando
+    minutos antes do usuário notar e reportar.
+  - Handshake mais velho que 180s (o dobro do dobro do `PersistentKeepalive=25` que o bypass
+    configura) com o bypass ativo vira aviso, não só info — sinal direto de túnel morto ou
+    endpoint inalcançável.
+  - Todo report de bug (os dois caminhos: `report-bug`/`bugreport.ts` e o
+    `open-bug-report`/diagnóstico manual) inclui um snapshot fresco na hora do envio:
+    `wg_handshake_ha_s`, `wg_rx_kb`, `wg_tx_kb`. O endpoint em si nunca é incluído (seria a
+    saída escolhida da pessoa — mesma política de privacidade do resto do relatório).
+  - **Linux**: como a GUI normalmente roda sem privilégio pra entrar no namespace de rede
+    (`setns` exige `CAP_SYS_ADMIN`), a leitura não tenta o `ip netns exec` direto do processo
+    desprivilegiado — o script standalone (que já roda elevado quando precisa) expõe os
+    mesmos dados via `--status --json` (`wg_stats_json()`) e no `--status` legível, e a GUI
+    consulta por ali. Sem privilégio nenhum disponível, o campo vem `"indisponivel"` de forma
+    explícita em vez de simplesmente faltar.
+  - **Windows**: lido via `wg.exe` (wireguard-tools) quando presente no PATH; sem ele, o
+    report mostra `indisponivel` com o motivo em vez de omitir o campo.
+  - **macOS**: fora do escopo — ainda usa o mecanismo legado de PAC/Tor, sem interface WireGuard
+    nenhuma para vigiar.
+  - Testado com `tests/wgstats.test.ts` (parsing do dump, handshake nunca, endpoint `(none)`,
+    dump incompleto/vazio) e ao vivo nesta máquina via `--status --json` real.
+
+- **Envelopamento de Discord via WireGuard Per-App VPN (Substituição do Proxy Legado)**:
+  o mecanismo legado de injeção em `app.asar` e proxy PAC SOCKS5 para `*.discord.gg` foi
+  desativado devido a incompatibilidades com sinalizações binárias ETF do Discord e bloqueios
+  de IP cruzado em sessões de voz e WebRTC. Em seu lugar:
+  - **Linux (`golivebypass-standalone.sh` e GUI)**: implementado isolamento via Network Namespaces
+    do kernel Linux (`discord-vpn`). O Discord roda 100% envelopado dentro do túnel WireGuard,
+    enquanto todo o restante da máquina continua operando diretamente na rede local/brasileira.
+    O Discord permanece vanilla, sem adulteração de arquivos `.asar`.
+  - **Windows (`GoLiveBypass-Standalone.ps1` e GUI)**: implementado isolamento via WireSock WFP
+    (`wiresock-client-service`), tunelando estritamente os processos `Discord.exe` e `Update.exe`
+    através de WireGuard, sem afetar navegadores ou conexões do sistema.
+  - **Configurações WireGuard**: perfil padrão livre integrado (EUA/México) com suporte a importação
+    de arquivos `.conf` customizados do usuário via flag `--wg-conf` / `-WgConf` ou no diretório local.
+  - **Removidos os modos "Tor" e "Proxy gratuita" da GUI/Linux**: eram exclusivos do
+    mecanismo legado de proxy/PAC (a saída precisava ser um túnel SOCKS5 apontado no
+    `app.asar` injetado). Com Windows (WireSock) e Linux (netns) envelopando o Discord
+    inteiro, a única saída de rede é a configuração `.conf` importada pelo usuário — não há
+    mais seletor de modo na tela (`vpnConfigCard` substituiu o antigo seletor de `routeMode`).
+    **macOS é a exceção**: sem um equivalente de Per-App VPN ainda implementado lá, ele
+    continua dependendo do mecanismo antigo (PAC + injeção de `app.asar`, Tor incluso) como
+    mecanismo real, não vestigial — não foi tocado nesta rodada.
+
+- **Correção da trava de orçamento RTC no espectador (`standalone/golivebypass.js`)**:
+  a função `renovarOrcamentoRtc` atualizava a chave `videoNativoOrcamentoChave` mesmo
+  quando havia uma tentativa em voo (`videoNativoPendente !== null`), porém sem limpar
+  as tentativas anteriores. Como as checagens subsequentes viam a chave já igual à
+  armazenada, as tentativas gastas nunca eram reinicializadas, travando o espectador
+  permanentemente em `teto_tentativas` e induzindo ao Erro 2012 na reabertura da Live.
+  A atualização de chave agora é adiada até a resolução da tentativa pendente, a chave
+  do espectador embute a identidade estrutural da conexão ativa (`stream.id`), e o
+  encerramento de conexão (`conn.destroy`) reseta o estado ativo de demanda para
+  garantir o avanço determinístico de epoch em nova intenção de assistir. Coberto em
+  `tests/test-native-rtc-recovery.cjs`.
+
+- **Fechamento prematuro de janelas PowerShell nos caminhos de status e sucesso (`standalone/GoLiveBypass-Standalone.ps1`)**:
+  ao executar o script pelo Windows Explorer ("Executar com o PowerShell"), qualquer
+  ação de status (`-Mode Status`), checagem/aplicação de update ou término bem-sucedido
+  fechava instantaneamente a janela do console antes de o usuário ler as mensagens
+  de confirmação. `Wait-AntesDeFechar` agora é invocado antes de cada `return` precoce
+  e no encerramento normal do script. Coberto em `tests/test-error-handling.ps1`.
+
+- **Corrida de ciclo de vida no plugin (`goLiveBypass/native.ts`)**: `shutdown()`
+  não cancelava a promessa `enableOnce()` em voo caso o usuário desativasse o plugin
+  durante a resolução de proxy ou subida de servidor, ressuscitando o roteador em
+  segundo plano após o desligamento. Adicionada esgrima por sequência `enableSeq`,
+  anulação do singleton `enabling` e reset da contagem de `retries` no `shutdown()`.
+  Coberto em `tests/test-distribution-parity.cjs`.
+
+- **Sincronização de porta Tor nas configurações de instalações injetadas no Windows/macOS (`main.ts`)**:
+  `saveTorAddr` atualizava apenas o `settings.json` compartilhado, deixando o arquivo
+  local dentro de `resources/app.asar/settings.json` com a porta antiga (9060) caso uma
+  outra porta Tor fosse adotada pelo sistema. `saveTorAddr` agora chama
+  `reescreverSettingsInjetado({ torAddr: addr })` imediatamente. Coberto em
+  `golive-gui/tests/ativacao-guard.test.ts`.
+
+- **Remoção de banner zumbi preso no DOM após recuperação (`standalone/golivebypass.js`)**:
+  ao se recuperar de um congelamento de gateway com dispatches voltando a fluir, o código
+  registrava a remoção mas não removia `#golivebypass-zumbi` do documento. Implementada
+  a função `hideZumbiBanner()`, garantindo que o alerta seja retirado da interface
+  após a recuperação. Coberto em `tests/test-gateway-zumbi-revive.cjs`.
+
+- **Paridade de portas de varredura Tor (`standalone/golivebypass.js`)**: a lista
+  `TOR_PORTS` no standalone omitia a porta `9060` (onde a GUI do GoLiveBypass sobe o Tor
+  embutido), divergindo do plugin (`goLiveBypass/native.ts`). A porta `9060` foi
+  adicionada à lista de busca padrão. Coberto em `tests/test-distribution-parity.cjs`.
+
+- **Vazamento de timer de verificação de atualização no plugin (`goLiveBypass/index.tsx`)**:
+  o timer de 8 segundos agendado em `start()` para checar novas versões não era salvo
+  nem cancelado em `stop()`. O handle agora é retido em `updateCheckTimer` e cancelado
+  explicitamente no desmonte do plugin. Coberto em `tests/test-distribution-parity.cjs`.
+
+- **Resiliência do observador de RTC contra falhas transitórias do DOM (`standalone/golivebypass.js`)**:
+  em `consultarRtcNativo(win)`, uma exceção durante descarregamento de página principal
+  derrubava o `Promise.all` e abortava todo o probe de RTC nativo no mundo isolado.
+  Adicionado tratamento com `.catch(() => null)` e guarda de `webContents.isDestroyed()`.
+  Coberto em `tests/test-native-rtc-recovery.cjs`.
+
+- **Precedência de versões SemVer beta para estável no instalador Linux (`installer/golivebypass-installer.sh`)**:
+  a ordenação direta via `sort -V` considerava sufixos alfanuméricos (`1.1.12-beta.13`)
+  superiores à versão estável (`1.1.12`), classificando a release estável final como
+  downgrade. A função `compare_version` foi corrigida para separar o núcleo numérico dos
+  sufixos de pré-release. Coberto em `tests/test-auto-update.sh`.
+
+- **Precedência de versões SemVer beta para estável no instalador Windows (`installer/GoLiveBypass-Installer.ps1`)**:
+  `Compare-Version` removia qualquer caractere após o hífen antes do cast para `[version]`,
+  igualando versões beta à versão final estável e bloqueando o update. A função agora
+  separa `$localCore` e `$localPre`, priorizando a release estável oficial. Coberto
+  em `tests/test-auto-update.ps1`.
+
+- **Eliminação de timeout de 6s em probes TLS fechados limpos (`readOverTls`)**:
+  em `standalone/golivebypass.js` e `goLiveBypass/native.ts`, `readOverTls` não escutava
+  o evento `close` do socket TLS, fazendo com que desconexões limpas do servidor sem
+  erro TLS ficassem presas até o estouro total do timeout (`PROBE_TIMEOUT_MS`, 6s).
+  Adicionado `tls.on("close", () => finish(body || null))` em ambas as distribuições.
+  Coberto em `tests/test-distribution-parity.cjs`.
+
+- **Guarda de falha de injeção no standalone Linux (`standalone/golivebypass-standalone.sh`)**:
+  quando nenhum alvo era injetado com sucesso (`$injected -eq 0`), o script reabria o
+  Discord vanilla antes de abortar com mensagem de erro. A verificação foi movida para
+  antes de `start_discord`.
+
+- **Extração de segredos da proxy pessoal (`redact.ts`, usado no report de
+  bug) cortava a senha no primeiro `@` dela, em vez de tratá-la inteira**:
+  a regex `extrairSegredosDaProxy()` usava uma classe que excluía `@` no
+  trecho de credenciais (`[^/@]+@`), diferente do parser real da proxy em
+  produção (`PROXY_RE`/`parseProxy()` em `standalone/golivebypass.js`), que
+  usa `.+` guloso e por isso lida corretamente com uma senha contendo `@`
+  não codificado (ex.: `socks5://user:p@ss@host:1080`). Com a regex antiga,
+  o "segredo" extraído para a senha virava só o fragmento antes do primeiro
+  `@` (`"p"` no exemplo) — descartado pelo filtro de tamanho mínimo (3
+  chars) — e a senha real nunca entrava na lista L2 de redação literal do
+  report de bug. Mitigado na prática porque `safeProxy()` já mascara a
+  senha na origem dos logs (`bypass.log`/`gui.log` nunca a escrevem crua) e
+  a URL inteira ainda entrava como segredo próprio (cobre o caso de a URL
+  completa aparecer verbatim em algum lugar) — mas qualquer caminho que
+  algum dia logasse a senha isolada (fora do formato de URL completa)
+  vazaria para um report público no GitHub. Corrigido para espelhar
+  `PROXY_RE`: credenciais capturadas de forma gulosa até o ÚLTIMO `@` antes
+  do host (`(.+)@([^/@]+)$`), igual ao parser de produção.
+  Teste: `golive-gui/tests/redact.test.ts`
+  ("extrai a senha inteira mesmo com @ nao codificado dentro dela").
+  Achado por revisão de código (sem reprodução ao vivo — o pipeline L1/L3
+  do report de bug já bloqueava o cenário de vazamento direto no formato de
+  log atual; a correção fecha a lacuna de defesa em profundidade, não uma
+  exploração confirmada em produção).
+
+- **`--uninstall` do script standalone Linux tinha o mesmo vazamento de Tor
+  do bug do `deactivateAll()` (abaixo), por um caminho diferente**: achado
+  puxando o fio deixado pela correção anterior — a GUI no Linux delega TODO
+  o `deactivate`/uninstall para `standalone/golivebypass-standalone.sh
+  --uninstall`, então aquele fix (que só mexeu em `main.ts`) não cobria
+  Linux. No script, a chamada a `remove_tor` (para/desabilita o serviço
+  systemd `golivebypass-tor.service`) só rodava dentro de `if [ "$failed"
+  -eq 0 ]` — ou seja, só quando TODOS os Discords detectados (pode haver
+  vários: estável, PTB, Vesktop...) foram revertidos com sucesso. Um único
+  alvo falhando (elevação/polkit recusada, arquivo travado por um processo
+  ainda vivo) deixava o serviço systemd do Tor rodando para sempre, sem
+  nenhum alvo mais usando aquela saída — inconsistente com o bloco
+  `restore` logo abaixo no mesmo arquivo, que já chama `remove_tor`
+  incondicionalmente. `remove_tor` movida para fora do `if`, chamada
+  sempre logo após o laço de reversão; o `if [ "$failed" -eq 0 ]` continua
+  controlando só a reabertura do Discord/`exit 0` vs. `fail`. Coberto em
+  `tests/test-distribution-parity.cjs`.
+- **`deactivateAll()` deixava o Tor embutido órfão — vazamento de
+  processo**: revisitando uma pergunta em aberto anotada durante a
+  investigação do Bug 2 ("por que havia um Tor extra para matar
+  deliberadamente"). `deactivateAll()` só chamava `torWatchdogParar()`
+  (para o timer de vigia), nunca `stopTor()` (mata o processo `tor.exe`
+  de verdade). O quit limpo (`before-quit`) já chamava `stopTor()`
+  separadamente antes de `deactivateAll()`, por outro motivo documentado —
+  mas o botão "Desativar Bypass" (`ipcMain.handle("deactivate", ...)`) e o
+  toggle da bandeja do sistema chamam `deactivateAll()` direto, sem passar
+  por `stopTor()` antes. Resultado: desativar o bypass pelo botão ou pela
+  bandeja (sem fechar o app inteiro) deixava um `tor.exe` **órfão** rodando
+  para sempre — ninguém mais usa aquela saída (o Discord acabou de ser
+  desinjetado) e ninguém mais vigia se ela morre (o watchdog também parou
+  junto). Tor continuava ligado depois da pessoa pedir explicitamente para
+  desligar, consumindo recursos à toa. `stopTor()` agora roda no início de
+  `deactivateAll()`, antes até do "nada a desfazer, sai" — o Tor pode estar
+  de pé desde a abertura da GUI (o boot sobe o daemon cedo, independente de
+  já ter ativado), mesmo quando não há injeção nenhuma para reverter, e o
+  pedido de desligar vale de qualquer jeito. Chamada duplicada no caminho
+  de quit limpo é inofensiva (`stopTor()` já é idempotente). Coberto em
+  `golive-gui/tests/torwatchdog.test.ts`.
+- **Plugin (renderer): `check()` de verificação de atualização não tratava
+  rejeição, diferente da função irmã `update()`**: achado por uma revisão
+  dedicada ao lado renderer do plugin (`goLiveBypass/index.tsx`).
+  `Native.checkPluginUpdate()` em si nunca rejeita (o lado nativo já
+  resolve sempre com `{ok:true|false,...}`), mas a chamada IPC por baixo
+  pode rejeitar sozinha — plausível logo após um self-update do plugin, com
+  o handler `ipcMain.handle` temporariamente desalinhado durante a
+  recompilação. `update()`, a função irmã logo abaixo, já tratava isso
+  corretamente com `catch`; `check()` não tinha, deixando uma promise
+  rejeitada sem dono no console do renderer (inofensivo no renderer —
+  diferente do processo principal, onde uma rejeição sem tratamento
+  derruba o processo inteiro — mas inconsistente e sem feedback para a
+  pessoa). `finally` já garantia que `busy` nunca ficasse preso, então
+  severidade baixa. Adicionado `catch` espelhando o padrão de `update()`.
+  Coberto em `tests/test-distribution-parity.cjs`.
+- **GUI: diálogo de atualização usava `showMessageBoxSync`, que bloqueia o
+  watchdog do Tor enquanto espera resposta**: achado ao investigar a lógica
+  de auto-update (`golive-gui/electron/updater.ts`) durante a rodada de
+  estabilidade. `dialog.showMessageBoxSync` bloqueia a thread JS do
+  processo principal até a pessoa clicar um botão — inclusive o
+  `setInterval` do watchdog do Tor (o mesmo mecanismo corrigido nesta
+  rodada para o Bug 2), que fica sem checar o daemon durante todo o tempo
+  que o aviso de atualização ficar aberto sem resposta (a pessoa pode ficar
+  minutos, ou nunca voltar, sem clicar). Se o Tor morrer nessa janela, a
+  recuperação automática fica pausada até o diálogo ser respondido. O resto
+  do código já usava a versão assíncrona (`main.ts`, com `await`); só
+  `updater.ts` (4 ocorrências, Linux e Windows) ficou para trás com a
+  síncrona. Trocado para `await dialog.showMessageBox(...)` nos quatro
+  pontos — mesmo comportamento visível, sem bloquear o processo principal.
+  Coberto em `golive-gui/tests/updater-channel.test.ts`. Não reproduzido ao
+  vivo (exigiria forçar uma atualização disponível e deixar o diálogo
+  aberto enquanto se mata o Tor) — achado e corrigido por leitura de
+  código, `tsc --noEmit` e `npm run compile` limpos.
+- **Plugin Vencord/Equicord: `shutdown()` não zerava os mutexes de busca de
+  saída (`choosing`/`hunting`)**: achado por uma revisão profunda dedicada
+  ao plugin (`goLiveBypass/native.ts`). `choosing`/`hunting` guardam uma
+  PROMESSA ("já tem uma busca em voo?"), não um booleano —
+  `chooseExit()`/`sharedFreeExit()` só começam uma busca nova quando o
+  campo está `null`. Um toggle rápido desligar→ligar no switch do plugin
+  (ação normal da UI do Vencord, sem debounce) podia fazer a reativação
+  reaproveitar CALADA uma busca de saída ainda em andamento de antes do
+  desligamento — a sessão nova ficava dependendo do tempo de conclusão de
+  uma busca que não reflete mais a configuração/intenção atual, em vez de
+  começar do zero (ex.: Tor local, que resolveria em milissegundos).
+  `shutdown()` agora zera os dois campos; a busca órfã ainda termina
+  sozinha em segundo plano (suas próprias promessas já se resolvem sem
+  quebrar nada), só não é mais reaproveitada por engano. Coberto em
+  `tests/test-distribution-parity.cjs`. Não reproduzido ao vivo (fora do
+  escopo desta tarefa, sem VM disponível) — achado e corrigido por leitura
+  de código, verificado com checagem de sintaxe/transpile TypeScript.
+- **Instalador (`installer/GoLiveBypass-Installer.ps1`) e standalone
+  (`standalone/GoLiveBypass-Standalone.ps1`) não fecham mais a janela antes
+  da pessoa ler o erro**: relato — no Windows 10 sem `winget`, o instalador
+  falha e a janela "fecha sozinha", parecendo silencioso. Causa raiz: "Executar
+  com o PowerShell" no menu de contexto do Explorer (ou duplo clique num
+  `.ps1` associado a essa ação) faz o Windows abrir `powershell.exe -File
+  script.ps1` **sem** `-NoExit` — a janela fecha sozinha ao sair do script,
+  erro ou não. O `.bat` companheiro já tem `pause` para isso, mas quem baixa
+  e roda só o `.ps1` (o link do README salva só esse arquivo) não passa por
+  ele. Agora os dois `.ps1` detectam se o processo pai é o `explorer.exe`
+  (`Test-JanelaTransitoria`) e, se for (e não estiver em modo `-Yes`,
+  automação), pausam com "Pressione Enter para fechar esta janela" antes de
+  sair — tanto no caminho de erro quanto no de sucesso. Sem afetar o uso
+  normal via terminal (onde o pai não é o Explorer) nem a automação (`-Yes`
+  pula a checagem antes mesmo de consultar o processo pai). Coberto em
+  `tests/test-error-handling.ps1`.
+- **`refreshExit()` (busca de saída em segundo plano, disparada na 2ª
+  reconexão da rajada do gateway) podia sobrescrever `chosenExit` calado**:
+  achado por uma revisão de código dedicada ao fluxo de reservas/troca de
+  saída em modo gratuitas/auto. `refreshExit()` roda sem `await` no
+  chamador e pode resolver DEPOIS de uma troca síncrona já ter acontecido
+  no meio do caminho — a 3ª reconexão da mesma rajada dispara uma troca
+  síncrona via `trocarPara()` (loga `saida.trocada`, limpa
+  `missedBeats`/`rttLentoSeguidas` da saída nova, zera a janela de rajada).
+  Quando a busca em segundo plano resolvia depois disso, ela chamava
+  `settleExit()` sozinho — sem nenhum log estruturado dizendo o que foi
+  substituído (só "saída nova encontrada: X", sem a saída anterior) e sem
+  limpar os contadores de falha da saída nova, que podiam carregar
+  contagem de uma ativação anterior dela. Não trava nem derruba nada
+  ativamente (uma saída viva sempre acaba escolhida), mas corrompe
+  silenciosamente o log — exatamente a fonte de evidência que este projeto
+  depende para diagnosticar "carregamento infinito" depois do fato. Agora
+  `refreshExit()` também loga no formato estruturado (`de=`/`para=`/`motivo=`)
+  e limpa os contadores da saída nova quando de fato troca uma saída ativa
+  por outra; confirmar a MESMA saída que já estava ativa continua sem gerar
+  log de troca falso. Coberto em `tests/test-tor-oscillation-test.cjs`.
+- **Classificação de socket RTC (issue #186) podia ser rebaixada de `'stream'`
+  de volta para `'voice'` por uma mensagem chegando depois do IDENTIFY**:
+  achado por uma revisão de código dedicada à lógica de pareamento RTC. O
+  `IDENTIFY` (enviado pelo cliente) é a única prova forte — array de
+  `streams` para `'stream'`, `server_id`+`channel_id` para `'voice'`. Mas o
+  handler de `message` (mensagens do servidor, recebidas repetidas vezes
+  durante a vida do socket) escrevia o mesmo campo sem nenhuma trava: um
+  `op 5` chegando depois do IDENTIFY sobrescrevia `kind='stream'` de volta
+  para `'voice'`, mesmo já provado. `socketMidiaDaStream()` exclui todo
+  socket `'voice'` do close direcionado, então o socket certo da stream
+  ficava permanentemente inelegível para a recuperação RTC, sem nunca ser
+  reavaliado — o mesmo tipo de dano silencioso que a própria #186 já havia
+  corrigido uma vez. Agora o handler de mensagem só classifica enquanto
+  `kind` ainda está vazio (sem prova do IDENTIFY); uma vez que o IDENTIFY
+  estabelece `'stream'` ou `'voice'`, nenhum sinal mais fraco e recorrente
+  pode desfazer essa prova. Aplicado nos dois shims (frame e worker).
+  Coberto em `tests/test-native-rtc-recovery.cjs` e
+  `tests/test-worker-shim.cjs`.
+- **`reloadPorRevive()` (escada de revive do gateway zumbi, nível 2) travava
+  o mutex de reload só de leitura, nunca de escrita**: achado por uma
+  revisão de código dedicada à lógica de recuperação RTC/gateway.
+  `maybeReloadAfterDirect()` e `maybeReloadAfterColdHold()` escrevem
+  `reloading = true` antes de chamar `win.webContents.reload()` e só
+  liberam depois; `reloadPorRevive()` (nível 2 da escada de zumbi) conferia
+  `if (reloading) return;` mas nunca setava a flag — as outras duas funções
+  sempre viam `reloading === false` e podiam disparar um SEGUNDO
+  `reload()` na mesma janela enquanto o reload do revive ainda estava
+  navegando. Alcançável de verdade numa sessão com Tor caindo e gateway
+  zumbi ao mesmo tempo (a mesma rede ruim motiva os dois gatilhos), não só
+  em teoria. Agora `reloadPorRevive()` também trava `reloading = true`
+  antes do reload, e `watchReloads()` libera o mutex assim que a navegação
+  de verdade começa (`did-start-loading`) — o mesmo sinal que já limpa o
+  resto do estado de revive/zumbi. Coberto em
+  `tests/test-gateway-zumbi-revive.cjs`.
+- **Aviso de arranque frio do Tor escala depois de 3 min parado, em vez de prometer "menos de
+  um minuto" para sempre**: reproduzido ao vivo no laboratório (VM viewer, modo tor) — a GUI
+  (dona do processo Tor e do watchdog que o ressuscita) havia saído em algum momento anterior
+  sem deixar rastro de erro, mas o Discord já injetado continuou de pé, reabrindo sozinho e
+  ficando preso em "Problemas de conexão?" com o banner "GoLiveBypass: aguardando o Tor... isso
+  costuma levar menos de um minuto" imutável. `bypass.log` confirmou o runtime tentando e
+  recusando a conexão do gateway a cada nova tentativa do próprio cliente
+  (`modo tor: nenhuma saida entregou gateway.discord.gg, recusando esta conexao`) por mais de 5
+  minutos seguidos; `gui.log` mostrava o Tor tendo bootstrapado com sucesso muito antes
+  (`Bootstrapped 100% (done)`, `tunel confirmado ate o gateway`) e depois simplesmente parando
+  de escrever — o processo da GUI não estava mais rodando (confirmado no Gerenciador de
+  Tarefas: nenhum `tor.exe`, nenhum app GoLiveBypass). O runtime injetado nunca tem como subir
+  Tor sozinho (só detecta), então sem aviso a pessoa fica lendo uma promessa falsa
+  indefinidamente — exatamente o padrão de "carregamento infinito" que o projeto já combate em
+  outras issues, só que originado da própria dependência externa em vez de rede. Agora, se o
+  modo tor continuar sem saída passados `TOR_BOOT_STALL_MS` (3 min, checado a cada batimento de
+  30 s que já tentava `detectTor()` de novo), o mesmo banner troca de texto e ícone
+  (⏳ → ⚠️, borda âmbar) para explicar a causa provável e a ação real: reabrir o aplicativo
+  GoLiveBypass, já que reiniciar só o Discord não liga o Tor. Escala uma única vez por arranque
+  frio e reseta se uma saída real aparecer depois, permitindo escalar de novo num arranque frio
+  seguinte. Sem retry indiscriminado nem enfraquecimento do fail-closed do modo tor (a conexão
+  continua sendo recusada, nunca cai para IP direto). Coberto em
+  `tests/test-cold-tor-boot-test.cjs`. Não se aplica ao plugin Vencord/Equicord: ele não sobe
+  nem gerencia um processo Tor próprio (Tor é um proxy manual digitado pelo usuário, tratado
+  como estrito) e já usa toasts com número de tentativa em vez de um banner silencioso de
+  arranque frio — lacuna documentada aqui por não haver equivalente a portar.
+- **Watchdog do Tor não rearmava sozinho ao reabrir a GUI sem o marcador de
+  sessão** (mais grave que o item acima — é a causa de por que o Tor morto do
+  cenário anterior nunca se recupera sozinho): reproduzido ao vivo — matei o
+  `tor.exe` da VM com uma Live saudável em andamento e o watchdog (função pura
+  já testada e correta em `torwatchdog.ts`) simplesmente nunca reagiu por 7+
+  minutos. Causa raiz em `golive-gui/electron/main.ts`: o boot só chamava
+  `torWatchdogIniciar()` quando `sessaoAtiva()` (um marcador efêmero em disco,
+  `session.json`, escrito em `activateAll()` e apagado em `deactivateAll()`)
+  era verdadeiro. Neste boot específico o marcador estava ausente mas a
+  injeção estava genuinamente ativa (`getStatus() === "ACTIVE"`, confirmado
+  por `Get-Process` mostrando os processos `GoLiveBypass`/`tor` de pé) — o
+  watchdog nunca era armado, e uma morte real do Tor no meio da sessão ficava
+  sem qualquer vigia pelo resto da vida do processo da GUI. Agora o boot arma
+  o watchdog com `sessaoAtiva() || getStatus() === "ACTIVE"`, usando a mesma
+  fonte de verdade (leitura de disco) que já decide se o botão da UI mostra
+  "Ativo". Coberto em `golive-gui/tests/torwatchdog.test.ts`. Detalhes e
+  passo a passo da reprodução em
+  `docs/handoff-2026-09-02-tor-watchdog-gap.md`.
+- **Guarda de ativação duplicada (issue #145) volta a valer logo após reabrir
+  a GUI**: achado varrendo o código atrás do mesmo padrão do bug do watchdog
+  acima. `assinaturaUltimaAtivacao` é um `let` de módulo que nasce vazio a
+  cada boot, mesmo quando o bypass já está injetado de verdade
+  (`getStatus() === "ACTIVE"`). Sem re-semear essa assinatura no boot, a
+  primeira `activateBypass()` pós-reinício com a mesma proxy/modo nunca batia
+  com `""`, e a guarda pensada para a #145 (duas ativações em segundos
+  derrubando o gateway recém-nascido) ficava cega logo após qualquer
+  reinício da GUI — uma reativação idêntica reinjetaria por cima de um
+  bypass já correto, derrubando gateway/RTC à toa. Agora o boot reconstrói a
+  assinatura a partir do proxy salvo em disco quando encontra a injeção já
+  ativa. Coberto em `golive-gui/tests/ativacao-guard.test.ts`.
+- **Revisão adversarial do fix do watchdog acima encontrou uma corrida nova
+  que ele tornava alcançável**: armar o watchdog em mais situações é correto,
+  mas abre uma janela em que o boot falha em subir o Tor (rede ruim), cai
+  para a insistência de fundo (`tentarTorEmFundo`) — que roda `garantirTor()`
+  FORA do singleton de promessa, porque começa depois dele já ter resolvido
+  — e agora o watchdog, também armado, vê a porta fechada e chama
+  `garantirTor()` por conta própria 5s depois. Duas chamadas de `spawnTor()`
+  concorrentes checam a porta livre ao mesmo tempo e podem subir dois
+  `tor.exe` (o "Address already in use" da issue #51, por um caminho novo).
+  `torWatchdogRecuperar()` agora sai cedo quando `tentarTorEmFundo` já está
+  tentando, antes de chamar `garantirTor()` — a insistência de fundo já
+  cobre a recuperação; o watchdog só precisa esperar o próximo tick.
+  Coberto em `golive-gui/tests/torwatchdog.test.ts`.
+- **Primeira entrada de Live sem vídeo não espera mais 60 s** ([#181](https://github.com/bezumiya/GoLiveBypass/issues/181),
+  [#183](https://github.com/bezumiya/GoLiveBypass/issues/183)): o viewer já
+  tinha um caminho de 1 s apenas depois de uma Live saudável; um renderer
+  recém-aberto ainda podia exibir Error 2012 por até 60 s antes da primeira
+  tentativa. Agora, com demanda positiva, amostra inbound atual e socket de
+  mídia pareado de forma não ambígua, um segundo sem quadro basta: o poll de 5 s
+  fecha somente o RTC daquela stream em até ~6 s. Voz, gateway e renderer ficam
+  intactos; falta de qualquer uma dessas provas continua sem ação. O plugin não
+  tem observador RTC automático equivalente, lacuna já documentada e não
+  aplicável à sua arquitetura.
+- **Recuperação do viewer continua armada após `RTCControlSocket.reconnect`**
+  ([#186](https://github.com/bezumiya/GoLiveBypass/issues/186)): o Discord pode
+  reaproveitar a conexão nativa `discord_voice` de uma Live por minutos ou
+  horas, mas recriar o WebSocket `*.discord.media`. O pareamento antigo por
+  idade então ultrapassava 15 s e devolvia `socket=?`, desarmando para sempre o
+  único close RTC seguro. O shim agora classifica cada socket pelo protocolo:
+  `IDENTIFY` com vídeo/streams e mensagens de mídia confirmam `stream`; voz
+  explícita é excluída. Entre streams confirmadas, escolhe somente a mais nova;
+  a proximidade temporal permanece apenas como fallback fail-closed para mocks
+  sem tráfego. A call principal continua fora de qualquer close. A GUI recebe a
+  fonte sincronizada e os testes cobrem reconexão longa, eleição da stream mais
+  nova e imunidade da voz; o plugin não possui esse observador nativo e a lacuna
+  permanece explicitamente fora do escopo da sua arquitetura.
+- **Classificação protocolar do RTC mais conservadora — `video:true` sozinho
+  nunca é prova de Go Live** ([#186](https://github.com/bezumiya/GoLiveBypass/issues/186)):
+  a marcação `stream` por `IDENTIFY` passou a exigir o array `streams` não
+  vazio; um socket com `video:true` e apenas `server_id`/`channel_id` é
+  classificado como `voice` e fica excluído de qualquer close direcionado (era
+  o caminho pelo qual uma câmera ligada depois da stream poderia roubar o
+  pareamento e derrubar a própria chamada). Sem servidor/canal e sem streams, a
+  classificação fica desconhecida e o pareamento temporal estrito — fail-closed
+  — assume. Medido no Discord atual, os dois sockets de mídia chegam com
+  `streams` no `IDENTIFY`; a distinção por `kind` é defesa em profundidade, e a
+  eleição mais-recente/idade continua sendo o pareamento real. Coberto em
+  `tests/test-native-rtc-recovery.cjs` e `tests/test-worker-shim.cjs` (câmera
+  vira `voice`, streams vira `stream`, sem prova fica sem `kind`, voz mais nova
+  não rouba o close).
+- **Contexto do voice shim comprovado no laboratório — o diagnóstico anterior
+  lia o mundo errado, não o runtime** ([#186](https://github.com/bezumiya/GoLiveBypass/issues/186)):
+  `executeJavaScriptInIsolatedWorld(999)` alcança sim o mesmo contexto isolado
+  do preload (`Electron Isolated Context`); a telemetria do processo principal
+  (`voice.probe` com `stream`/`socket`/`fonte`) bate exatamente com esse
+  contexto. O que enganava era o `gateway-summary` do lab, que avaliava no
+  mundo da página — onde a cópia do shim de voz convive com estado vazio
+  (`connections: []`). O lab ganhou `linux voice-isolated-summary`, que lê o
+  contexto isolado (o que o main consulta) e imprime os dois lados lado a lado.
+  Nenhuma mudança de runtime foi necessária para "resolver" o contexto; a
+  correção foi no diagnóstico. O plugin não é afetado (não usa o hook
+  `discord_voice`).
+- **`rtt`/`feedback_ha` no `voice.probe`: distingue "meu encoder está bem" de
+  "meu pacote está chegando de verdade"**: bateria de fault injection (queda de
+  rede real via `virsh domif-setlink`, firewall/iptables bloqueando só UDP de
+  saída) mostrou que `fps_out`/`framesEncoded` continuam subindo normalmente no
+  sender mesmo quando o pacote é descartado pelo firewall/NAT antes de sair da
+  máquina — são contagem puramente local, o SO não sabe que o pacote não
+  chegou. `getFilteredStats` passou de bitmask `6` (outbound+inbound) para `7`
+  (+transport), expondo `rtt` e `receiverReports` do addon nativo, que só
+  avançam com confirmação real de entrega vinda do outro lado. Um novo
+  `feedback_ha` (idade desde a última mudança real de `rtt`/`receiverReports`,
+  independente de `packetsSent`/`packetsReceived` — esses dois continuavam
+  subindo sozinhos mesmo com a saída bloqueada e mascaravam o sinal numa
+  primeira tentativa) fica congelado enquanto o encoder finge normalidade;
+  provado ao vivo, subiu 0s → 25s → 60s com `frames` passando de 471 para 1364
+  durante um bloqueio real de UDP, e voltou a 0s assim que a rede foi liberada.
+  Não guarda `localAddress` nem o id do `receiverReport` — só `rtt` (número) e
+  a idade em segundos. Testado nos dois papéis (sender/viewer) com stats
+  brutas reais e cobertura nova em `tests/test-native-rtc-recovery.cjs`
+  (rtt/idade aparecem, idade cresce parado, zera com feedback novo, nenhum dos
+  dois identificadores vaza no resumo).
+- **Observador direto do gateway pelo CDP `Network`** (beta 13, fix
+  [#169](https://github.com/bezumiya/GoLiveBypass/issues/169)): a hipótese de que
+  o websocket do gateway vivia em um dos Dedicated Workers visíveis foi
+  refutada no laboratório — eles eram workers de blurhash/busca. O processo
+  principal agora habilita `Network` junto de `Target.setAutoAttach`, antes do
+  primeiro documento, e observa `webSocketCreated`, frames e fechamento do
+  socket real do Chromium. Assim o probe nasce `origem=network` já no cold boot,
+  sem wrapper de `Worker`, XHR síncrono, Blob substituto, BroadcastChannel ou
+  ponte pelo renderer. Estado e ações são isolados por `webContents`, sessão CDP,
+  target e geração; dois gateways abertos ou geração divergente falham fechado.
+  O protocolo CDP desta versão do Chromium não oferece `Network.closeWebSocket`,
+  portanto a origem `network` é deliberadamente somente observável; quando um
+  shim de frame passa a enxergar uma reconexão, a origem acionável mais precisa
+  vence.
+- **Sniff ETF compatível com o Discord atual**: captura sanitizada ao vivo
+  mostrou que os frames são `ETF MAP_EXT` (`#{<<"op">> => inteiro, ...}`), não a
+  tupla presumida nas betas anteriores. Os parsers do frame, worker e CDP agora
+  aceitam estritamente a chave inicial `op` e reconhecem `4`, `18`–`22` e `37`.
+  Em especial, `18` registra criação da Live e `20` registra o pedido real do
+  viewer para assistir. Formato, chave ou inteiro fora da whitelist devolvem
+  `-1`; payload, URL autenticada e token nunca saem do processo.
+- **Stress real do Tor sem punir a saída única**: após três reconexões em 180 s,
+  `routeMode=tor` agora registra `gw.rajada_tor` apenas como diagnóstico. Não faz
+  refresh proativo, não troca e não coloca `127.0.0.1:9060` em quarentena. O
+  watchdog e `detectTor` continuam responsáveis pela morte real do daemon, e a
+  política “só Tor, nunca direta” permanece intacta.
+- **Paridade de estabilidade no plugin Vencord/Equicord** (beta 13): um Tor
+  local escrito explicitamente no campo Proxy agora é uma escolha estrita. Se
+  o daemon/circuito cair, o gateway falha fechado e o heartbeat tenta o mesmo
+  Tor novamente; o plugin não usa o pote, proxy gratuita ou `DIRECT`. Proxy
+  manual comum também deixou de trocar por um único probe ruidoso e só cede à
+  reserva após dois batimentos perdidos. No renderer, uma UI que afirma Live
+  por 30s sem nenhuma chave nativa em `StreamRTCConnectionStore` é registrada
+  e avisada como possível erro 2001; store desconhecida falha fechado e não há
+  reload/close automático. As decisões vivem em `stability.ts`, cobertas por
+  matriz pura, teste de paridade das distribuições, ZIP E2E e compilação real
+  no Equicord. Manifesto e instaladores Linux/Windows agora distribuem os quatro
+  arquivos do plugin.
+- **Provas ao vivo da beta 13**: cold restart isolado do sender, isolado do viewer
+  e simultâneo passaram com Linux codificando a 60 fps e a VM apenas
+  decodificando a 60 fps. A bateria normal passou 9 ciclos úteis. No fault
+  injection, o `tor.exe` foi morto repetidamente durante a Live: zero saída
+  direta, o gateway voltou depois do bootstrap, um único clique de assistir
+  recriou o RTC e a ROI voltou viva. O teste também documentou o limite do
+  cliente: indisponibilidade total do gateway encerra a visualização atual; o
+  Discord recupera a chamada/tile, mas não reassiste a Live automaticamente.
+- **Guarda de rota durante mídia**: uma ocorrência real no viewer Linux mostrou
+  que a troca gratuita proativa por RTT, embora o gateway ainda estivesse vivo,
+  precedeu o fechamento 4014 do RTC e uma renegociação DAVE sem frames de vídeo.
+  RTT/rajada agora não trocam nem colocam a saída em quarentena durante os 20
+  minutos de mídia recente; a troca por morte confirmada continua disponível.
+  O plugin não possui esses caminhos proativos, portanto não há equivalente a
+  portar. O replayer offline `tests/test-viewer-dave-race.cjs` reproduz o burst
+  pre-DAVE/MLS com áudio/UDP vivo e confirmou 5.000/5.000 variações sem close
+  repetido, queda da voz ou reload automático.
+- **Reentrada do viewer após parar/voltar a assistir** ([#170](https://github.com/bezumiya/GoLiveBypass/issues/170),
+  [#171](https://github.com/bezumiya/GoLiveBypass/issues/171)): os dois relatos
+  apontaram o mesmo gatilho — a Live ficava saudável, o viewer parava de
+  assistir e, ao voltar, o probe de uma saída gratuita podia perder um único
+  batimento. `checkPool` agora aplica à saída ativa o mesmo limiar de dois
+  batimentos consecutivos usado para retirar reservas: um miss isolado é
+  mantido e só a morte confirmada pode fazer a troca emergencial. O porte foi
+  feito também no plugin, em `stability.ts` + `native.ts`, com a arquitetura
+  própria dele. O laboratório `tests/live-rtc-issue-170-e2e.mjs` executa
+  literalmente `viewer close` → espera → `viewer watch`, comprova pixels móveis
+  na VM e FPS do sender/viewer quando a implementação oferece essa telemetria,
+  e falha se houver troca proativa, DIRECT, revive ou reload durante a reentrada.
+  A lacuna independente de auto-recuperação de gateway/RTC do plugin continua
+  documentada abaixo.
+- **Recuperação direcional do RTC da transmissão** (próxima beta,
+  [#164](https://github.com/bezumiya/GoLiveBypass/issues/164)): a reprodução ao
+  vivo no Linux delimitou a falha que o probe da beta 10 não enxergava. O
+  Discord desktop mantém a Live no addon nativo `discord_voice`, não em
+  `window.RTCPeerConnection`. Durante o loading infinito, a captura do sender
+  seguia em ~60 fps, mas `framesEncoded=0` e `targetMediaBitrate=0`. O stress de
+  01/09 mostrou que esse target também pode ficar zerado com um viewer real
+  esperando: ele é diagnóstico do Discord, não prova de ausência de receiver.
+  - os ensaios descartaram duas curas inseguras. `destroy(stream)`/fechar toda a
+    mídia derrubou também a voz e perdeu a fonte; `clearDesktopSource()` + replay
+    transformou uma stream capturando em `stats=sem-video`. As duas rotas foram
+    removidas, assim como a API interna de replay;
+  - o preload envolve os factories de `discord_voice`, usa
+    `getFilteredStats(6, callback)` (inbound + outbound) e classifica o papel da
+    stream pelo uso real de `setDesktopSource*`: sender se configurou a fonte,
+    viewer caso contrário. Ele guarda somente o marcador da chamada, nunca
+    sourceId, callbacks, endpoints, tokens ou stats brutos;
+  - no **sender**, sem demanda remota positiva o encoder zerado continua sendo
+    ociosidade normal e nunca provoca ação. Com demanda positiva, captura viva
+    e encoder parado por ≥20s confirmam o travamento mesmo que
+    `targetMediaBitrate=0`. No **viewer**, demanda positiva + vídeo inbound
+    ausente/parado por ≥60s é a assinatura que dispara a recuperação. O viewer
+    conserva por até 120s a intenção positiva anterior quando a tela de erro
+    zera `pixelCount`; a diferença de 40s deixa o sender agir e concluir sua
+    observação antes da outra ponta;
+  - cada websocket `*.discord.media` recebe um id local sanitizado. A conexão
+    nativa da stream é pareada ao socket que nasceu no mesmo intervalo (≤15s),
+    distinguindo-o do socket mais antigo da call; empate, dado incompleto ou
+    pareamento distante falham fechado;
+  - a única tentativa automática envia `close(4000)` **somente ao socket RTC
+    pareado da stream**; o socket da voz principal, o gateway e a janela
+    continuam intactos. O teste de fogo `blocked_start` provou que repetir
+    `close(4000)` no socket substituto recria o websocket, mas conserva a mesma
+    stream nativa congelada em `fps_out=0`; `close(4006)` cria outra stream,
+    porém perde fonte/demanda e também não cura. A segunda tentativa foi
+    removida. Se o vídeo não progride por 30s após o close seguro, o bypass
+    mostra o aviso manual: recarregar o renderer é a única cura confirmada para
+    esse estado fechado do Discord. Não há reload automático, destruição de
+    voice/stream, close-all de mídia nem replay/clear da fonte;
+  - sucesso exige progressão inbound/outbound recente e sustentada por 10s. Se a
+    demanda cair durante a renegociação, a escada pausa e encerra sem escalar
+    após 60s. Telemetria `voice.probe` agora inclui papel, socket pareado, vídeo
+    inbound e target bitrate. O standalone é a fonte e a GUI recebe o mesmo
+    código via `sync-bypass`; testes cobrem privacidade, filtro 6, classificação
+    direcional, target zero com/sem demanda, pareamento ambíguo e preservação da
+    call.
 - **Injeção à prova de corrida: o shim vira preload de sessão** (beta 10,
   [#163](https://github.com/bezumiya/GoLiveBypass/issues/163)): a #163 pegou uma
   sessão inteira **cega** — o CDP não anexou, o fallback do `did-finish-load`
@@ -52,7 +607,7 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   antes de qualquer script da página, em toda janela/frame, sem CDP e sem
   corrida. CDP e fallback ficam como reforço (tudo self-guardado: injeção dupla
   é inofensiva).
-- **Instrumentação RTC + gatilho "áudio vivo, vídeo parado" + cura de voz**
+- **Instrumentação RTC + gatilho "áudio vivo, vídeo parado"**
   (beta 10): o nyxxy revelou o sintoma decisivo — **o áudio da transmissão
   toca, mas o vídeo nunca sai**. Áudio de Go Live vai por RTC/UDP (não pelo
   gateway): a conexão de voz ESTÁ de pé — o que trava é a ativação do vídeo.
@@ -65,12 +620,11 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
     **áudio vivo** (< 60s) + **track de vídeo esperada** (call só de voz nunca
     dispara) + **vídeo parado** (nunca chegou byte ou ≥ 120s) + **não é quem
     transmite** = video-travado.
-  - **Cura**: reconstruir a VOZ, não a janela — `__goliveMidiaFechar()` fecha o
-    ws `*.discord.media` com close(4000); o cliente reconecta/resume a voz e
-    re-negocia o vídeo, **sem derrubar a sessão do Discord** (a regra §6 segue
-    intacta — sem reload com mídia aberta). Escada própria: 2 tentativas/30min
-    com cooldown de 3min; exauriu → banner dedicado (`golivebypass-video`) que
-    explica o que aconteceu. Recuperação: vídeo voltou a crescer → sucesso.
+  - A cura inicial da beta 10 fechava todos os ws `*.discord.media`. O ensaio da
+    #164 mostrou que isso também alcança a call principal e não restaura a
+    assinatura perdida; `__goliveMidiaFechar()` foi removida. A implementação
+    final usa o close direcionado descrito acima e conserva a instrumentação
+    `RTCPeerConnection` apenas como diagnóstico complementar.
 - **Gatilho de stream travada: sniff do op 4 + fluxo de mídia** (beta 9,
   retorno da beta 8 nas issues [#159](https://github.com/bezumiya/GoLiveBypass/issues/159),
   [#160](https://github.com/bezumiya/GoLiveBypass/issues/160) e
@@ -289,7 +843,158 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   spawnavam dois `tor.exe` — um perdia a porta e morria com "Reading config
   failed".
 
+### Investigado (documentado, não corrigido)
+- **Upload de imagem no chat trava e some com o bypass ativo**: reproduzido ao vivo em
+  2026-09-03 (VM Windows/WireSock) — a barra de progresso do anexo trava e a mensagem some do
+  canal, sem completar nem dar erro. Causa provável: o perfil WireGuard gratuito **embutido no
+  app** (`Endpoint = 84.20.27.53:51820`, o mesmo `EMBEDDED_WG_CONF` de `wiresock.ts`/
+  `golivebypass-standalone.sh`) é compartilhado entre todos os usuários que não importaram uma
+  config própria, e satura sob carga real concorrente — um teste isolado de 5MB via `curl` pelo
+  mesmo endpoint completou sem problema, descartando MTU/fragmentação como causa estrutural.
+  Não é uma correção de código simples (a causa é capacidade de infraestrutura compartilhada de
+  terceiros); detalhe completo, evidências e opções de mitigação (aviso de degradação na GUI,
+  pool de perfis gratuitos, documentação) em `AGENTS.md` seção 10.1.
+
 ### Corrigido
+- **Windows: GUI ativava de verdade mas a tela continuava mostrando "Ativar" (relato de beta
+  tester)**: `getStatus()` só checava `isWireSockRunning()` (estado do **serviço** Windows,
+  `sc query wiresock-client-service`). Mas `startWireSockService()` tem um fallback deliberado
+  para quando o serviço não sobe (tipicamente falta de privilégio de administrador): ele
+  spawna o `wiresock-client.exe` **direto, sem serviço** (`spawn(wsExe, ["run", ...])`), e a
+  própria ativação já confere isso via `tunelConfirmado()`/`esperarTunel()` antes de declarar
+  sucesso. `getStatus()` nunca soube desse segundo modo — com o túnel genuinamente de pé (sem
+  serviço), ele reportava `INACTIVE` para sempre, e a UI ficava presa mostrando "Ativar" com o
+  bypass realmente ativo por trás. Corrigido: nova `isWireSockActive()` (exportada de
+  `wiresock.ts`) cobre os dois modos — serviço rodando OU processo `wiresock-client.exe` vivo
+  (via `tasklist`) — e `getStatus()` passou a usá-la. Reproduzido e confirmado na VM Windows:
+  parei o serviço, subi o `wiresock-client.exe` direto (mesmo estado do fallback), a beta 20
+  reportava `INACTIVE` com o processo genuinamente vivo; a build corrigida reporta `ACTIVE` no
+  mesmo estado exato, sem reiniciar nada.
+- **GUI apagava Vencord/Equicord instalado no mesmo Discord (Linux, Windows)**: em
+  `golivebypass-standalone.sh`, o loop de ativação calculava `injection_state()` (que já
+  distinguia "nosso" de "outromod") e chegava a avisar/pedir confirmação quando achava outro
+  mod, mas a remoção de fato (`remove_injection`, que faz `rm -rf app.asar && mv _app.asar
+  app.asar`) rodava **incondicionalmente** sempre que `_app.asar` existisse — ignorando essa
+  variável e a resposta do usuário. Como a GUI sempre chama o script com `--yes` (o `confirm()`
+  do script vira no-op), todo clique em "Ativar" com Vencord/Equicord instalado restaurava o
+  Discord vanilla por cima, apagando o mod sem aviso nenhum na tela. O mesmo padrão existia no
+  `--uninstall`/`--restore` (desativar também apagava). Em `golive-gui/electron/main.ts`, o
+  caminho Windows/macOS (`executarAtivacao`) tinha o problema ainda mais exposto: restaurava
+  `_app.asar → app.asar` sempre que o backup existisse, sem checar se a injeção ali era nossa —
+  as funções `detectOtherMod`/`isProtectedMod` existiam no arquivo mas nunca eram chamadas.
+  Corrigido: nova função `asar_is_ours()` (ignora se o túnel netns já está de pé, ao contrário
+  de `injection_state()`, para não confundir "WireGuard ativo" com "injeção nossa no asar") guarda
+  as duas remoções do script; no Windows a restauração só roda quando `isOurInjection()` é
+  verdadeiro (Vencord/Equicord/qualquer mod fica intocado — o WireSock envelopa o processo
+  independente do que há no `app.asar`); no macOS (que ainda faz injeção real) as funções de
+  detecção foram finalmente conectadas, com confirmação explícita do usuário antes de
+  sobrescrever um mod protegido (`OUTRO_MOD:<mod>:<path>` tratado no renderer com um diálogo de
+  confirmação). Testado nesta máquina com uma instalação real de Vencord
+  (`~/.config/Vencord/dist/patcher.js`) simulando o app.asar patcheado: `injection_state`
+  classifica corretamente como `outromod` e `asar_is_ours` recusa a remoção; a injeção legada
+  do próprio GoLiveBypass continua sendo limpa normalmente (`nosso`/`asar_is_ours=sim`). O teste
+  completo fim-a-fim (netns + WireGuard reais) não rodou por exigir elevação interativa não
+  disponível nesta sessão.
+- **Ativação podia falhar por causa de um Tor sem relação nenhuma com a rota real**: tanto
+  `executarAtivacao` (Windows) quanto `linuxActivate` bootstrapavam um Tor embutido sempre que
+  `readNetMode()` lia `"tor"` — o valor padrão para qualquer `settings.json` sem `routeMode`
+  salvo, ou seja, toda instalação nova. Como não existe mais seletor de modo na tela, isso só
+  acontecia por acidente, e uma falha no download/bootstrap do Tor abortava a ativação inteira
+  mesmo com uma configuração WireGuard perfeitamente válida já conferida na função. Removido do
+  Windows (WireSock não depende disso) e do Linux (o `netMode` passado ao script agora é sempre
+  `"auto"`, o único valor que nunca aciona o `ensure_tor` do script); mantido no macOS, que
+  ainda depende do Tor de verdade para o proxy manual/PAC.
+- **Morte do Tor embutido deixa de esperar ~60 s para iniciar recuperação**:
+  o watchdog da GUI tratava porta fechada (processo morto) igual a um circuito
+  Tor temporariamente lento e só agia depois de duas verificações de 30 s. A
+  porta agora é conferida a cada 5 s; fechada, ela é prova suficiente para um
+  único bootstrap imediato do mesmo daemon. O bootstrap é serializado para que
+  polls seguintes não criem processos concorrentes. Se a porta ainda atende,
+  o probe de túnel mantém as duas amostras espaçadas por 30 s, preservando a
+  rotação normal de circuito. Standalone e plugin não têm esse daemon embutido
+  sob sua posse; seus caminhos estritos de detecção/falha fechada permanecem
+  inalterados. Coberto por testes puros de porta morta, circuito lento e
+  intervalo de probe.
+- **Auto-update do standalone nunca notificaria quem está na beta, e podia
+  instalar script de uma versão com payload de outra**: `Compare-StandaloneVersion`
+  tratava o sufixo `-beta.N` como um componente numérico extra do
+  `Split('.')` (`1.1.12-beta.13` virava `[1,1,12,13]` contra `[1,1,12,0]` da
+  stable, "local mais nova" sempre venceu) — o mesmo bug existia em
+  `standalone_compare_version` no `.sh` apesar do `sort -V`, verificado com
+  testes diretos da função (`1.1.12-beta.13` contra `1.1.12` também dava
+  "mais nova" lá). As duas agora separam base e sufixo antes de comparar: um
+  sufixo de pre-release conta sempre como mais antigo que a mesma base sem
+  sufixo. Corrigido também `Invoke-StandaloneUpdate`/`standalone_update`:
+  buscavam o script sempre de `main` (HEAD mutável) mas o payload da tag da
+  release (imutável), podendo instalar um par nunca lançado junto; os dois
+  artefatos agora vêm da mesma tag.
+- **Recuperação RTC obrigatória e regressão da beta 15**
+  ([#183](https://github.com/bezumiya/GoLiveBypass/issues/183), beta 16): o log
+  provou que o viewer saudável (geração 2) era substituído por gerações novas
+  com `dec=0`/`fps_dec=0`, sem nenhum `gw.revive`. A beta 15 atualizava a
+  memória de saúde antes de avaliar a nova geração e aceitava `0` ou um burst
+  de bytes como vídeo saudável; por isso voltava ao início frio de 60 s a cada
+  renegociação. Agora a leitura atual é pura, só frames/FPS realmente
+  decodificados podem creditar saúde, e a memória anterior é usada para fechar
+  somente o WebSocket RTC pareado da nova geração no próximo poll (~5 s). O
+  gateway não é tocado durante mídia ativa. A recuperação automática deixou de
+  ser uma escolha: checkbox, IPC e opt-out de runtime foram removidos, settings
+  legados `autoRevive:false` são saneados para `true` e o report informa
+  `obrigatorio`. Teto, cooldown, pareamento e as proteções de call/Live
+  permanecem. O plugin Vencord/Equicord segue fora deste porte porque não possui
+  este vigia RTC/gateway; a lacuna continua explícita.
+  Uma auditoria posterior da reprodução real encontrou mais dois casos que os
+  contadores nativos, sozinhos, escondiam: o Discord pode reutilizar a mesma
+  conexão `discord_voice` enquanto troca o `srcObject` do `DirectVideo`, e os
+  seus `getFilteredStats` antigos podem continuar mostrando FPS depois de a UI
+  exibir o erro 2012. O shim agora soma uma geração visual local, sem expor
+  identificadores da página, à geração nativa do viewer; uma troca visual sem
+  frames entra no caminho rápido. A recuperação só é creditada quando a fonte
+  visível recebeu um frame novo — anexar uma fonte parada em `currentTime=0`
+  nunca vale como sucesso. Isso conserva a única tentativa de `close(4000)`
+  direcionado e impede tanto a espera fria errada quanto o falso positivo que
+  antes encerrava a escada sem recuperar a imagem.
+  O teto também ganhou um fallback defensivo para implementações de
+  `discord_voice` que não exponham `setDesktopSource*` ao hook: quando a fonte
+  não é observável, usa a transição local de demanda remota como identidade da
+  Live. Uma nova Live/reentrada avança esse epoch e ganha uma tentativa limpa;
+  o `close(4000)` provocado pelo próprio bypass conserva a demanda e não pode
+  reiniciar a escada. O replayer cobre ambos os ramos. A chamada Linux→Windows
+  confirmou uma Live encerrada e iniciada de novo com imagem, encoder a 15 fps
+  e nenhuma repetição automática de close, reload ou troca de rota. A página
+  CDP comum não enxerga o mundo isolado do preload; por isso seus campos de
+  fonte não são usados para diagnosticar a presença do callback real.
+- **Seletores Tor/Gratuitas respeitam a escolha explícita**: a GUI preserva o
+  texto da proxy ao trocar de modo para que ele possa ser reutilizado em
+  “Personalizado”, mas o runtime ainda lhe dava precedência. Assim, uma GUI em
+  Tor podia rotear por uma proxy manual antiga e aplicar a ela a tolerância de
+  circuito do Tor. Agora somente `routeMode:auto` usa a saída/configuração de
+  range manual; `tor` usa exclusivamente o Tor e `free` busca exclusivamente a
+  lista. O log explica quando uma proxy salva foi ignorada. O plugin não tem
+  esse seletor de três modos — nele a proxy explícita continua sendo, por
+  desenho, a escolha do usuário — portanto não há porte aplicável.
+- **Viewer que já recebia vídeo agora recupera a reentrada travada em até 5 s**
+  ([#181](https://github.com/bezumiya/GoLiveBypass/issues/181)): uma nova conexão
+  `discord_voice` de viewer sem frames, logo após outra que decodificava vídeo,
+  não espera mais 60 s. O vigia fecha somente o WebSocket RTC pareado no próximo
+  poll (limiar de 1 s, poll de 5 s), preservando gateway, chamada e janela. A
+  primeira negociação da sessão continua com a guarda de 60 s, pois ainda pode
+  ser conexão normal; sem socket pareado, demanda ativa e histórico saudável a
+  ação falha fechada. O toggle de revive também passa a ser lido ao vivo do
+  `settings.json`, para a GUI não mostrar "ligado" enquanto o runtime conserva
+  um valor antigo. O plugin Vencord/Equicord não recebe porte: ele não possui o
+  vigia nativo de `discord_voice`/recuperação RTC desta GUI.
+- **Reconexão do gateway não dá mais Ctrl+R em viewer ativo**
+  ([#178](https://github.com/bezumiya/GoLiveBypass/issues/178)): uma Live assistida
+  por mais de 20 minutos continuava decodificando vídeo pelo `discord_voice`, mas
+  o WebSocket `*.discord.media` tinha deixado de aparecer no shim. A marca de
+  mídia expirava, a reconexão do Tor era lida como "sem chamada" e o reload
+  preventivo derrubava o viewer. Stream nativa ativa agora renova a guarda de
+  mídia mesmo sem esse WebSocket; antes do reload a GUI consulta novamente o
+  estado nativo e, com stream/mídia ou telemetria indisponível, cancela a ação e
+  mostra somente o aviso manual. A ausência comprovada de stream mantém o reload
+  preventivo fora de chamadas. O plugin Vencord/Equicord não recebe porte: ele
+  ainda não implementa esse auto-reload/revive de gateway, lacuna já documentada.
 - **Banner de zumbi da beta 4 disparava em falso — e ficava preso** (achado no
   ciclo da #153): `avaliarSinalGw()` comparava a IDADE do último frame (`srvHa`,
   em ms desde o evento) como se fosse timestamp (`agora - srvHa`); o gate de
@@ -436,15 +1141,11 @@ uma cópia mecânica do standalone):
   proxy Tor manual, que antes falhava e caía para uma saída gratuita da
   Coreia do Sul, passou a responder em ~1,1s.
 
-Fora do escopo desta rodada (documentado como trabalho futuro): o plugin não
-tem um modo "só Tor, nunca vaza direto" equivalente ao `routeMode` do
-standalone/GUI — ele sempre tenta manual → pote → Tor → gratuitas → direto,
-nessa ordem, com um teto de 12s. Sem relato específico de "carregamento
-infinito ao abrir" para o plugin (o padrão da issue #116 é sobre a corrida
-GUI×Discord no boot do Windows, que não existe da mesma forma aqui), não
-implementei um modo equivalente nesta rodada — adicionar um exigiria nova
-opção de settings e mudança maior na cadeia `pickExit`/`autoExit`. Também
-ficaram de fora o **alarme de "gateway zumbi"** do beta 3 (#145), o **pill de
+Fora do escopo desta rodada (documentado como trabalho futuro): o plugin ainda
+não expõe um seletor `routeMode` equivalente ao da GUI. Campo vazio continua
+significando automático (Tor detectado → gratuitas → direto), mas um Tor local
+digitado explicitamente agora é estrito e nunca vaza para essas alternativas.
+Também ficaram de fora o **alarme de "gateway zumbi"** do beta 3 (#145), o **pill de
 recuperação + probe** do beta 4 (#149) e o **revive automático** do beta 6
 (#153 — detecção de dispatch starve + close 4000 + escada até reload): no
 plugin eles sairiam mais precisos (o renderer enxerga o socket do gateway, o
@@ -452,9 +1153,20 @@ timestamp da última mensagem e o decompress sem CDP) — o pill e o close do ws
 são quase diretos lá — mas o porte não entrou neste ciclo; o plugin segue sem
 nenhum deles até o próximo. A recuperação nativa de vídeo da #164 também fica
 fora do plugin nesta rodada: ela depende do preload de sessão no processo
-principal, do world isolado 999 e do ciclo de vida de `discord_voice`; o plugin
-tem IPC/patches próprios e precisa de um porte manual com as mesmas guardas,
-nunca de uma cópia literal do standalone.
+principal, do world isolado 999, dos stats inbound/outbound de `discord_voice` e
+do pareamento temporal com o websocket RTC específico da stream; o plugin tem
+IPC/patches próprios e precisa de um porte manual que preserve as mesmas guardas
+(sem demanda positiva nunca age; com demanda positiva o target zero é apenas
+diagnóstico; a call principal nunca fecha; no máximo um close direcionado antes
+do fallback manual), nunca de uma cópia literal do standalone.
+
+O observador CDP `Network`, o parser ETF `MAP_EXT` e o controlador de ações por
+target/geração da beta 13 também não foram copiados para o plugin: essa via não
+injeta um app principal Electron próprio e já executa patches dentro do renderer,
+portanto precisa observar o websocket por sua arquitetura nativa. A regra
+`gw.rajada_tor` não tem equivalente direto — o plugin não implementa a janela
+de rajadas do standalone, mas seu heartbeat Tor permanece informativo e o Tor
+manual estrito agora também bloqueia reservas/DIRECT no tráfego vivo.
 
 **Pendência da regra de sincronização (seção 4 do AGENTS.md):** o aviso de
 proxy manual quebrada da issue #134 (ver acima, nesta mesma versão) só foi

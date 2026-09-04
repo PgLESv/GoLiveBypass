@@ -44,6 +44,15 @@ function loadBypass() {
   const appStub = { on: () => {}, whenReady: () => ({ then: () => {} }), setAppPath: () => {} };
   const sessionStub = { defaultSession: { resolveProxy: async () => "DIRECT", setProxy: async () => {} } };
   const code = fs.readFileSync(BYPASS, "utf8");
+  // O bypass usa o ambiente para escolher o diretório persistente de logs.
+  // Nunca emprestar o process real ao VM: além de trocar argv do próprio teste,
+  // ele fazia as linhas sintéticas desta suite poluírem o golivebypass.log do
+  // Discord que está rodando no host.
+  const sandboxProcess = Object.create(process);
+  Object.defineProperties(sandboxProcess, {
+    env: { value: { ...process.env, XDG_DATA_HOME: path.join(BASE, "data") } },
+    argv: { value: ["node", path.join(FAKE_RES, "_app.asar", "index.js")] },
+  });
   const sandboxRequire = (name) => {
     if (name === "electron") return { app: appStub, session: sessionStub };
     if (name === "original-fs") return require("fs");
@@ -56,14 +65,13 @@ function loadBypass() {
     exports: {},
     __dirname: FAKE_RES,
     __filename: BYPASS,
-    console, process, Buffer,
+    console, process: sandboxProcess, Buffer,
     setTimeout, clearTimeout, setInterval, clearInterval,
     URL, URLSearchParams, Date,
   };
   sandbox.module.exports = sandbox.exports;
   sandbox.global = sandbox;
   vm.createContext(sandbox);
-  Object.defineProperty(sandbox.process, "argv", { value: ["node", path.join(FAKE_RES, "_app.asar", "index.js")], writable: false });
   vm.runInContext(code, sandbox, { filename: BYPASS });
 
   const g = sandbox;

@@ -13,6 +13,8 @@
 #   ./golivebypass-standalone.sh --proxy socks5://127.0.0.1:9050
 #   ./golivebypass-standalone.sh --uninstall
 #   ./golivebypass-standalone.sh --status
+#   ./golivebypass-standalone.sh --check-update
+#   ./golivebypass-standalone.sh --update
 
 # So construcoes POSIX: roda em dash, bash, zsh, ksh e busybox ash.
 set -eu
@@ -44,6 +46,10 @@ unset -f _local_probe 2>/dev/null || true
 
 
 PATCHER_NAME="golivebypass.js"
+STANDALONE_VERSION="1.1.12-beta.13"
+WG_CONF_CLI=""
+NETNS_NAME="discord-vpn"
+WG_IF="wg-discord"
 # ---------------------------------------------------------------------------
 # Home do usuario real
 #
@@ -115,7 +121,98 @@ TOR_ADDR_CLI=""
 ASSUME_YES=0
 JSON=0
 
-C_OFF=$(printf '\033[0m'); C_CYAN=$(printf '\033[36m'); C_GREEN=$(printf '\033[32m'); C_YELLOW=$(printf '\033[33m'); C_RED=$(printf '\033[31m'); C_DIM=$(printf '\033[2m')
+STANDALONE_REPO_API="https://api.github.com/repos/bezumiya/GoLiveBypass/releases/latest"
+
+standalone_release() {
+    local json tag_raw tag payload
+    if have curl; then
+        json=$(curl -fsSL -H 'User-Agent: GoLiveBypass-Standalone' -H 'Accept: application/vnd.github+json' "$STANDALONE_REPO_API") || return 1
+    elif have wget; then
+        json=$(wget -qO- --header='User-Agent: GoLiveBypass-Standalone' "$STANDALONE_REPO_API") || return 1
+    else
+        return 1
+    fi
+    tag_raw=$(printf '%s' "$json" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v?[0-9][^"]*"' | head -1 | sed 's/.*"\(v\?[0-9][^"]*\)".*/\1/')
+    tag=${tag_raw#v}
+    payload=$(printf '%s' "$json" | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^\"]*-[0-9][^\"]*-bypass\.js"' | head -1 | sed 's/.*"\(http[^\"]*\)".*/\1/')
+    # A 3a linha (tag_raw, com o "v" que o git usa de verdade) e o que da pra
+    # montar uma URL raw.githubusercontent presa nessa release; a 1a linha
+    # (tag, sem "v") e so para exibir/comparar versao.
+    [ -n "$tag" ] && printf '%s\n%s\n%s\n' "$tag" "$payload" "$tag_raw"
+}
+
+standalone_compare_version() {
+    local local_version="$1" remote_version="$2"
+    local_version=${local_version#v}; remote_version=${remote_version#v}
+    [ -n "$remote_version" ] || { echo 0; return; }
+    [ "$local_version" = "$remote_version" ] && { echo 0; return; }
+    local local_core="${local_version%%-*}" local_pre="" remote_core="${remote_version%%-*}" remote_pre=""
+    case "$local_version" in *-*) local_pre="${local_version#*-}" ;; esac
+    case "$remote_version" in *-*) remote_pre="${remote_version#*-}" ;; esac
+    if [ "$local_core" != "$remote_core" ]; then
+        [ "$(printf '%s\n%s\n' "$local_core" "$remote_core" | sort -V | head -1)" = "$remote_core" ] && echo 1 || echo -1
+        return
+    fi
+    # Mesma versao base: um sufixo de pre-release (-beta.N) sempre conta como
+    # mais antigo que a mesma base sem sufixo, nunca como um componente extra
+    # (sort -V sozinho, sem separar o sufixo, tratava beta.N como mais novo).
+    if [ -n "$local_pre" ] && [ -z "$remote_pre" ]; then echo -1; return; fi
+    if [ -z "$local_pre" ] && [ -n "$remote_pre" ]; then echo 1; return; fi
+    if [ -n "$local_pre" ] && [ -n "$remote_pre" ]; then
+        [ "$(printf '%s\n%s\n' "$local_pre" "$remote_pre" | sort -V | head -1)" = "$remote_pre" ] && echo 1 || echo -1
+        return
+    fi
+    echo 0
+}
+
+standalone_check_update() {
+    local release latest payload cmp
+    release="$(standalone_release 2>/dev/null || true)"
+    latest="$(printf '%s' "$release" | head -1)"
+    [ -n "$latest" ] || { warn 'nao consegui consultar a release estavel'; return 0; }
+    cmp="$(standalone_compare_version "$STANDALONE_VERSION" "$latest")"
+    printf '  standalone: v%s\n' "$STANDALONE_VERSION"
+    printf '  remoto:     v%s\n' "$latest"
+    case "$cmp" in
+        -1) printf '  resultado:  %sha uma atualizacao%s\n' "$C_YELLOW" "$C_OFF" ;;
+        0) printf '  resultado:  %sja esta atualizado%s\n' "$C_GREEN" "$C_OFF" ;;
+        1) printf '  resultado:  %sversao local e mais nova%s\n' "$C_DIM" "$C_OFF" ;;
+    esac
+}
+
+standalone_update() {
+    local release latest payload tag_ref target tmp backup
+    release="$(standalone_release 2>/dev/null || true)"
+    latest="$(printf '%s' "$release" | head -1)"
+    payload="$(printf '%s' "$release" | sed -n '2p')"
+    tag_ref="$(printf '%s' "$release" | sed -n '3p')"
+    [ -n "$latest" ] || fail 'nao consegui consultar a release estavel'
+    [ "$(standalone_compare_version "$STANDALONE_VERSION" "$latest")" = "-1" ] || { ok "standalone ja esta na v$STANDALONE_VERSION"; return 0; }
+    [ -n "$payload" ] || fail 'release sem asset do standalone'
+    [ -n "$tag_ref" ] || fail 'release sem tag para travar o script no mesmo par'
+    tmp="$(mktemp)"; backup="${SCRIPT_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+    step "Baixando standalone v$latest"
+    # Script e payload sempre vem da MESMA tag da release: buscar o script em
+    # main misturaria uma versao do script com um payload de outra release.
+    local script_url="https://raw.githubusercontent.com/bezumiya/GoLiveBypass/$tag_ref/standalone/golivebypass-standalone.sh"
+    if have curl; then curl -fsSL "$script_url" -o "$tmp" || { rm -f "$tmp"; fail 'download do standalone falhou'; }
+    else wget -qO "$tmp" "$script_url" || { rm -f "$tmp"; fail 'download do standalone falhou'; }
+    fi
+    chmod +x "$tmp"
+    mv "$SCRIPT_PATH" "$backup" || { rm -f "$tmp"; fail 'nao consegui criar backup do standalone'; }
+    mv "$tmp" "$SCRIPT_PATH" || { mv "$backup" "$SCRIPT_PATH"; fail 'nao consegui instalar o standalone novo'; }
+    if [ -f "$INSTALL_DIR/$PATCHER_NAME" ]; then
+        local payload_url="$payload"
+        tmp="$(mktemp)"
+        if have curl; then curl -fsSL "$payload_url" -o "$tmp" || { rm -f "$tmp"; warn 'payload instalado nao foi atualizado'; return 0; }
+        else wget -qO "$tmp" "$payload_url" || { rm -f "$tmp"; warn 'payload instalado nao foi atualizado'; return 0; }
+        fi
+        chmod +x "$tmp"; mv "$INSTALL_DIR/$PATCHER_NAME" "$INSTALL_DIR/$PATCHER_NAME.bak.$(date +%Y%m%d%H%M%S)"; mv "$tmp" "$INSTALL_DIR/$PATCHER_NAME"
+    fi
+    ok "standalone atualizado para v$latest (backup: $backup)"
+}
+
+C_OFF=$(printf '\033[0m'); C_CYAN=$(printf '\033[36m'); C_GREEN=$(printf '\033[32m'); C_YELLOW=$(printf '\033[33m'); C_RED=$(printf '\033[31m'); C_DIM=$(printf '\033[2m'); C_BOLD=$(printf '\033[1m')
 
 # Tudo em stderr: estas funcoes sao chamadas de dentro de $(...), e escrever em stdout faria o
 # texto colar no valor de retorno. Foi assim que a primeira versao do instalador de Linux
@@ -200,6 +297,10 @@ report_sanitize() {
     texto="$(printf '%s' "$texto" | sed -E 's/\b(mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,})\b/***/g')"
     # query de gateway: so o host interessa
     texto="$(printf '%s' "$texto" | sed -E 's#(https://gateway[^ ?]+)\?[^ ]*#\1?<params>#g')"
+    # Identidade local: e-mails e a pasta pessoal podem aparecer em erros de sistema/logs.
+    texto="$(printf '%s' "$texto" | sed -E 's/[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}/<email>/g')"
+    texto="$(printf '%s' "$texto" | sed -E 's#/(home|var/home|Users)/[^/[:space:]]+#/\1/<usuario>#g')"
+    texto="$(printf '%s' "$texto" | sed -E 's/(nome|name|usuario|username|user)[[:space:]]*([:=])[[:space:]]*[^[:space:],;]+/\1\2<usuario>/g')"
     # proxy personalizada salva (host/porta e URL inteira)
     if [ -f "$INSTALL_DIR/settings.json" ]; then
         local segredo
@@ -540,6 +641,7 @@ st_tui_done() { printf '\033[2K\r%s%s[OK]%s\n' "$ST_BG" "$ST_OK" "$ST_RSET" >&2;
 while [ $# -gt 0 ]; do
     case "$1" in
         --proxy) PROXY="${2:-}"; shift ;;
+        --wg-conf) WG_CONF_CLI="${2:-}"; shift ;;
         --excluded-countries) EXCLUDED="${2:-BR}"; shift ;;
         --net-mode) NET_MODE="${2:-}"; shift ;;
         --tor-addr) TOR_ADDR_CLI="${2:-}"; shift ;;
@@ -551,6 +653,8 @@ while [ $# -gt 0 ]; do
         --uninstall) MODE="uninstall" ;;
         --restore) MODE="restore" ;;
         --status) MODE="status" ;;
+        --check-update) MODE="check-update" ;;
+        --update) MODE="update" ;;
         --json) JSON=1 ;;
         -y|--yes) ASSUME_YES=1 ;;
         -h|--help) sed -n '3,15p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -912,6 +1016,10 @@ aviso_empacotado() {
 
 injection_state() {
     local resources="$1"
+    if ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
+        printf 'nosso\n'
+        return 0
+    fi
     [ -f "$resources/_app.asar" ] || { printf 'vanilla\n'; return 0; }
 
     if [ -f "$resources/app.asar/index.js" ] && grep -qF "$PATCHER_NAME" "$resources/app.asar/index.js" 2>/dev/null; then
@@ -920,6 +1028,58 @@ injection_state() {
         printf 'outromod\n'
     fi
     return 0
+}
+
+# So olha o conteudo do app.asar, ignorando se o netns ja esta de pe -- ao contrario de
+# injection_state() (que responde "nosso" so por o tunel estar ativo), usada para QUALQUER
+# decisao de apagar _app.asar. Sem isto, Vencord/Equicord instalado DEPOIS do tunel ja
+# ativo seria confundido com nossa injecao legada e apagado na proxima ativacao/desativacao.
+asar_is_ours() {
+    local resources="$1"
+    [ -f "$resources/_app.asar" ] || return 1
+    [ -f "$resources/app.asar/index.js" ] && grep -qF "$PATCHER_NAME" "$resources/app.asar/index.js" 2>/dev/null
+}
+
+# Handshake e trafego do peer WireGuard dentro do namespace, para o --status --json. Motivo de
+# existir: pos-migracao pra WireGuard, "Discord carregando infinito" e mais provavel de ser
+# tunel morto ou saturado (endpoint gratuito compartilhado) do que o gateway zumbi do proxy
+# legado -- e sem isto nao havia NENHUM jeito de diferenciar os dois num report. Handshake mais
+# velho que ~180s (o dobro do dobro do PersistentKeepalive=25 do bypass) com o namespace de pe
+# e o sinal mais direto de tunel morto ou endpoint inalcancavel.
+#
+# So leitura (nunca falha fechado): sem privilegio ou sem namespace, devolve ok:false com o
+# motivo em vez de travar o --status inteiro -- os passos que de fato mudam algo (elevate) tem
+# a propria guarda em outro lugar.
+wg_stats_json() {
+    if ! ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
+        printf '{"ok":false,"error":"namespace inativo"}'
+        return 0
+    fi
+    local dump
+    if [ "$(id -u)" -eq 0 ]; then
+        dump="$(ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
+    elif have sudo && sudo -n true 2>/dev/null; then
+        dump="$(sudo ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
+    else
+        printf '{"ok":false,"error":"sem privilegio para ler (precisa root ou sudo sem senha)"}'
+        return 0
+    fi
+    local linha2 handshake rx tx agora idade
+    linha2="$(printf '%s\n' "$dump" | sed -n '2p')"
+    if [ -z "$linha2" ]; then
+        printf '{"ok":false,"error":"sem peer no dump do wg"}'
+        return 0
+    fi
+    handshake="$(printf '%s' "$linha2" | cut -f5)"
+    rx="$(printf '%s' "$linha2" | cut -f6)"
+    tx="$(printf '%s' "$linha2" | cut -f7)"
+    agora="$(date +%s)"
+    if [ -n "$handshake" ] && [ "$handshake" -gt 0 ] 2>/dev/null; then
+        idade=$((agora - handshake))
+        printf '{"ok":true,"handshakeAgoS":%d,"rxBytes":%s,"txBytes":%s}' "$idade" "${rx:-0}" "${tx:-0}"
+    else
+        printf '{"ok":true,"handshakeAgoS":null,"rxBytes":%s,"txBytes":%s}' "${rx:-0}" "${tx:-0}"
+    fi
 }
 
 # Escrever em /usr/share exige raiz; em ~/.local/share nao. Pedir sudo sempre seria grosseiro,
@@ -1013,6 +1173,12 @@ stop_discord() {
     pkill -x discord 2>/dev/null || true
     pkill -x discord-canary 2>/dev/null || true
     pkill -x discordptb 2>/dev/null || true
+    if have systemctl; then
+        systemctl stop 'discord-vpn-*' 2>/dev/null || true
+    fi
+    rm -f "$_USER_HOME/.config/discord/Singleton"* 2>/dev/null || true
+    rm -f "$_USER_HOME/.config/discordptb/Singleton"* 2>/dev/null || true
+    rm -f "$_USER_HOME/.config/discordcanary/Singleton"* 2>/dev/null || true
     kill_parallel_by_path
     if have flatpak; then
         local id
@@ -1108,7 +1274,8 @@ install_patcher() {
 {
     "enabled": true,
     "proxy": "$proxy_json",
-    "excludedCountries": "$EXCLUDED"$net_keys
+    "excludedCountries": "$EXCLUDED",
+    "autoRevive": true$net_keys
 }
 JSON
 
@@ -1308,14 +1475,102 @@ remove_injection() {
 }
 
 
-# Reabre o Discord depois de injetar ou de desfazer. Quem tem o flatpak e um Discord nativo
-# pela metade acabaria com o errado aberto: abre o mesmo que foi mexido. Recebe a linha crua
-# do FOUND (path|flav|...) para abrir o binario certo do flav — injetou no Equibop, abre o
-# equibop, nao "discord".
+EMBEDDED_WG_CONF='[Interface]
+PrivateKey = UDisDb8fm+SeuHuJgKtWFcGMNHz30eBPHZWND/Jou2M=
+Address = 10.2.0.2/32, 2a07:b944::2:2/128
+DNS = 10.2.0.1, 2a07:b944::2:1
+
+[Peer]
+# US-FREE#1
+PublicKey = gucaLaM/mgJQbHVvnZNtW+1L4Mi7E2mtTMrhS0K4miU=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 146.70.230.146:51820
+PersistentKeepalive = 25'
+
+ensure_wireguard_conf() {
+    local wg_file="$INSTALL_DIR/wireguard.conf"
+    if [ -n "$WG_CONF_CLI" ] && [ -f "$WG_CONF_CLI" ]; then
+        mkdir -p "$INSTALL_DIR"
+        cp "$WG_CONF_CLI" "$wg_file"
+        chmod 600 "$wg_file" 2>/dev/null || true
+        ok "Configuracao WireGuard importada de $WG_CONF_CLI"
+        return 0
+    fi
+    if [ -f "$wg_file" ]; then
+        return 0
+    fi
+
+    local found_dl=""
+    for f in "$_USER_HOME/Downloads"/wg-*.conf; do
+        if [ -f "$f" ]; then
+            found_dl="$f"
+            break
+        fi
+    done
+
+    mkdir -p "$INSTALL_DIR"
+    if [ -n "$found_dl" ]; then
+        cp "$found_dl" "$wg_file"
+        chmod 600 "$wg_file" 2>/dev/null || true
+        ok "Configuracao WireGuard encontrada em $found_dl"
+    else
+        printf '%s\n' "$EMBEDDED_WG_CONF" > "$wg_file"
+        chmod 600 "$wg_file" 2>/dev/null || true
+        ok "Configuracao padrao WireGuard (EUA) gravada em $wg_file"
+    fi
+}
+
+setup_wireguard_netns() {
+    have ip || fail "Comando 'ip' nao encontrado no sistema."
+    have wg || fail "Comando 'wg' (wireguard-tools) nao encontrado. Instale com seu gerenciador de pacotes."
+
+    ensure_wireguard_conf
+    local wg_file="$INSTALL_DIR/wireguard.conf"
+
+    if ! ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
+        step "Criando namespace de rede '$NETNS_NAME'"
+        elevate ip netns add "$NETNS_NAME"
+    fi
+
+    step "Configurando interface WireGuard '$WG_IF' no namespace '$NETNS_NAME'"
+    elevate ip -n "$NETNS_NAME" link del dev "$WG_IF" 2>/dev/null || true
+    elevate ip link del dev "$WG_IF" 2>/dev/null || true
+
+    local tmp_conf
+    tmp_conf="$(mktemp)"
+    grep -vE "^(Address|DNS)" "$wg_file" > "$tmp_conf"
+
+    elevate ip link add dev "$WG_IF" type wireguard
+    elevate wg setconf "$WG_IF" "$tmp_conf"
+    rm -f "$tmp_conf"
+
+    elevate ip link set "$WG_IF" netns "$NETNS_NAME"
+
+    local addr
+    addr="$(grep -E "^Address" "$wg_file" | cut -d= -f2 | awk -F, '{print $1}' | tr -d ' ')"
+    [ -n "$addr" ] || addr="10.2.0.2/32"
+
+    elevate ip -n "$NETNS_NAME" addr add "$addr" dev "$WG_IF"
+    elevate ip -n "$NETNS_NAME" link set "$WG_IF" up
+    elevate ip -n "$NETNS_NAME" link set lo up
+    elevate ip -n "$NETNS_NAME" route add default dev "$WG_IF"
+
+    elevate mkdir -p "/etc/netns/$NETNS_NAME"
+    printf 'nameserver 10.2.0.1\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' | elevate tee "/etc/netns/$NETNS_NAME/resolv.conf" >/dev/null
+    ok "Tunel WireGuard 100% ativo no namespace '$NETNS_NAME'."
+}
+
+teardown_wireguard_netns() {
+    if ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
+        step "Removendo namespace de rede '$NETNS_NAME' e interface WireGuard"
+        elevate ip netns del "$NETNS_NAME" 2>/dev/null || true
+        elevate rm -rf "/etc/netns/$NETNS_NAME" 2>/dev/null || true
+        ok "Tunel WireGuard encerrado."
+    fi
+}
+
+# Reabre o Discord envelopado dentro do namespace WireGuard (sem proxy).
 start_discord() {
-    # `local a=X b=Y` em uma linha so quebra em ksh93/mksh: as atribuicoes depois da
-    # primeira viram globais. Separar em linhas e' o que o POSIX manda, e o
-    # `|` em ${var%%pattern} precisa de escape `\|` para ksh.
     local linha="${1:-}"
     local resources=""
     local flav=""
@@ -1323,29 +1578,52 @@ start_discord() {
     local exe
 
     resources="${linha%%\|*}"
-    [ -n "$resources" ] || return 1
 
-    if id="$(flatpak_app_id "$resources")" && have flatpak; then
-        nohup flatpak run "$id" >/dev/null 2>&1 &
-        return 0
+    local run_user="${SUDO_USER:-$(id -un 2>/dev/null || whoami)}"
+    local run_uid="$(id -u "$run_user" 2>/dev/null || id -u)"
+    local run_env="HOME=$_USER_HOME USER=$run_user LOGNAME=$run_user DISPLAY=${DISPLAY:-:1} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$run_uid} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus} PULSE_SERVER=unix:/run/user/$run_uid/pulse/native"
+
+    # Remove travas Singleton orfas que fazem o Chromium fechar imediatamente com before-quit
+    rm -f "$_USER_HOME/.config/discord/Singleton"* 2>/dev/null || true
+    rm -f "$_USER_HOME/.config/discordptb/Singleton"* 2>/dev/null || true
+    rm -f "$_USER_HOME/.config/discordcanary/Singleton"* 2>/dev/null || true
+
+    local target_cmd=""
+    if [ -n "$resources" ] && id="$(flatpak_app_id "$resources")" && have flatpak; then
+        target_cmd="flatpak run $id"
+    elif [ -n "$linha" ]; then
+        flav="$(printf '%s' "$linha" | cut -d'|' -f2)"
+        case "$flav" in
+            equibop|vesktop|legcord)
+                if have "$flav"; then target_cmd="$flav"; fi
+                ;;
+        esac
     fi
 
-    flav="$(printf '%s' "$linha" | cut -d'|' -f2)"
-    case "$flav" in
-        equibop|vesktop|legcord)
-            if have "$flav"; then
-                nohup "$flav" >/dev/null 2>&1 &
-                return 0
-            fi
-            ;;
-    esac
-
-    for exe in discord Discord discord-canary; do
-        if have "$exe"; then
-            nohup "$exe" >/dev/null 2>&1 &
-            return 0
+    if [ -z "$target_cmd" ] && [ -n "$resources" ] && [ -d "$resources" ]; then
+        local dc_path
+        dc_path="$(find "$resources/.." -maxdepth 2 -name "Discord" -type f -executable 2>/dev/null | head -1 || true)"
+        if [ -n "$dc_path" ] && [ -x "$dc_path" ]; then
+            target_cmd="$dc_path"
         fi
-    done
+    fi
+
+    if [ -z "$target_cmd" ]; then
+        for exe in discord Discord discord-canary discordptb; do
+            if have "$exe"; then
+                target_cmd="$exe"
+                break
+            fi
+        done
+    fi
+
+    [ -n "$target_cmd" ] || return 1
+
+    if have systemd-run; then
+        elevate systemd-run --unit="discord-vpn-$(date +%s)" ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env $target_cmd >/dev/null 2>&1
+    else
+        elevate ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env nohup $target_cmd >/dev/null 2>&1 &
+    fi
 }
 
 printf '\n  %sGoLiveBypass standalone%s\n' "$C_CYAN" "$C_OFF" >&2
@@ -1361,18 +1639,27 @@ printf '  %s%s%s\n\n' "$C_DIM" "$DISTRO" "$C_OFF" >&2
 # fluxo continua 100% por flags (comportamento atual).
 if [ "$MODE" = "install" ] && st_tui_is_interactive; then
     st_choice="$(st_tui_menu "GoLiveBypass standalone" \
-        "Instalar / atualizar o bypass" \
+        "Instalar o bypass" \
         "Ver status" \
+        "Verificar atualizacoes" \
+        "Atualizar standalone" \
         "Desinstalar" \
         "Sair")"
     case "$st_choice" in
         1) : ;;  # continua no fluxo de instalação abaixo
         2) MODE="status"; JSON=0 ;;
-        3) MODE="uninstall" ;;
+        3) MODE="check-update" ;;
+        4) MODE="update" ;;
+        5) MODE="uninstall" ;;
         *) printf '  %sAte mais.%s\n' "$C_DIM" "$C_OFF"; exit 0 ;;
     esac
     # Se veio de "Ver status" ou "Desinstalar", despacha abaixo (code continua).
 fi
+
+case "$MODE" in
+    check-update) standalone_check_update; exit 0 ;;
+    update) standalone_update; exit 0 ;;
+esac
 
 aviso_empacotado
 
@@ -1486,17 +1773,9 @@ FOUND="$(discord_dirs)"
 
 if [ "$MODE" = "status" ]; then
     if [ "$JSON" -eq 1 ]; then
-        # Saida maquina para a GUI: um JSON com o estado de cada Discord encontrado.
-        # Formato de cada linha do FOUND: path|flavour|detected_by|flatpak_id(opcional)
-        # routeMode/torAddr na raiz: o modo que o runtime VAI ler, para a GUI (e o bug
-        # report) compararem contra o modo do seletor e denunciar drift (issue #108).
-        settings_file="$INSTALL_DIR/settings.json"
-        route_mode_disk="" tor_addr_disk=""
-        if [ -f "$settings_file" ]; then
-            route_mode_disk="$(sed -n 's/.*"routeMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$settings_file" | head -1)"
-            tor_addr_disk="$(sed -n 's/.*"torAddr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$settings_file" | head -1)"
-        fi
-        printf '{"routeMode":"%s","torAddr":"%s","discords":[' "$route_mode_disk" "$tor_addr_disk"
+        route_mode_disk="wireguard"
+        tor_addr_disk=""
+        printf '{"routeMode":"%s","torAddr":"%s","wg":%s,"discords":[' "$route_mode_disk" "$tor_addr_disk" "$(wg_stats_json)"
         first=1
         printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav detect id; do
             [ "$first" -eq 1 ] || printf ','
@@ -1509,74 +1788,66 @@ if [ "$MODE" = "status" ]; then
             fi
             printf '}'
         done
-        printf ']}'
-        printf '\n'
+        printf ']}\n'
         exit 0
     fi
+    printf '\n  %b=== STATUS DO DISCORD E REDE ===%b\n' "$C_BOLD" "$C_OFF" >&2
+    sys_ip="$(curl -s -m 3 https://api.ipify.org 2>/dev/null || echo "Desconhecido")"
+    printf '  [Rede Normal do PC]\n' >&2
+    printf '    IP Publico : %s (resto do PC navega por aqui)\n\n' "$sys_ip" >&2
+
+    printf '  [Tunel WireGuard do Discord]\n' >&2
+    if ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
+        printf '  [✓] Namespace "%s" ATIVO.\n' "$NETNS_NAME" >&2
+        if [ "$(id -u)" -eq 0 ] || (have sudo && sudo -n true 2>/dev/null); then
+            vpn_ip="$(sudo ip netns exec "$NETNS_NAME" curl -s -m 4 https://api.ipify.org 2>/dev/null || echo "N/A")"
+            vpn_loc="$(sudo ip netns exec "$NETNS_NAME" curl -s -m 4 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^loc=' | cut -d= -f2 || echo "N/A")"
+            printf '    IP no Discord: %s\n' "$vpn_ip" >&2
+            printf '    Pais         : %s\n' "$vpn_loc" >&2
+        fi
+        printf '  [✓] TODO o trafego do Discord (voz, video, gateway) esta envelopado no WireGuard!\n' >&2
+        wg_info="$(wg_stats_json)"
+        case "$wg_info" in
+            '{"ok":true'*)
+                wg_hs="$(printf '%s' "$wg_info" | sed -n 's/.*"handshakeAgoS":\([^,}]*\).*/\1/p')"
+                wg_rx="$(printf '%s' "$wg_info" | sed -n 's/.*"rxBytes":\([0-9]*\).*/\1/p')"
+                wg_tx="$(printf '%s' "$wg_info" | sed -n 's/.*"txBytes":\([0-9]*\).*/\1/p')"
+                [ "$wg_hs" = "null" ] && wg_hs="nunca"
+                printf '  Handshake: ha %ss | trafego: rx=%sKB tx=%sKB\n\n' "$wg_hs" "$((${wg_rx:-0} / 1024))" "$((${wg_tx:-0} / 1024))" >&2
+                ;;
+            *)
+                printf '  Handshake/trafego indisponivel (rode como root ou com sudo sem senha para ver).\n\n' >&2
+                ;;
+        esac
+    else
+        printf '  [!] Namespace "%s" NAO esta ativo.\n\n' "$NETNS_NAME" >&2
+    fi
+
+    printf '  [Instalacoes do Discord]\n' >&2
     printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav detect id; do
         case "$(injection_state "$resources")" in
-            vanilla)  printf '  %s (%s): sem nada instalado\n' "$resources" "$flav" >&2 ;;
-            nosso)    printf '  %s (%s): com o GoLiveBypass standalone\n' "$resources" "$flav" >&2 ;;
+            nosso)    printf '  %s (%s): envelopado via WireGuard (%s)\n' "$resources" "$flav" "$NETNS_NAME" >&2 ;;
             outromod) printf '  %s (%s): com Equicord/Vencord (ou outro mod)\n' "$resources" "$flav" >&2 ;;
+            *)        printf '  %s (%s): vanilla (sem tunel)\n' "$resources" "$flav" >&2 ;;
         esac
     done
-    [ -f "$INSTALL_DIR/golivebypass.log" ] && tail -12 "$INSTALL_DIR/golivebypass.log" >&2
     exit 0
 fi
 
-if [ "$MODE" = "uninstall" ]; then
+if [ "$MODE" = "uninstall" ] || [ "$MODE" = "restore" ]; then
     stop_discord
-    # O seletor pergunta so quando ha mais de um Discord; -Yes e entrada nao
-    # interativa (GUI) continuam agindo em todos.
-    FOUND="$(escolher_alvos "remover o bypass de")"
-    failed=0
-    # Arquivo em vez de pipe: o while dentro de um pipe roda em subshell, e o "failed"
-    # nao voltaria para o pai. Com redirecionamento, o laco roda no shell principal.
-    tmp="$(mktemp)"
-    printf '%s\n' "$FOUND" > "$tmp"
-    while IFS='|' read -r resources flav detect id; do
-        if [ "$(injection_state "$resources")" != "nosso" ]; then
-            warn "$resources nao tem o standalone, deixando como esta."
-            continue
-        fi
-        if remove_injection "$resources" && [ "$(injection_state "$resources")" = "vanilla" ]; then
-            ok "$resources voltou ao normal."
-            if id="$(flatpak_app_id "$resources")"; then
-                revoke_flatpak_access "$id" "$INSTALL_DIR"
-            fi
-        else
-            warn "NAO consegui desinstalar de $resources — a elevacao falhou ou o arquivo esta bloqueado."
-            failed=1
-        fi
-    done < "$tmp"
-    rm -f "$tmp"
-
-    # Nao reabrir o Discord nao-revertido: abriria com a injecao ainda no disco, e o botao
-    # da GUI voltaria a "Ativo" por engano. Se nada falhou e ha um vanilla pra abrir, abre.
-    if [ "$failed" -eq 0 ]; then
-        remove_tor
-        start_discord "$(printf '%s\n' "$FOUND" | head -1)"
-        exit 0
-    fi
-    fail "Nao consegui desinstalar de todos — a elevacao pode ter falhado. Enviando relatorio."
-fi
-
-# Igual ao --uninstall, mas sem reabrir o Discord: usado pela GUI no boot para reverter
-# uma injecao orfa de uma sessao anterior que morreu sem o quit limpo (PC desligado,
-# crash). Reabrir aqui abriria o Discord de surpresa no login.
-if [ "$MODE" = "restore" ]; then
-    stop_discord
+    teardown_wireguard_netns
+    remove_tor
     printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav detect id; do
-        if [ "$(injection_state "$resources")" != "nosso" ]; then
-            warn "$resources nao tem o standalone, deixando como esta."
-            continue
-        fi
-        remove_injection "$resources" && ok "$resources voltou ao normal."
-        if id="$(flatpak_app_id "$resources")"; then
-            revoke_flatpak_access "$id" "$INSTALL_DIR"
+        # Mesma guarda do install: so desfaz _app.asar quando a injecao ali e NOSSA. Se for
+        # backup do Vencord/Equicord, restaurar por cima apaga o mod do usuario ao desativar.
+        if asar_is_ours "$resources"; then
+            remove_injection "$resources" && ok "$resources voltou ao normal."
         fi
     done
-    remove_tor
+    if [ "$MODE" = "uninstall" ]; then
+        ok "GoLiveBypass desinstalado e Discord restaurado."
+    fi
     exit 0
 fi
 
@@ -1610,12 +1881,12 @@ while IFS='|' read -r resources flav detect id; do
     printf '  %s (%s): %s\n' "$resources" "$flav" "$state" >&2
 
     if [ "$state" = "outromod" ]; then
-        warn "Este Discord ja tem Equicord ou Vencord injetado."
-        printf '      %sO standalone ocupa o mesmo lugar, entao instalar aqui desliga o outro mod.%s\n' "$C_DIM" "$C_OFF" >&2
-        printf '      %sSe voce usa Equicord ou Vencord, prefira o plugin: ele convive com o resto.%s\n' "$C_DIM" "$C_OFF" >&2
-        printf '      %sBaixe o goLiveBypass-vencord.zip na aba Releases e siga o tutorial%s\n' "$C_DIM" "$C_OFF" >&2
-        printf '      %sdo README (Instalação: passo a passo completo).%s\n' "$C_DIM" "$C_OFF" >&2
-        confirm "Substituir o mod em $resources pelo standalone?" || { warn "Deixei como estava."; continue; }
+        # Desde a migracao para WireGuard Per-App VPN o bypass nao toca mais no app.asar de
+        # ninguem: o tunel envelopa o processo do Discord inteiro, seja qual for o app.asar
+        # dentro dele. Antigamente o standalone e o Vencord/Equicord disputavam o mesmo lugar
+        # (a injecao por pasta) e um apagava o outro sem aviso real na GUI (--yes zera o
+        # confirm) -- essa nota e so informativa agora, nada e sobrescrito.
+        printf '  %sEquicord/Vencord detectado em %s -- convive normalmente: o WireGuard envelopa o processo sem tocar no app.asar dele.%s\n' "$C_DIM" "$resources" "$C_OFF" >&2
     fi
 
     # Vesktop, Equibop e Legcord de flatpak usam Electron 18 com zypak, que tenta ler o
@@ -1636,41 +1907,33 @@ while IFS='|' read -r resources flav detect id; do
         continue
     fi
 
-    install_patcher
-
-    # Antes do stop_discord de proposito: vale tanto para a injecao nova quanto para a que ja
-    # estava la, que sai por baixo daqui pelo continue.
-    if id="$(flatpak_app_id "$resources")"; then
-        grant_flatpak_access "$id" "$INSTALL_DIR"
-    fi
+    setup_wireguard_netns
 
     stop_discord
 
-    [ "$state" = "outromod" ] && remove_injection "$resources"
-    if [ "$(injection_state "$resources")" = "nosso" ]; then
-        ok "Ja estava injetado, so atualizei o bypass."
-        printf '1\n' >> "$tally"
-        continue
-    fi
-
-    if ! install_injection "$resources"; then
-        warn "Pulei $resources -- os outros Discords encontrados continuam."
-        continue
+    # So desfazemos _app.asar quando a injecao la dentro e NOSSA (versao antiga, pre-WireGuard,
+    # que patcheava o app.asar). Quando e outro mod (Vencord/Equicord), _app.asar e o backup
+    # DELES -- restaurar por cima apagava o mod inteiro a toa, ja que o WireGuard nem precisa
+    # do app.asar vanilla para envelopar o processo.
+    if asar_is_ours "$resources"; then
+        remove_injection "$resources"
+        ok "Injecao legada de proxy removida de $resources (Discord restaurado para vanilla)."
     fi
     printf '1\n' >> "$tally"
-    ok "$resources pronto."
+    ok "$resources pronto para execucao no WireGuard."
 done < "$lista"
 injected="$(grep -c . "$tally" || true)"
 rm -f "$lista" "$tally"
 
-# Modo portatil: reabre o Discord ja com o bypass ativo (mesmo comportamento do app do Windows).
-# head -1 em vez de pipe para o while: nohup num subshell morreria junto com ele.
-start_discord "$(printf '%s\n' "$FOUND" | head -1)"
 if [ "$injected" -eq 0 ]; then
     # Nada foi injetado: nao reabrir (senao a GUI mostraria um "sucesso" mentiroso) e
     # falhar de verdade para o chamador enxergar.
     fail "NADA foi injetado — a elevacao falhou ou nenhum Discord foi tocado."
 fi
+
+# Modo portatil: reabre o Discord ja com o bypass ativo (mesmo comportamento do app do Windows).
+# head -1 em vez de pipe para o while: nohup num subshell morreria junto com ele.
+start_discord "$(printf '%s\n' "$FOUND" | head -1)"
 printf '\n  %sDiscord aberto com o GoLiveBypass.%s\n' "$C_GREEN" "$C_OFF" >&2
 
 # O updater do Discord baixa a versao nova numa pasta app-<versao> inteiramente nova, entao a

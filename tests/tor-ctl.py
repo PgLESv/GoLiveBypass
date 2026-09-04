@@ -20,7 +20,7 @@ import time
 
 HOST = "127.0.0.1"
 PORT = 9051
-PASSWORD = os.environ.get("TOR_CTL_PASSWORD", "golivebypass-test-2026")
+PASSWORD = os.environ["TOR_CTL_PASSWORD"]
 
 
 def connect():

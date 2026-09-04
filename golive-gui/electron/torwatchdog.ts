@@ -17,10 +17,16 @@ export interface TorWatchdogProbes {
   torEntregando: (porta: number, timeoutMs?: number) => Promise<boolean>;
 }
 
-/** Quantas falhas seguidas fazem o watchdog reiniciar o daemon (2: nao age por um timeout so). */
+/** Quantas falhas de tunel seguidas fazem o watchdog reiniciar o daemon. */
 export const TOR_WATCHDOG_FAIL_LIMIT = 2;
-/** A cada quanto o watchdog roda, em ms. */
-export const TOR_WATCHDOG_MS = 30_000;
+/** Em quanto tempo uma porta fechada (morte comprovada do daemon) e percebida. */
+export const TOR_WATCHDOG_PORT_MS = 5_000;
+/**
+ * Intervalo dos probes de tunel quando a porta ainda esta viva. Rotacao normal
+ * de circuito pode levar segundos; manter 30s evita matar um Tor saudavel por
+ * esse transitório.
+ */
+export const TOR_WATCHDOG_TUNNEL_MS = 30_000;
 /** Timeout curto do probe de tunel dentro do watchdog (a sessao nao pode ficar 20s presa). */
 export const TOR_WATCHDOG_PROBE_TIMEOUT_MS = 2_000;
 
@@ -38,36 +44,62 @@ export function createTorWatchdog(
   initialState: TorWatchdogState = { active: false, failStreak: 0, porta: 9060 },
 ) {
   let state: TorWatchdogState = { ...initialState };
+  // `null` garante que a primeira amostra de uma sessao confira o tunel, sem
+  // depender de Date.now() ser maior que o intervalo.
+  let ultimoProbeTunelEm: number | null = null;
 
   /** Seta se a sessao esta ativa (chamado pela GUI ao ativar/desativar). */
   function setActive(active: boolean): void {
     state.active = active;
     // Desativa zera a sequencia de falhas: um problema da sessao anterior nao conta aqui.
-    if (!active) state.failStreak = 0;
+    if (!active) {
+      state.failStreak = 0;
+      ultimoProbeTunelEm = null;
+    }
   }
 
-  /** Roda uma checagem e devolve a acao. Nao muta nada alem do contador interno. */
-  async function check(): Promise<TorWatchdogAction> {
+  /**
+   * Roda uma checagem e devolve a acao.
+   *
+   * A porta fechada e prova de que o processo morreu, portanto nao espera uma
+   * segunda janela: o timer curto a recupera em ate 5s. Porta aberta com tunel
+   * lento e diferente (rotacao natural do Tor); esse caminho conserva dois
+   * probes de 30s antes de reiniciar.
+   */
+  async function check(agora = Date.now()): Promise<TorWatchdogAction> {
     if (!state.active) return "ignore";
 
-    let alive = false;
+    let portaAberta = false;
     try {
-      alive = await probes.portaViva(state.porta);
+      portaAberta = await probes.portaViva(state.porta);
     } catch {
-      alive = false;
+      portaAberta = false;
     }
 
-    if (alive) {
-      // A porta atende, mas o proxy pode estar morto (cenario #49: porta aberta, tunel
-      // timeout). So quem entrega de verdade conta como saudavel.
-      try {
-        alive = await probes.torEntregando(state.porta, TOR_WATCHDOG_PROBE_TIMEOUT_MS);
-      } catch {
-        alive = false;
-      }
+    // Processo/porta mortos nao sao uma oscilacao de circuito. E seguro agir no
+    // primeiro poll e o processo que ressuscita o Tor confirma o tunel antes de
+    // liberar a sessao.
+    if (!portaAberta) {
+      state.failStreak = 0;
+      ultimoProbeTunelEm = null;
+      return "restart";
     }
 
-    if (alive) {
+    // A porta atende, mas o proxy pode estar construindo um circuito novo. O
+    // probe caro permanece no ritmo antigo para nao reiniciar um Tor saudavel.
+    if (ultimoProbeTunelEm !== null && agora - ultimoProbeTunelEm < TOR_WATCHDOG_TUNNEL_MS) {
+      return "ok";
+    }
+    ultimoProbeTunelEm = agora;
+
+    let tunelOk = false;
+    try {
+      tunelOk = await probes.torEntregando(state.porta, TOR_WATCHDOG_PROBE_TIMEOUT_MS);
+    } catch {
+      tunelOk = false;
+    }
+
+    if (tunelOk) {
       state.failStreak = 0;
       return "ok";
     }

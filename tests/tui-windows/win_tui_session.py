@@ -190,7 +190,7 @@ class WinTuiSession(SshPty):
 
 
 if __name__ == "__main__":
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     s.send_line("echo HELLO_FROM_TUI")
     s.wait_for_text("HELLO_FROM_TUI", timeout=10)

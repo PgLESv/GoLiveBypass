@@ -87,7 +87,14 @@ $tests = @(
     @{ Installed='';      Latest='1.1.8'; Expected=-1; Desc='instalado vazio' },
     @{ Installed='1.1.8'; Latest='';      Expected=0;  Desc='latest vazio' },
     @{ Installed='1.9.0'; Latest='1.10.0'; Expected=-1; Desc='10 > 9 (sort -V)' },
-    @{ Installed='1.10.0'; Latest='1.9.0'; Expected=1;  Desc='1.10 > 1.9' }
+    @{ Installed='1.10.0'; Latest='1.9.0'; Expected=1;  Desc='1.10 > 1.9' },
+    @{ Installed='v1.1.8'; Latest='1.1.8'; Expected=0;  Desc='prefixo v no instalado' },
+    @{ Installed='1.1.8'; Latest='v1.1.8'; Expected=0;  Desc='prefixo v no latest' },
+    @{ Installed='1.1.8'; Latest='v1.1.7'; Expected=1;  Desc='downgrade com prefixo v' },
+    @{ Installed='1.1.12-beta.13'; Latest='1.1.12'; Expected=-1; Desc='beta para release estavel correspondente' },
+    @{ Installed='1.1.12'; Latest='1.1.12-beta.13'; Expected=1;  Desc='release estavel nao faz downgrade para beta' },
+    @{ Installed='1.1.12-beta.1'; Latest='1.1.12-beta.2'; Expected=-1; Desc='beta 1 para beta 2' },
+    @{ Installed='1.1.12-beta.2'; Latest='1.1.12-beta.1'; Expected=1;  Desc='beta 2 para beta 1' }
 )
 foreach ($t in $tests) {
     $result = Compare-Version $t.Installed $t.Latest

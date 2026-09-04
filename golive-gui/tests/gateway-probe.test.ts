@@ -85,18 +85,27 @@ interface Resumo {
   srvBytes: number;
   srvBytesDesdeAtividade: number;
   midiaAberta: boolean;
+  midiaSockets: Array<{ id: number; createdHa: number; openHa: number; readyState: number }>;
   infladorOk: boolean;
 }
 
 interface VoiceStatsResumo {
   statsOk: boolean;
+  direction: "inbound" | "outbound";
   sampleHa: number;
-  entradaHa: number;
-  saidaHa: number;
-  captureFrames: number | null;
-  inputFrameRate: number | null;
-  framesEncoded: number | null;
-  encodeFrameRate: number | null;
+  entradaHa?: number;
+  saidaHa?: number;
+  captureFrames?: number | null;
+  inputFrameRate?: number | null;
+  framesEncoded?: number | null;
+  encodeFrameRate?: number | null;
+  targetMediaBitrate?: number | null;
+  videoPresent?: boolean;
+  videoHa?: number;
+  framesDecoded?: number | null;
+  decodeFrameRate?: number | null;
+  renderFrameRate?: number | null;
+  bytesReceived?: number | null;
 }
 
 interface VoiceContexto {
@@ -106,13 +115,22 @@ interface VoiceContexto {
     connections: Array<{
       id: number;
       kind: string;
+      role: string;
       destroyed: boolean;
       createdHa: number;
       stats: VoiceStatsResumo;
     }>;
   };
-  demanda: { known: boolean; active: boolean; demandHa: number; changedHa: number };
-  midia: { midiaAberta: boolean };
+  demanda: {
+    sender: { known: boolean; active: boolean; demandHa: number; changedHa: number };
+    viewer: { known: boolean; active: boolean; demandHa: number; changedHa: number };
+  };
+  midia: {
+    midiaAberta: boolean;
+    midiaSockets: Array<{ id: number; createdHa: number; openHa: number; readyState: number }>;
+  };
+  viewerSaudavelGeracao?: string;
+  viewerSaudavelHa?: number;
 }
 
 function rodarShim(opts: { semInflador?: boolean } = {}): {
@@ -122,13 +140,16 @@ function rodarShim(opts: { semInflador?: boolean } = {}): {
   resumo: () => Resumo;
   rtcResumo: () => Promise<RtcResumo>;
   midiaAberta: () => boolean;
-  midiaFechar: () => number;
+  midiaFecharId: (id: number) => { ok: boolean; id: number; reason?: string };
   fechar: () => boolean;
 } {
   const shim = extrairConst("SHIM_GATEWAY_SRC");
   const win = {
     WebSocket: FakeWS as unknown,
     RTCPeerConnection: FakeRTC as unknown,
+    // O shim tambem observa gestos trusted para que uma escolha manual cancele
+    // a reassistencia pendente. O restante deste laboratorio nao despacha UI.
+    addEventListener() {},
   } as Record<string, unknown>;
   // 1) avalia a EXPRESSAO (concatenacao de strings) para obter o codigo fonte;
   // 2) executa o codigo fonte contra o window falso.
@@ -147,7 +168,8 @@ function rodarShim(opts: { semInflador?: boolean } = {}): {
     resumo: () => (win.__goliveGwResumo as () => Resumo)(),
     rtcResumo: () => (win.__goliveRtcResumo as () => Promise<RtcResumo>)(),
     midiaAberta: () => (win.__goliveMidiaAberta as () => boolean)(),
-    midiaFechar: () => (win.__goliveMidiaFechar as () => number)(),
+    midiaFecharId: (id: number) => (win.__goliveMidiaFecharId as
+      (socketId: number) => { ok: boolean; id: number; reason?: string })(id),
     fechar: () => (win.__goliveGwFechar as () => boolean)(),
   };
 }
@@ -175,6 +197,7 @@ function resumoBase(parcial: Partial<Resumo>): Resumo {
     srvBytes: 5000,
     srvBytesDesdeAtividade: 100,
     midiaAberta: false,
+    midiaSockets: [],
     infladorOk: true,
     ...parcial,
   };
@@ -217,11 +240,25 @@ function rodarEscada(): (ctx: CtxRevive) => { acao: string; motivo: string } {
 function rodarGatilhoVideoNativo(): (ctx: VoiceContexto | null) => string | null {
   const codigo =
     "const VOICE_STREAM_AQUECIMENTO_MS = (" + extrairConst("VOICE_STREAM_AQUECIMENTO_MS") + ");\n" +
+    "const VOICE_VIEWER_REENTRADA_AQUECIMENTO_MS = (" + extrairConst("VOICE_VIEWER_REENTRADA_AQUECIMENTO_MS") + ");\n" +
+    "const VOICE_VIEWER_REENTRADA_SAIDA_PARADA_MS = (" + extrairConst("VOICE_VIEWER_REENTRADA_SAIDA_PARADA_MS") + ");\n" +
+    "const VOICE_VIEWER_REENTRADA_JANELA_MS = (" + extrairConst("VOICE_VIEWER_REENTRADA_JANELA_MS") + ");\n" +
     "const VOICE_DEMANDA_GRACA_MS = (" + extrairConst("VOICE_DEMANDA_GRACA_MS") + ");\n" +
+    "const VOICE_VIEWER_DEMANDA_RECENTE_MS = (" + extrairConst("VOICE_VIEWER_DEMANDA_RECENTE_MS") + ");\n" +
     "const VOICE_ENTRADA_VIVA_MS = (" + extrairConst("VOICE_ENTRADA_VIVA_MS") + ");\n" +
     "const VOICE_SAIDA_PARADA_MS = (" + extrairConst("VOICE_SAIDA_PARADA_MS") + ");\n" +
+    "const VOICE_VIEWER_SAIDA_PARADA_MS = (" + extrairConst("VOICE_VIEWER_SAIDA_PARADA_MS") + ");\n" +
     "const VOICE_SAMPLE_MAX_MS = (" + extrairConst("VOICE_SAMPLE_MAX_MS") + ");\n" +
+    "const VOICE_SOCKET_PAREAMENTO_MS = (" + extrairConst("VOICE_SOCKET_PAREAMENTO_MS") + ");\n" +
     extrairFuncao("streamNativaAtiva") + "\n" +
+    extrairFuncao("voiceNativaAtiva") + "\n" +
+    extrairFuncao("geracaoNativa") + "\n" +
+    extrairFuncao("visualViewerAtivo") + "\n" +
+    extrairFuncao("geracaoViewerNativa") + "\n" +
+    extrairFuncao("visualViewerRenderizado") + "\n" +
+    extrairFuncao("viewerReentradaAposSaude") + "\n" +
+    extrairFuncao("demandaRtcDaStream") + "\n" +
+    extrairFuncao("socketMidiaDaStream") + "\n" +
     extrairFuncao("avaliarRtcNativo") + "\nreturn avaliarRtcNativo;";
   return new Function(codigo)() as (ctx: VoiceContexto | null) => string | null;
 }
@@ -323,6 +360,22 @@ describe("shim do gateway (codigo real do renderer)", () => {
     expect(app.resumo().op4Ha).toBeGreaterThanOrEqual(0); // segue do op4 anterior
   });
 
+  it("SNIFF do MAP_EXT atual reconhece STREAM_CREATE/STREAM_WATCH e ignora delete como novo pedido", () => {
+    const app = rodarShim();
+    const ws = app.ws("wss://gateway.discord.gg/?v=10&encoding=etf");
+    ws.emitir("open");
+    const mapa = (op: number) => new Uint8Array([
+      131, 116, 0, 0, 0, 2, 109, 0, 0, 0, 2, 111, 112, 97, op,
+    ]);
+    ws.send(mapa(18));
+    ws.send(mapa(20));
+    const pedido = app.resumo();
+    expect(pedido.op4Ha).toBeGreaterThanOrEqual(0);
+    expect(pedido.opCounts).toMatchObject({ "18": 1, "20": 1 });
+    ws.send(mapa(19));
+    expect(app.resumo().opCounts["19"]).toBe(1);
+  });
+
   it("op 4 em JSON texto tambem marca o pedido de assistir", () => {
     const app = rodarShim();
     const ws = app.ws("wss://gateway.discord.gg/?v=10&encoding=json");
@@ -357,6 +410,25 @@ describe("shim do gateway (codigo real do renderer)", () => {
     expect(r.subs).toBe(0);
     expect(r.srvFrames).toBe(0);
     expect(r.estado).toBe("aberta");
+  });
+
+  it("eventos atrasados do ws antigo nao corrompem a geracao corrente", () => {
+    const app = rodarShim();
+    const ws1 = app.ws("wss://gateway.discord.gg/?v=10&encoding=json");
+    ws1.emitir("open");
+    const ws2 = app.ws("wss://gateway.discord.gg/?v=10&encoding=json");
+    ws2.emitir("open");
+
+    ws1.send('{"op":4,"d":{}}');
+    ws1.emitir("message", { data: '{"op":0,"t":"LATE"}' });
+    ws1.emitir("close");
+
+    const r = app.resumo();
+    expect(r.geracao).toBe(2);
+    expect(r.estado).toBe("aberta");
+    expect(r.srvFrames).toBe(0);
+    expect(r.dispatches).toBe(0);
+    expect(r.op4Ha).toBe(-1);
   });
 
   it("__goliveGwFechar fecha o ws do gateway com close 4000 (revive nivel 1)", () => {
@@ -398,7 +470,11 @@ describe("shim do gateway (codigo real do renderer)", () => {
 
   it("preserva a identidade do WebSocket original (prototype e estaticos)", () => {
     const shim = extrairConst("SHIM_GATEWAY_SRC");
-    const win = { WebSocket: FakeWS, RTCPeerConnection: FakeRTC } as Record<string, unknown>;
+    const win = {
+      WebSocket: FakeWS,
+      RTCPeerConnection: FakeRTC,
+      addEventListener() {},
+    } as Record<string, unknown>;
     const fonte = new Function("window", "return " + shim)(win) as string;
     new Function("window", fonte)(win);
     const Construtor = win.WebSocket as unknown as { prototype: unknown; OPEN: number };
@@ -446,20 +522,24 @@ describe("shim: instrumentacao RTC (o que TOCA — audio/video por RTC, nao pelo
     expect(r3.audioHa).toBeLessThan(100);
   });
 
-  it("__goliveMidiaFechar fecha os ws de midia com close 4000 (cura de voz)", () => {
+  it("__goliveMidiaFecharId fecha somente o RTC escolhido e preserva a voz", () => {
     const app = rodarShim();
     const m1 = app.ws("wss://eu-central-1.c1.discord.media/?v=1");
     const m2 = app.ws("wss://eu-central-1.c1.discord.media/?v=1");
     m1.emitir("open");
     m2.emitir("open");
-    expect(app.midiaFechar()).toBe(2);
-    expect(m1.closes[0].code).toBe(4000);
+    expect(app.resumo().midiaSockets.map(socket => socket.id)).toEqual([1, 2]);
+    expect(app.midiaFecharId(2)).toEqual({ ok: true, id: 2 });
+    expect(m1.closes).toHaveLength(0);
     expect(m2.closes[0].code).toBe(4000);
-    expect(app.midiaFechar()).toBe(0); // ja fechados
+    expect(m2.closes[0].reason).toBe("golive-stream-revive");
+    expect(app.resumo().midiaSockets.map(socket => socket.id)).toEqual([1]);
+    expect(app.midiaFecharId(999)).toEqual({ ok: false, id: 999, reason: "ausente" });
+    expect(app.win.__goliveMidiaFechar).toBeUndefined();
   });
 });
 
-describe("gatilho de video nativo travado no transmissor (issue #164)", () => {
+describe("gatilho direcional de RTC nativo travado (issue #164)", () => {
   const g = rodarGatilhoVideoNativo();
   const base: VoiceContexto = {
     voice: {
@@ -468,44 +548,129 @@ describe("gatilho de video nativo travado no transmissor (issue #164)", () => {
       connections: [{
         id: 7,
         kind: "stream",
+        role: "viewer",
         destroyed: false,
         createdHa: 60_000,
         stats: {
           statsOk: true,
+          direction: "inbound",
           sampleHa: 0,
-          entradaHa: 0,
-          saidaHa: 21_000,
-          captureFrames: 5000,
-          inputFrameRate: 60,
-          framesEncoded: 0,
-          encodeFrameRate: 0,
+          videoPresent: false,
+          videoHa: 61_000,
+          framesDecoded: null,
+          decodeFrameRate: null,
+          renderFrameRate: null,
+          bytesReceived: null,
         },
       }],
     },
-    demanda: { known: true, active: true, demandHa: 2_000, changedHa: 2_000 },
-    midia: { midiaAberta: true },
+    demanda: {
+      sender: { known: false, active: false, demandHa: -1, changedHa: -1 },
+      viewer: { known: true, active: true, demandHa: 2_000, changedHa: 2_000 },
+    },
+    midia: {
+      midiaAberta: true,
+      midiaSockets: [
+        { id: 1, createdHa: 600_000, openHa: 599_000, readyState: 1 },
+        { id: 2, createdHa: 59_000, openHa: 58_000, readyState: 1 },
+      ],
+    },
   };
 
-  it("captura viva + espectador + encoder parado por 20s confirma o zumbi", () => {
-    expect(g(base)).toBe("video-nativo-travado");
+  it("viewer com entrada comprovadamente sem quadro age no proximo poll", () => {
+    expect(g(base)).toBe("viewer-video-ausente");
   });
 
-  it("oscilacao curta de 3s nao dispara", () => {
+  it("viewer com video recente nao dispara", () => {
     const stream = base.voice.connections[0];
-    expect(g({ ...base, voice: { ...base.voice, connections: [{ ...stream, stats: { ...stream.stats, saidaHa: 3_000 } }] } })).toBeNull();
+    expect(g({ ...base, voice: { ...base.voice, connections: [{ ...stream, stats: {
+      ...stream.stats, videoPresent: true, videoHa: 0, framesDecoded: 100,
+    } }] } })).toBeNull();
   });
 
-  it("sem demanda, sem midia ou em aquecimento nunca age", () => {
-    expect(g({ ...base, demanda: { ...base.demanda, active: false } })).toBeNull();
-    expect(g({ ...base, midia: { midiaAberta: false } })).toBeNull();
-    expect(g({ ...base, voice: { ...base.voice, connections: [{ ...base.voice.connections[0], createdHa: 10_000 }] } })).toBeNull();
-  });
-
-  it("captura morta, stats incompletos e conexao unknown falham fechado", () => {
+  it("reentrada de viewer sem frame depois de video saudavel age no proximo poll", () => {
     const stream = base.voice.connections[0];
-    expect(g({ ...base, voice: { ...base.voice, connections: [{ ...stream, stats: { ...stream.stats, entradaHa: 20_000 } }] } })).toBeNull();
+    expect(g({
+      ...base,
+      viewerSaudavelGeracao: "legacy:7",
+      viewerSaudavelHa: 5_000,
+      voice: { ...base.voice, connections: [{ ...stream, id: 8, createdHa: 1_000, stats: { ...stream.stats, videoHa: 1_000 } }] },
+      midia: { ...base.midia, midiaSockets: [base.midia.midiaSockets[0], { ...base.midia.midiaSockets[1], createdHa: 1_000 }] },
+    })).toBe("viewer-reentrada-video-ausente");
+  });
+
+  it("sem demanda, sem midia ou antes de 1s nunca age", () => {
+    expect(g({ ...base, demanda: { ...base.demanda, viewer: {
+      ...base.demanda.viewer, active: false, demandHa: 121_000, changedHa: 121_000,
+    } } })).toBeNull();
+    expect(g({ ...base, midia: { ...base.midia, midiaAberta: false } })).toBeNull();
+    const stream = base.voice.connections[0];
+    expect(g({
+      ...base,
+      voice: { ...base.voice, connections: [{ ...stream, createdHa: 999, stats: { ...stream.stats, videoHa: 999 } }] },
+      midia: { ...base.midia, midiaSockets: [base.midia.midiaSockets[0], { ...base.midia.midiaSockets[1], createdHa: 999 }] },
+    })).toBeNull();
+  });
+
+  it("pedido recente do viewer sobrevive ao pixelCount zero do erro 2012", () => {
+    expect(g({ ...base, demanda: { ...base.demanda, viewer: {
+      ...base.demanda.viewer, active: false, demandHa: 25_000, changedHa: 4_000,
+    } } })).toBe("viewer-video-ausente");
+  });
+
+  it("sender com demanda real e target zero ainda detecta encoder parado", () => {
+    const stream = base.voice.connections[0];
+    expect(g({ ...base, demanda: { ...base.demanda, sender: {
+      known: true, active: true, demandHa: 2_000, changedHa: 2_000,
+    } }, voice: { ...base.voice, connections: [{
+      ...stream,
+      role: "sender",
+      stats: {
+        statsOk: true, direction: "outbound", sampleHa: 0, entradaHa: 0, saidaHa: 21_000,
+        captureFrames: 5000, inputFrameRate: 60, framesEncoded: 0, encodeFrameRate: 0,
+        targetMediaBitrate: 0,
+      },
+    }] } })).toBe("sender-video-parado");
+  });
+
+  it("sender sem demanda remota fica ocioso sem acao", () => {
+    const stream = base.voice.connections[0];
+    expect(g({ ...base, demanda: { ...base.demanda, sender: {
+      known: true, active: false, demandHa: 61_000, changedHa: 61_000,
+    } }, voice: { ...base.voice, connections: [{
+      ...stream,
+      role: "sender",
+      stats: {
+        statsOk: true, direction: "outbound", sampleHa: 0, entradaHa: 0, saidaHa: 21_000,
+        captureFrames: 5000, inputFrameRate: 60, framesEncoded: 0, encodeFrameRate: 0,
+        targetMediaBitrate: 0,
+      },
+    }] } })).toBeNull();
+  });
+
+  it("sender com target positivo e encoder parado dispara", () => {
+    const stream = base.voice.connections[0];
+    expect(g({ ...base, demanda: { ...base.demanda, sender: {
+      known: true, active: true, demandHa: 2_000, changedHa: 2_000,
+    } }, voice: { ...base.voice, connections: [{
+      ...stream,
+      role: "sender",
+      stats: {
+        statsOk: true, direction: "outbound", sampleHa: 0, entradaHa: 0, saidaHa: 21_000,
+        captureFrames: 5000, inputFrameRate: 60, framesEncoded: 0, encodeFrameRate: 0,
+        targetMediaBitrate: 600000,
+      },
+    }] } })).toBe("sender-video-parado");
+  });
+
+  it("stats incompletos, papel unknown e socket ambiguo falham fechado", () => {
+    const stream = base.voice.connections[0];
     expect(g({ ...base, voice: { ...base.voice, connections: [{ ...stream, stats: { ...stream.stats, statsOk: false } }] } })).toBeNull();
-    expect(g({ ...base, voice: { ...base.voice, connections: [{ ...stream, kind: "unknown" }] } })).toBeNull();
+    expect(g({ ...base, voice: { ...base.voice, connections: [{ ...stream, role: "unknown" }] } })).toBeNull();
+    expect(g({ ...base, midia: { ...base.midia, midiaSockets: [
+      { id: 1, createdHa: 59_000, openHa: 58_000, readyState: 1 },
+      { id: 2, createdHa: 61_000, openHa: 60_000, readyState: 1 },
+    ] } })).toBeNull();
     expect(g(null)).toBeNull();
   });
 });
@@ -760,15 +925,22 @@ describe("pill de recuperacao + wiring no script", () => {
 
   it("o script inteiro liga o shim via CDP, o pill no did-finish-load e o vigia no boot", () => {
     const src = lerScript();
-    expect(src).toContain('wc.debugger.sendCommand(\'Page.addScriptToEvaluateOnNewDocument\', { source: SHIM_ALL_SRC })');
+    expect(src).toContain("comandoCdp('Page.addScriptToEvaluateOnNewDocument', { source: paginaShimSrc })");
+    expect(src).toContain("Target.setAutoAttach");
+    expect(src).toContain("waitForDebuggerOnStart: true");
+    expect(src).toContain("Runtime.runIfWaitingForDebugger");
     expect(src).toContain("wc.on('did-finish-load'");
     expect(src).toContain("app.on(\"web-contents-created\"");
     expect(src).toContain("setInterval(() => { checarGatewaySilente(); }, GW_PROBE_CHECAGEM_MS);");
     // escada de revive: o main chama o fechar do shim e respeita os guardas proprios
-    expect(src).toContain("window.__goliveGwFechar ? window.__goliveGwFechar() : false");
+    expect(src).toContain("fecharGatewayInstrumentado(win, resumo)");
+    expect(src).toContain("_workerSessionId");
+    expect(src).not.toContain("BroadcastChannel");
     expect(src).toContain("function decidirRevive");
     expect(src).toContain("revivePendenteEm");
-    expect(src).toContain("autoRevive");
+    expect(src).toContain("recuperacao automatica obrigatoria");
+    expect(src).not.toContain("autoReviveAtivo");
+    expect(src).not.toContain("settings.autoRevive");
     // shim v3: agnostico de protocolo (issues #154/#156/#158)
     expect(src).toContain("registrarEnvio");
     expect(src).toContain("srvBytesDesdeAtividade");
@@ -782,8 +954,14 @@ describe("pill de recuperacao + wiring no script", () => {
     expect(src).toContain("getFilteredStats");
     expect(src).toContain("function avaliarRtcNativo");
     expect(src).toContain("executeJavaScriptInIsolatedWorld");
-    expect(src).toContain("window.__goliveVoiceRecuperar");
-    expect(src).toContain("window.__goliveMidiaFechar ? window.__goliveMidiaFechar() : 0");
+    expect(src).toContain("setDesktopSourceWithOptions");
+    expect(src).toContain("function decidirDemandaRecuperacao");
+    expect(src).toContain("window.__goliveMidiaFecharId");
+    expect(src).toContain("function socketMidiaDaStream");
+    expect(src).toContain("targetMediaBitrate nao participa do");
+    // A recuperacao nao pode voltar a rejogar fonte nem fechar todos os RTCs.
+    expect(src).not.toContain("window.__goliveVoiceRecuperar");
+    expect(src).not.toContain("window.__goliveMidiaFechar =");
     expect(src).toContain("voice.probe |");
     expect(src).toContain("golivebypass-video");
     // o detector de bytes da beta.3 foi removido de verdade

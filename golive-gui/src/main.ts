@@ -14,8 +14,6 @@ declare global {
       setStartup: (enabled: boolean) => Promise<void>;
       getAutoUpdate: () => Promise<boolean>;
       setAutoUpdate: (enabled: boolean) => Promise<void>;
-      getAutoRevive: () => Promise<boolean>;
-      setAutoRevive: (enabled: boolean) => Promise<void>;
       getUpdateChannel: () => Promise<string>;
       setUpdateChannel: (canal: string) => Promise<void>;
       getNetMode: () => Promise<string>;
@@ -59,6 +57,19 @@ declare global {
       onRefreshStatus: (callback: () => void) => void;
       onTorWatchdogRecuperado: (callback: () => void) => void;
       resizeWindow: (height: number) => void;
+      importWgConf: () => Promise<{ success: boolean; fileName?: string; path?: string; error?: string } | null>;
+      importWgConfFile: (filePath: string) => Promise<{ success: boolean; fileName?: string; path?: string; error?: string } | null>;
+      getWgConfName: () => Promise<string>;
+      testWgConf: () => Promise<{
+        ok: boolean;
+        endpoint?: string;
+        resolvedIp?: string;
+        address?: string;
+        dns?: string;
+        exitInfo?: { ip?: string; country?: string };
+        active?: boolean;
+        error?: string;
+      }>;
       setTheme: (theme: string) => void;
       reportBug: (payload: { title: string; description: string; includeLogs: boolean }) => Promise<{
         ok: boolean;
@@ -68,6 +79,33 @@ declare global {
         blocked?: boolean;
         retryAfter?: number;
       }>;
+      getVpnMode: () => Promise<'proton' | 'custom'>;
+      setVpnMode: (mode: 'proton' | 'custom') => Promise<string>;
+      checkProtonSession: (username?: string) => Promise<{ valid: boolean; username?: string; expiresIn?: string; error?: string }>;
+      loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) => Promise<{ success: boolean; error?: string }>;
+      logoutProton: () => Promise<boolean>;
+      optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) => Promise<{
+        success: boolean;
+        server?: string;
+        country?: string;
+        city?: string;
+        tier?: string;
+        load?: number;
+        score?: number;
+        pingMs?: number;
+        endpoint?: string;
+        confFile?: string;
+        error?: string;
+      }>;
+      getProtonSettings: () => Promise<{
+        vpnMode: 'proton' | 'custom';
+        username: string;
+        country: string;
+        freeOnly: boolean;
+        autoPing: boolean;
+        lastServer?: any;
+      }>;
+      setProtonSettings: (settings: any) => Promise<boolean>;
     }
   }
 }
@@ -75,7 +113,6 @@ declare global {
 const platform = window.api.platform;
 const isMac = platform === 'darwin';
 const isLinux = platform === 'linux';
-const reloadShortcut = isMac ? 'Cmd + R' : 'Ctrl + R';
 
 function applyPlatformCopy() {
   document.body.classList.toggle('darwin', isMac);
@@ -92,9 +129,6 @@ function applyPlatformCopy() {
       ? 'Fechar a janela esconde o app na barra de menus, junto do relógio — para reverter tudo, saia pelo ícone de lá.'
       : 'Fechar a janela esconde o app na bandeja, junto do relógio — para reverter tudo, saia pelo ícone de lá.';
   }
-
-  const reloadKeys = document.getElementById('reloadKeys');
-  if (reloadKeys) reloadKeys.textContent = reloadShortcut;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,51 +165,23 @@ const statusTag = document.getElementById('statusTag')!;
 const statusCard = document.getElementById('statusCard')!;
 const toggleBtn = document.getElementById('toggleBtn') as HTMLButtonElement;
 const btnText = document.getElementById('btnText')!;
-// Card de aviso quando o Discord tem Vencord/Equicord/Vesktop/Equibop/Legcord.
-// Acoes: baixar o plugin (link) ou sobrescrever (botao secundario, com confirmacao).
-const conflictCard = document.getElementById('conflictCard')!;
-const conflictTitleText = document.getElementById('conflictTitleText')!;
-const conflictBodyText = document.getElementById('conflictBodyText')!;
-const conflictPluginLink = document.getElementById('conflictPluginLink') as HTMLAnchorElement;
-const conflictOverwriteBtn = document.getElementById('conflictOverwriteBtn') as HTMLButtonElement | null;
-
-// Guarda o nome do mod detectado (vencord/equicord/vesktop/equibop/legcord) entre
-// updates de status. Vencord/Equicord exigem confirmacao explicita para sobrescrever;
-// Vesktop/Equibop/Legcord apenas avisam, e a GUI pode sobrescrever sem bloqueio
-// (cliente paralelo, sem plugins do user perdidos).
-let detectedMod: string | null = null;
-const warningToast = document.getElementById('warningToast') as HTMLElement | null;
-const toastClose = document.getElementById('toastClose') as HTMLButtonElement | null;
+let hasSelectedConf = false;
 const appVersionEl = document.getElementById('appVersion');
-const proxyInput = document.getElementById('proxyInput') as HTMLInputElement;
+const proxyInput = document.getElementById('proxyInput') as HTMLInputElement | null;
 const startupToggle = document.getElementById('startupToggle') as HTMLInputElement;
 const autoUpdateToggle = document.getElementById('autoUpdateToggle') as HTMLInputElement | null;
-const autoReviveToggle = document.getElementById('autoReviveToggle') as HTMLInputElement | null;
 const updateChannelRow = document.getElementById('updateChannelRow') as HTMLElement | null;
 const updateChannelToggle = document.getElementById('updateChannelToggle') as HTMLInputElement | null;
 const settingsBtn = document.getElementById('settingsBtn') as HTMLButtonElement | null;
 const settingsDialog = document.getElementById('settingsDialog') as HTMLElement | null;
 const settingsBackdrop = document.getElementById('settingsBackdrop') as HTMLElement | null;
 const settingsClose = document.getElementById('settingsClose') as HTMLButtonElement | null;
+const vpnImportBtn = document.getElementById('vpnImportBtn') as HTMLButtonElement | null;
+const vpnConfigStatus = document.getElementById('vpnConfigStatus') as HTMLElement | null;
+const vpnDropZone = document.getElementById('vpnDropZone') as HTMLElement | null;
+const vpnDropFeedback = document.getElementById('vpnDropFeedback') as HTMLElement | null;
 
 let currentState = 'INACTIVE';
-
-// ---------------------------------------------------------------------------
-// Toast de aviso — canto superior direito. Persistente: so fecha quando o
-// usuario clica no "x" (sem auto-close). Reaparece ao ativar o bypass.
-// ---------------------------------------------------------------------------
-function setWarningOpen(open: boolean) {
-  if (!warningToast) return;
-  warningToast.hidden = !open;
-}
-
-toastClose?.addEventListener('click', () => setWarningOpen(false));
-
-// Em dev mostra o toast automaticamente para validar layout sem precisar ativar
-// @ts-ignore - import.meta.env vem do Vite
-if ((import.meta as any).env?.DEV) {
-  window.setTimeout(() => setWarningOpen(true), 700);
-}
 
 // ---------------------------------------------------------------------------
 // Configurações: o botão de canto abre o dialog com tema + notificações de
@@ -238,22 +244,7 @@ async function updateStatus() {
     
     statusIndicator.className = 'status-indicator';
     statusTag.className = 'status-tag';
-    toggleBtn.disabled = false;
     toggleBtn.classList.remove('loading', 'deactivate', 'overwrite');
-    conflictCard.hidden = true;
-    // Link do plugin (zip do release): mesma URL para todos os mods.
-    conflictPluginLink.href =
-      'https://github.com/bezumiya/GoLiveBypass#instala%C3%A7%C3%A3o-passo-a-passo-completo';
-
-    // Decodifica o status: pode ser "OTHER_MOD" (legado) ou "OTHER_MOD:vencord" / "OTHER_MOD:equicord" / etc.
-    let baseStatus = status;
-    let modName: string | null = null;
-    const m = status.match(/^OTHER_MOD(?::(.+))?$/);
-    if (m) {
-      baseStatus = 'OTHER_MOD';
-      modName = m[1] || null;
-    }
-    detectedMod = modName;
 
     if (status === 'ACTIVE') {
       statusText.innerText = 'GoLiveBypass está Ativo';
@@ -261,48 +252,8 @@ async function updateStatus() {
       statusTag.classList.add('tag--ok');
       btnText.innerText = 'Desativar Bypass';
       toggleBtn.classList.add('deactivate');
+      toggleBtn.disabled = false;
       statusCard.hidden = true;
-    } else if (baseStatus === 'OTHER_MOD') {
-      // Mod detectado. Texto do card depende do tipo:
-      // - Vencord/Equicord: ameaca real (perde plugins do user). Mostra conflictCard
-      //   com link pro plugin, esconde o botao principal de ativar e exige
-      //   clique explicito no botao "Sobrescrever mesmo assim".
-      // - Vesktop/Equibop/Legcord: cliente paralelo, sem plugins perdidos. Mostra o
-      //   conflictCard informativo mas o botao principal segue funcional.
-      const isProtected = modName === 'vencord' || modName === 'equicord';
-      const friendly = isProtected
-        ? (modName === 'vencord' ? 'Vencord' : 'Equicord')
-        : modName
-          ? modName.charAt(0).toUpperCase() + modName.slice(1)
-          : 'Outro mod';
-      statusText.innerText = `${friendly} detectado`;
-      statusTag.textContent = isProtected ? 'Conflito' : 'Cliente paralelo';
-      statusTag.classList.add(isProtected ? 'tag--warn' : 'tag--info');
-      // Esconde o botao principal para Vencord/Equicord (sobrescrita so via
-      // botao secundario dentro do conflictCard). Para outros mods, mantem.
-      if (isProtected) {
-        toggleBtn.hidden = true;
-      } else {
-        toggleBtn.hidden = false;
-        btnText.innerText = 'Sobrescrever e Ativar';
-        toggleBtn.classList.add('overwrite');
-      }
-      statusCard.hidden = false;
-      // Conflict card: texto especifico por mod
-      conflictTitleText.textContent = `${friendly} detectado`;
-      if (isProtected) {
-        conflictBodyText.innerHTML =
-          `Sobrescrever este Discord <strong>apaga o ${friendly}</strong> e os outros plugins ` +
-          `dele ate voce reinstalar tudo. Use o <strong>plugin</strong> do GoLiveBypass ` +
-          `para conviver com o mod.`;
-      } else {
-        conflictBodyText.innerHTML =
-          `Detectamos o cliente paralelo <strong>${friendly}</strong>. Como esse cliente ` +
-          `nao roda plugins de Vencord/Equicord, sobrescrever o app.asar dele nao perde ` +
-          `nada - mas o ${friendly} deixa de existir como tal (vira um Discord com bypass). ` +
-          `Para manter o mod embutido do ${friendly}, o caminho recomendado tambem e o plugin.`;
-      }
-      conflictCard.hidden = false;
     } else if (status === 'NOT_FOUND') {
       statusText.innerText = 'Discord não encontrado';
       statusTag.textContent = 'Ausente';
@@ -311,11 +262,23 @@ async function updateStatus() {
       btnText.innerText = 'Não Disponível';
       statusCard.hidden = false;
     } else {
-      statusText.innerText = 'Discord limpo. Pronto para injetar.';
-      statusTag.textContent = 'Pronto';
-      statusTag.classList.add('tag--ok');
-      btnText.innerText = 'Ativar Bypass';
-      statusCard.hidden = true;
+      if (!hasSelectedConf) {
+        toggleBtn.disabled = true;
+        btnText.innerText = 'Selecione uma Configuração';
+        statusText.innerText = currentVpnMode === 'proton'
+          ? 'Conecte sua conta ProtonVPN abaixo para ativar'
+          : 'Importe uma configuração WireGuard (.conf) abaixo para ativar';
+        statusTag.textContent = 'Configuração necessária';
+        statusTag.classList.add('tag--warn');
+        statusCard.hidden = false;
+      } else {
+        toggleBtn.disabled = false;
+        btnText.innerText = 'Ativar Bypass';
+        statusText.innerText = 'Discord pronto para execução';
+        statusTag.textContent = 'Pronto';
+        statusTag.classList.add('tag--ok');
+        statusCard.hidden = true;
+      }
     }
   } catch (err) {
     console.error(err);
@@ -324,9 +287,6 @@ async function updateStatus() {
     statusTag.classList.add('tag--danger');
     statusCard.hidden = false;
   }
-  // O updateStatus acabou de reabilitar o botao; se o modo e Tor e o daemon nao esta de pe,
-  // a trava tem que valer por cima -- senao dava para injetar e ficar sem conectar.
-  aplicarTravaDoTor();
   // Depois de mudar o estado, ajusta a janela ao novo tamanho do conteudo.
   fitWindowToContent();
 }
@@ -340,70 +300,54 @@ toggleBtn.addEventListener('click', async () => {
       try {
         await window.api.deactivate();
       } catch (err) {
-        // O script pode falhar (elevacao/sudo) DEPOIS de fechar o Discord. Em vez de
-        // simplesmente alertar, deixa o botao travado e o status dirá "Desativar Bypass"
-        // enquanto o disco continuar "nosso" — a pessoa sabe que a desinstalacao nao
-        // aconteceu e pode fechar o cliente pra tentar de novo (o boot limpa a orfã).
         updateStatus();
         throw err;
       }
     } else {
-      const proxy = proxyInput.value.trim();
-      // Vencord/Equicord: a GUI esconde o botao principal e so deixa o usuario
-      // prosseguir via o botao "Sobrescrever mesmo assim" do conflictCard, que
-      // confirma explicitamente. Se por algum motivo o toggleBtn for clicado
-      // (atalho de teclado, DevTools, etc), a gente envia confirmOverride=true
-      // tambem, porque o dialog.showMessageBox no main process faz a trava final.
-      const isProtected = detectedMod === 'vencord' || detectedMod === 'equicord';
-      await window.api.activate(proxy, isProtected);
-
-      // Popup de aviso
-      setWarningOpen(true);
+      if (!hasSelectedConf) {
+        const msg = currentVpnMode === 'proton'
+          ? 'Por favor, conecte sua conta ProtonVPN antes de ativar.'
+          : 'Por favor, importe uma configuração WireGuard (.conf) antes de ativar.';
+        alert(msg);
+        toggleBtn.disabled = true;
+        return;
+      }
+      try {
+        await window.api.activate();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const outroMod = msg.match(/OUTRO_MOD:([a-z]+):/);
+        if (outroMod) {
+          const nome = outroMod[1] === 'vencord' ? 'Vencord' : outroMod[1] === 'equicord' ? 'Equicord' : outroMod[1];
+          const prosseguir = confirm(
+            `Detectei ${nome} instalado neste Discord. Ativar o GoLiveBypass aqui vai substituir o ${nome} (você perde os plugins dele). Sobrescrever e ativar mesmo assim?`,
+          );
+          if (!prosseguir) {
+            toggleBtn.disabled = false;
+            toggleBtn.classList.remove('loading');
+            await updateStatus();
+            return;
+          }
+          await window.api.activate(undefined, true);
+        } else {
+          throw err;
+        }
+      }
     }
   } catch (err) {
     alert('Erro: ' + err);
   }
 
   await updateStatus();
-  // O Tor sobe durante a ativacao, entao o texto lido na abertura da janela ja nasceu velho:
-  // ficava em "aguardando ativacao" com o Tor de pe e o bypass funcionando.
-  refreshTorStatus();
-});
-
-// Botao secundario dentro do conflictCard. Aparece quando ha Vencord/Equicord.
-// O fluxo:
-//   1) User clica "Sobrescrever mesmo assim"
-//   2) Enviamos activate(proxy, confirmOverride=true) pro backend
-//   3) Backend abre o dialog.showMessageBox nativo (defesa em profundidade)
-//   4) Se confirmar, segue o fluxo normal de ativacao
-// Sem o passo 3, o user poderia clicar direto aqui sem ler o aviso.
-conflictOverwriteBtn?.addEventListener('click', async () => {
-  conflictOverwriteBtn.disabled = true;
-  try {
-    const proxy = proxyInput.value.trim();
-    await window.api.activate(proxy, true);
-    setWarningOpen(true);
-  } catch (err) {
-    alert('Erro: ' + err);
-  }
-  conflictOverwriteBtn.disabled = false;
-  await updateStatus();
-  refreshTorStatus();
 });
 
 // Inicialização
 applyPlatformCopy();
 initTheme();
 refreshVersion();
-updateStatus();
+initVpnSection().then(() => updateStatus());
 refreshStartup();
 refreshAutoUpdate();
-refreshProxy();
-refreshNetMode();
-refreshTorStatus();
-// O Tor pode subir depois (durante a ativacao) ou cair no meio; sem reconferir, o texto
-// congela no que era verdade quando a janela abriu. A checagem custa um connect no loopback.
-setInterval(refreshTorStatus, 5000);
 fitWindowToContent();
 
 async function refreshVersion() {
@@ -430,9 +374,6 @@ async function refreshAutoUpdate() {
     if (autoUpdateToggle) {
       autoUpdateToggle.checked = await window.api.getAutoUpdate();
     }
-    if (autoReviveToggle) {
-      autoReviveToggle.checked = await window.api.getAutoRevive();
-    }
     // O canal beta so existe onde ha updater que o suporta (updater proprio no
     // Windows, allowPrerelease no Linux); no macOS nao existe updater nenhum.
     if (updateChannelRow) {
@@ -446,184 +387,514 @@ async function refreshAutoUpdate() {
   }
 }
 
-// Preenche o campo de proxy com o valor salvo no settings.json (se houver),
-// para a configuracao ficar visivel apos reiniciar o app.
-async function refreshProxy() {
-  try {
-    proxyInput.value = await window.api.getProxy();
-  } catch (err) {
-    console.error(err);
+// ---------------------------------------------------------------------------
+// Configuração WireGuard & ProtonVPN (Per-App VPN)
+// ---------------------------------------------------------------------------
+const tabProton = document.getElementById('tabProton') as HTMLButtonElement | null;
+const tabCustom = document.getElementById('tabCustom') as HTMLButtonElement | null;
+const panelProton = document.getElementById('panelProton') as HTMLElement | null;
+const panelCustom = document.getElementById('panelCustom') as HTMLElement | null;
+
+const protonAuthForm = document.getElementById('protonAuthForm') as HTMLElement | null;
+const protonConnectedView = document.getElementById('protonConnectedView') as HTMLElement | null;
+const protonUsername = document.getElementById('protonUsername') as HTMLInputElement | null;
+const protonPassword = document.getElementById('protonPassword') as HTMLInputElement | null;
+const protonPasswordToggle = document.getElementById('protonPasswordToggle') as HTMLButtonElement | null;
+const protonPasswordShowIcon = document.getElementById('protonPasswordShowIcon') as SVGElement | null;
+const protonPasswordHideIcon = document.getElementById('protonPasswordHideIcon') as SVGElement | null;
+const proton2FA = document.getElementById('proton2FA') as HTMLInputElement | null;
+const proton2FADialog = document.getElementById('proton2FADialog') as HTMLElement | null;
+const proton2FABackdrop = document.getElementById('proton2FABackdrop') as HTMLElement | null;
+const proton2FACloseBtn = document.getElementById('proton2FACloseBtn') as HTMLButtonElement | null;
+const proton2FACancelBtn = document.getElementById('proton2FACancelBtn') as HTMLButtonElement | null;
+const proton2FAConfirmBtn = document.getElementById('proton2FAConfirmBtn') as HTMLButtonElement | null;
+const protonLoginBtn = document.getElementById('protonLoginBtn') as HTMLButtonElement | null;
+const protonLoginBtnText = document.getElementById('protonLoginBtnText') as HTMLElement | null;
+const protonLoginSpinner = document.getElementById('protonLoginSpinner') as HTMLElement | null;
+
+const protonUserDisplay = document.getElementById('protonUserDisplay') as HTMLElement | null;
+const protonDot = document.getElementById('protonDot') as HTMLElement | null;
+const protonLogoutBtn = document.getElementById('protonLogoutBtn') as HTMLButtonElement | null;
+const protonCountrySelect = document.getElementById('protonCountrySelect') as HTMLSelectElement | null;
+const protonOptimizeBtn = document.getElementById('protonOptimizeBtn') as HTMLButtonElement | null;
+const protonOptimizeBtnText = document.getElementById('protonOptimizeBtnText') as HTMLElement | null;
+
+const protonServerBadge = document.getElementById('protonServerBadge') as HTMLElement | null;
+const protonServerName = document.getElementById('protonServerName') as HTMLElement | null;
+const protonServerPing = document.getElementById('protonServerPing') as HTMLElement | null;
+const protonServerLoad = document.getElementById('protonServerLoad') as HTMLElement | null;
+const protonFeedback = document.getElementById('protonFeedback') as HTMLElement | null;
+
+let currentVpnMode: 'proton' | 'custom' = 'proton';
+let isProtonAuthenticated = false;
+let protonOptimizationInFlight = false;
+
+protonPasswordToggle?.addEventListener('click', () => {
+  if (!protonPassword) return;
+
+  const visible = protonPassword.type === 'password';
+  protonPassword.type = visible ? 'text' : 'password';
+  protonPasswordToggle.setAttribute('aria-pressed', String(visible));
+  protonPasswordToggle.setAttribute('aria-label', visible ? 'Ocultar senha' : 'Mostrar senha');
+  protonPasswordToggle.title = visible ? 'Ocultar senha' : 'Mostrar senha';
+  if (protonPasswordShowIcon) {
+    protonPasswordShowIcon.toggleAttribute('hidden', visible);
   }
-}
+  if (protonPasswordHideIcon) {
+    protonPasswordHideIcon.toggleAttribute('hidden', !visible);
+  }
+  protonPassword.focus();
+});
 
-// ---------------------------------------------------------------------------
-// Rede de saida: tres modos segmentados (Tor / Gratuitas / Personalizado).
-// O padrao e TOR (o app instala e usa o Tor sempre). O campo de proxy so aparece
-// no modo Personalizado.
-// ---------------------------------------------------------------------------
-const segBtns = Array.from(document.querySelectorAll<HTMLButtonElement>('.seg-btn'));
-const torStatusEl = document.getElementById('torStatus') as HTMLElement;
-const manualProxyGroup = document.getElementById('manualProxyGroup') as HTMLElement;
-
-// O modo escolhido e se o Tor ja foi verificado: juntos decidem se o botao de ativar pode ser
-// liberado. Injetar em modo Tor sem o daemon de pe deixa o Discord sem conectar -- o bypass
-// segura o gateway em vez de vazar pelo IP brasileiro, entao o Discord fica sem rede nenhuma.
-let modoAtual = 'tor';
-let torPronto = false;
-
-// Libera ou trava o botao conforme o Tor. Fora do modo Tor nao ha o que travar; o resto do
-// estado (Discord ausente, etc.) continua mandando no updateStatus.
-function aplicarTravaDoTor() {
-  if (currentState === 'NOT_FOUND') return;
-  if (modoAtual !== 'tor' || currentState === 'ACTIVE') return;
-
-  if (torPronto) {
-    toggleBtn.disabled = false;
-    btnText.innerText = currentState === 'OTHER_MOD' ? 'Sobrescrever e Ativar' : 'Ativar Bypass';
+function setProtonFeedback(msg: string, type?: 'ok' | 'err' | 'busy') {
+  if (!protonFeedback) return;
+  if (!msg) {
+    protonFeedback.hidden = true;
+    protonFeedback.textContent = '';
+    protonFeedback.className = 'proton-feedback';
+    fitWindowToContent();
     return;
   }
-
-  toggleBtn.disabled = true;
-  btnText.innerText = 'Aguardando o Tor...';
-}
-
-function selectMode(mode: string) {
-  modoAtual = mode;
-  for (const btn of segBtns) {
-    const checked = btn.dataset.mode === mode;
-    btn.setAttribute('aria-checked', String(checked));
-    btn.classList.toggle('seg-btn--active', checked);
-  }
-  manualProxyGroup.hidden = mode !== 'manual';
-  // O status do Tor so faz sentido no modo Tor; nos outros ele so confunde.
-  torStatusEl.hidden = mode !== 'tor';
-  // Fecha o guia VPS ao sair do Personalizado: se ficar aberto, a proxima visita ja nasce alta.
-  if (mode !== 'manual') {
-    const guide = manualProxyGroup.querySelector('details.vps-guide');
-    if (guide) (guide as HTMLDetailsElement).open = false;
-  }
+  protonFeedback.hidden = false;
+  protonFeedback.className = 'proton-feedback' + (type ? ` proton-feedback--${type}` : '');
+  protonFeedback.textContent = msg;
   fitWindowToContent();
 }
 
-async function refreshNetMode() {
+let proton2FALastFocus: HTMLElement | null = null;
+
+function closeProton2FADialog(restoreFocus = true) {
+  if (!proton2FADialog) return;
+  proton2FADialog.hidden = true;
+  if (restoreFocus) (proton2FALastFocus ?? protonLoginBtn)?.focus();
+  proton2FALastFocus = null;
+  fitWindowToContent();
+}
+
+function openProton2FADialog() {
+  if (!proton2FADialog) return;
+  proton2FALastFocus = document.activeElement instanceof HTMLElement ? document.activeElement : protonLoginBtn;
+  proton2FADialog.hidden = false;
+  requestAnimationFrame(() => proton2FA?.focus());
+  fitWindowToContent();
+}
+
+proton2FABackdrop?.addEventListener('click', () => closeProton2FADialog());
+proton2FACloseBtn?.addEventListener('click', () => closeProton2FADialog());
+proton2FACancelBtn?.addEventListener('click', () => closeProton2FADialog());
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && proton2FADialog && !proton2FADialog.hidden) {
+    event.preventDefault();
+    closeProton2FADialog();
+  }
+});
+
+function protonNeeds2FA(error?: string): boolean {
+  return !!error && /2FA_REQUIRED|2FA|two.?factor/i.test(error);
+}
+
+async function switchVpnMode(mode: 'proton' | 'custom') {
+  currentVpnMode = mode;
   try {
-    const saved = await window.api.getNetMode();
-    const proxy = await window.api.getProxy();
-    // Mapeia o estado salvo para a UI de 3 opcoes:
-    // - "free" -> Gratuitas (escolha explicita)
-    // - "auto" com proxy preenchida -> Personalizado
-    // - o resto ("tor", "auto" sem proxy, vazio) -> Tor, que e o padrao
-    if (saved === 'free') selectMode('free');
-    else if (saved === 'auto' && proxy) selectMode('manual');
-    else selectMode('tor');
+    await window.api.setVpnMode(mode);
+  } catch {}
+
+  if (tabProton && tabCustom && panelProton && panelCustom) {
+    const isProton = mode === 'proton';
+    tabProton.classList.toggle('vpn-mode-tab--active', isProton);
+    tabProton.setAttribute('aria-selected', String(isProton));
+    tabCustom.classList.toggle('vpn-mode-tab--active', !isProton);
+    tabCustom.setAttribute('aria-selected', String(!isProton));
+
+    panelProton.hidden = !isProton;
+    panelCustom.hidden = isProton;
+  }
+
+  await atualizarStatusWgConf();
+  await updateStatus();
+  fitWindowToContent();
+}
+
+tabProton?.addEventListener('click', () => switchVpnMode('proton'));
+tabCustom?.addEventListener('click', () => switchVpnMode('custom'));
+
+async function refreshProtonState() {
+  try {
+    const s = await window.api.getProtonSettings();
+    if (protonCountrySelect) {
+      protonCountrySelect.value = s.country || '';
+    }
+
+    if (s.username) {
+      if (protonUsername) protonUsername.value = s.username;
+      const chk = await window.api.checkProtonSession(s.username);
+      if (chk.valid) {
+        isProtonAuthenticated = true;
+        if (protonAuthForm) protonAuthForm.hidden = true;
+        if (protonConnectedView) protonConnectedView.hidden = false;
+        if (protonUserDisplay) protonUserDisplay.textContent = `Conta: ${s.username}`;
+        if (protonDot) protonDot.style.background = '#22c55e';
+
+        if (s.lastServer?.server && protonServerBadge && protonServerName && protonServerPing && protonServerLoad) {
+          protonServerName.textContent = s.lastServer.server;
+          const ping = s.lastServer.pingMs;
+          if (ping > 0) {
+            protonServerPing.textContent = `${ping} ms`;
+            protonServerPing.classList.toggle('proton-ping-pill--high', ping > 180);
+          } else {
+            protonServerPing.textContent = 'Ping: rápido';
+          }
+          protonServerLoad.textContent = `${s.lastServer.load ?? 0}% carga`;
+          protonServerBadge.hidden = false;
+        } else if (protonServerBadge) {
+          protonServerBadge.hidden = true;
+        }
+        return;
+      }
+    }
+
+    isProtonAuthenticated = false;
+    if (protonAuthForm) protonAuthForm.hidden = false;
+    if (protonConnectedView) protonConnectedView.hidden = true;
   } catch (err) {
-    console.error(err);
+    console.error('Falha ao verificar sessão Proton:', err);
+    isProtonAuthenticated = false;
+    if (protonAuthForm) protonAuthForm.hidden = false;
+    if (protonConnectedView) protonConnectedView.hidden = true;
   }
 }
 
-async function refreshTorStatus() {
+async function submitProtonLogin() {
+    const user = protonUsername?.value.trim() || '';
+    const pass = protonPassword?.value || '';
+    const twoFa = proton2FA?.value.trim() || undefined;
+
+    if (!user) {
+      setProtonFeedback('Informe o usuário Proton.', 'err');
+      return;
+    }
+    if (!pass) {
+      setProtonFeedback('Informe sua senha Proton.', 'err');
+      return;
+    }
+
+    if (protonLoginBtn) protonLoginBtn.disabled = true;
+    if (protonLoginSpinner) protonLoginSpinner.hidden = false;
+    if (protonLoginBtnText) protonLoginBtnText.textContent = 'Conectando...';
+    setProtonFeedback('Autenticando com ProtonVPN...', 'busy');
+
+    try {
+      const res = await window.api.loginProton({
+        username: user,
+        password: pass,
+        twoFactorCode: twoFa,
+      });
+
+      if (res.success) {
+        setProtonFeedback('Conectado com sucesso! Servidor rápido selecionado.', 'ok');
+        if (protonPassword) protonPassword.value = '';
+        if (proton2FA) proton2FA.value = '';
+        closeProton2FADialog(false);
+        await refreshProtonState();
+        await atualizarStatusWgConf();
+        await updateStatus();
+      } else {
+        if (protonNeeds2FA(res.error)) {
+          setProtonFeedback(
+            twoFa ? 'Código 2FA inválido ou expirado. Tente novamente.' : 'Esta conta exige um código 2FA.',
+            'err'
+          );
+          openProton2FADialog();
+        } else {
+          setProtonFeedback(res.error || 'Falha na autenticação.', 'err');
+        }
+      }
+    } catch (err) {
+      setProtonFeedback((err as Error)?.message || String(err), 'err');
+    } finally {
+      if (protonLoginBtn) protonLoginBtn.disabled = false;
+      if (protonLoginSpinner) protonLoginSpinner.hidden = true;
+      if (protonLoginBtnText) protonLoginBtnText.textContent = 'Conectar conta Proton';
+    }
+}
+
+protonLoginBtn?.addEventListener('click', () => void submitProtonLogin());
+proton2FAConfirmBtn?.addEventListener('click', () => {
+  const code = proton2FA?.value.trim() || '';
+  if (!code) {
+    setProtonFeedback('Digite o código 2FA para continuar.', 'err');
+    proton2FA?.focus();
+    return;
+  }
+  closeProton2FADialog(false);
+  void submitProtonLogin();
+});
+
+if (protonLogoutBtn) {
+  protonLogoutBtn.addEventListener('click', async () => {
+    await window.api.logoutProton();
+    setProtonFeedback('');
+    await refreshProtonState();
+    await atualizarStatusWgConf();
+    await updateStatus();
+  });
+}
+
+if (protonCountrySelect) {
+  protonCountrySelect.addEventListener('change', async () => {
+    const country = protonCountrySelect.value;
+    await window.api.setProtonSettings({ country });
+    protonOptimizeBtn?.click();
+  });
+}
+
+async function optimizeProtonRoute(onStartup = false) {
+  if (protonOptimizationInFlight || !isProtonAuthenticated) return;
+
+  protonOptimizationInFlight = true;
+  if (protonOptimizeBtn) protonOptimizeBtn.disabled = true;
+  if (protonOptimizeBtnText) protonOptimizeBtnText.textContent = onStartup ? 'Otimizando...' : 'Medindo ping...';
+  setProtonFeedback(
+    onStartup ? 'Atualizando automaticamente a rota Proton...' : 'Testando servidores em tempo real para menor latência...',
+    'busy',
+  );
+
   try {
-    const st = await window.api.getTorStatus();
-    torPronto = st.ativo;
-    if (st.ativo) {
-      torStatusEl.textContent = `Tor pronto (porta ${st.porta})`;
-      torStatusEl.classList.add('tor-status--ok');
-    } else if (st.presente) {
-      torStatusEl.textContent = 'Tor baixado, preparando... o botao libera quando ele subir.';
-      torStatusEl.classList.remove('tor-status--ok');
+    const country = protonCountrySelect?.value || '';
+    const res = await window.api.optimizeProtonRoute({ country, autoPing: true });
+
+    if (res.success) {
+      const pingStr = res.pingMs && res.pingMs > 0 ? ` (${res.pingMs}ms)` : '';
+      await refreshProtonState();
+      await atualizarStatusWgConf();
+      await updateStatus();
+      // Otimizar so grava/prepara a configuracao WireGuard. Sem o bypass ativo, dizer
+      // "conectado" sugere que o Discord ja esta passando pelo novo servidor.
+      const rotaEmUso = currentState === 'ACTIVE';
+      setProtonFeedback(
+        rotaEmUso
+          ? `Servidor ${res.server} conectado!${pingStr}`
+          : `Rota ${res.server} selecionada!${pingStr} Ative o Bypass para usá-la.`,
+        'ok',
+      );
     } else {
-      torStatusEl.textContent = 'Tor sera baixado automaticamente ao ativar.';
-      torStatusEl.classList.remove('tor-status--ok');
+      setProtonFeedback(res.error || 'Falha ao buscar servidor.', 'err');
     }
   } catch (err) {
-    console.error(err);
+    setProtonFeedback((err as Error)?.message || String(err), 'err');
+  } finally {
+    protonOptimizationInFlight = false;
+    if (protonOptimizeBtn) protonOptimizeBtn.disabled = false;
+    if (protonOptimizeBtnText) protonOptimizeBtnText.textContent = 'Otimizar rota';
   }
-  // O botao depende disto: em modo Tor ele so libera com o daemon verificado.
-  aplicarTravaDoTor();
 }
 
-// Troca de modo com o bypass ativo: o main reescreve o settings.json dentro do asar
-// injetado, mas o runtime so rele no proximo start do Discord. O hint avisa disso
-// quando a reescrita aconteceu (reescritos > 0 = havia injecao nossa no disco).
-const netModeHint = document.getElementById('netModeHint') as HTMLElement | null;
-let netModeHintTimer: number | undefined;
-function mostrarNetModeHint(reescritos: number) {
-  if (!netModeHint) return;
-  if (reescritos > 0) {
-    netModeHint.textContent = 'Novo modo salvo — vale no próximo start do Discord (ou desative/ative pra aplicar agora).';
-    netModeHint.hidden = false;
-    if (netModeHintTimer) window.clearTimeout(netModeHintTimer);
-    netModeHintTimer = window.setTimeout(() => { netModeHint.hidden = true; }, 9000);
+protonOptimizeBtn?.addEventListener('click', () => void optimizeProtonRoute());
+
+async function atualizarStatusWgConf() {
+  if (currentVpnMode === 'proton') {
+    hasSelectedConf = isProtonAuthenticated;
   } else {
-    netModeHint.hidden = true;
+    try {
+      const nome = await window.api.getWgConfName();
+      if (nome && nome.trim() && !nome.startsWith('ProtonVPN')) {
+        hasSelectedConf = true;
+        if (vpnConfigStatus) vpnConfigStatus.textContent = `Arquivo: ${nome}`;
+      } else {
+        hasSelectedConf = false;
+        if (vpnConfigStatus) vpnConfigStatus.textContent = 'Nenhum arquivo (.conf) importado';
+      }
+    } catch {
+      hasSelectedConf = false;
+      if (vpnConfigStatus) vpnConfigStatus.textContent = 'Nenhum arquivo (.conf) importado';
+    }
   }
 }
 
-for (const btn of segBtns) {
-  btn.addEventListener('click', () => {
-    const mode = btn.dataset.mode!;
-    selectMode(mode);
+async function initVpnSection() {
+  try {
+    const mode = await window.api.getVpnMode();
+    currentVpnMode = mode || 'proton';
+    if (tabProton && tabCustom && panelProton && panelCustom) {
+      const isProton = currentVpnMode === 'proton';
+      tabProton.classList.toggle('vpn-mode-tab--active', isProton);
+      tabCustom.classList.toggle('vpn-mode-tab--active', !isProton);
+      panelProton.hidden = !isProton;
+      panelCustom.hidden = isProton;
+    }
+    await refreshProtonState();
+    await atualizarStatusWgConf();
+    if (currentVpnMode === 'proton' && isProtonAuthenticated) {
+      void optimizeProtonRoute(true);
+    }
+  } catch (err) {
+    console.error('Erro ao inicializar seção VPN:', err);
+  }
+}
 
-    if (mode === 'tor') {
-      // Prepara o Tor (baixa/sobe) — o padrao. Nao espera: o status atualiza.
-      window.api.setNetMode('tor').then((r) => mostrarNetModeHint(r.reescritos)).catch(() => {});
-      // Trava o botao na hora: ate o Tor estar de pe, injetar so deixaria o Discord sem
-      // conectar. O refreshTorStatus (a cada 5s) libera quando ele subir.
-      torPronto = false;
-      aplicarTravaDoTor();
-      window.api.installTor().then((r) => {
-        torPronto = !!r.ok;
-        torStatusEl.textContent = r.ok
-          ? `Tor pronto (porta ${r.porta ?? 9060})`
-          : `${r.error ?? 'nao consegui preparar o Tor'}`;
-        torStatusEl.classList.toggle('tor-status--ok', !!r.ok);
-        aplicarTravaDoTor();
-      }).catch(() => {});
-      fitWindowToContent();
-    } else if (mode === 'free') {
-      window.api.setNetMode('free').then((r) => mostrarNetModeHint(r.reescritos)).catch(() => {});
-      // Fora do modo Tor nao ha o que esperar: devolve o botao.
-      aplicarTravaDoTor();
-      updateStatus();
+if (vpnImportBtn) {
+  vpnImportBtn.addEventListener('click', async () => {
+    try {
+      const res = await window.api.importWgConf();
+      if (res && res.success) {
+        await atualizarStatusWgConf();
+        await updateStatus();
+        setVpnDropFeedback(`Arquivo ${res.fileName ?? 'WireGuard'} importado.`, 'ok');
+      } else if (res?.error) {
+        setVpnDropFeedback(res.error, 'bad');
+      }
+    } catch (err) {
+      console.error('Falha ao importar config WireGuard:', err);
+    }
+  });
+}
+
+function setVpnDropActive(active: boolean) {
+  vpnDropZone?.classList.toggle('vpn-drop-zone--active', active);
+}
+
+function setVpnDropFeedback(message: string, type: 'ok' | 'bad') {
+  if (!vpnDropFeedback) return;
+  vpnDropFeedback.hidden = false;
+  vpnDropFeedback.className = `vpn-drop-feedback vpn-drop-feedback--${type}`;
+  vpnDropFeedback.textContent = message;
+  fitWindowToContent();
+}
+
+async function importDroppedWgFile(file: File) {
+  const filePath = (file as File & { path?: string }).path;
+  if (!filePath) {
+    setVpnDropFeedback('Não foi possível ler este arquivo. Use o botão Importar.', 'bad');
+    return;
+  }
+  if (!file.name.toLowerCase().endsWith('.conf')) {
+    setVpnDropFeedback('Solte um arquivo WireGuard com extensão .conf.', 'bad');
+    return;
+  }
+
+  setVpnDropFeedback('Validando configuração WireGuard...', 'ok');
+  try {
+    const res = await window.api.importWgConfFile(filePath);
+    if (res?.success) {
+      setVpnDropFeedback(`Arquivo ${res.fileName ?? 'WireGuard'} importado.`, 'ok');
+      await atualizarStatusWgConf();
+      await updateStatus();
     } else {
-      // Personalizado: volta ao auto com a proxy do campo.
-      window.api.setNetMode('auto').then((r) => mostrarNetModeHint(r.reescritos)).catch(() => {});
-      aplicarTravaDoTor();
-      updateStatus();
+      setVpnDropFeedback(res?.error ?? 'Não foi possível importar este arquivo.', 'bad');
+    }
+  } catch (err) {
+    setVpnDropFeedback(err instanceof Error ? err.message : String(err), 'bad');
+  }
+}
+
+if (vpnDropZone) {
+  let dragDepth = 0;
+  vpnDropZone.addEventListener('click', () => vpnImportBtn?.click());
+  vpnDropZone.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      vpnImportBtn?.click();
+    }
+  });
+  vpnDropZone.addEventListener('dragenter', (event) => {
+    event.preventDefault();
+    dragDepth += 1;
+    setVpnDropActive(true);
+  });
+  vpnDropZone.addEventListener('dragover', (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    setVpnDropActive(true);
+  });
+  vpnDropZone.addEventListener('dragleave', (event) => {
+    event.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) setVpnDropActive(false);
+  });
+  vpnDropZone.addEventListener('drop', async (event) => {
+    event.preventDefault();
+    dragDepth = 0;
+    setVpnDropActive(false);
+    const file = event.dataTransfer?.files[0];
+    if (file) await importDroppedWgFile(file);
+  });
+
+  window.addEventListener('dragover', (event) => event.preventDefault());
+  window.addEventListener('drop', (event) => event.preventDefault());
+}
+
+const vpnTestBtn = document.getElementById('vpnTestBtn') as HTMLButtonElement | null;
+const vpnTestFeedback = document.getElementById('vpnTestFeedback') as HTMLElement | null;
+
+if (vpnTestBtn && vpnTestFeedback) {
+  vpnTestBtn.addEventListener('click', async () => {
+    vpnTestBtn.disabled = true;
+    vpnTestFeedback.classList.remove('vpn-test-feedback--ok', 'vpn-test-feedback--bad');
+    vpnTestFeedback.classList.add('vpn-test-feedback--busy');
+    vpnTestFeedback.hidden = false;
+    vpnTestFeedback.textContent = 'Testando configuração...';
+    fitWindowToContent();
+
+    try {
+      const r = await window.api.testWgConf();
+      vpnTestFeedback.classList.remove('vpn-test-feedback--busy');
+      if (r.ok) {
+        vpnTestFeedback.classList.add('vpn-test-feedback--ok');
+        const partes = [`Endpoint ${r.endpoint ?? '?'}`];
+        if (r.resolvedIp) partes.push(`resolve para ${r.resolvedIp}`);
+        if (r.active && r.exitInfo?.ip) {
+          const geo = r.exitInfo.country ? ` [${r.exitInfo.country}]` : '';
+          partes.push(`saída ativa ${r.exitInfo.ip}${geo}`);
+        } else if (!r.active) {
+          partes.push('bypass inativo — não foi possível confirmar a saída real');
+        }
+        vpnTestFeedback.textContent = `OK — ${partes.join(' · ')}`;
+      } else {
+        vpnTestFeedback.classList.add('vpn-test-feedback--bad');
+        vpnTestFeedback.textContent = r.error ?? 'Falha no teste';
+      }
+    } catch (err) {
+      vpnTestFeedback.classList.remove('vpn-test-feedback--busy');
+      vpnTestFeedback.classList.add('vpn-test-feedback--bad');
+      vpnTestFeedback.textContent = err instanceof Error ? err.message : String(err);
+    } finally {
+      vpnTestBtn.disabled = false;
       fitWindowToContent();
     }
   });
 }
 
-const proxyTestBtn = document.getElementById('proxyTestBtn') as HTMLButtonElement;
-const proxyTestStatus = document.getElementById('proxyTestStatus') as HTMLElement;
+const proxyTestBtn = document.getElementById('proxyTestBtn') as HTMLButtonElement | null;
+const proxyTestStatus = document.getElementById('proxyTestStatus') as HTMLElement | null;
 
-proxyTestBtn.addEventListener('click', async () => {
-  const proxy = proxyInput.value.trim();
-  proxyTestBtn.disabled = true;
-  proxyTestStatus.classList.remove('proxy-test-status--ok', 'proxy-test-status--bad');
-  proxyTestStatus.textContent = 'Testando túnel até o gateway...';
-  fitWindowToContent();
-
-  try {
-    const r = await window.api.testProxy(proxy);
-    if (r.ok) {
-      proxyTestStatus.classList.add('proxy-test-status--ok');
-      const geo = r.country ? ` · saída ${r.country}` : '';
-      proxyTestStatus.textContent = `OK — túnel em ${r.ms ?? '?'}ms (${r.host}:${r.port})${geo}`;
-    } else {
-      proxyTestStatus.classList.add('proxy-test-status--bad');
-      const geo = r.country ? ` [${r.country}]` : '';
-      proxyTestStatus.textContent = `${r.error ?? 'Falha no teste'}${geo}`;
-    }
-  } catch (err) {
-    proxyTestStatus.classList.add('proxy-test-status--bad');
-    proxyTestStatus.textContent = err instanceof Error ? err.message : String(err);
-  } finally {
-    proxyTestBtn.disabled = false;
+if (proxyTestBtn && proxyTestStatus && proxyInput) {
+  proxyTestBtn.addEventListener('click', async () => {
+    const proxy = proxyInput.value.trim();
+    proxyTestBtn.disabled = true;
+    proxyTestStatus.classList.remove('proxy-test-status--ok', 'proxy-test-status--bad');
+    proxyTestStatus.textContent = 'Testando túnel até o gateway...';
     fitWindowToContent();
-  }
-});
+
+    try {
+      const r = await window.api.testProxy(proxy);
+      if (r.ok) {
+        proxyTestStatus.classList.add('proxy-test-status--ok');
+        const geo = r.country ? ` · saída ${r.country}` : '';
+        proxyTestStatus.textContent = `OK — túnel em ${r.ms ?? '?'}ms (${r.host}:${r.port})${geo}`;
+      } else {
+        proxyTestStatus.classList.add('proxy-test-status--bad');
+        const geo = r.country ? ` [${r.country}]` : '';
+        proxyTestStatus.textContent = `${r.error ?? 'Falha no teste'}${geo}`;
+      }
+    } catch (err) {
+      proxyTestStatus.classList.add('proxy-test-status--bad');
+      proxyTestStatus.textContent = err instanceof Error ? err.message : String(err);
+    } finally {
+      proxyTestBtn.disabled = false;
+      fitWindowToContent();
+    }
+  });
+}
 
 const vpsGuide = document.querySelector('.vps-guide');
 if (vpsGuide) {
@@ -637,13 +908,6 @@ startupToggle.addEventListener('change', async () => {
 autoUpdateToggle?.addEventListener('change', async () => {
   if (autoUpdateToggle) {
     await window.api.setAutoUpdate(autoUpdateToggle.checked);
-  }
-});
-
-// Revive automatico do gateway zumbi (issues #145/#149/#153).
-autoReviveToggle?.addEventListener('change', async () => {
-  if (autoReviveToggle) {
-    await window.api.setAutoRevive(autoReviveToggle.checked);
   }
 });
 
@@ -716,10 +980,6 @@ try {
 // A bandeja tambem tem esses controles; sem os avisos, os dois ficariam dessincronizados.
 window.api.onRefreshStartup(refreshStartup);
 window.api.onRefreshStatus(updateStatus);
-
-// O watchdog do Tor ressuscitou o daemon no meio da sessao: reabre o aviso do Ctrl+R
-// (a reconexao do gateway pode travar o video ate um reload — armadilha conhecida).
-window.api.onTorWatchdogRecuperado(() => setWarningOpen(true));
 
 // ---------------------------------------------------------------------------
 // Report de bug — dialog + IPC

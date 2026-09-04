@@ -10,6 +10,9 @@ const root = path.resolve(__dirname, "..");
 const read = relative => fs.readFileSync(path.join(root, relative), "utf8");
 const standalone = read("standalone/golivebypass.js");
 const generatedGui = read("golive-gui/electron/bypass.ts");
+const guiMain = read("golive-gui/electron/main.ts");
+const guiPreload = read("golive-gui/electron/preload.ts");
+const guiHtml = read("golive-gui/index.html");
 const pluginNative = read("goLiveBypass/native.ts");
 const pluginRenderer = read("goLiveBypass/index.tsx");
 const pluginStability = read("goLiveBypass/stability.ts");
@@ -35,9 +38,29 @@ test("standalone limita RTC a uma tentativa", () => {
     assert.match(standalone, /const VOICE_TENTATIVAS = 1;/);
 });
 
-test("standalone da 60s ao viewer e 120s a demanda recente", () => {
-    assert.match(standalone, /const VOICE_VIEWER_SAIDA_PARADA_MS = 60_000;/);
+test("standalone limita a primeira tentativa do viewer ao proximo poll e preserva demanda recente", () => {
+    assert.match(standalone, /const VOICE_STREAM_AQUECIMENTO_MS = 1_000;/);
+    assert.match(standalone, /const VOICE_VIEWER_SAIDA_PARADA_MS = 1_000;/);
     assert.match(standalone, /const VOICE_VIEWER_DEMANDA_RECENTE_MS = 120_000;/);
+});
+
+test("standalone recupera reentrada de viewer saudavel no proximo poll", () => {
+    assert.match(standalone, /const VOICE_VIEWER_REENTRADA_AQUECIMENTO_MS = 1_000;/);
+    assert.match(standalone, /const VOICE_VIEWER_REENTRADA_SAIDA_PARADA_MS = 1_000;/);
+    assert.match(standalone, /function viewerReentradaAposSaude\(/);
+});
+
+test("recuperacao critica do standalone nao tem opt-out", () => {
+    assert.match(standalone, /recuperacao automatica obrigatoria/);
+    assert.doesNotMatch(standalone, /autoReviveAtivo/);
+    assert.doesNotMatch(standalone, /settings\.autoRevive/);
+});
+
+test("GUI nao expoe toggle ou IPC para desarmar a recuperacao", () => {
+    assert.doesNotMatch(guiHtml, /autoReviveToggle|autoReviveRow/);
+    assert.doesNotMatch(guiPreload, /get-auto-revive|set-auto-revive/);
+    assert.doesNotMatch(guiMain, /get-auto-revive|set-auto-revive|readAutoRevive|saveAutoRevive/);
+    assert.match(guiMain, /autoRevive: true/);
 });
 
 test("standalone trata rajada Tor sem refresh ou quarentena", () => {
@@ -107,6 +130,7 @@ test("guarda 2001 apenas avisa e nao recarrega ou fecha socket", () => {
 test("watchdog do plugin e cancelado ao desativar", () => {
     assert.match(pluginRenderer, /function stopStreamClaimWatch\(\)/);
     assert.match(pluginRenderer, /stop\(\) \{[\s\S]*?stopStreamClaimWatch\(\);/);
+    assert.match(pluginRenderer, /stop\(\) \{[\s\S]*?clearTimeout\(updateCheckTimer\);/);
 });
 
 test("instalador Linux distribui stability.ts", () => {
@@ -127,6 +151,14 @@ test("plugin mostra versao e oferece verificacao na configuracao", () => {
     assert.match(pluginRenderer, /Atualizar/);
 });
 
+test("check() de update do plugin trata rejeicao igual a update() (nao deixa promise sem dono)", () => {
+    // Native.checkPluginUpdate() em si nunca rejeita, mas a chamada IPC por baixo pode --
+    // update(), a funcao irma, ja tratava; check() nao tratava ate esta correcao.
+    const checkBody = section(pluginRenderer, "const check = async () => {", "const update = async () => {");
+    assert.match(checkBody, /\}\s*catch\s*\(error\)\s*\{/);
+    assert.match(checkBody, /finally\s*\{\s*setBusy\(false\);/);
+});
+
 test("plugin atualiza somente no processo nativo com checksum e backup", () => {
     assert.match(pluginNative, /GITHUB_RELEASES_URL/);
     assert.match(pluginNative, /createHash\("sha256"\)/);
@@ -142,9 +174,14 @@ test("updater do plugin nunca substitui o bundle dist do Vencord/Equicord", () =
     assert.doesNotMatch(pluginNative, /const target = __dirname;/);
 });
 
-test("updater recompila pelo cmd.exe no Windows", () => {
-    assert.match(pluginNative, /const command = windows \? "pnpm\.cmd" : "pnpm"/);
-    assert.match(pluginNative, /shell: windows/);
+test("updater localiza pnpm e recompila pelo cmd.exe no Windows", () => {
+    assert.match(pluginNative, /function resolveWindowsPnpm\(\)/);
+    assert.match(pluginNative, /AppData.*npm.*pnpm\.cmd/);
+    assert.match(pluginNative, /ProgramFiles.*nodejs.*pnpm\.cmd/);
+    assert.match(pluginNative, /windowsRoot, "System32", "cmd\.exe"/);
+    assert.match(pluginNative, /"call",\s*pnpm,\s*"build"/);
+    assert.match(pluginNative, /shell: false/);
+    assert.match(pluginNative, /env,/);
     assert.match(pluginNative, /failure\.message/);
     assert.match(pluginNative, /falha ao recompilar userplugin/);
 });
@@ -161,6 +198,55 @@ test("TUI standalone tem consulta e update separados", () => {
     assert.match(read("standalone/golivebypass-standalone.sh"), /standalone_update\(\)/);
     assert.match(read("standalone/GoLiveBypass-Standalone.ps1"), /Invoke-StandaloneCheckUpdate/);
     assert.match(read("standalone/GoLiveBypass-Standalone.ps1"), /Invoke-StandaloneUpdate/);
+});
+
+test("shutdown() do plugin zera os mutexes de busca de saida (choosing/hunting) e cancela enableOnce em voo", () => {
+    // choosing/hunting sao mutexes de PROMESSA ("ja tem uma busca em voo?"), nao um
+    // booleano. Sem resetar no shutdown, um toggle rapido desligar->ligar do plugin (sem
+    // debounce na UI) podia fazer a reativacao reaproveitar calada uma busca de saida
+    // ainda em andamento de ANTES do desligamento -- ela so comeca busca nova quando o
+    // campo esta null, e a sessao nova ficava dependendo do tempo de uma busca que nao
+    // reflete mais a configuracao/intencao atual. Da mesma forma, shutdown cancela qualquer
+    // enableOnce em voo (++enableSeq, enabling = null) e reseta retries = 0.
+    const shutdownBody = section(pluginNative, "export async function shutdown(", "\n}");
+    assert.match(shutdownBody, /choosing\s*=\s*null/);
+    assert.match(shutdownBody, /hunting\s*=\s*null/);
+    assert.match(shutdownBody, /\+\+enableSeq/);
+    assert.match(shutdownBody, /enabling\s*=\s*null/);
+    assert.match(shutdownBody, /retries\s*=\s*0/);
+});
+
+test("standalone --uninstall desliga o Tor mesmo com falha parcial de elevacao", () => {
+    // remove_tor() estava dentro do "if failed -eq 0": um so alvo falhando ao reverter
+    // (elevacao recusada, arquivo travado, entre varios Discords) deixava o servico
+    // golivebypass-tor.service rodando pra sempre sob o systemd -- ninguem mais usa
+    // aquela saida e ninguem mais vigia se ela morre. Mesma classe de vazamento do
+    // deactivateAll() do Windows/Mac (main.ts), e inconsistente com o modo "restore"
+    // logo acima no mesmo arquivo, que ja chama remove_tor sem essa guarda.
+    const standaloneSh = read("standalone/golivebypass-standalone.sh");
+    const uninstallBlock = section(
+        standaloneSh,
+        'if [ "$MODE" = "uninstall" ]; then',
+        '\nif [ "$MODE" = "restore" ]; then',
+    );
+    const removeTorIndex = uninstallBlock.indexOf("remove_tor");
+    const failedGateIndex = uninstallBlock.indexOf('if [ "$failed" -eq 0 ]; then');
+    assert.notEqual(removeTorIndex, -1);
+    assert.notEqual(failedGateIndex, -1);
+    // remove_tor precisa rodar ANTES da checagem de failed, nao dentro do bloco de sucesso.
+    assert.ok(removeTorIndex < failedGateIndex);
+});
+
+test("paridade de portas Tor: TOR_PORTS inclui a porta 9060 no standalone e no plugin", () => {
+    assert.match(standalone, /const TOR_PORTS = \[9060,/);
+    assert.match(pluginNative, /const TOR_PORTS = \[9060,/);
+});
+
+test("readOverTls escuta evento close para nao segurar o probe no fechamento limpo", () => {
+    const standaloneReadOverTls = section(standalone, "function readOverTls(", "\n}");
+    const pluginReadOverTls = section(pluginNative, "function readOverTls(", "\n}");
+    assert.match(standaloneReadOverTls, /tls\.on\("close",/);
+    assert.match(pluginReadOverTls, /tls\.on\("close",/);
 });
 
 process.stdout.write(`1..${passed}\n`);

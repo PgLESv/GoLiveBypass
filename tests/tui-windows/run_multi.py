@@ -17,9 +17,9 @@ sys.path.insert(0, HERE)
 from win_tui_session import WinTuiSession
 
 INSTALLER = "C:\\GLB-TEST\\GoLiveBypass-Installer.ps1"
-HOST = os.environ.get("TUI_VM_HOST", "192.168.122.198")
+HOST = os.environ["TUI_VM_HOST"]
 USER = os.environ.get("TUI_VM_USER", "teste")
-PASSWORD = os.environ.get("TUI_VM_PASSWORD", "1241")
+PASSWORD = os.environ.get("TUI_VM_PASSWORD")
 
 # Extrai as funcoes da TUI por AST (sem rodar o script) e chama Tui-MenuMulti.
 PS_TEMPLATE = r"""

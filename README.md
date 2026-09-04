@@ -5,9 +5,9 @@
   <a href="https://discord.gg/7cWbtr82rG"><img src="https://img.shields.io/badge/💬_Discord-Entrar_na_comunidade-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Entrar no Discord"></a>
 </p>
 
-Feito por um desenvolvedor brasileiro, o GoLiveBypass **devolve o Go Live e a câmera para usuários brasileiros** no Discord para computador. Escolha a forma de instalação que combina com você — a GUI é o caminho mais simples.
+Feito por um desenvolvedor brasileiro, o GoLiveBypass **devolve o Go Live e a câmera para usuários brasileiros** no Discord para computador. Na versão 2.0.0, a GUI cria um túnel WireGuard exclusivo para os processos do Discord, sem transformar a conexão inteira do computador em VPN.
 
-Por dentro, só o WebSocket de gateway do Discord passa por uma proxy fora do Brasil — todo o resto sai direto, na sua velocidade normal. Os detalhes técnicos ficam [mais abaixo](#como-funciona).
+No Windows, o WireSock aplica o túnel via WFP somente a `Discord.exe` e `Update.exe`. No Linux, o Discord é iniciado dentro de um namespace de rede dedicado. Navegadores, jogos e os demais aplicativos continuam usando a rede normal. Os detalhes técnicos ficam [mais abaixo](#como-funciona-na-versão-200).
 
 > **English summary below / Resumo em inglês no final.**
 
@@ -17,24 +17,49 @@ Você não precisa usar todas as opções. Escolha uma delas:
 
 | Variante | É para você se... | O que fazer |
 |---|---|---|
-| **[GUI](#-novo-interface-gráfica-plug-and-play-windows-e-macos)** | quer ativar e desativar com poucos cliques, sem terminal | baixe o aplicativo para Windows, macOS ou Linux |
-| **[Standalone](#modo-standalone-só-o-discord-sem-equicord-e-sem-vencord)** | usa o Discord puro e não quer instalar Equicord/Vencord | rode o script diretamente no Discord |
-| **[Plugin](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop)** | já usa Equicord, Vencord ou Vesktop | instale o plugin dentro do seu mod |
+| **[GUI](#-versão-200-interface-gráfica-com-wireguard-por-aplicativo)** | quer ativar e desativar com poucos cliques, sem terminal | baixe o aplicativo para Windows, macOS ou Linux |
+| **[Standalone](#modo-standalone-só-o-discord-sem-equicord-e-sem-vencord)** | usa o Discord puro e não quer instalar Equicord/Vencord | temporariamente indisponível na 2.0.0 |
+| **[Plugin](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop)** | já usa Equicord, Vencord ou Vesktop | temporariamente indisponível na 2.0.0 |
 
 > **Regra rápida:** GUI para simplicidade, standalone para Discord sem mods, plugin para quem já usa um mod.
 
-## 🌟 NOVO: Interface Gráfica Plug and Play (Windows e macOS)
+> **Status da versão 2.0.0:** neste momento, somente a **GUI** está disponível e mantida.
+> O plugin Equicord/Vencord e o standalone CLI estão temporariamente fora do ar enquanto a
+> solução WireGuard por aplicativo é portada para essas variantes. Não instale essas duas
+> opções esperando o comportamento da 2.0.0; elas voltarão após a portabilidade e validação.
+
+## 🌟 Versão 2.0.0: Interface Gráfica com WireGuard por aplicativo
 
 Criamos um aplicativo completo que faz todo o trabalho de forma **100% automática**, sem precisar abrir terminais, usar scripts ou instalar modificações complexas como o Equicord.
 
 <p align="center">
-  <img src="golive-gui/src/assets/hero-ui.png" alt="A interface do GoLiveBypass: status do Discord, botao de ativar, tema claro e escuro e proxy customizada" width="420">
+  <img src="golive-gui/src/assets/gui-v2.png" alt="Interface do GoLiveBypass 2.0.0 com ProtonVPN otimizado, status da rota e botão Ativar Bypass" width="520">
 </p>
+
+### O que mudou na 2.0.0
+
+- O proxy SOCKS/PAC deixou de ser o caminho principal da GUI. Windows e Linux agora usam WireGuard por aplicativo.
+- O Discord permanece original, sem substituição do `app.asar` pela GUI.
+- A GUI reinicia o Discord ao ativar ou desativar para garantir que ele entre ou saia do túnel corretamente.
+- A rota ProtonVPN pode ser otimizada por ping. Depois de otimizar, saia e entre novamente na chamada para a nova rota entrar em vigor.
+- O e-mail da conta Proton aparece desfocado durante o compartilhamento de tela e só é revelado ao passar o mouse.
+
+> **Importante:** o perfil WireGuard gratuito integrado é compartilhado e pode ter limite de capacidade. Para uploads e uso frequente, prefira importar uma configuração WireGuard privada.
+
+### Como funciona na versão 2.0.0
+
+| Plataforma | Como o Discord entra no túnel | O restante do computador |
+|---|---|---|
+| **Windows** | WireSock/WFP filtra `Discord.exe`, `Discord`, `Update.exe` e seus processos relacionados | Continua na conexão normal |
+| **Linux** | Network namespace `discord-vpn` com interface WireGuard dedicada | Continua na conexão normal |
+| **macOS** | Mecanismo legado de PAC/injeção até existir um equivalente de VPN por aplicativo | Continua na conexão normal |
+
+O túnel cobre o processo do Discord inteiro — gateway, login, voz, vídeo e anexos — evitando a divergência de IP que motivou a migração. A mídia não é roteada por um proxy SOCKS separado.
 
 ### Como Baixar e Instalar
 1. Vá na **[última release](https://github.com/bezumiya/GoLiveBypass/releases/latest)** aqui no GitHub.
 2. Baixe o arquivo da sua plataforma, na lista no fim da página:
-   - **Windows:** `GoLiveBypass.exe` (portátil, roda direto sem instalar)
+   - **Windows:** `GoLiveBypass-*.exe` (portátil, roda direto sem instalar)
    - **macOS (Apple Silicon):** `GoLiveBypass.dmg`, ou o `GoLiveBypass.zip` se preferir
 3. Abra o arquivo que você acabou de baixar.
 
@@ -55,7 +80,7 @@ Dois avisos do sistema, e nenhum dos dois é o GoLiveBypass “quebrado”.
 ### Como Usar
 1. O aplicativo vai detectar o seu Discord automaticamente (no Mac, em `/Applications` ou `~/Applications`, inclusive PTB e Canary).
 2. Clique em **"Ativar Bypass"**.
-3. O Discord vai reiniciar automaticamente com o Go Live desbloqueado!
+3. O Discord vai reiniciar automaticamente com o Go Live desbloqueado. Ao desativar, ele também reinicia para sair do túnel.
 4. Pode fechar a janela sem medo: o app fica na **bandeja** do Windows (junto do relógio) ou na **barra de menus** do Mac. Clique no ícone de lá para reabrir, ativar/desativar ou **Sair** — sair por esse ícone é o que reverte tudo ao normal.
 5. Se quiser que ele já abra com o PC (direto escondido, sem janela pulando na tela), marque **"Iniciar com o Windows"** ou **"Iniciar com o Mac"** na janela ou no menu do ícone.
 
@@ -100,7 +125,7 @@ chmod +x GoLiveBypass-*.AppImage
 - [**GUI (Windows, macOS e Linux)**](#escolha-sua-variante) — 1 clique para ativar/desativar, sem terminal
 - [**Standalone**](#modo-standalone-só-o-discord-sem-equicord-e-sem-vencord) — Discord puro, sem Equicord/Vencord
 - [**Plugin**](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop) — para Equicord, Vencord e Vesktop
-- [Interface Gráfica (Windows e macOS)](#-novo-interface-gráfica-plug-and-play-windows-e-macos) — detalhes da GUI
+- [Interface Gráfica 2.0.0](#-versão-200-interface-gráfica-com-wireguard-por-aplicativo) — detalhes da GUI
 - [Interface Gráfica (Linux, AppImage)](#-interface-gráfica-para-linux-appimage) — detalhes da GUI no Linux
 - [**Um comando só**](#um-comando-só) — uma linha no PowerShell ou no terminal, sem baixar nada
 - [Instalação automática do plugin](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop) — instalador completo, com menu
@@ -127,6 +152,9 @@ chmod +x GoLiveBypass-*.AppImage
 ---
 
 ## Instalação do plugin (recomendado para Equicord, Vencord e Vesktop)
+
+> **Temporariamente indisponível na 2.0.0.** O plugin está pausado enquanto a arquitetura
+> WireGuard por aplicativo é portada e testada nessa variante.
 
 <p align="center">
   <img src="assets/instalacao.gif" alt="O instalador acha o Equicord, instala o plugin, compila e o Go Live volta a funcionar" width="720">
@@ -276,6 +304,9 @@ O instalador **baixa o plugin direto deste repositório** em vez de carregar uma
 O instalador já deixa o plugin **ativado e configurado**. Depois que ele terminar, feche o Discord pela bandeja e abra de novo: é isso.
 
 ## Modo standalone: só o Discord, sem Equicord e sem Vencord
+
+> **Temporariamente indisponível na 2.0.0.** O standalone CLI está pausado durante a
+> portabilidade da nova solução WireGuard. Esta seção fica como referência da versão anterior.
 
 Se você não usa nenhum mod e não quer instalar um, existe o **modo standalone**. Ele instala o bypass direto no Discord.
 
@@ -456,7 +487,7 @@ Nas settings do plugin:
 - **Captcha ou verificação de telefone no login**: o Discord marca muitos IPs de proxies públicas. Use Tor ou outra proxy.
 - **`Cannot find matching keyid` ao instalar as dependências**: é o corepack, não o plugin. Ele cria o atalho do `pnpm` antes de saber que versão usar, e na primeira execução busca essa versão no registro do npm conferindo a assinatura com chaves embutidas nele — as que vêm no Node 22 estão vencidas. O instalador detecta isso e instala o pnpm pelo npm. Se estiver fazendo à mão, rode `npm install -g pnpm` e siga com `pnpm install`.
 - **Erro de build `Could not resolve "./plugins/userplugins"`**: você copiou a pasta para dentro de `src/plugins/` por engano. O caminho certo é `src/userplugins/goLiveBypass` — a pasta `userplugins` fica em `src/`, **ao lado** de `plugins`, e pode ser necessário criá-la.
-- **Plugin não aparece na lista**: confirme que a pasta está em `src/userplugins/goLiveBypass` (com `index.tsx` e `native.ts`) e que você rodou `pnpm build` + `pnpm inject` e reiniciou o Discord.
+- **Plugin não aparece na lista**: confirme que a pasta está em `src/userplugins/goLiveBypass` (com `index.tsx`, `native.ts` e `stability.ts`) e que você rodou `pnpm build` + `pnpm inject` e reiniciou o Discord.
 
 ## O registro: o que o plugin anotou
 
@@ -599,7 +630,7 @@ Medido: escolher aleatoriamente e testar só o handshake acerta 12% das vezes; r
 
 - **Quem decide o fallback é o roteador, não o Chromium.** A regra PAC não tem alternativa do tipo `PROXY;DIRECT`: se a saída falha, a conexão cai para a direta *dentro* do roteador, com registro. Um proxy morto nunca deixa o Discord preso na tela de abertura — e nunca faz o Chromium desistir da regra em silêncio.
 - **Orçamento de espera por conexão**: o gateway aguarda uma saída por no máximo 12s; estourado, sai direto. Só o socket do gateway espera — a abertura do app nunca é segurada.
-- **Reservas mantidas vivas (batimento)**: até 5 saídas ficam guardadas num pote em `native-settings.json`, sob `pool`. A cada **30 segundos**, com a sessão já aberta, a saída ativa e todas as reservas são reconferidas com um túnel de verdade até o gateway do Discord. Quem erra o batimento perde a vez na hora: a ativa é trocada por uma reserva **testada há 30 segundos** no primeiro erro, e sai do pote no segundo erro seguido (um erro solto costuma ser congestionamento, não morte). Quando sobra menos de uma reserva viva de folga, o pote é reabastecido em segundo plano — sem trocar a saída ativa, que é o IP que o servidor já aceitou nesta sessão.
+- **Reservas mantidas vivas (batimento)**: até 5 saídas ficam guardadas num pote em `native-settings.json`, sob `pool`. A cada **30 segundos**, com a sessão já aberta, a saída ativa e todas as reservas são reconferidas com um túnel de verdade até o gateway do Discord. Um falso negativo isolado nunca troca a saída ativa: tanto standalone quanto plugin exigem **dois batimentos consecutivos** antes de assumir uma reserva **testada há 30 segundos** ou retirar a saída morta do pote. Isso evita reconectar o gateway no meio da reentrada de uma Live (issues #170/#171). Quando sobra menos de uma reserva viva de folga, o pote é reabastecido em segundo plano — sem trocar a saída ativa, que é o IP que o servidor já aceitou nesta sessão.
 - **Reservas correndo juntas, não em fila**: quando a saída ativa não entrega uma conexão, todas as reservas são tentadas **ao mesmo tempo** e a primeira que responder leva. Em fila, com 2,5s de prazo cada, a troca podia somar mais de dez segundos — tempo de sobra para o Chromium desistir do roteador.
 - **Reutilizar só depois de testar de novo**: no boot, as saídas guardadas são revalidadas (orçamento de 2,5s) antes de valerem. Descobrir uma do zero leva de 8 a 23 segundos; o que causava o travamento antigo era reaplicar uma proxy morta às cegas, e isso não acontece mais.
 - **A regra de proxy do sistema é respeitada**: se ela varia por host (proxy corporativo ou PAC de verdade), o plugin se recusa a ligar o roteador em vez de atropelar a política da rede.
@@ -697,7 +728,7 @@ Duas formas de baixar este repositório:
 - **Pelo terminal** (estando fora da pasta Equicord): `git clone https://github.com/bezumiya/GoLiveBypass`
 - **Pelo navegador**: abra [github.com/bezumiya/GoLiveBypass](https://github.com/bezumiya/GoLiveBypass), clique no botão verde **Code → Download ZIP** e extraia o arquivo
 
-Depois copie a pasta **`goLiveBypass`** (a que contém `index.tsx` e `native.ts`) para dentro de:
+Depois copie a pasta **`goLiveBypass`** (a que contém `index.tsx`, `native.ts` e `stability.ts`) para dentro de:
 
 ```
 Equicord/src/userplugins/goLiveBypass
@@ -707,7 +738,7 @@ Equicord/src/userplugins/goLiveBypass
 
 - A pasta `userplugins` **não existe por padrão** — crie ela dentro de `src/`
 - Ela fica em `src/userplugins`, **ao lado** de `src/plugins` — **nunca dentro** de `src/plugins` (isso gera o erro `Could not resolve "./plugins/userplugins"` no build)
-- No final, o caminho dos arquivos deve ser exatamente `src/userplugins/goLiveBypass/index.tsx` e `src/userplugins/goLiveBypass/native.ts`
+- No final, os arquivos devem ficar juntos em `src/userplugins/goLiveBypass/`, incluindo `index.tsx`, `native.ts` e `stability.ts`
 
 ### Passo 4 — Compile
 
@@ -760,7 +791,7 @@ pnpm install
 ### Passo 3 — Baixe o plugin e coloque na pasta certa
 
 1. Clone este repositório: `git clone https://github.com/bezumiya/GoLiveBypass`
-2. Copie a pasta **`goLiveBypass`** (a que contém `index.tsx` e `native.ts`) para dentro de:
+2. Copie a pasta **`goLiveBypass`** (a que contém `index.tsx`, `native.ts` e `stability.ts`) para dentro de:
 
 ```
 Vencord/src/userplugins/goLiveBypass
@@ -770,7 +801,7 @@ Vencord/src/userplugins/goLiveBypass
 
 - A pasta `userplugins` **não existe por padrão** — crie ela dentro de `src/`
 - Ela fica em `src/userplugins`, **ao lado** de `src/plugins` — **nunca dentro** de `src/plugins`
-- No final, o caminho dos arquivos deve ser exatamente `src/userplugins/goLiveBypass/index.tsx` e `src/userplugins/goLiveBypass/native.ts`
+- No final, os arquivos devem ficar juntos em `src/userplugins/goLiveBypass/`, incluindo `index.tsx`, `native.ts` e `stability.ts`
 
 ### Passo 4 — Compile
 
@@ -808,9 +839,11 @@ Isso gera a pasta `dist/` com o Vencord modificado já incluindo o plugin.
 goLiveBypass/
 ├── index.tsx                      # renderer: patches do video guard e do stream, seletor de região,
 │                                  #   override do RTCRegionStore, veredito da sessão, eventos de fluxo
-└── native.ts                      # processo principal: roteador SOCKS local em 127.0.0.1, PAC por host,
+├── native.ts                      # processo principal: roteador SOCKS local em 127.0.0.1, PAC por host,
                                    #   escolha da saída com teste TLS real, pote de reservas, registro,
                                    #   nova tentativa com recarga
+└── stability.ts                   # decisões puras/fail-closed: Tor estrito, morte manual confirmada e
+                                   #   guarda do falso estado de Live/erro 2001
 
 installer/
 ├── GoLiveBypass-Installer.bat     # Windows: dois cliques, libera a execução e chama o .ps1

@@ -222,19 +222,22 @@ html[data-theme='dark'] .page-ambient::before {
 .header {
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 10px;
+  text-align: center;
 }
 
 .header-top {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
+  align-items: center;
+  justify-content: center;
   gap: 14px;
 }
 
 .wordmark-group {
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 7px;
   min-width: 0;
 }
@@ -271,6 +274,7 @@ html[data-theme='dark'] .page-ambient::before {
   line-height: 1.6;
   color: var(--muted);
   max-width: 30ch;
+  margin: 0 auto;
 }
 
 /* ------------------------------------------------------------
@@ -757,8 +761,494 @@ html[data-theme='dark'] .switch-row input:checked + .switch-track .switch-thumb 
 }
 
 /* ============================================================
-   Rede de saida — 3 modos segmentados, sempre visiveis
+   Configuração WireGuard (Per-App VPN)
    ============================================================ */
+.vpn-config-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  margin-top: 10px;
+  margin-bottom: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.vpn-config-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.vpn-config-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  flex: 1;
+  min-width: 0;
+}
+
+.vpn-config-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.vpn-config-status {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+}
+
+.vpn-config-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.vpn-import-btn,
+.vpn-test-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 150ms ease;
+  box-sizing: border-box;
+}
+
+.vpn-import-btn:hover,
+.vpn-test-btn:hover {
+  background: var(--surface);
+  border-color: var(--ink-strong);
+  color: var(--ink-strong);
+}
+
+.vpn-test-btn:disabled,
+.vpn-import-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.vpn-test-feedback {
+  font-size: 11.5px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  text-align: left;
+  line-height: 1.4;
+  word-break: break-word;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.vpn-test-feedback--ok {
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+  border: 1px solid rgba(34, 197, 94, 0.25);
+}
+
+.vpn-test-feedback--bad {
+  background: var(--err-bg);
+  color: var(--err-ink);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.vpn-test-feedback--busy {
+  background: var(--surface-muted);
+  color: var(--muted);
+  border: 1px solid var(--line-strong);
+}
+
+/* Tabs de Modo VPN */
+.vpn-mode-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 3px;
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.vpn-mode-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+  user-select: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vpn-mode-tab svg {
+  flex-shrink: 0;
+}
+
+.vpn-mode-tab:hover {
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.vpn-mode-tab--active {
+  background: var(--surface);
+  color: var(--ink-strong);
+  border-color: var(--line-strong);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+/* Painéis de Conexão */
+.vpn-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Formulário Proton */
+.proton-auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 2px 0 0;
+}
+
+.proton-form-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.proton-form-row {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.proton-input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  height: 34px;
+  background: var(--surface-muted);
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  padding: 0 12px;
+  font-family: inherit;
+  font-size: 13.5px;
+  color: var(--ink-strong);
+  outline: none;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.proton-input::placeholder {
+  color: var(--faint);
+  font-size: 12.5px;
+}
+
+.proton-input:focus {
+  border-color: #6D4AFF;
+  background: var(--surface);
+}
+
+.proton-input--2fa {
+  flex: 0 0 95px;
+  max-width: 95px;
+  text-align: center;
+}
+
+.proton-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 42px;
+  width: 100%;
+  padding: 0 16px;
+  border-radius: 9px;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 150ms var(--ease);
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+
+.proton-btn--primary {
+  background: #6D4AFF;
+  color: #FFFFFF;
+}
+
+.proton-btn--primary:hover:not(:disabled) {
+  background: #5B3CE6;
+}
+
+.proton-btn--primary:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.proton-btn--action {
+  width: auto;
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 10px;
+  background: var(--surface-muted);
+  border: 1px solid var(--line-strong);
+  color: var(--ink-strong);
+  font-size: 11.5px;
+}
+
+.proton-btn--action:hover:not(:disabled) {
+  background: rgba(109, 74, 255, 0.1);
+  border-color: #6D4AFF;
+  color: #6D4AFF;
+}
+
+.proton-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.proton-hint {
+  font-size: 10.5px;
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.proton-hint a {
+  color: #6D4AFF;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.proton-hint a:hover {
+  color: #5B3CE6;
+}
+
+/* Visão Conectada Proton */
+.proton-connected-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Privacidade durante compartilhamento de tela: o e-mail só fica legível quando
+   o usuário aponta para ele ou o alcança pelo teclado. */
+.proton-private-email {
+  filter: blur(5px);
+  transition: filter 140ms ease;
+  cursor: default;
+  user-select: none;
+}
+
+.proton-private-email:hover,
+.proton-private-email:focus-visible {
+  filter: blur(0);
+}
+
+.proton-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 2px;
+  width: 100%;
+}
+
+.proton-user-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--ink-strong);
+  font-weight: 500;
+  min-width: 0;
+}
+
+.proton-user-info span:last-child {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.proton-dot {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 6px rgba(34, 197, 94, 0.5);
+}
+
+.proton-logout-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 6px;
+  transition: all 150ms ease;
+  flex-shrink: 0;
+}
+
+.proton-logout-btn:hover {
+  background: var(--err-bg);
+  border-color: var(--err-ink);
+  color: var(--err-ink);
+}
+
+.proton-controls-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+}
+
+.proton-select {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  background: var(--surface-muted);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 0 8px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--ink);
+  outline: none;
+  cursor: pointer;
+  transition: border-color 150ms ease;
+}
+
+.proton-select:focus {
+  border-color: #6D4AFF;
+}
+
+.proton-server-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 11px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.proton-server-name {
+  font-weight: 600;
+  color: var(--ink-strong);
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.proton-ping-pill {
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+  padding: 2px 7px;
+  border-radius: var(--r-full);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.proton-ping-pill--high {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+}
+
+.proton-load-pill {
+  background: var(--surface-muted);
+  color: var(--muted);
+  padding: 2px 7px;
+  border-radius: var(--r-full);
+  font-family: var(--mono);
+  font-size: 10px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.proton-feedback {
+  font-size: 11px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  text-align: left;
+  line-height: 1.35;
+  width: 100%;
+  box-sizing: border-box;
+  word-break: break-word;
+}
+
+.proton-feedback--err {
+  background: var(--err-bg);
+  color: var(--err-ink);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+}
+
+.proton-feedback--ok {
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+  border: 1px solid rgba(34, 197, 94, 0.25);
+}
+
+
 .net-mode-group {
   display: flex;
   flex-direction: column;
@@ -1125,90 +1615,9 @@ body.logs-window {
   color: var(--faint);
 }
 
-/* ------------------------------------------------------------
-   Toast de aviso — canto superior direito
-   ------------------------------------------------------------ */
-.toast {
-  position: fixed;
-  top: 44px;
-  right: 14px;
-  width: 300px;
-  max-width: calc(100vw - 28px);
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 12px 12px 12px 14px;
-  border-radius: var(--r-md);
-  background: var(--warn-bg);
-  border: 1px solid var(--warn-line);
-  color: var(--warn-ink);
-  font-size: 12.5px;
-  line-height: 1.6;
-  box-shadow: var(--shadow-sm);
-  z-index: 80;
-}
-
-.toast[hidden] { display: none !important; }
-
-.toast:not([hidden]) {
-  animation: toast-in 220ms var(--ease);
-}
-
-@keyframes toast-in {
-  from { opacity: 0; transform: translateY(-8px) scale(0.98); }
-  to   { opacity: 1; transform: none; }
-}
-
 @keyframes pop-in {
   from { opacity: 0; transform: translateY(4px) scale(0.98); }
   to   { opacity: 1; transform: none; }
-}
-
-.toast p { flex: 1; }
-
-.toast strong { color: var(--ink-strong); font-weight: 600; }
-
-.toast-close {
-  flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  display: grid;
-  place-items: center;
-  border: none;
-  border-radius: var(--r-full);
-  background: transparent;
-  color: var(--warn-ink);
-  font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-  transition: background 150ms var(--ease);
-  margin-top: -2px;
-}
-
-.toast-close:hover {
-  background: color-mix(in srgb, var(--warn-ink) 12%, transparent);
-}
-
-.warn-icon {
-  flex-shrink: 0;
-  width: 16px;
-  height: 16px;
-  margin-top: 1px;
-  color: var(--warn-ink);
-}
-
-kbd {
-  display: inline-block;
-  font-family: var(--mono);
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--ink-strong);
-  background: var(--surface-muted);
-  border: 1px solid var(--line-strong);
-  border-bottom-width: 2px;
-  border-radius: 4px;
-  padding: 1px 5px;
-  margin: 0 1px;
 }
 
 /* ------------------------------------------------------------
@@ -1757,5 +2166,713 @@ html[data-theme='dark'] .settings-switch input:checked + .switch-track .switch-t
 
   * {
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ------------------------------------------------------------
+   Composição principal — ação e conexão lado a lado
+   ------------------------------------------------------------ */
+.container {
+  max-width: 760px;
+  padding-left: 24px;
+  padding-right: 24px;
+}
+
+.control-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 14px;
+  width: 100%;
+}
+
+.bypass-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.connection-column {
+  display: flex;
+  min-width: 0;
+}
+
+.connection-column .vpn-config-card {
+  margin-top: 0;
+  margin-bottom: 0;
+  height: 100%;
+}
+
+.bypass-heading {
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 4px;
+  text-align: center;
+}
+
+.bypass-kicker {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.bypass-title {
+  color: var(--ink-strong);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.bypass-description {
+  min-height: 31px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.bypass-column .toggle-btn {
+  height: 46px;
+  padding: 0 14px;
+  font-size: 13px;
+  line-height: 1.15;
+}
+
+.bypass-column .status-card {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  align-items: start;
+  order: -1;
+  padding: 9px 10px;
+  gap: 7px;
+  background: var(--surface-muted);
+  border-color: var(--line);
+  box-shadow: none;
+}
+
+.bypass-column .status-card #statusText {
+  grid-column: 2;
+  font-size: 10.5px;
+  line-height: 1.25;
+}
+
+.bypass-column .status-card .status-tag {
+  grid-column: 2;
+  justify-self: start;
+  margin-top: 2px;
+  font-size: 8px;
+  padding: 3px 6px;
+}
+
+.bypass-column .status-card .status-indicator {
+  grid-column: 1;
+  grid-row: 1;
+  margin-top: 3px;
+}
+
+.bypass-column .switch-row {
+  justify-content: center;
+  gap: 8px;
+  padding-top: 1px;
+  font-size: 10.5px;
+}
+
+.bypass-note {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 0;
+  justify-content: center;
+  color: var(--faint);
+  font-size: 9px;
+  line-height: 1.3;
+}
+
+.bypass-note span {
+  color: var(--ok-ink);
+  font-size: 10px;
+}
+
+@media (max-width: 640px) {
+  .container {
+    max-width: 560px;
+  }
+
+  .control-layout {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .bypass-column {
+    padding: 12px;
+  }
+
+  .vpn-config-card {
+    padding: 10px;
+  }
+
+  .vpn-card-title {
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 420px) {
+  .container {
+    max-width: 380px;
+    padding-left: 30px;
+    padding-right: 30px;
+  }
+
+  .control-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .bypass-description {
+    min-height: 0;
+  }
+}
+
+/* ------------------------------------------------------------
+   ProtonVPN — fluxo guiado, sem perder a densidade da janela
+   ------------------------------------------------------------ */
+.vpn-config-card {
+  gap: 11px;
+}
+
+.vpn-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 1px 1px 0;
+}
+
+.vpn-card-kicker,
+.proton-server-caption {
+  display: block;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.vpn-card-title {
+  margin-top: 3px;
+  color: var(--ink-strong);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.vpn-mode-tabs {
+  gap: 3px;
+}
+
+.vpn-mode-tab--active {
+  color: #9a86ff;
+  border-color: rgba(139, 116, 255, 0.35);
+}
+
+.vpn-panel {
+  gap: 10px;
+}
+
+.proton-auth-form {
+  gap: 10px;
+  padding: 1px 0 0;
+}
+
+.proton-auto-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 1px 2px;
+}
+
+.proton-panel-title {
+  color: var(--ink-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.proton-panel-copy {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.proton-recommended {
+  padding: 2px 6px;
+  border: 1px solid rgba(34, 197, 94, 0.25);
+  border-radius: var(--r-full);
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.1;
+  text-transform: uppercase;
+}
+
+.proton-step-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #9a86ff;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.proton-step-label span {
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.proton-form-fields {
+  gap: 10px;
+}
+
+.proton-form-row {
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.proton-field {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.proton-field > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.proton-field em {
+  color: var(--faint);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 400;
+}
+
+.proton-field--2fa {
+  flex: 0 0 130px;
+}
+
+.proton-form-fields .proton-input {
+  height: 30px;
+}
+
+.proton-password-control {
+  position: relative;
+  display: block;
+}
+
+.proton-password-control .proton-input {
+  padding-right: 42px;
+}
+
+.proton-password-toggle {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  display: grid;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  place-items: center;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.proton-password-toggle:hover {
+  background: var(--surface);
+  color: var(--ink-strong);
+}
+
+.proton-password-toggle:focus-visible {
+  outline: 2px solid #9a86ff;
+  outline-offset: 1px;
+}
+
+.proton-password-toggle svg {
+  width: 16px;
+  height: 16px;
+}
+
+.proton-input--2fa {
+  flex: 1;
+  max-width: none;
+  letter-spacing: 0.05em;
+}
+
+.proton-2fa-dialog[hidden] {
+  display: none !important;
+}
+
+.proton-2fa-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+
+.proton-2fa-dialog__backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--overlay-bg);
+  backdrop-filter: blur(3px);
+}
+
+.proton-2fa-dialog__panel {
+  position: relative;
+  width: min(100%, 330px);
+  padding: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: 15px;
+  background: var(--surface);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.32);
+  animation: pop-in 200ms var(--ease);
+}
+
+.proton-2fa-dialog__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.proton-2fa-dialog__eyebrow {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.proton-2fa-dialog__header h2 {
+  color: var(--ink-strong);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.proton-2fa-dialog__close {
+  display: grid;
+  place-items: center;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  margin: -2px -2px 0 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.proton-2fa-dialog__close:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
+  color: var(--ink-strong);
+}
+
+.proton-2fa-dialog__close:focus-visible,
+.proton-2fa-dialog__cancel:focus-visible,
+.proton-2fa-dialog__confirm:focus-visible {
+  outline: 2px solid #9a86ff;
+  outline-offset: 2px;
+}
+
+.proton-2fa-dialog__close svg {
+  width: 15px;
+  height: 15px;
+}
+
+.proton-2fa-dialog__hint {
+  margin: 12px 0 16px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.proton-2fa-dialog__field {
+  gap: 6px;
+}
+
+.proton-2fa-dialog__field > span {
+  font-size: 10px;
+}
+
+.proton-2fa-dialog__field .proton-input {
+  text-align: center;
+  letter-spacing: 0.15em;
+}
+
+.proton-2fa-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 15px;
+}
+
+.proton-2fa-dialog__cancel,
+.proton-2fa-dialog__confirm {
+  min-height: 35px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.proton-2fa-dialog__cancel {
+  border: 1px solid var(--line-strong);
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+.proton-2fa-dialog__confirm {
+  border: 1px solid #765cff;
+  background: #765cff;
+  color: #fff;
+}
+
+.proton-2fa-dialog__cancel:hover {
+  border-color: var(--ink-strong);
+  color: var(--ink-strong);
+}
+
+.proton-2fa-dialog__confirm:hover {
+  background: #684df0;
+}
+
+@media (max-width: 620px) {
+  .control-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ------------------------------------------------------------
+   Importação por arrastar e soltar — WireGuard .conf
+   ------------------------------------------------------------ */
+.vpn-drop-zone {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 68px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  background: var(--canvas);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+
+.vpn-drop-zone:hover,
+.vpn-drop-zone:focus-visible {
+  border-color: #9a86ff;
+  background: rgba(139, 116, 255, 0.07);
+  color: var(--ink);
+}
+
+.vpn-drop-zone:focus-visible {
+  outline: 2px solid #9a86ff;
+  outline-offset: 2px;
+}
+
+.vpn-drop-zone--active {
+  border-color: #9a86ff;
+  background: rgba(139, 116, 255, 0.13);
+  color: #b0a2ff;
+}
+
+.vpn-drop-zone__icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(139, 116, 255, 0.3);
+  border-radius: 9px;
+  background: rgba(139, 116, 255, 0.1);
+  color: #9a86ff;
+}
+
+.vpn-drop-zone__icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.vpn-drop-zone__copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.vpn-drop-zone__copy strong {
+  color: var(--ink-strong);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.vpn-drop-zone__copy span {
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.2;
+}
+
+.vpn-drop-feedback {
+  padding: 6px 8px;
+  border-radius: 7px;
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.vpn-drop-feedback--ok {
+  border: 1px solid rgba(34, 197, 94, 0.25);
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+}
+
+.vpn-drop-feedback--bad {
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: var(--err-bg);
+  color: var(--err-ink);
+}
+
+.proton-btn--primary {
+  background: #765cff;
+}
+
+.proton-btn--primary:hover:not(:disabled) {
+  background: #684df0;
+}
+
+.proton-btn--action:hover:not(:disabled) {
+  background: rgba(139, 116, 255, 0.1);
+  border-color: #8b74ff;
+  color: #9a86ff;
+}
+
+.proton-hint {
+  padding-left: 1px;
+}
+
+.proton-hint a {
+  color: #9a86ff;
+}
+
+.proton-hint a:hover {
+  color: #b0a2ff;
+}
+
+.proton-connected-view {
+  gap: 10px;
+}
+
+.proton-status-bar {
+  padding: 1px 2px 0;
+}
+
+.proton-user-info {
+  gap: 8px;
+}
+
+.proton-user-info > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.proton-status-label {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.proton-select:focus {
+  border-color: #8b74ff;
+}
+
+.proton-server-badge {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto;
+  gap: 3px 7px;
+  padding: 8px 10px;
+}
+
+.proton-server-caption {
+  grid-column: 1 / -1;
+  font-size: 8px;
+}
+
+.proton-server-name {
+  font-size: 11.5px;
+}
+
+.proton-ping-pill,
+.proton-load-pill {
+  padding: 3px 7px;
+}
+
+.proton-feedback {
+  padding: 7px 9px;
+}
+
+@media (max-width: 360px) {
+  .proton-field--2fa {
+    flex-basis: 112px;
+  }
+
+  .proton-panel-copy {
+    font-size: 10px;
   }
 }

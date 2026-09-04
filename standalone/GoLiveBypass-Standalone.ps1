@@ -8,14 +8,18 @@
       .\GoLiveBypass-Standalone.ps1
       .\GoLiveBypass-Standalone.ps1 -Proxy "socks5://127.0.0.1:9050"
       .\GoLiveBypass-Standalone.ps1 -Mode Uninstall
+      .\GoLiveBypass-Standalone.ps1 -Mode CheckUpdate
+      .\GoLiveBypass-Standalone.ps1 -Mode Update
 #>
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Install', 'Uninstall', 'Status')]
+    [ValidateSet('Install', 'Uninstall', 'Status', 'CheckUpdate', 'Update')]
     [string] $Mode = 'Install',
 
     [string] $Proxy = '',
+
+    [string] $WgConf = '',
 
     [string] $ExcludedCountries = 'BR',
 
@@ -26,7 +30,35 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$StandaloneVersion = '1.1.12-beta.13'
+$StandaloneRepoApi = 'https://api.github.com/repos/bezumiya/GoLiveBypass/releases/latest'
+$StandaloneRepoRoot = 'https://raw.githubusercontent.com/bezumiya/GoLiveBypass'
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }
+
+# "Executar com o PowerShell" no menu de contexto do Explorer (ou duplo clique num .ps1
+# associado a isso) spawna powershell.exe -File sem -NoExit: a janela fecha sozinha ao sair,
+# mesmo com erro. Sem pausa aqui a pessoa nunca le a mensagem (o .bat ja tem "pause" pra
+# isso, mas quem roda so o .ps1 baixado direto do README nao passa por ele). Mesmo padrao
+# usado no installer/GoLiveBypass-Installer.ps1 (achado por um relato de winget ausente no
+# Windows 10 "fechando sozinho"). Definida cedo: a checagem de proxy invalida, logo abaixo,
+# ja pode sair antes de qualquer outra funcao existir.
+function Test-JanelaTransitoria {
+    try {
+        $atual = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+        $pai = Get-CimInstance Win32_Process -Filter "ProcessId=$($atual.ParentProcessId)" -ErrorAction Stop
+        return $pai.Name -eq 'explorer.exe'
+    } catch {
+        return $false
+    }
+}
+
+function Wait-AntesDeFechar {
+    if ($Yes) { return }
+    if (-not (Test-JanelaTransitoria)) { return }
+    Write-Host ''
+    Write-Host '  Pressione Enter para fechar esta janela.' -ForegroundColor DarkGray
+    try { [void][Console]::ReadLine() } catch { }
+}
 
 # O trecho antes do @ e opcional e casado com ganancia, para a senha poder conter @ e :
 # codificados. Sem validar aqui, um endereco com erro de digitacao viraria configuracao e o
@@ -37,6 +69,7 @@ if ($Proxy -ne '' -and $Proxy -notmatch '^(socks5|socks4|https?)://(?:.+@)?[^:/@
     Write-Host '      Use socks5://host:porta, ou socks5://usuario:senha@host:porta.' -ForegroundColor DarkGray
     Write-Host '      Senha com @ ou : precisa vir codificada (@ vira %40, : vira %3A).' -ForegroundColor DarkGray
     Write-Host ''
+    Wait-AntesDeFechar
     exit 1
 }
 
@@ -70,6 +103,109 @@ $TorTorrc = Join-Path $TorDir 'torrc'
 $TorArchiveName = 'tor-expert-bundle-windows-x86_64-13.5.tar.gz'
 $TorUrl = "https://archive.torproject.org/tor-package-archive/torbrowser/$TorBundle/$TorArchiveName"
 $TorSha256 = '5978ccc2a7fed783c329474888e87f5e6349aa132d9c43016418bff296c7becb'
+
+$EmbeddedWgConf = @'
+[Interface]
+PrivateKey = sLPBSsrhzoqZSOY/XxAzGAy5F+sQKQIIE3WoxG8buWM=
+Address = 10.2.0.2/32
+DNS = 10.2.0.1
+
+[Peer]
+# MX-FREE#16
+PublicKey = mkI+cC9ggzfMdZy1cl3Fl01gPJJxsLXjshXAN8EedQ8=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 84.20.27.53:51820
+PersistentKeepalive = 25
+'@
+
+function Ensure-WireGuardConf {
+    $wgFile = Join-Path $InstallDir 'wireguard.conf'
+    if ($WgConf -and (Test-Path -LiteralPath $WgConf)) {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        Copy-Item -LiteralPath $WgConf -Destination $wgFile -Force
+        Write-Ok "Configuracao WireGuard importada de $WgConf"
+        return $wgFile
+    }
+    if (Test-Path -LiteralPath $wgFile) {
+        return $wgFile
+    }
+    
+    $dl = Join-Path $env:USERPROFILE 'Downloads'
+    $foundDl = Get-ChildItem -Path $dl -Filter 'wg-*.conf' -ErrorAction SilentlyContinue | Select-Object -First 1
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    if ($foundDl) {
+        Copy-Item -LiteralPath $foundDl.FullName -Destination $wgFile -Force
+        Write-Ok "Configuracao WireGuard encontrada em $($foundDl.FullName)"
+    } else {
+        [IO.File]::WriteAllText($wgFile, $EmbeddedWgConf, (New-Object Text.UTF8Encoding $false))
+        Write-Ok "Configuracao padrao WireGuard (Mexico) gravada em $wgFile"
+    }
+    return $wgFile
+}
+
+function Ensure-WireSock {
+    $wsCmd = Get-Command 'wiresock-client.exe' -ErrorAction SilentlyContinue
+    if ($wsCmd) { return $wsCmd.Source }
+    
+    $commonPath = 'C:\Program Files\WireSock Secure Connect\sdk\wiresock-client.exe'
+    if (Test-Path -LiteralPath $commonPath) { return $commonPath }
+    
+    Write-Step "Instalando WireSock VPN Client..."
+    try {
+        Start-Process winget -ArgumentList 'install', 'NTKERNEL.WireSockVPNClientCLI', '--accept-package-agreements', '--accept-source-agreements', '--silent' -Wait -NoNewWindow
+    } catch { }
+
+    $wsCmd = Get-Command 'wiresock-client.exe' -ErrorAction SilentlyContinue
+    if ($wsCmd) { return $wsCmd.Source }
+    if (Test-Path -LiteralPath $commonPath) { return $commonPath }
+    
+    throw "WireSock nao encontrado. Instale via 'winget install NTKERNEL.WireSockVPNClientCLI'."
+}
+
+function Install-WireSockTunnel {
+    $rawWg = Ensure-WireGuardConf
+    $wsExe = Ensure-WireSock
+    $wsConf = Join-Path $InstallDir 'wiresock-discord.conf'
+
+    $lines = Get-Content -LiteralPath $rawWg
+    $hasAllowedApps = $false
+    $newLines = @()
+    foreach ($line in $lines) {
+        if ($line -match '^\s*AllowedApps\s*=') {
+            $hasAllowedApps = $true
+            $newLines += 'AllowedApps = Discord, Discord.exe, Update.exe'
+        } else {
+            $newLines += $line
+        }
+    }
+    if (-not $hasAllowedApps) {
+        $newLines += 'AllowedApps = Discord, Discord.exe, Update.exe'
+    }
+    [IO.File]::WriteAllLines($wsConf, $newLines, (New-Object Text.UTF8Encoding $false))
+
+    Write-Step "Configurando servico WireSock..."
+    Stop-Service -Name 'wiresock-client-service' -Force -ErrorAction SilentlyContinue
+    
+    & $wsExe install -start-type 2 -config $wsConf -log-level info | Out-Null
+    Start-Sleep -Seconds 1
+    Start-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    $svc = Get-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') {
+        Write-Ok "Servico WireSock ativo. Todo o Discord esta envelopado na VPN!"
+    } else {
+        Write-Warn "Iniciando WireSock em modo processo avulso..."
+        Start-Process -FilePath $wsExe -ArgumentList 'run', '-config', "`"$wsConf`"", '-log-level', 'info' -WindowStyle Hidden
+        Write-Ok "WireSock iniciado em segundo plano."
+    }
+}
+
+function Stop-WireSockTunnel {
+    Stop-Service -Name 'wiresock-client-service' -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name 'wiresock-client' -Force -ErrorAction SilentlyContinue
+    Write-Ok "Tunel WireSock parado."
+}
 
 function Write-Step($m) { Write-Host "  [*] $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "  [OK] $m" -ForegroundColor Green }
@@ -506,6 +642,9 @@ function Get-DiscordResources {
 # com texto especifico. Vesktop/Equibop/Legcord sao clientes paralelos - o user
 # perde a identidade do cliente mas nao tem plugins de Vencord perdidos.
 function Get-InjectionState($resources) {
+    $svc = Get-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') { return 'Nosso' }
+
     if (-not $resources) { return 'Vanilla' }
     $asar = Join-Path $resources 'app.asar'
     $original = Join-Path $resources '_app.asar'
@@ -685,6 +824,9 @@ function Install-Patcher {
         enabled = $true
         proxy = $Proxy
         excludedCountries = $ExcludedCountries
+        # Recuperacao de gateway/RTC e critica; builds novos nunca preservam
+        # o opt-out legado de uma GUI anterior.
+        autoRevive = $true
     }
     if ($Proxy -eq '' -and $settings.proxy) { $result.proxy = $settings.proxy }
 
@@ -895,26 +1037,108 @@ function Remove-Injection($resources) {
     return $true
 }
 
-function Show-Status {
-    $installs = Get-DiscordResources
-    if (-not $installs) { Write-Bad 'Nao achei nenhum Discord instalado.'; return }
+function Compare-StandaloneVersion([string]$local, [string]$remote) {
+    $local = $local -replace '^v', ''
+    $remote = $remote -replace '^v', ''
+    $localDash = $local.IndexOf('-')
+    $remoteDash = $remote.IndexOf('-')
+    $localCore = if ($localDash -ge 0) { $local.Substring(0, $localDash) } else { $local }
+    $localPre = if ($localDash -ge 0) { $local.Substring($localDash + 1) } else { '' }
+    $remoteCore = if ($remoteDash -ge 0) { $remote.Substring(0, $remoteDash) } else { $remote }
+    $remotePre = if ($remoteDash -ge 0) { $remote.Substring($remoteDash + 1) } else { '' }
+    $a = $localCore.Split('.')
+    $b = $remoteCore.Split('.')
+    for ($i = 0; $i -lt [Math]::Max($a.Count, $b.Count); $i++) {
+        $left = if ($i -lt $a.Count) { [int]($a[$i] -replace '[^0-9].*$', '') } else { 0 }
+        $right = if ($i -lt $b.Count) { [int]($b[$i] -replace '[^0-9].*$', '') } else { 0 }
+        if ($left -ne $right) { return $(if ($left -lt $right) { -1 } else { 1 }) }
+    }
+    # Mesma versao base: um sufixo de pre-release (-beta.N) sempre conta como
+    # mais antigo que a mesma base sem sufixo, nunca como um componente extra.
+    if ($localPre -and -not $remotePre) { return -1 }
+    if (-not $localPre -and $remotePre) { return 1 }
+    if ($localPre -and $remotePre) { return [string]::Compare($localPre, $remotePre, [System.StringComparison]::Ordinal) }
+    return 0
+}
 
-    foreach ($install in $installs) {
-        $state = Get-InjectionState $install.Resources
-        $label = switch ($state) {
-            'Vanilla'  { 'sem nada instalado' }
-            'Nosso'    { 'com o GoLiveBypass standalone' }
-            'OutroMod' { 'com Equicord/Vencord (ou outro mod)' }
-        }
-        Write-Host "  $($install.Flavour): $label" -ForegroundColor White
-        Write-Host "    $($install.Resources)" -ForegroundColor DarkGray
+function Get-StandaloneRelease {
+    $headers = @{ 'User-Agent' = 'GoLiveBypass-Standalone' }
+    $release = Invoke-RestMethod -Uri $StandaloneRepoApi -Headers $headers -TimeoutSec 20
+    if ($release.draft -or $release.prerelease) { throw 'a release estavel nao esta disponivel' }
+    $asset = @($release.assets) | Where-Object { $_.name -match '-bypass\.js$' } | Select-Object -First 1
+    if (-not $asset) { throw 'release sem asset do payload standalone' }
+    return [pscustomobject]@{ Tag = ($release.tag_name -replace '^v', ''); TagRef = $release.tag_name; PayloadUrl = $asset.browser_download_url }
+}
+
+function Invoke-StandaloneCheckUpdate {
+    try { $release = Get-StandaloneRelease } catch { Write-Warn "Nao consegui consultar a release estavel: $($_.Exception.Message)"; return }
+    $cmp = Compare-StandaloneVersion $StandaloneVersion $release.Tag
+    Write-Host "  standalone: v$StandaloneVersion"
+    Write-Host "  remoto:     v$($release.Tag)"
+    if ($cmp -lt 0) { Write-Host '  resultado:  ha uma atualizacao' -ForegroundColor Yellow }
+    elseif ($cmp -eq 0) { Write-Host '  resultado:  ja esta atualizado' -ForegroundColor Green }
+    else { Write-Host '  resultado:  versao local e mais nova' -ForegroundColor DarkGray }
+}
+
+function Invoke-StandaloneUpdate {
+    $release = Get-StandaloneRelease
+    if ((Compare-StandaloneVersion $StandaloneVersion $release.Tag) -ge 0) { Write-Ok "Standalone ja esta na v$StandaloneVersion"; return }
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) "golivebypass-$($release.Tag).ps1"
+    $backup = "$PSCommandPath.bak.$(Get-Date -Format yyyyMMddHHmmss)"
+    # Script e payload sempre vem da MESMA tag da release: buscar o script em
+    # main misturaria uma versao do script com um payload de outra release.
+    $scriptUrl = "$StandaloneRepoRoot/$($release.TagRef)/standalone/GoLiveBypass-Standalone.ps1"
+    Invoke-WebRequest -Uri $scriptUrl -OutFile $tmp -UseBasicParsing -TimeoutSec 60
+    Copy-Item -LiteralPath $PSCommandPath -Destination $backup -Force
+    Move-Item -LiteralPath $tmp -Destination $PSCommandPath -Force
+    $installed = Join-Path $InstallDir $PatcherName
+    if (Test-Path -LiteralPath $installed) {
+        $payloadTmp = Join-Path ([IO.Path]::GetTempPath()) "golivebypass-payload-$($release.Tag).js"
+        Invoke-WebRequest -Uri $release.PayloadUrl -OutFile $payloadTmp -UseBasicParsing -TimeoutSec 60
+        Copy-Item -LiteralPath $installed -Destination "$installed.bak.$(Get-Date -Format yyyyMMddHHmmss)" -Force
+        Move-Item -LiteralPath $payloadTmp -Destination $installed -Force
+    }
+    Write-Ok "Standalone atualizado para v$($release.Tag). Backup: $backup"
+}
+
+function Show-Status {
+    Write-Host "`n=== STATUS DO DISCORD E REDE ===" -ForegroundColor Cyan
+    try {
+        $sysIp = (curl.exe -s -m 3 https://api.ipify.org).Trim()
+        Write-Host "  [Rede Normal do PC]"
+        Write-Host "    IP Publico : $sysIp (todo o restante do PC navega por aqui)"
+    } catch {
+        Write-Host "    IP Publico : Desconhecido"
     }
 
-    $log = Join-Path $InstallDir 'golivebypass.log'
-    if (Test-Path -LiteralPath $log) {
-        Write-Host ''
-        Write-Host '  ultimas linhas do registro:' -ForegroundColor White
-        Get-Content -LiteralPath $log -Tail 12 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    Write-Host "`n  [Tunel WireGuard para o Discord]"
+    $svc = Get-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') {
+        Write-Ok "WireSock ATIVO (Servico em execucao)."
+        try {
+            $tmpCurl = Join-Path $InstallDir 'Discord.exe'
+            Copy-Item (Get-Command curl.exe).Source $tmpCurl -Force
+            $trace = & $tmpCurl -s -m 5 https://cloudflare.com/cdn-cgi/trace
+            Remove-Item $tmpCurl -Force -ErrorAction SilentlyContinue
+            
+            $loc = ($trace | Select-String "^loc=").ToString().Trim()
+            $ip  = ($trace | Select-String "^ip=").ToString().Trim()
+            Write-Host "    IP no Discord : $ip"
+            Write-Host "    Pais          : $loc"
+            Write-Ok "TODO o trafego do Discord esta 100% envelopado na VPN (sem proxy)!"
+        } catch { }
+    } else {
+        Write-Warn "WireSock NAO esta em execucao."
+    }
+
+    Write-Host "`n  [Instalacoes do Discord]"
+    $installs = Get-DiscordResources
+    if ($installs) {
+        foreach ($install in $installs) {
+            $state = Get-InjectionState $install.Resources
+            Write-Host "  $($install.Flavour): $state" -ForegroundColor White
+            Write-Host "    $($install.Resources)" -ForegroundColor DarkGray
+        }
     }
 }
 
@@ -923,10 +1147,12 @@ Write-Host '  GoLiveBypass standalone' -ForegroundColor Magenta
 Write-Host '  Go Live e camera de volta, direto no Discord' -ForegroundColor DarkGray
 Write-Host ''
 
-if ($Mode -eq 'Status') { Show-Status; return }
+if ($Mode -eq 'Status') { Show-Status; Wait-AntesDeFechar; return }
+if ($Mode -eq 'CheckUpdate') { Invoke-StandaloneCheckUpdate; Wait-AntesDeFechar; return }
+if ($Mode -eq 'Update') { Invoke-StandaloneUpdate; Wait-AntesDeFechar; return }
 
 $installs = @(Get-PatchTargets)
-if (-not $installs) { Write-Bad 'Nao achei nenhum Discord instalado.'; return }
+if (-not $installs) { Write-Bad 'Nao achei nenhum Discord instalado.'; Wait-AntesDeFechar; return }
 
 # corpo principal protegido: qualquer erro nao tratado vira report automatico
 try {
@@ -936,48 +1162,50 @@ try {
 # sem TTY, o fluxo continua por flags (comportamento atual).
 if ($Mode -eq 'Install' -and (Test-TuiInteractive)) {
     $tuiChoice = Tui-Menu 'GoLiveBypass standalone' @(
-        'Instalar / atualizar o bypass',
+        'Instalar o bypass',
         'Ver status',
+        'Verificar atualizacoes',
+        'Atualizar standalone',
         'Desinstalar',
         'Sair'
     )
     switch ($tuiChoice) {
         2 {
             Show-Status
+            Wait-AntesDeFechar
             return
         }
         3 {
+            Invoke-StandaloneCheckUpdate
+            Wait-AntesDeFechar
+            return
+        }
+        4 {
+            Invoke-StandaloneUpdate
+            Wait-AntesDeFechar
+            return
+        }
+        5 {
             $Mode = 'Uninstall'
         }
-        0 { Write-Host '  Ate mais.' -ForegroundColor DarkGray; return }
-        default {
-            # Instalar: pede a rede antes de prosseguir.
-            $tuiNet = Tui-Menu 'Como o bypass vai sair?' @(
-                'Tor automatico (recomendado, baixa e sobe sozinho)',
-                'Proxy gratuita (escolhida e testada sozinha)',
-                'Proxy minha (socks5://host:porta)'
-            )
-            if ($tuiNet -eq 1) { $Tor = $true }
-            elseif ($tuiNet -eq 3) { $Proxy = (Tui-Input 'Endereco da proxy').Trim() }
-        }
+        0 { Write-Host '  Ate mais.' -ForegroundColor DarkGray; Wait-AntesDeFechar; return }
+        default { }
     }
 }
 
 if ($Mode -eq 'Uninstall') {
     Stop-Discord
-    # O seletor pergunta so quando ha mais de um Discord; -Yes e entrada nao
-    # interativa (GUI) continuam agindo em todos.
+    Stop-WireSockTunnel
     $alvos = @(Select-PatchTargets $installs 'remover o bypass de')
     foreach ($install in $alvos) {
-        if ((Get-InjectionState $install.Resources) -ne 'Nosso') {
-            Write-Warn "$($install.Flavour) nao tem o standalone, deixando como esta."
-            continue
+        if (Test-Path -LiteralPath (Join-Path $install.Resources '_app.asar')) {
+            Remove-Injection $install.Resources | Out-Null
+            Write-Ok "$($install.Flavour) restaurado para vanilla."
         }
-        if (Remove-Injection $install.Resources) { Write-Ok "$($install.Flavour) voltou ao normal." }
     }
     Remove-Tor
     Write-Host ''
-    Write-Host "  A pasta $InstallDir ficou, com o registro e a sua configuracao." -ForegroundColor DarkGray
+    Write-Host "  GoLiveBypass desinstalado e Discord restaurado." -ForegroundColor Green
     return
 }
 
@@ -1028,17 +1256,15 @@ foreach ($install in $alvos) {
         break
     }
 
-    Install-Patcher
+    Install-WireSockTunnel
     Stop-Discord
 
-    if ($state -eq 'OutroMod') { Remove-Injection $install.Resources | Out-Null }
-    if ((Get-InjectionState $install.Resources) -eq 'Nosso') {
-        Write-Ok "$($install.Flavour) ja estava injetado, so atualizei o bypass."
-        continue
+    if (Test-Path -LiteralPath (Join-Path $install.Resources '_app.asar')) {
+        Remove-Injection $install.Resources | Out-Null
+        Write-Ok "Injecao legada de proxy removida de $($install.Flavour) (Discord restaurado para vanilla)."
     }
 
-    Install-Injection $install.Resources
-    Write-Ok "$($install.Flavour) pronto."
+    Write-Ok "$($install.Flavour) pronto para execucao no WireGuard."
 }
 
 Write-Host ''
@@ -1050,4 +1276,8 @@ Write-Host ''
     Write-Host ''
     Write-Bad "Erro: $($_.Exception.Message)"
     Invoke-AutoBugReport 'Falha no GoLiveBypass standalone' $_.Exception.Message $_
+    Wait-AntesDeFechar
 }
+
+Write-Host ''
+Wait-AntesDeFechar

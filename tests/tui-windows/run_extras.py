@@ -10,7 +10,7 @@ INSTALLER = "C:\\GLB-TEST\\GoLiveBypass-Installer.ps1"
 
 def t08_extreme_resize():
     print("\n=== T08 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")
@@ -27,7 +27,7 @@ def t08_extreme_resize():
 
 def t09_big_terminal():
     print("\n=== T09 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=250, rows=60)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=250, rows=60)
     s.open()
     try:
         s.send_line("cls")
@@ -43,7 +43,7 @@ def t09_big_terminal():
 
 def t10_keyboard_layout():
     print("\n=== T10 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")

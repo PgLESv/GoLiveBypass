@@ -13,8 +13,6 @@ import { ipcRenderer } from 'electron';
   setStartup: (enabled: boolean) => ipcRenderer.invoke('set-startup', enabled),
   getAutoUpdate: () => ipcRenderer.invoke('get-auto-update'),
   setAutoUpdate: (enabled: boolean) => ipcRenderer.invoke('set-auto-update', enabled),
-  getAutoRevive: () => ipcRenderer.invoke('get-auto-revive'),
-  setAutoRevive: (enabled: boolean) => ipcRenderer.invoke('set-auto-revive', enabled),
   getUpdateChannel: () => ipcRenderer.invoke('get-update-channel'),
   setUpdateChannel: (canal: string) => ipcRenderer.invoke('set-update-channel', canal),
   getNetMode: () => ipcRenderer.invoke('get-net-mode'),
@@ -22,6 +20,10 @@ import { ipcRenderer } from 'electron';
   getTorStatus: () => ipcRenderer.invoke('get-tor-status'),
   installTor: () => ipcRenderer.invoke('install-tor'),
   testProxy: (proxy: string) => ipcRenderer.invoke('test-proxy', proxy),
+  importWgConf: () => ipcRenderer.invoke('import-wg-conf'),
+  importWgConfFile: (filePath: string) => ipcRenderer.invoke('import-wg-conf-file', filePath),
+  getWgConfName: () => ipcRenderer.invoke('get-wg-conf-name'),
+  testWgConf: () => ipcRenderer.invoke('test-wg-conf'),
   startLogWatch: () => ipcRenderer.invoke('start-log-watch'),
   stopLogWatch: () => ipcRenderer.invoke('stop-log-watch'),
   getDiagnostic: (payload: { status: string; note?: string }) =>
@@ -45,4 +47,14 @@ import { ipcRenderer } from 'electron';
   resizeWindow: (height: number) => ipcRenderer.send('resize-window', height),
   setTheme: (theme: string) => ipcRenderer.send('set-theme', theme),
   reportBug: (payload: { title: string; description: string; includeLogs: boolean }) => ipcRenderer.invoke('report-bug', payload),
+  getVpnMode: () => ipcRenderer.invoke('get-vpn-mode'),
+  setVpnMode: (mode: 'proton' | 'custom') => ipcRenderer.invoke('set-vpn-mode', mode),
+  checkProtonSession: (username: string) => ipcRenderer.invoke('check-proton-session', username),
+  loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) =>
+    ipcRenderer.invoke('login-proton', payload),
+  logoutProton: () => ipcRenderer.invoke('logout-proton'),
+  optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) =>
+    ipcRenderer.invoke('optimize-proton-route', options),
+  getProtonSettings: () => ipcRenderer.invoke('get-proton-settings'),
+  setProtonSettings: (settings: any) => ipcRenderer.invoke('set-proton-settings', settings),
 };

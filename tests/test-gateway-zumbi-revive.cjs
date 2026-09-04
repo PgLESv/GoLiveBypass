@@ -12,11 +12,12 @@
 //   3. zumbi de novo apos o close -> nivel 2: reload da janela
 //   4. teto de tentativas estourado -> volta a ser ambiental (banner)
 //   5. midia aberta ou recente (§6) -> nunca automatico, so banner
-//   6. o ws nao renasceu apos o close -> auto-cura subindo direto pro reload
+//   6. o ws fechado ou a mesma geracao que ignorou close -> reload
 //   7. dispatches voltaram -> sucesso credita e zera a escada
 //   8. silente (servidor inteiro calado) segue banner-only
-//   9. autoRevive=false -> banner em vez de agir
+//   9. autoRevive=false legado nao desarma a recuperacao
 //  10. guarda da rajada existe no fonte (a reconexao do revive nao alimenta a janela)
+//  11. probe travado tem timeout, single-flight e cooldown por webContents
 //
 // Nao precisa de container: nada toca rede externa (a janela e o session sao stubs
 // e a sandbox vm carrega o bypass real, igual aos outros testes da bateria).
@@ -37,21 +38,69 @@ let failures = 0;
 function ok(name) { console.log("  [OK] " + name); }
 function bad(name, extra) { failures++; console.log("  [FAIL] " + name + (extra ? ": " + extra : "")); }
 
+const sandboxDirs = new Set();
+
+function limparSandboxes() {
+  for (const dir of sandboxDirs) {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
+    sandboxDirs.delete(dir);
+  }
+}
+
+process.once("exit", () => {
+  try { limparSandboxes(); } catch { /* a limpeza principal reporta a falha */ }
+});
+
+function fsRestritoAoSandbox(base) {
+  const raiz = path.resolve(base);
+  const validar = (alvo) => {
+    if (typeof alvo !== "string") throw new TypeError("sandbox fs exige caminho em string");
+    const resolvido = path.resolve(alvo);
+    if (resolvido !== raiz && !resolvido.startsWith(raiz + path.sep)) {
+      throw new Error("sandbox tentou escrever fora do temporario: " + resolvido);
+    }
+    return resolvido;
+  };
+  const isolado = Object.create(fs);
+  for (const metodo of ["appendFileSync", "mkdirSync", "writeFileSync"]) {
+    isolado[metodo] = (alvo, ...args) => fs[metodo](validar(alvo), ...args);
+  }
+  isolado.renameSync = (origem, destino) => fs.renameSync(validar(origem), validar(destino));
+  return isolado;
+}
+
 // --- sandbox: carrega o bypass real com janela/session falsas ---
-function carregarSandbox(settingsExtras) {
+function carregarSandbox(settingsExtras, harnessExtras) {
   const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "fake-res-zumbi-"));
-  const FAKE_RES = BASE + "/resources";
-  fs.mkdirSync(FAKE_RES + "/_app.asar", { recursive: true });
-  fs.writeFileSync(FAKE_RES + "/_app.asar/package.json", JSON.stringify({ name: "discord", main: "index.js" }));
-  fs.writeFileSync(FAKE_RES + "/_app.asar/index.js", "// discord fake");
-  fs.writeFileSync(FAKE_RES + "/settings.json", JSON.stringify(Object.assign(
+  sandboxDirs.add(BASE);
+  const FAKE_RES = path.join(BASE, "resources");
+  const FAKE_APP = path.join(FAKE_RES, "_app.asar");
+  fs.mkdirSync(FAKE_APP, { recursive: true });
+  fs.writeFileSync(path.join(FAKE_APP, "package.json"), JSON.stringify({ name: "discord", main: "index.js" }));
+  fs.writeFileSync(path.join(FAKE_APP, "index.js"), "// discord fake");
+  fs.writeFileSync(path.join(FAKE_RES, "settings.json"), JSON.stringify(Object.assign(
     { enabled: true, routeMode: "tor", torAddr: "127.0.0.1:9050", excludedCountries: "BR" },
     settingsExtras || {}
   )));
 
+  // O bypass grava dois logs persistentes por desenho. No teste, ambos apontam
+  // para o mkdtemp e o fs da VM recusa qualquer mutacao que escape dele.
+  const sandboxProcess = Object.freeze({
+    platform: process.platform,
+    argv: Object.freeze(["node", path.join(FAKE_APP, "index.js")]),
+    env: Object.freeze({
+      HOME: path.join(BASE, "home"),
+      XDG_DATA_HOME: path.join(BASE, "xdg-data"),
+      LOCALAPPDATA: path.join(BASE, "local-app-data"),
+    }),
+  });
+  const sandboxFs = fsRestritoAoSandbox(BASE);
+
   const executedScripts = [];
   const contadores = { fechar: 0, reload: 0 };
   let resumoAtual = null;
+  let voiceResumoAtual = null;
+  let probeFactory = null;
   let onBeforeRequestCb = null;
 
   const fakeWin = {
@@ -60,10 +109,16 @@ function carregarSandbox(settingsExtras) {
       getURL: () => "https://discord.com/channels/@me",
       executeJavaScript: (script) => {
         executedScripts.push(script);
-        if (script.indexOf("__goliveGwResumo") !== -1) return Promise.resolve(resumoAtual);
         if (script.indexOf("__goliveGwFechar") !== -1) { contadores.fechar++; return Promise.resolve(true); }
+        if (script.indexOf("__goliveVoiceDemandaResumo") !== -1) {
+          return Promise.resolve({ demanda: null, midia: resumoAtual });
+        }
+        if (script.indexOf("__goliveGwResumo") !== -1) {
+          return probeFactory ? probeFactory() : Promise.resolve(resumoAtual);
+        }
         return Promise.resolve();
       },
+      executeJavaScriptInIsolatedWorld: () => Promise.resolve(voiceResumoAtual),
       reload: () => { contadores.reload++; },
     },
   };
@@ -81,27 +136,32 @@ function carregarSandbox(settingsExtras) {
     },
   };
 
-  const code = fs.readFileSync(BYPASS, "utf8");
+  let code = fs.readFileSync(BYPASS, "utf8");
+  if (harnessExtras && Number.isFinite(harnessExtras.probeTimeoutMs)) {
+    code = code.replace(
+      "const GW_PROBE_TIMEOUT_MS = 8_000;",
+      "const GW_PROBE_TIMEOUT_MS = " + Math.max(1, Math.trunc(harnessExtras.probeTimeoutMs)) + ";"
+    );
+  }
   const sandboxRequire = (name) => {
     if (name === "electron") return { app: appStub, session: sessionStub, BrowserWindow: { getAllWindows: () => [fakeWin] } };
-    if (name === "original-fs") return require("fs");
+    if (name === "original-fs") return sandboxFs;
     return Module._load(name, { filename: BYPASS }, false);
   };
-  sandboxRequire.main = { filename: FAKE_RES + "/_app.asar/index.js" };
+  sandboxRequire.main = { filename: path.join(FAKE_APP, "index.js") };
   const sandbox = {
     require: sandboxRequire,
     module: { exports: {} },
     exports: {},
     __dirname: FAKE_RES,
     __filename: BYPASS,
-    console, process, Buffer,
+    console, process: sandboxProcess, Buffer,
     setTimeout, clearTimeout, setInterval, clearInterval,
     URL, URLSearchParams, Date,
   };
   sandbox.module.exports = sandbox.exports;
   sandbox.global = sandbox;
   vm.createContext(sandbox);
-  Object.defineProperty(sandbox.process, "argv", { value: ["node", FAKE_RES + "/_app.asar/index.js"], writable: false });
   vm.runInContext(code, sandbox, { filename: BYPASS });
 
   return {
@@ -110,6 +170,8 @@ function carregarSandbox(settingsExtras) {
     executedScripts,
     contadores,
     setResumo: (r) => { resumoAtual = r; },
+    setVoiceResumo: (r) => { voiceResumoAtual = r; },
+    setProbeFactory: (fn) => { probeFactory = fn; },
     getOnBeforeRequestCb: () => onBeforeRequestCb,
     vmSet: (expr) => vm.runInContext(expr, sandbox),
     vmGet: (expr) => vm.runInContext(expr, sandbox),
@@ -164,6 +226,7 @@ function resetarEstadoZumbi(app) {
     revivePendenteEm = 0;
     reviveFecharEm = 0;
     reviveFecharGeracao = 0;
+    reviveFecharOrigem = '';
     ultimaMidiaEm = 0;
     gatewayConnCount = 0;
     reloading = false;
@@ -171,8 +234,7 @@ function resetarEstadoZumbi(app) {
 }
 
 async function poll(app) {
-  app.g.checarGatewaySilente();
-  await new Promise(r => setTimeout(r, 20));
+  await app.g.checarGatewaySilente();
 }
 
 function temBannerZumbi(app) {
@@ -245,6 +307,53 @@ async function testNivel2Reload() {
   else bad("escada nao registrou o reload");
 }
 
+// --- 3b: nivel 2 (reload) trava o mutex "reloading" contra um segundo reload concorrente ---
+// reloadPorRevive() so LIA `reloading` (nunca escrevia): maybeReloadAfterDirect() e
+// maybeReloadAfterColdHold() (que escrevem o mesmo `reloading`) viam sempre false e podiam
+// disparar um SEGUNDO win.webContents.reload() na mesma janela enquanto o reload do revive
+// ainda estava navegando -- alcancavel numa sessao com Tor caindo e gateway zumbi ao mesmo
+// tempo (a mesma rede ruim motiva os dois gatilhos).
+async function testNivel2TravaMutexReload() {
+  const app = carregarSandbox();
+  resetarEstadoZumbi(app);
+  app.vmSet(`
+    zumbiTentativaEm = [Date.now() - 4 * 60_000];
+    zumbiUltimaAcaoEm = Date.now() - 4 * 60_000;
+    zumbiUltimaAcao = "fechar";
+  `);
+  app.setResumo(resumoZumbi({ geracao: 2 }));
+  await poll(app);
+  if (app.contadores.reload === 1) ok("pre-condicao: nivel 2 recarregou (reload=1)");
+  else return bad("pre-condicao falhou", "reload=" + app.contadores.reload);
+
+  if (app.vmGet("reloading") === true) {
+    ok("reloadPorRevive() trava o mutex reloading=true (antes so lia, nunca escrevia)");
+  } else {
+    return bad("reloadPorRevive() nao travou o mutex reloading", "reloading=" + app.vmGet("reloading"));
+  }
+
+  // Um segundo gatilho de reload (arranque frio do Tor respondendo, por exemplo) chega
+  // enquanto o reload do revive ainda esta "em voo": com o mutex correto, ele precisa
+  // desistir sem recarregar de novo -- sem esperar nenhum probe assincrono, porque a guarda
+  // "if (reloading) return;" e a PRIMEIRA linha de maybeReloadAfterColdHold().
+  app.vmSet("chosenExit = 'socks5://127.0.0.1:9060';");
+  app.g.maybeReloadAfterColdHold();
+  if (app.contadores.reload === 1) {
+    ok("com o mutex travado, um segundo gatilho de reload (arranque frio) nao recarrega de novo");
+  } else {
+    bad("dois reloads concorrentes na mesma janela", "reload=" + app.contadores.reload);
+  }
+
+  // A navegacao de verdade comecando (did-start-loading) e quem deve liberar o mutex de
+  // volta -- simula o reset que watchReloads() aplica no shim real.
+  app.vmSet("reloading = false;");
+  if (app.vmGet("reloading") === false) {
+    ok("mutex libera quando a navegacao comeca de verdade (nao fica preso para sempre)");
+  } else {
+    bad("mutex nao liberou");
+  }
+}
+
 // --- 4: teto de tentativas -> banner ---
 async function testTetoViraBanner() {
   const app = carregarSandbox();
@@ -308,6 +417,24 @@ async function testWsNaoRenasceuAutoCura() {
   else bad("reviveFecharEm nao foi zerado pela auto-cura");
 }
 
+// --- 6b: close(4000) no-op, o mesmo ws segue aberto -> reload ---
+async function testMesmoWsIgnorouClose() {
+  const app = carregarSandbox();
+  resetarEstadoZumbi(app);
+  app.vmSet(`
+    reviveFecharEm = Date.now() - 20_000;
+    reviveFecharGeracao = 7;
+    reviveFecharOrigem = 'frame:';
+    zumbiTentativaEm = [Date.now() - 20_000];
+    zumbiUltimaAcaoEm = Date.now() - 20_000;
+    zumbiUltimaAcao = "fechar";
+  `);
+  app.setResumo(resumoZumbi({ geracao: 7, estado: "aberta" }));
+  await poll(app);
+  if (app.contadores.reload === 1) ok("mesma geracao aberta apos 20s: close no-op sobe direto pro reload");
+  else bad("close no-op foi confundido com reconexao", "reload=" + app.contadores.reload);
+}
+
 // --- 7: dispatches voltaram -> sucesso credita ---
 async function testSucessoCredita() {
   const app = carregarSandbox();
@@ -318,12 +445,16 @@ async function testSucessoCredita() {
     zumbiTentativaEm = [Date.now() - 6 * 60_000];
     zumbiUltimaAcaoEm = Date.now() - 6 * 60_000;
     zumbiUltimaAcao = "fechar";
+    zumbiBannerAtivo = true;
   `);
   app.setResumo(resumoZumbi(Object.assign({}, RESUMO_SAUDAVEL)));
   await poll(app);
   if (app.vmGet("zumbiTentativaEm.length") === 0 && app.vmGet("zumbiUltimaAcao") === null) {
     ok("dispatches fluindo apos o aquecimento: escada credita sucesso e zera o teto");
   } else bad("sucesso do revive nao foi creditado", "tentativas=" + app.vmGet("zumbiTentativaEm.length"));
+  if (app.vmGet("zumbiBannerAtivo") === false && app.executedScripts.some(s => s.indexOf("golivebypass-zumbi") !== -1 && s.indexOf("remove") !== -1)) {
+    ok("recuperacao do gateway remove o elemento #golivebypass-zumbi do DOM via hideZumbiBanner");
+  } else bad("hideZumbiBanner nao removeu o elemento do DOM");
   if (app.contadores.fechar === 0 && app.contadores.reload === 0) ok("sessao saudavel nao sofre acao");
   else bad("sessao saudavel sofreu acao automatica");
 }
@@ -342,17 +473,15 @@ async function testSilenteBannerOnly() {
   else bad("silente agiu automatico");
 }
 
-// --- 9: autoRevive=false -> banner ---
-async function testAutoReviveDesligado() {
+// --- 9: autoRevive=false legado continua recuperando ---
+async function testAutoReviveLegadoObrigatorio() {
   const app = carregarSandbox({ autoRevive: false });
   resetarEstadoZumbi(app);
   app.setResumo(resumoZumbi());
   await poll(app);
-  if (app.vmGet("autoRevive") === false) ok("flag autoRevive lida do settings.json");
-  else return bad("autoRevive nao foi lido como false");
-  if (temBannerZumbi(app) && app.contadores.fechar === 0 && app.contadores.reload === 0) {
-    ok("autoRevive=false: deteccao continua, acao fica sendo do usuario (banner)");
-  } else bad("autoRevive=false agiu automatico", "fechar=" + app.contadores.fechar + " reload=" + app.contadores.reload);
+  if (app.contadores.fechar === 1 && app.contadores.reload === 0 && !temBannerZumbi(app)) {
+    ok("autoRevive=false legado e ignorado: nivel 1 continua automatico");
+  } else bad("autoRevive=false legado desarmou ou pulou a escada", "fechar=" + app.contadores.fechar + " reload=" + app.contadores.reload);
 }
 
 // --- 10: guarda da rajada existe no fonte ---
@@ -363,11 +492,200 @@ function testGuardaRajadaNoFonte() {
   } else {
     bad("guarda da rajada ausente no fonte");
   }
-  if (src.indexOf("window.__goliveGwFechar ? window.__goliveGwFechar() : false") !== -1) {
-    ok("o main aciona o close pelo shim (executeJavaScript)");
+  if (src.indexOf("fecharGatewayInstrumentado(win, resumo)") !== -1) {
+    ok("o main aciona o close no target instrumentado exato");
   } else {
-    bad("chamada do __goliveGwFechar ausente no fonte");
+    bad("chamada do fecharGatewayInstrumentado ausente no fonte");
   }
+  if (!src.includes("autoReviveAtivo") && !src.includes("settings.autoRevive")) {
+    ok("runtime nao possui mais opt-out de recuperacao critica");
+  } else {
+    bad("runtime ainda le opt-out autoRevive");
+  }
+}
+
+// --- 10b: trocas proativas nao atravessam uma call/Live ---
+function testTrocaProativaProtegeMidia() {
+  const app = carregarSandbox();
+  resetarEstadoZumbi(app);
+  app.vmSet("ultimaMidiaEm = Date.now() - 19 * 60_000;");
+  if (app.vmGet("midiaRecenteParaTrocaProativa()") === true) {
+    ok("midia aberta ha 19min ainda bloqueia troca proativa");
+  } else {
+    bad("guarda de midia recente nao reconheceu uma call ativa");
+  }
+  app.vmSet("ultimaMidiaEm = Date.now() - 21 * 60_000;");
+  if (app.vmGet("midiaRecenteParaTrocaProativa()") === false) {
+    ok("guarda expira fora da janela de 20min");
+  } else {
+    bad("guarda de midia recente ficou presa alem da janela");
+  }
+  const src = fs.readFileSync(BYPASS, "utf8");
+  if (src.indexOf("troca proativa suspensa: midia recente") !== -1 &&
+      src.indexOf("!midiaProtegida && cooldownOk") !== -1) {
+    ok("RTT e rajada usam a guarda antes de trocar a saida");
+  } else {
+    bad("guarda de midia nao esta ligada aos caminhos proativos");
+  }
+  if (src.indexOf("escolhido.midia && escolhido.midia.midiaAberta === true") !== -1 &&
+      src.indexOf("ultimaMidiaEm = Date.now();") !== -1) {
+    ok("probe nativo renova a marca de uma midia que continua aberta");
+  } else {
+    bad("call longa pode perder a marca de midia aberta");
+  }
+}
+
+function vozViewerAtiva() {
+  return {
+    installed: true,
+    voiceHooked: true,
+    connections: [{
+      id: 2, kind: "stream", role: "viewer", destroyed: false, createdHa: 25 * 60_000,
+      stats: { statsOk: true, direction: "inbound", sampleHa: 0, videoPresent: true, videoHa: 0, framesDecoded: 42_000, decodeFrameRate: 30 }
+    }],
+  };
+}
+
+async function esperarAssincrono() {
+  await new Promise(resolve => setTimeout(resolve, 25));
+}
+
+// Regressao #178: o viewer ficou mais de 20min na mesma Live. O websocket de
+// *.discord.media ja nao aparecia no shim, mas discord_voice seguia decodificando
+// a 30 fps. A guarda antiga deixava a marca expirar e o reconnect dava Ctrl+R.
+async function testViewerNativoProtegeReload() {
+  let app = carregarSandbox();
+  app.setResumo(resumoZumbi({ midiaAberta: false }));
+  app.setVoiceResumo(vozViewerAtiva());
+  app.vmSet("ultimaMidiaEm = Date.now() - 21 * 60_000;");
+  app.g.checarRtcNativo();
+  await esperarAssincrono();
+  if (app.vmGet("midiaProtegidaRecentemente(MIDIA_RECENTE_MS)") === true) {
+    ok("viewer nativo ativo renova a guarda mesmo sem websocket de midia (#178)");
+  } else {
+    bad("viewer nativo nao renovou a guarda de midia");
+  }
+
+  // A revalidacao no fim do probe fecha a corrida: mesmo que a marca ja tenha
+  // expirado, uma stream ativa agora transforma o reload em aviso manual.
+  app = carregarSandbox();
+  app.setResumo(resumoZumbi({ midiaAberta: false }));
+  app.setVoiceResumo(vozViewerAtiva());
+  app.vmSet(`
+    ultimaMidiaEm = Date.now() - 21 * 60_000;
+    chosenExit = "socks5://127.0.0.1:9050";
+    probe = async () => 1;
+    gatewayConnCount = 1;
+  `);
+  app.g.markGatewayRouted();
+  await esperarAssincrono();
+  if (app.contadores.reload === 0 && temBannerRecorrencia(app)) {
+    ok("reconexao com viewer ativo cancela reload e mostra somente aviso (#178)");
+  } else {
+    bad("reconexao de viewer ativo ainda recarregou", "reload=" + app.contadores.reload);
+  }
+
+  // Quando a ausencia e realmente observada pelo hook nativo, a recuperacao
+  // preventiva antiga continua disponivel fora de chamada.
+  app = carregarSandbox();
+  app.setResumo(resumoZumbi({ midiaAberta: false }));
+  app.setVoiceResumo({ installed: true, voiceHooked: true, connections: [] });
+  app.vmSet(`
+    ultimaMidiaEm = Date.now() - 21 * 60_000;
+    chosenExit = "socks5://127.0.0.1:9050";
+    probe = async () => 1;
+    gatewayConnCount = 1;
+  `);
+  app.g.markGatewayRouted();
+  await esperarAssincrono();
+  if (app.contadores.reload === 1) ok("sem stream observada, reload preventivo continua disponivel");
+  else bad("ausencia comprovada de stream bloqueou reload preventivo", "reload=" + app.contadores.reload);
+}
+
+// --- 10c: uma falha de heartbeat nao e morte confirmada ---
+function testHeartbeatConfirmaMorteAntesDeTrocar() {
+  const app = carregarSandbox({ routeMode: "free" });
+  if (app.vmGet('ativaMortaConfirmada("a", ["b"], [])') === false) {
+    ok("primeira falha da ativa nao e tratada como morte confirmada");
+  } else {
+    bad("primeira falha da ativa trocaria a saida");
+  }
+  if (app.vmGet('ativaMortaConfirmada("a", ["b"], ["a"])') === true) {
+    ok("a ativa so fica confirmada depois de entrar na lista de dois batimentos mortos");
+  } else {
+    bad("segunda falha nao confirmou a morte da ativa");
+  }
+  const src = fs.readFileSync(BYPASS, "utf8");
+  if (src.indexOf("if (!ativaMortaConfirmada(active, live, dead))") !== -1 &&
+      src.indexOf("if (count >= MAX_MISSED_BEATS) dead.push(entry.proxy)") !== -1) {
+    ok("checkPool aplica o mesmo limiar de morte à ativa e às reservas");
+  } else {
+    bad("limiar de morte confirmada nao esta ligado ao checkPool");
+  }
+}
+
+// --- 10d: trocar o seletor da GUI para Tor/Gratuitas nao pode herdar uma
+// proxy salva pelo modo Personalizado. Sem esta guarda o runtime escolhia a
+// proxy antiga, mas o heartbeat a tratava como Tor unico e nunca confirmava a
+// morte da saida manual real.
+async function testModoExplicitoNaoHerdaProxyManual() {
+  const manual = "socks5://198.51.100.7:1080";
+  const tor = carregarSandbox({ proxy: manual });
+  tor.g.detectTor = async () => "socks5://127.0.0.1:9050";
+  const torEscolhido = await tor.g.chooseExit();
+  if (tor.g.manualProxy() === "" && tor.vmGet("usingManualProxy") === false &&
+      tor.g.isManualAddress(manual) === false && torEscolhido === "socks5://127.0.0.1:9050") {
+    ok("modo Tor ignora proxy manual salva e escolhe somente o Tor");
+  } else {
+    bad("modo Tor herdou proxy manual", JSON.stringify({ manual: tor.g.manualProxy(), using: tor.vmGet("usingManualProxy"), escolhido: torEscolhido }));
+  }
+
+  const free = carregarSandbox({ routeMode: "free", proxy: manual });
+  free.g.pickFreeExit = async () => "socks5://203.0.113.9:1080";
+  const freeEscolhido = await free.g.chooseExit();
+  if (free.g.manualProxy() === "" && free.vmGet("usingManualProxy") === false &&
+      free.g.isManualAddress(manual) === false && freeEscolhido === "socks5://203.0.113.9:1080") {
+    ok("modo Gratuitas ignora proxy manual salva e procura a lista");
+  } else {
+    bad("modo Gratuitas herdou proxy manual", JSON.stringify({ manual: free.g.manualProxy(), using: free.vmGet("usingManualProxy"), escolhido: freeEscolhido }));
+  }
+
+  const personalizado = carregarSandbox({ routeMode: "auto", proxy: manual });
+  personalizado.g.probe = async () => ({ proxy: manual, ms: 1 });
+  const personalizadoEscolhido = await personalizado.g.chooseExit();
+  if (personalizado.g.manualProxy() === manual && personalizado.vmGet("usingManualProxy") === true &&
+      personalizado.g.isManualAddress(manual) === true && personalizadoEscolhido === manual) {
+    ok("modo Personalizado preserva a proxy manual");
+  } else {
+    bad("modo Personalizado deixou de usar a proxy manual", JSON.stringify({ manual: personalizado.g.manualProxy(), using: personalizado.vmGet("usingManualProxy"), escolhido: personalizadoEscolhido }));
+  }
+
+  const src = fs.readFileSync(BYPASS, "utf8");
+  if (src.includes('const usingManualProxy = routeMode === "auto"') &&
+      src.includes("if (usingManualProxy && typeof raw")) {
+    ok("range manual tambem respeita o modo selecionado");
+  } else {
+    bad("range manual ainda pode vazar para Tor/Gratuitas");
+  }
+}
+
+async function testProbeTravadoIsolado() {
+  const app = carregarSandbox(null, { probeTimeoutMs: 25 });
+  resetarEstadoZumbi(app);
+  let chamadas = 0;
+  app.setProbeFactory(() => {
+    chamadas++;
+    return new Promise(() => {});
+  });
+  const primeira = app.g.checarGatewaySilente();
+  const concorrente = await app.g.checarGatewaySilente();
+  await primeira;
+  await new Promise(r => setTimeout(r, 10));
+  if (concorrente === false && chamadas === 1) ok("probe travado: single-flight impede acumulacao concorrente");
+  else bad("probe travado acumulou execucoes", "concorrente=" + concorrente + " chamadas=" + chamadas);
+  if (app.vmGet("gatewayProbeRodando") === false && app.vmGet("gatewayProbeBloqueadoAte.has((require('electron').BrowserWindow.getAllWindows()[0]).webContents)") === true) {
+    ok("timeout libera a trava e aplica cooldown somente ao webContents travado");
+  } else bad("timeout nao liberou/cooldown nao foi aplicado");
 }
 
 (async () => {
@@ -380,23 +698,42 @@ function testGuardaRajadaNoFonte() {
     await testReconexaoDoReviveNaoViraRecorrencia();
     console.log("\n== nivel 2: zumbi persistente apos o close -> reload ==");
     await testNivel2Reload();
+    console.log("\n== nivel 2 trava o mutex reloading contra reload concorrente ==");
+    await testNivel2TravaMutexReload();
     console.log("\n== teto de tentativas -> banner ==");
     await testTetoViraBanner();
     console.log("\n== midia aberta/recente: nunca automatico (§6) ==");
     await testMidiaNuncaAutomatico();
     console.log("\n== ws nao renasceu apos o close: auto-cura ==");
     await testWsNaoRenasceuAutoCura();
+    console.log("\n== mesma geracao ignorou close: auto-cura ==");
+    await testMesmoWsIgnorouClose();
     console.log("\n== dispatches voltaram: sucesso credita ==");
     await testSucessoCredita();
     console.log("\n== silente segue banner-only ==");
     await testSilenteBannerOnly();
-    console.log("\n== autoRevive=false: banner em vez de agir ==");
-    await testAutoReviveDesligado();
+    console.log("\n== autoRevive=false legado: recuperacao obrigatoria ==");
+    await testAutoReviveLegadoObrigatorio();
     console.log("\n== guardas no fonte ==");
     testGuardaRajadaNoFonte();
+    console.log("\n== troca proativa durante midia ==");
+    testTrocaProativaProtegeMidia();
+    console.log("\n== viewer nativo protege reload automatico (#178) ==");
+    await testViewerNativoProtegeReload();
+    console.log("\n== heartbeat isolado nao troca a ativa ==");
+    testHeartbeatConfirmaMorteAntesDeTrocar();
+    console.log("\n== modo explicito nao herda proxy manual ==");
+    await testModoExplicitoNaoHerdaProxyManual();
+    console.log("\n== probe renderer travado ==");
+    await testProbeTravadoIsolado();
   } catch (e) {
     console.error("ERRO:", e.message, e.stack);
     failures++;
+  }
+  try {
+    limparSandboxes();
+  } catch (e) {
+    bad("limpeza dos diretorios temporarios", e.message);
   }
   console.log("");
   console.log(failures === 0 ? "RESULTADO: TUDO OK" : "RESULTADO: " + failures + " FALHA(S)");

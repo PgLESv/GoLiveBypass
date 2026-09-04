@@ -1,7 +1,7 @@
 # GoLiveBypass — plugin do Vencord/Equicord
 
-Este zip traz os **3 arquivos fonte** do plugin (`index.tsx`, `native.ts` e
-`manifest.json`). Ele não é um instalador: os arquivos entram dentro de um
+Este zip traz os arquivos fonte do plugin (`index.tsx`, `native.ts`,
+`stability.ts` e `manifest.json`). Ele não é um instalador: os arquivos entram dentro de um
 **checkout (código-fonte) do Equicord ou do Vencord**, que compila o plugin.
 
 ## Instalação resumida

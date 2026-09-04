@@ -11,6 +11,7 @@ import fs from "fs";
 import path from "path";
 import * as logger from "./logger";
 import * as logsDir from "./logsDir";
+import type { WgTunnelStats } from "./wgstats";
 import {
   cortarDoFim,
   extrairSegredosDaProxy,
@@ -71,10 +72,12 @@ function lerArquivoSeguro(file: string, maxBytes = LOG_TAIL_BYTES): string {
   }
 }
 
-// A proxy personalizada vive no settings.json da pasta compartilhada (e, em instalacoes
-// antigas, dentro do app.asar injetado). De la saem APENAS os segredos p/ varredura.
+// A proxy personalizada e a conta Proton vivem no settings.json da pasta compartilhada (e,
+// em instalacoes antigas, dentro do app.asar injetado). Sao usados APENAS como segredos para
+// a varredura local; nunca entram no payload.
 export function coletarSegredos(dadosRaiz: string): SegredosConhecidos {
   const dir = settingsDir(dadosRaiz);
+  const segredos: string[] = [dadosRaiz];
   const candidatos = [
     path.join(dir, "settings.json"),
     // installs antigos guardavam settings dentro do asar; varre os resources marcados na sessao
@@ -85,14 +88,16 @@ export function coletarSegredos(dadosRaiz: string): SegredosConhecidos {
       if (!fs.existsSync(file)) continue;
       const data = JSON.parse(fs.readFileSync(file, "utf8"));
       if (typeof data.proxy === "string" && data.proxy.trim()) {
-        const s = extrairSegredosDaProxy(data.proxy);
-        if (s.length) return s;
+        segredos.push(...extrairSegredosDaProxy(data.proxy));
+      }
+      if (typeof data.protonUsername === "string" && data.protonUsername.trim()) {
+        segredos.push(data.protonUsername.trim());
       }
     } catch {
       // arquivo corrompido/asar: segue pro proximo candidato
     }
   }
-  return [];
+  return [...new Set(segredos.filter((s) => s.length >= 3))];
 }
 
 function installsDaSessao(dir: string): string[] {
@@ -171,7 +176,7 @@ export function montarMeta(
   torAtivo: boolean,
   torPorta: number | null,
   routeModeDisco: string,
-  autoRevive?: boolean,
+  wgTunel?: WgTunnelStats,
 ): Record<string, string> {
   return {
     versao: app.getVersion(),
@@ -184,11 +189,20 @@ export function montarMeta(
     // modoRoteamento de cima = drift de configuracao (o cenario da issue #108, que
     // dizia tor com o runtime rodando auto).
     routeModeDisco: routeModeDisco === "" ? "ausente" : routeModeDisco,
-    // O revive automatico so age com a flag LIGADA (leitura do RUNTIME, nao da GUI):
-    // report sem nenhum gw.revive com "desligado" aqui e comportamento esperado.
-    autoRevive: autoRevive === false ? "desligado" : "ligado",
+    // Recuperacao e critica e nao possui mais opt-out. Mantemos a chave para
+    // distinguir reports de builds anteriores sem induzir leitura de settings.
+    autoRevive: "obrigatorio",
     bypass: statusBypass.toLowerCase(),
     tor: torAtivo ? `ativo:${torPorta ?? "?"}` : "inativo",
+    // Snapshot do tunel WireGuard NO MOMENTO do report — a causa mais provavel de "carregando
+    // infinito" pos-migracao e o tunel morto/saturado, nao mais o gateway zumbi do proxy legado.
+    // handshake_ha_s velho (>180s) com bypass ativo = tunel morto ou endpoint inalcancavel;
+    // trafego (rx/tx) parado tambem indica saturacao ou queda. Endpoint NUNCA sai daqui (seria
+    // a saida escolhida da pessoa) -- so o numero, igual ao resto deste objeto.
+    wg_handshake_ha_s: wgTunel?.ok ? String(wgTunel.handshakeAgoS ?? "nunca") : "indisponivel",
+    wg_rx_kb: wgTunel?.ok && wgTunel.rxBytes !== null ? String(Math.round(wgTunel.rxBytes / 1024)) : "indisponivel",
+    wg_tx_kb: wgTunel?.ok && wgTunel.txBytes !== null ? String(Math.round(wgTunel.txBytes / 1024)) : "indisponivel",
+    wg_erro: !wgTunel?.ok ? (wgTunel?.error ?? "?") : "",
     uptime_s: String(Math.round(process.uptime())),
     installs: String(installsDaSessao(settingsDir(app.getPath("home"))).length),
     // Diagnostico da deteccao do Discord — sem caminhos completos do usuario.
@@ -201,25 +215,27 @@ export async function submitBugReport(
   ctx: {
     netMode: string;
     routeModeDisco?: string;
-    autoRevive?: boolean;
     statusBypass: string;
     torAtivo: boolean;
     torPorta: number | null;
     installsFlavours?: string;
+    wgTunel?: WgTunnelStats;
   },
 ): Promise<ReportResult> {
   const title = payload.title.trim().slice(0, TITLE_MAX);
   if (!title) return { ok: false, error: "Informe um resumo do problema." };
 
   const home = app.getPath("home");
-  const segredos = payload.includeLogs ? coletarSegredos(home) : [];
+  // Titulo e descricao tambem passam pela redacao, mesmo sem anexar logs.
+  // Caso contrario uma conta Proton que nao parece e-mail poderia vazar pelo texto livre.
+  const segredos = coletarSegredos(home);
   const description = (payload.description ?? "").slice(0, DESC_MAX);
 
   const corpo: { title: string; description: string; log?: string; meta: Record<string, string> } = {
-    title,
+    title: redigir(title, segredos, BUG_API_TOKEN),
     description: redigir(description, segredos, BUG_API_TOKEN),
     meta: {
-      ...montarMeta(ctx.netMode, ctx.statusBypass, ctx.torAtivo, ctx.torPorta, ctx.routeModeDisco ?? "", ctx.autoRevive),
+      ...montarMeta(ctx.netMode, ctx.statusBypass, ctx.torAtivo, ctx.torPorta, ctx.routeModeDisco ?? "", ctx.wgTunel),
       // Flavours vistos na varredura (discord,vesktop,...) — mostra na hora se
       // um cliente paralelo foi achado ou se o report e de "nao achei o Vesktop".
       ...(ctx.installsFlavours ? { installs_flavours: ctx.installsFlavours } : {}),

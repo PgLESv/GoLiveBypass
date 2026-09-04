@@ -160,6 +160,14 @@ const sandbox = {
 sandbox.module.exports = sandbox.exports;
 sandbox.global = sandbox;
 vm.createContext(sandbox);
+// O runtime usa process.argv[1] como fonte confiavel para achar o app.asar do
+// cliente (inclusive Vesktop/Equibop/Legcord). Sem fixar o argv no sandbox, o
+// caminho real deste helper (/helpers/proxy-mechanism-test.js) vence o
+// require.main fake e faz o bypass procurar /_app.asar/package.json.
+Object.defineProperty(sandbox.process, "argv", {
+  value: ["node", "/tmp/discord-fake/resources/app.asar/index.js"],
+  writable: false,
+});
 vm.runInContext(code, sandbox, { filename: BYPASS });
 
 const g = sandbox;
@@ -218,6 +226,7 @@ main().catch((e) => { console.error(e); process.exit(1); });
 EOF
 
 step "Teste do proxy (SOCKS5 manual) no Artix/OpenRC"
+set +e
 out="$("$RUNTIME" run --rm --pull=missing --user 0 \
     -v "$REPO:/repo:ro" \
     -v "$TMP:/helpers:ro" \
@@ -246,14 +255,17 @@ out="$("$RUNTIME" run --rm --pull=missing --user 0 \
     kill $socks_pid 2>/dev/null || true
     exit $rc
 ' 2>&1)"
+container_rc=$?
+set -e
 
 echo "$out" | tail -12
 
-if printf '%s' "$out" | grep -q "SETTINGS_OK" \
+if [ "$container_rc" -eq 0 ] \
+   && printf '%s' "$out" | grep -q "SETTINGS_OK" \
    && printf '%s' "$out" | grep -q "RESULTADO: TUDO OK"; then
     ok "proxy manual (SOCKS5) funciona no Artix/OpenRC: settings + tunel + roteador"
 else
-    bad "proxy manual falhou no Artix/OpenRC: $(printf '%s' "$out" | tail -4)"
+    bad "proxy manual falhou no Artix/OpenRC (container rc=$container_rc): $(printf '%s' "$out" | tail -4)"
 fi
 
 echo

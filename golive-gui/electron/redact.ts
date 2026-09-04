@@ -22,6 +22,11 @@ const RE_HEADER_AUTH = /^((?:proxy-)?authorization\s*:\s*).+$/gim;
 const RE_DISCORD_TOKEN = /\b(mfa\.[\w-]{20,}|[MN][\w-]{23}\.[\w-]{6}\.[\w-]{27,40})\b/g;
 // Query string de URL do gateway carrega params de sessao — so o host interessa
 const RE_GATEWAY_QUERY = /(https:\/\/gateway[^?\s]+)\?\S*/g;
+// Identificadores pessoais que podem aparecer em mensagens de erro, descricoes ou logs.
+const RE_EMAIL = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+const RE_HOME_POSIX = /(\/(?:home|var\/home|Users)\/)[^/\s]+/g;
+const RE_HOME_WINDOWS = /([A-Z]:\\Users\\)[^\\\s]+/gi;
+const RE_IDENTITY_LABEL = /\b(nome|name|usu[aá]rio|username|user)\s*([:=])\s*[^\s,;]+/gi;
 
 export function l1Padroes(texto: string): string {
   return (
@@ -30,6 +35,10 @@ export function l1Padroes(texto: string): string {
       .replace(RE_HEADER_AUTH, "$1***")
       .replace(RE_DISCORD_TOKEN, "***")
       .replace(RE_GATEWAY_QUERY, "$1?<params>")
+      .replace(RE_EMAIL, "<email>")
+      .replace(RE_HOME_POSIX, "$1<usuario>")
+      .replace(RE_HOME_WINDOWS, "$1<usuario>")
+      .replace(RE_IDENTITY_LABEL, "$1$2<usuario>")
   );
 }
 
@@ -41,7 +50,13 @@ export function extrairSegredosDaProxy(proxySalva: string): SegredosConhecidos {
   const p = proxySalva.trim();
   if (!p) return segredos;
 
-  const m = /^[a-z][a-z0-9+.-]*:\/\/([^/@]+)@(.+)$/i.exec(p);
+  // Credenciais podem conter "@" nao codificado (o parser real da proxy em
+  // standalone/golivebypass.js, PROXY_RE, aceita isso via ".+" guloso). Usar
+  // aqui uma classe que exclui "@" cortava a senha no primeiro "@" dela,
+  // extraindo so um fragmento (as vezes <3 chars, descartado pelo filtro
+  // final) em vez da senha inteira — a senha real nunca entrava na lista de
+  // segredos a redigir. Espelha o mesmo "guloso ate o ultimo @" do parser.
+  const m = /^[a-z][a-z0-9+.-]*:\/\/(.+)@([^/@]+)$/i.exec(p);
   if (m) {
     const [, auth, resto] = m;
     const doisPontos = auth.indexOf(":");

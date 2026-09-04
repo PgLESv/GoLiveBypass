@@ -11,8 +11,8 @@ STANDALONE = "C:\\GLB-TEST\\GoLiveBypass-Standalone.ps1"
 
 def ssh_cmd(cmd, timeout=15):
     return subprocess.run(
-        ["sshpass", "-p", "1241", "ssh", "-o", "StrictHostKeyChecking=no",
-         "-o", "UserKnownHostsFile=/dev/null", "teste@192.168.122.198", cmd],
+        ["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=no",
+         "-o", "UserKnownHostsFile=/dev/null", os.environ["TUI_VM_SSH"], cmd],
         capture_output=True, text=True, timeout=timeout)
 
 
@@ -24,7 +24,7 @@ def setup():
 
 def t01_main_menu_cmd():
     print("\n=== T01 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls"); s.wait_for_text(">", timeout=5)
@@ -43,7 +43,7 @@ def t01_main_menu_cmd():
 
 def t02_standalone_pwsh():
     print("\n=== T02 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")
@@ -67,7 +67,7 @@ def t02_standalone_pwsh():
 
 def t03_no_tty():
     print("\n=== T03 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")
@@ -84,7 +84,7 @@ def t03_no_tty():
 
 def t04_resize():
     print("\n=== T04 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")
@@ -100,7 +100,7 @@ def t04_resize():
 
 def t05_key_storm():
     print("\n=== T05 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")
@@ -117,7 +117,7 @@ def t05_key_storm():
 
 def t06_ansi_leak():
     print("\n=== T06 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")
@@ -131,7 +131,7 @@ def t06_ansi_leak():
 
 def t07_setup_wizard():
     print("\n=== T07 ===")
-    s = WinTuiSession(host="192.168.122.198", user="teste", password="1241", cols=120, rows=30)
+    s = WinTuiSession(host=os.environ["TUI_VM_HOST"], user=os.environ["TUI_VM_USER"], password=os.environ["TUI_VM_PASSWORD"], cols=120, rows=30)
     s.open()
     try:
         s.send_line("cls")

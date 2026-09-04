@@ -154,30 +154,30 @@ async function main() {
   if (s.active === A && s.pool.length === 3) ok("1. tudo vivo mantem ativa e pote");
   else bad("1. tudo vivo", JSON.stringify(s));
 
-  // 2) ativa morre: reserva assume no PRIMEIRO erro, ninguem sai do pote ainda
+  // 2) um falso negativo isolado: a ativa fica de pe e ninguem sai do pote
   await seed([A, B, C], A);
   vivos([B, C]);
   logs.length = 0;
   await g.checkPool();
   s = g.poolStatus();
-  if (s.active !== A && (s.active === B || s.active === C)) ok("2. reserva assume no primeiro erro");
-  else bad("2. promocao", JSON.stringify(s));
+  if (s.active === A) ok("2. primeiro falso negativo mantem ativa");
+  else bad("2. troca prematura", JSON.stringify(s));
   if (s.pool.length === 3) ok("2b. um erro so nao tira do pote");
   else bad("2b. pote", JSON.stringify(s.pool));
   if (s.missed.some(([p, n]) => p === A && n === 1)) ok("2c. o erro ficou marcado");
   else bad("2c. marca", JSON.stringify(s.missed));
-  // O log mudou de uma linha inline para o formato estruturado do trocarPara() compartilhado
-  // ("saida.trocada | de=... para=... motivo=..."); o motivo continua o mesmo texto.
-  if (logs.some(l => l.includes("saida.trocada") && l.includes("motivo=perdeu o batimento"))) ok("2d. a troca foi registrada");
-  else bad("2d. registro", logs.join(" | "));
+  if (!logs.some(l => l.includes("saida.trocada") && l.includes("motivo=perdeu o batimento"))) ok("2d. nenhuma troca prematura");
+  else bad("2d. troca prematura registrada", logs.join(" | "));
 
   // 3) segundo erro seguido: sai do pote
   await g.checkPool();
   s = g.poolStatus();
-  if (!s.pool.includes(A) && s.pool.length === 2) ok("3. segundo erro seguido tira do pote");
-  else bad("3. remocao", JSON.stringify(s.pool));
-  if (!s.missed.some(([p]) => p === A)) ok("3b. a marca foi limpa junto");
-  else bad("3b. marca", JSON.stringify(s.missed));
+  if (s.active !== A && (s.active === B || s.active === C)) ok("3. segundo erro assume reserva viva");
+  else bad("3. promocao", JSON.stringify(s));
+  if (!s.pool.includes(A) && s.pool.length === 2) ok("3b. segundo erro tira do pote");
+  else bad("3b. remocao", JSON.stringify(s.pool));
+  if (!s.missed.some(([p]) => p === A)) ok("3c. a marca foi limpa junto");
+  else bad("3c. marca", JSON.stringify(s.missed));
 
   // 4) uma resposta boa zera a contagem
   await seed([A, B], A);

@@ -32,7 +32,9 @@ if ! command -v "$RUNTIME" >/dev/null 2>&1; then
     exit 1
 fi
 
-APPIMAGE="$REPO/golive-gui/dist-app/GoLiveBypass.AppImage"
+APP_VERSION="$(node -p "require('$REPO/golive-gui/package.json').version")"
+APPIMAGE_NAME="GoLiveBypass-$APP_VERSION.AppImage"
+APPIMAGE="$REPO/golive-gui/dist-app/$APPIMAGE_NAME"
 [ -f "$APPIMAGE" ] || {
     echo "AppImage nao encontrado. Rode 'cd golive-gui && npm run build:linux' primeiro." >&2
     exit 1
@@ -43,25 +45,49 @@ ok()   { PASS=$((PASS + 1)); printf '  [OK] %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  [FAIL] %s\n' "$1"; }
 
 step "Teste ponta a ponta: Artix (OpenRC) + weston headless + Wayland/Vulkan"
+set +e
 out="$("$RUNTIME" run --rm --pull=missing --user 0 \
     -v "$REPO:/repo:ro" \
     -e WAYLAND_DISPLAY=wayland-0 \
     -e XDG_RUNTIME_DIR=/tmp/home/.xdg \
     -e HOME=/tmp/home \
     -e DISPLAY= \
+    -e APPIMAGE_NAME="$APPIMAGE_NAME" \
     "$IMG" sh -c '
     set -e
     # 1. deps GUI + weston (compositor wayland headless) + vulkan
-    pacman -Sy --noconfirm --needed \
-        nss atk gtk3 alsa-lib \
-        libx11 libxcb libxkbcommon libxrandr libxcomposite libxdamage libxfixes \
-        libxext libxi libxtst libgl libdrm mesa libxss libxinerama libxcursor \
-        weston vulkan-icd-loader vulkan-mesa-layers \
-        >/dev/null 2>&1 || { echo "FALHA_DEPS"; exit 1; }
+    # O primeiro mirror da imagem Artix fica intermitente e o segundo pode ter
+    # pacotes 404 durante sincronizacao. Prioriza um mirror comprovadamente
+    # atualizado e tenta novamente sem transformar falha de infra em falha da GUI.
+    {
+        printf "%s\n" "Server = https://artix.wheaton.edu/repos/\$repo/os/\$arch"
+        cat /etc/pacman.d/mirrorlist
+    } >/tmp/mirrorlist
+    cp /tmp/mirrorlist /etc/pacman.d/mirrorlist
+
+    deps_ok=0
+    : >/tmp/pacman-install.log
+    for attempt in 1 2 3; do
+        if pacman -Syy --noconfirm --needed \
+            nss atk gtk3 alsa-lib \
+            libx11 libxcb libxkbcommon libxrandr libxcomposite libxdamage libxfixes \
+            libxext libxi libxtst libgl libdrm mesa libxss libxinerama libxcursor \
+            weston vulkan-icd-loader vulkan-mesa-layers \
+            >>/tmp/pacman-install.log 2>&1; then
+            deps_ok=1
+            break
+        fi
+        echo "RETRY_DEPS=$attempt"
+    done
+    if [ "$deps_ok" -ne 1 ]; then
+        echo "FALHA_DEPS"
+        tail -30 /tmp/pacman-install.log
+        exit 1
+    fi
 
     # 2. extrair o AppImage (sem FUSE -> --appimage-extract-and-run)
     mkdir -p /tmp/home/.xdg /tmp/app
-    cp /repo/golive-gui/dist-app/GoLiveBypass.AppImage /tmp/app/
+    cp "/repo/golive-gui/dist-app/$APPIMAGE_NAME" /tmp/app/GoLiveBypass.AppImage
     chmod +x /tmp/app/GoLiveBypass.AppImage
 
     # 3. subir weston headless no socket wayland-0
@@ -91,16 +117,19 @@ out="$("$RUNTIME" run --rm --pull=missing --user 0 \
     echo "PROCS=$procs VULKAN_ERR=$vulkan_err GPU_CRASH=$gpu_crash"
     grep -iE "vulkan|not compatible" /tmp/app.log | head -3 || true
 ' 2>&1)"
+container_rc=$?
+set -e
 
-echo "$out" | tail -5
+echo "$out" | tail -35
 
 # Validacao: nenhum erro Vulkan, nenhum crash de GPU e processos vivos
-if printf '%s' "$out" | grep -q "VULKAN_ERR=0" \
+if [ "$container_rc" -eq 0 ] \
+   && printf '%s' "$out" | grep -q "VULKAN_ERR=0" \
    && printf '%s' "$out" | grep -q "GPU_CRASH=0" \
    && printf '%s' "$out" | grep -q "PROCS=[1-9]"; then
     ok "AppImage roda no Wayland+Vulkan sem erro (Artix/OpenRC)"
 else
-    bad "AppImage ainda falha no Wayland+Vulkan: $(printf '%s' "$out" | tail -3)"
+    bad "AppImage ainda falha no Wayland+Vulkan (container rc=$container_rc): $(printf '%s' "$out" | tail -5)"
 fi
 
 echo

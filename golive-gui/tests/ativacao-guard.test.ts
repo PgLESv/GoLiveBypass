@@ -91,4 +91,38 @@ describe("guarda de ativacao duplicada", () => {
     expect(src).toMatch(/autoInject: bypass reativado"[\s\S]{0,600}refreshWindowStatus\(\);/);
     expect(src).toMatch(/autoInject falhou:[\s\S]{0,600}refreshWindowStatus\(\);/);
   });
+
+  // assinaturaUltimaAtivacao e um "let" de modulo: nasce "" a cada boot da GUI, mesmo quando
+  // o bypass ja esta injetado de verdade (getStatus() === "ACTIVE"). Reproduzido no
+  // laboratorio ao caçar o bug do watchdog do Tor: a GUI foi relançada com o Discord já
+  // injetado e rodando, e sem re-semear a assinatura no boot, a PRIMEIRA chamada de
+  // activateBypass() pos-boot com a mesma proxy/modo nunca bateria com "" — a guarda desta
+  // suite (pensada para a #145: duas ativações em segundos) ficaria cega logo após qualquer
+  // reinício da GUI, e uma reativação idêntica re-injetaria por cima de um bypass já correto,
+  // derrubando o gateway/RTC à toa.
+  it("o boot re-semeia assinaturaUltimaAtivacao quando o bypass ja esta injetado (nao so quando reativa)", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const bootBlock = src.slice(
+      src.indexOf('if (!IS_LINUX && readSharedSettings().autoInject === true) {'),
+      src.indexOf('if (!IS_LINUX && readSharedSettings().autoInject === true) {') + 1400,
+    );
+    expect(bootBlock).toMatch(/if\s*\(\s*injetado\s*\)\s*\{[\s\S]{0,1000}assinaturaUltimaAtivacao\s*=\s*assinaturaAtivacao\(/);
+  });
+
+  it("saveTorAddr atualiza tanto as settings compartilhadas quanto as injecoes existentes no Windows/macOS", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const fnStart = src.indexOf("function saveTorAddr(addr: string)");
+    expect(fnStart).toBeGreaterThan(0);
+    const fnBody = src.slice(fnStart, fnStart + 300);
+    expect(fnBody).toContain("updateSharedSettings({ torAddr: addr });");
+    expect(fnBody).toContain("reescreverSettingsInjetado({ torAddr: addr });");
+  });
+
+  it("desativar WireSock reinicia o Discord mesmo sem app.asar injetado", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const fnStart = src.indexOf("async function deactivateAll()");
+    const fnBody = src.slice(fnStart, fnStart + 2200);
+    expect(fnBody).toContain("const hadWireSock = IS_WINDOWS && isWireSockActive();");
+    expect(fnBody).toMatch(/if \(ours\.length === 0\) \{[\s\S]{0,500}await killDiscord\(\);[\s\S]{0,300}stopWireSockService\(\);[\s\S]{0,500}startDiscord\(install\)/);
+  });
 });

@@ -73,6 +73,7 @@ const STREAM_KEYS: "streamRegion"[] = ["streamRegion"];
 let original: RegionStore | undefined;
 let lastScope: string | null = null;
 let streamClaimTimer: ReturnType<typeof setInterval> | null = null;
+let updateCheckTimer: ReturnType<typeof setTimeout> | null = null;
 let streamClaimState: StreamClaimState = initialStreamClaimState();
 let streamClaimStatus = "idle";
 let streamClaimProbeFailed = false;
@@ -169,6 +170,16 @@ function PluginUpdateSettings() {
             } else {
                 setState({ label: `v${PLUGIN_VERSION} · atualizada`, tone: "success" });
             }
+        } catch (error) {
+            // Native.checkPluginUpdate() em si nunca rejeita (o corpo inteiro do lado nativo
+            // ja esta em try/catch, sempre resolve com {ok:true|false,...}) -- mas a chamada
+            // IPC por baixo pode rejeitar sozinha (ex.: logo apos um self-update do plugin,
+            // com o handler ipcMain.handle temporariamente desalinhado). update(), a funcao
+            // irma logo abaixo, ja trata isso; check() nao tratava, deixando uma rejeicao sem
+            // dono no console do renderer (inofensivo aqui -- so o processo PRINCIPAL derruba
+            // tudo com promise sem tratamento -- mas inconsistente e sem feedback pra pessoa).
+            const detail = error instanceof Error ? ` · ${error.message.slice(0, 48)}` : "";
+            setState({ label: `v${PLUGIN_VERSION} · verificação falhou${detail}`, tone: "neutral" });
         } finally {
             setBusy(false);
         }
@@ -604,7 +615,9 @@ export default definePlugin({
 
         // O aviso aparece mesmo para quem nunca abre a aba de configuracao. Consulta uma vez
         // por sessao; o botao da configuracao continua disponivel para uma consulta manual.
-        setTimeout(() => {
+        if (updateCheckTimer !== null) clearTimeout(updateCheckTimer);
+        updateCheckTimer = setTimeout(() => {
+            updateCheckTimer = null;
             Native?.checkPluginUpdate().then(result => {
                 if (result.ok && result.available)
                     showToast(`GoLiveBypass v${result.latest} disponível. Abra as configurações do plugin para atualizar.`, Toasts.Type.MESSAGE);
@@ -620,6 +633,10 @@ export default definePlugin({
     },
 
     stop() {
+        if (updateCheckTimer !== null) {
+            clearTimeout(updateCheckTimer);
+            updateCheckTimer = null;
+        }
         stopStreamClaimWatch();
         restoreRegion();
         Native?.shutdown().catch(error => logger.error("Failed to reach the desktop process", error));

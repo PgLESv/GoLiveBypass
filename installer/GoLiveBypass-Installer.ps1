@@ -43,7 +43,7 @@ $ErrorActionPreference = 'Stop'
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }
 
 $RepoRaw = 'https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main'
-$PluginFiles = @('goLiveBypass/index.tsx', 'goLiveBypass/native.ts', 'goLiveBypass/manifest.json')
+$PluginFiles = @('goLiveBypass/index.tsx', 'goLiveBypass/native.ts', 'goLiveBypass/stability.ts', 'goLiveBypass/manifest.json')
 $PluginDirName = 'goLiveBypass'
 $DiscordNames = @('Discord', 'DiscordCanary', 'DiscordPTB')
 
@@ -118,6 +118,30 @@ function Read-Escolha($prompt) {
     } catch {
         throw 'Este console nao aceita entrada de teclado. Feche e rode o instalador de novo com duplo clique no GoLiveBypass-Installer.bat (ou de uma janela normal do PowerShell).'
     }
+}
+
+# Diferente do #146 acima (console SEM teclado): aqui o console TEM teclado, mas a janela
+# some sozinha assim que o script termina — "Executar com o PowerShell" no menu de contexto
+# do Explorer (ou duplo clique num .ps1 associado a isso) spawna powershell.exe -File sem
+# -NoExit, e ela fecha ao sair mesmo com erro. Sem pausa aqui a pessoa nunca le a mensagem
+# (relato: Windows 10 sem winget falha e "fecha sozinho", parecendo silencioso — o .bat ja
+# tem "pause" pra isso, mas quem roda so o .ps1 baixado direto nao passa por ele).
+function Test-JanelaTransitoria {
+    try {
+        $atual = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+        $pai = Get-CimInstance Win32_Process -Filter "ProcessId=$($atual.ParentProcessId)" -ErrorAction Stop
+        return $pai.Name -eq 'explorer.exe'
+    } catch {
+        return $false
+    }
+}
+
+function Wait-AntesDeFechar {
+    if ($Yes) { return } # automacao: nada le a tela, nao ha por que travar aqui
+    if (-not (Test-JanelaTransitoria)) { return } # console normal ou automacao: quem chamou continua vendo a saida
+    Write-Host ''
+    Write-Host '  Pressione Enter para fechar esta janela.' -ForegroundColor DarkGray
+    try { [void][Console]::ReadLine() } catch { }
 }
 
 function Confirm-Action($question) {
@@ -1003,6 +1027,7 @@ function Install-Toolchain($needGit) {
 
         Write-Host ''
         Write-Warn 'Feche este terminal, abra outro e rode o instalador de novo para o PATH atualizar.'
+        Wait-AntesDeFechar
         exit 0
     }
 
@@ -1713,15 +1738,19 @@ function Show-MainMenu {
 
     if (Test-TuiInteractive) {
         $tui = Tui-Menu 'O que voce quer fazer?' @(
-            'Instalar ou atualizar o GoLiveBypass',
+            'Instalar o GoLiveBypass',
+            'Verificar atualizacoes do plugin',
+            'Atualizar o plugin',
             'Remover so o plugin (o mod continua)',
             'Restaurar tudo (remove o plugin e desfaz a injecao)',
             'Sair'
         )
         switch ($tui) {
             1 { Invoke-Install $root }
-            2 { Invoke-Uninstall }
-            3 { Invoke-RestoreEverything }
+            2 { Invoke-CheckUpdate }
+            3 { Invoke-Update }
+            4 { Invoke-Uninstall }
+            5 { Invoke-RestoreEverything }
             default { Write-Host '  Ate mais.' -ForegroundColor DarkGray }
         }
         return
@@ -1729,16 +1758,20 @@ function Show-MainMenu {
 
     Write-Host '  O que voce quer fazer?' -ForegroundColor White
     Write-Host ''
-    Write-Host '    [1] Instalar ou atualizar o GoLiveBypass' -ForegroundColor Green
-    Write-Host '    [2] Remover so o plugin (o mod continua)' -ForegroundColor Yellow
-    Write-Host '    [3] Restaurar tudo (remove o plugin e desfaz a injecao)' -ForegroundColor Red
+    Write-Host '    [1] Instalar o GoLiveBypass' -ForegroundColor Green
+    Write-Host '    [2] Verificar atualizacoes do plugin' -ForegroundColor Cyan
+    Write-Host '    [3] Atualizar o plugin' -ForegroundColor Green
+    Write-Host '    [4] Remover so o plugin (o mod continua)' -ForegroundColor Yellow
+    Write-Host '    [5] Restaurar tudo (remove o plugin e desfaz a injecao)' -ForegroundColor Red
     Write-Host '    [0] Sair' -ForegroundColor Gray
     Write-Host ''
 
     switch (Read-Escolha '  Escolha') {
         '1' { Invoke-Install $root }
-        '2' { Invoke-Uninstall }
-        '3' { Invoke-RestoreEverything }
+        '2' { Invoke-CheckUpdate }
+        '3' { Invoke-Update }
+        '4' { Invoke-Uninstall }
+        '5' { Invoke-RestoreEverything }
         default { Write-Host '  Ate mais.' -ForegroundColor DarkGray }
     }
 }
@@ -1804,10 +1837,25 @@ function Compare-Version($installed, $latest) {
     if (-not $latest) { return 0 }   # sem informacao do GitHub: sem atualizacao
     if (-not $installed) { return -1 }  # sem versao local: vale conferir
 
-    $a = [version]($installed -replace '-.*$', '')
-    $b = [version]($latest    -replace '-.*$', '')
+    $local = [string]$installed -replace '^[vV]', ''
+    $remote = [string]$latest -replace '^[vV]', ''
+    $localDash = $local.IndexOf('-')
+    $remoteDash = $remote.IndexOf('-')
+    $localCore = if ($localDash -ge 0) { $local.Substring(0, $localDash) } else { $local }
+    $localPre = if ($localDash -ge 0) { $local.Substring($localDash + 1) } else { '' }
+    $remoteCore = if ($remoteDash -ge 0) { $remote.Substring(0, $remoteDash) } else { $remote }
+    $remotePre = if ($remoteDash -ge 0) { $remote.Substring($remoteDash + 1) } else { '' }
+
+    $a = [version]$localCore
+    $b = [version]$remoteCore
     if ($b -gt $a) { return -1 }
     if ($b -lt $a) { return  1 }
+
+    # Mesma versao base: um sufixo de pre-release (-beta.N) sempre conta como
+    # mais antigo que a mesma base sem sufixo, nunca como versao igual.
+    if ($localPre -and -not $remotePre) { return -1 }
+    if (-not $localPre -and $remotePre) { return 1 }
+    if ($localPre -and $remotePre) { return [string]::Compare($localPre, $remotePre, [System.StringComparison]::Ordinal) }
     return 0
 }
 
@@ -1942,7 +1990,14 @@ function Invoke-UpdateFromZip($root, $zipUrl, $expectedVersion) {
     $shaUrl = "$zipUrl.sha256"
     $shaExpected = $null
     try {
-        $shaContent = (Invoke-WebRequest -Uri $shaUrl -UseBasicParsing -TimeoutSec 15).Content.Trim()
+        $shaResponse = Invoke-WebRequest -Uri $shaUrl -UseBasicParsing -TimeoutSec 15
+        # Windows PowerShell 5.1 pode expor Content como byte[] para assets
+        # binários/redirects do GitHub; normalize antes de aplicar Trim().
+        $shaContent = if ($shaResponse.Content -is [byte[]]) {
+            [Text.Encoding]::UTF8.GetString($shaResponse.Content).Trim()
+        } else {
+            ([string]$shaResponse.Content).Trim()
+        }
         $shaExpected = ($shaContent -split '\s+')[0].ToLower()
     } catch {
         Remove-CaminhoSilencioso $tempDir
@@ -2011,7 +2066,9 @@ try {
     if (Test-ShouldReport $_.Exception.Message) {
         Invoke-SendAutoReport "Falha no instalador GoLiveBypass: $($_.Exception.Message)" $_.Exception.Message $_
     }
+    Wait-AntesDeFechar
     exit 1
 }
 
 Write-Host ''
+Wait-AntesDeFechar

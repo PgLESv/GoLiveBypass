@@ -250,16 +250,14 @@ export function setupUpdater(
   isAutoUpdateEnabled: () => boolean = () => true,
   canalAtual: () => Canal = () => "stable",
 ) {
-  // Dev (npm run dev): o app roda fora do pacote, sem o app-update.yml embutido.
-  // O electron-updater usa o dev-app-update.yml na raiz do projeto + esta flag.
+  // Em desenvolvimento nao existe um AppImage/portable que possa receber update. Forcar
+  // electron-updater a usar dev-app-update.yml fazia o npm run dev consultar uma release
+  // com a versao local (ex.: v1.1.12-dev.8) e registrar um 404 ruidoso no terminal.
+  // Updates sao comportamento do aplicativo empacotado; o dev so valida a interface.
   const isDev = !app.isPackaged;
   if (isDev) {
-    autoUpdater.forceDevUpdateConfig = true;
-    // Em dev nao existe o runtime AppImage; sem este env o AppImageUpdater aborta
-    // antes de baixar. Aponta para um AppImage buildado (so o caminho importa aqui).
-    if (process.env.APPIMAGE === undefined) {
-      process.env.APPIMAGE = join(app.getAppPath(), "dist-app", `GoLiveBypass-${app.getVersion()}.AppImage`);
-    }
+    console.log("[updater] desenvolvimento: checagem de atualizacoes desativada.");
+    return;
   }
 
   // macOS fica de fora por enquanto. O MacUpdater exige app assinado com Developer ID, e o
@@ -287,12 +285,18 @@ export function setupUpdater(
 
     // O download corre sozinho em background; ao terminar, avisa o usuario e
     // so instala com o OK dele — atualizar sem avisar derruba o app na hora.
-    autoUpdater.on("update-downloaded", (info) => {
+    autoUpdater.on("update-downloaded", async (info) => {
       if (!isAutoUpdateEnabled()) return;
       updateReady = true;
       const win = getMainWindow();
+      // showMessageBox (assincrono), nao showMessageBoxSync: o sincrono bloqueia a
+      // thread JS do processo principal ate a pessoa clicar um botao -- inclusive o
+      // setInterval do watchdog do Tor (ver golive-gui/electron/main.ts), que fica
+      // sem checar o daemon por todo o tempo que o dialogo ficar aberto sem resposta.
+      // O restante do arquivo ja usa a versao async (main.ts:1162); so este trecho
+      // ficara para tras usando a sincrona.
       const choice = win
-        ? dialog.showMessageBoxSync(win, {
+        ? (await dialog.showMessageBox(win, {
             type: "info",
             title: "Atualização disponível",
             message: `GoLiveBypass ${info.version} foi baixada.`,
@@ -300,7 +304,7 @@ export function setupUpdater(
             buttons: ["Reiniciar agora", "Depois"],
             defaultId: 0,
             cancelId: 1,
-          })
+          })).response
         : 0;
 
       // Em dev o quitAndInstall nao funciona: nao ha runtime AppImage montado,
@@ -349,8 +353,10 @@ export async function checkWindowsUpdate(
     const latest = escolhida.tag.replace(/^v/, "");
     const ehBeta = escolhida.prerelease;
     const win = getMainWindow();
+    // showMessageBox (assincrono): ver comentario equivalente no caminho Linux acima --
+    // a versao Sync bloqueia o watchdog do Tor (setInterval) enquanto o dialogo espera.
     const choice = win
-      ? dialog.showMessageBoxSync(win, {
+      ? (await dialog.showMessageBox(win, {
           type: "info",
           title: "Atualização disponível",
           message: `GoLiveBypass ${latest}${ehBeta ? " (beta)" : ""} está disponível.`,
@@ -360,7 +366,7 @@ export async function checkWindowsUpdate(
           buttons: ["Atualizar agora", "Depois"],
           defaultId: 0,
           cancelId: 1,
-        })
+        })).response
       : 0;
 
     if (choice !== 0) return;
@@ -383,8 +389,8 @@ export async function checkWindowsUpdate(
           "A versão atual continua funcionando. Tente de novo mais tarde, ou baixe a versão nova manualmente em github.com/bezumiya/GoLiveBypass/releases.",
         buttons: ["OK"],
       };
-      if (win) dialog.showMessageBoxSync(win, aviso);
-      else dialog.showMessageBoxSync(aviso);
+      if (win) await dialog.showMessageBox(win, aviso);
+      else await dialog.showMessageBox(aviso);
     }
   } finally {
     checking = false;
