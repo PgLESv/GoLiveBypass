@@ -19,6 +19,14 @@
 # Obrigado ao Vithor (https://github.com/Vith0r), que escreveu o primeiro instalador do
 # GoLiveBypass e abriu o caminho para este aqui.
 
+# A instalacao do plugin e do standalone CLI esta temporariamente bloqueada durante a
+# portabilidade do novo sistema WireGuard por aplicativo. Saia antes de baixar ou alterar
+# qualquer cliente: a GUI 2.0.0 de teste e a variante mantida no momento.
+printf '\n[AVISO] Plugin e standalone CLI estao temporariamente fora do ar.\n' >&2
+printf '       O novo sistema WireGuard ainda esta sendo portado para essas variantes.\n' >&2
+printf '       Use a GUI 2.0.0 de teste enquanto isso. Nenhuma instalacao foi realizada.\n\n' >&2
+exit 1
+
 # So construcoes POSIX: roda em dash, bash, zsh, ksh e busybox ash.
 # (sem pipefail de proposito: o status de pipeline e o do ultimo comando, como manda o POSIX)
 set -eu

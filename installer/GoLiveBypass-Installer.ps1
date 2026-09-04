@@ -35,6 +35,13 @@ param(
     [switch] $Yes
 )
 
+Write-Host ''
+Write-Host '  [AVISO] Plugin e standalone CLI estao temporariamente fora do ar.' -ForegroundColor Yellow
+Write-Host '          O novo sistema WireGuard ainda esta sendo portado para essas variantes.' -ForegroundColor DarkGray
+Write-Host '          Use a GUI 2.0.0 de teste enquanto isso. Nenhuma instalacao foi realizada.' -ForegroundColor DarkGray
+Write-Host ''
+exit 1
+
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
