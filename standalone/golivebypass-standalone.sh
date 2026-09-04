@@ -21,6 +21,7 @@
 printf '\n[AVISO] O standalone CLI esta temporariamente indisponivel.\n' >&2
 printf '       Estamos portando o novo sistema WireGuard para esta variante.\n' >&2
 printf '       Use a GUI 2.0.0 de teste enquanto isso; ela e a variante mantida no momento.\n\n' >&2
+exit 1
 
 # So construcoes POSIX: roda em dash, bash, zsh, ksh e busybox ash.
 set -eu

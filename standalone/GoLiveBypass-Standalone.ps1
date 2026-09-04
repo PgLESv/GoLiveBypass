@@ -40,6 +40,7 @@ Write-Host '  [AVISO] O standalone CLI esta temporariamente indisponivel.' -Fore
 Write-Host '          Estamos portando o novo sistema WireGuard para esta variante.' -ForegroundColor DarkGray
 Write-Host '          Use a GUI 2.0.0 de teste enquanto isso; ela e a variante mantida no momento.' -ForegroundColor DarkGray
 Write-Host ''
+exit 1
 
 # "Executar com o PowerShell" no menu de contexto do Explorer (ou duplo clique num .ps1
 # associado a isso) spawna powershell.exe -File sem -NoExit: a janela fecha sozinha ao sair,
