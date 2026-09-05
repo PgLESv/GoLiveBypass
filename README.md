@@ -110,6 +110,20 @@ chmod +x GoLiveBypass-*.AppImage
 
 > **Nota:** se o seu Discord é flatpak do sistema, a primeira ativação pode pedir sua senha (via `pkexec`) para liberar a pasta do bypass para o sandbox.
 
+### Dependências no Arch Linux
+
+Na primeira abertura a GUI executa um preflight somente leitura. Se faltar alguma dependência,
+o botão de ativação fica bloqueado e o próprio aplicativo mostra o comando para corrigir. No
+Arch/derivadas, o comando é:
+
+```sh
+sudo pacman -S --needed wireguard-tools iproute2 curl
+```
+
+Nenhum pacote é instalado automaticamente. A verificação também reconhece o Discord oficial
+(`extra/discord`), `discord_arch_electron`, `discord-electron-openasar`, PTB/Canary, clientes
+paralelos e Flatpak; Equicord/Vencord é preservado e não impede o túnel por namespace.
+
 ---
 
 ---

@@ -23,12 +23,13 @@ import * as discordscan from "./discordscan";
 import * as netevents from "./netevents";
 import * as logsDir from "./logsDir";
 import { submitBugReport } from "./bugreport";
-import { getWireSockConnectionStatus, getWireSockAdapterTraffic, isWireSockActive, startWireSockService, recoverWireSockNetwork, verifyWindowsNetworkStable, type WireSockConnectionStatus } from "./wiresock";
+import { getWireSockConnectionStatus, getWireSockAdapterTraffic, hasWireSockAdapterTrafficIncrease, isWireSockActive, startWireSockService, recoverWireSockNetwork, type WireSockConnectionStatus } from "./wiresock";
 import { classifyWgReadiness, getWgStats, iniciarWgStatsWatchdog, pararWgStatsWatchdog, type WgTunnelStats } from "./wgstats";
 import { validateWgConfContent } from "./wg-validator";
 import * as proton from "./proton";
 import { findWindowsDiscordInstall } from "./windows-discord-install";
 import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } from "./wait-condition";
+import { parseLinuxPreflight, linuxPreflightMessage, type LinuxPreflight } from "./linux-preflight";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -399,6 +400,20 @@ function statusLabel(status: string) {
 // O status no Linux vem do script (async); no Windows e sincrono. Guardamos o ultimo valor
 // para o menu montar sem travar e para o botao Ativar/Desativar ficar sempre clicavel.
 let cachedStatus: string | null = null;
+let linuxPreflightInFlight: Promise<LinuxPreflight> | null = null;
+let linuxPreflightCache: { value: LinuxPreflight; expiresAt: number } | null = null;
+let linuxStatusInFlight: Promise<string> | null = null;
+let linuxStatusCache: { value: string; expiresAt: number } | null = null;
+let linuxStatusGeneration = 0;
+let linuxStatusLastLog = "";
+let linuxStatusLastLogAt = 0;
+function linuxStatusLogAllowed(signature: string): boolean {
+  const now = Date.now();
+  if (signature === linuxStatusLastLog && now - linuxStatusLastLogAt < 30_000) return false;
+  linuxStatusLastLog = signature;
+  linuxStatusLastLogAt = now;
+  return true;
+}
 
 // O menu e remontado a cada mudanca: e o jeito simples de o rotulo de status e o item
 // Ativar/Desativar refletirem o estado atual sem logica de diff.
@@ -461,8 +476,12 @@ async function toggleFromTray() {
 
     if (IS_LINUX) {
       const status = await linuxStatus();
-      if (status === "ACTIVE") await linuxDeactivate(() => {});
-      else await linuxActivate("", () => {});
+      if (status === "ACTIVE") await withWireSockLifecycle("desativar-linux-bandeja", () => linuxDeactivate(() => {}));
+      else await withWireSockLifecycle("ativar-linux-bandeja", async () => {
+        const preflight = await linuxPreflight();
+        if (!preflight.ok) throw new Error(`${linuxPreflightMessage(preflight)}${preflight.installCommand ? ` Execute: ${preflight.installCommand}` : ""}`);
+        return linuxActivate(() => {});
+      });
     } else if (getStatus() === "ACTIVE") {
       await deactivateAll();
     } else {
@@ -662,7 +681,9 @@ app.on("before-quit", (event) => {
   // podia encerrar o Electron no meio do stop/reset/flush do WireSock e deixar WFP ou o
   // processo filho residual bloqueando a rede. A segunda entrada em before-quit passa pela
   // guarda cleaningUp e permite a saída somente depois deste promise concluir.
-  const restore = IS_LINUX ? linuxDeactivate(() => {}) : deactivateAll();
+  const restore = IS_LINUX
+    ? withWireSockLifecycle("encerrar-linux", () => linuxDeactivate(() => {}))
+    : deactivateAll();
   restore
     .catch((error) => {
       logger.error("app", "limpeza no encerramento falhou", {
@@ -1274,6 +1295,7 @@ async function executarAtivacao(event: any) {
 
   await killDiscord();
 
+  let windowsDiscordStarted = false;
   if (IS_WINDOWS) {
     try {
       await withWireSockLifecycle("ativacao", async () => {
@@ -1284,6 +1306,16 @@ async function executarAtivacao(event: any) {
           if (!recovery.ok) throw new Error(`Não consegui limpar a sessão WireSock anterior (${recovery.residual.join(", ") || recovery.error || "rede não validada"}). Use "Restaurar internet".`);
         }
         await startWireSockService(settingsDir());
+        // O WireSock por aplicativo nao tem trafego antes de um executavel
+        // permitido falar com a rede. Em instalacoes sem wg.exe e sem a CLI
+        // opcional, esperar RX/TX aqui criava um ciclo: so abririamos o
+        // Discord depois do trafego que apenas o Discord pode gerar. O WFP ja
+        // esta ativo neste ponto; iniciar o cliente e seguro e permite provar
+        // o handshake com o trafego real dele.
+        if (!(await startDiscordAndConfirm(installs, "ativacao"))) {
+          throw new Error("O Discord não iniciou após preparar o túnel.");
+        }
+        windowsDiscordStarted = true;
         await waitForWindowsWgReady();
       });
     } catch (cause) {
@@ -1293,6 +1325,20 @@ async function executarAtivacao(event: any) {
       // de uma rede normal comprovada.
       pararWgStatsWatchdog();
       clearSessionMarker();
+      let closeError = "";
+      try {
+        // waitForWindowsWgReady agora ocorre depois do spawn para quebrar o
+        // ciclo de observabilidade. Portanto o rollback tambem deve encerrar
+        // esse cliente antes de remover o filtro WFP.
+        await killDiscord();
+      } catch (closeFailure) {
+        closeError = String((closeFailure as Error)?.message ?? closeFailure);
+      }
+      if (closeError) {
+        const detail = String((cause as Error)?.message ?? cause);
+        logger.error("wiresock", "ativacao.falhou_cliente_aberto", { erro: detail, encerramento: closeError });
+        throw new Error(`A ativação falhou (${detail}), mas não foi possível encerrar o Discord com segurança (${closeError}). Feche o Discord e use "Restaurar internet".`);
+      }
       let recoveryError = "";
       try {
         const recovery = await withWireSockLifecycle("ativacao.rollback", () => recoverWireSockNetwork());
@@ -1310,13 +1356,15 @@ async function executarAtivacao(event: any) {
     }
   }
 
-  for (const install of installs) {
-    startDiscord(install);
+  if (!windowsDiscordStarted) {
+    for (const install of installs) {
+      startDiscord(install);
+    }
   }
 
   // O spawn ter sido solicitado nao significa que o Electron do Discord sobreviveu ao
   // updater/antivirus. Sem este ack, a sessao ficava marcada como ativa mesmo sem cliente.
-  if (IS_WINDOWS && !(await waitUntilDiscordRunning())) {
+  if (IS_WINDOWS && !windowsDiscordStarted) {
     logger.error("discord", "inicio.timeout", { timeout_ms: 10_000 });
     await withWireSockLifecycle("ativacao.rollback", async () => {
       await killDiscord();
@@ -1505,8 +1553,6 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
   let cliFlowSamples = 0;
   let adapterFlowSamples = 0;
   let previousAdapterTraffic: ReturnType<typeof getWireSockAdapterTraffic> = null;
-  let lastNetworkCheckAt = 0;
-  let lastNetworkOk = false;
   while (Date.now() < deadline) {
     lastWireSock = getWireSockConnectionStatus();
     if (lastWireSock.source === "cli" && lastWireSock.state === "disconnected") {
@@ -1531,21 +1577,17 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
     // Algumas instalações oficiais expõem apenas wiresock-client.exe + ProTUN.
     // Exigimos tráfego nos dois sentidos e uma sondagem DNS/HTTPS antes do Discord.
     const traffic = getWireSockAdapterTraffic();
-    const adapterTrafficIncreasing = Boolean(
-      traffic && previousAdapterTraffic &&
-      traffic.receivedBytes > previousAdapterTraffic.receivedBytes &&
-      traffic.sentBytes > previousAdapterTraffic.sentBytes,
-    );
+    const adapterTrafficIncreasing = hasWireSockAdapterTrafficIncrease(previousAdapterTraffic, traffic);
     previousAdapterTraffic = traffic;
     if (lastWireSock.source === "service" && lastWireSock.state === "unknown" && traffic && adapterTrafficIncreasing) {
       adapterFlowSamples++;
-      if (Date.now() - lastNetworkCheckAt >= 3000) {
-        const network = await verifyWindowsNetworkStable();
-        lastNetworkCheckAt = Date.now();
-        lastNetworkOk = network.ok;
-      }
-      if (adapterFlowSamples >= 2 && lastNetworkOk) {
-        return { verified: true, state: "connected", source: "service", detail: `ProTUN ativo com tráfego RX/TX (${traffic.receivedBytes}/${traffic.sentBytes}) e DNS/HTTPS funcionais` };
+      if (adapterFlowSamples >= 2) {
+        logger.info("wiresock", "rota.confirmada.protun", {
+          received_bytes: traffic.receivedBytes,
+          sent_bytes: traffic.sentBytes,
+          samples: adapterFlowSamples,
+        });
+        return { verified: true, state: "connected", source: "service", detail: `ProTUN ativo com tráfego RX/TX (${traffic.receivedBytes}/${traffic.sentBytes})` };
       }
     } else {
       adapterFlowSamples = 0;
@@ -1559,12 +1601,17 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
 }
 
 function linuxStatus(): Promise<string> {
-  return runScript(["--status", "--json"])
+  const now = Date.now();
+  if (linuxStatusInFlight) return linuxStatusInFlight;
+  if (linuxStatusCache && linuxStatusCache.expiresAt > now) return Promise.resolve(linuxStatusCache.value);
+  const generation = ++linuxStatusGeneration;
+  const operation = runScript(["--status", "--json"])
     .then(({ code, stdout, stderr }) => {
-      // Loga o resultado do script (code) — o stderr de aviso vira trace legivel.
       if (code !== 0) {
-        discordscan.scriptStatus(code, false);
-        discordscan.scriptTrace(`script falhou com code ${code}`);
+        if (linuxStatusLogAllowed(`exit:${code}`)) {
+          discordscan.scriptStatus(code, false);
+          discordscan.scriptTrace(`script falhou com code ${code}`);
+        }
         return "NOT_FOUND";
       }
       try {
@@ -1573,51 +1620,90 @@ function linuxStatus(): Promise<string> {
           const g = data.graphics as Record<string, unknown>;
           ultimosGraficosLinux = `backend=${String(g.backend ?? "?")} wayland=${String(g.waylandDisplay ?? "")} session=${String(g.sessionType ?? "")} portal=${String(g.portal ?? "?")}`;
         }
-        // O script manda banner + avisos pro stderr; extrai so as linhas de
-        // trace/aviso (as que tem conteudo) e loga cada uma como evento.
-        // O banner (nome do app, subtitulo, distro) e ruido — filtra.
-        const stderrLimpo = (stderr ?? "").replace(/\x1b\[[0-9;]*m/g, "");
-        for (const linha of stderrLimpo.split("\n")) {
-          const t = linha.replace(/^[[:space:]]*\[\!\]\s*/, "").trim();
-          if (!t) continue;
-          if (/^(GoLiveBypass standalone|Go Live e camera de volta|CachyOS|Ubuntu|Arch|Fedora|Debian)/.test(t)) continue;
-          discordscan.scriptTrace(t);
-        }
-        discordscan.scriptStatus(code, true);
-        const discords = data.discords ?? [];
-        const flavours = new Set<string>();
-        for (const d of discords) {
-          if (typeof d?.path === "string") {
+        const discords = Array.isArray(data.discords) ? data.discords : [];
+        const anyRunning = discords.some((d: { running?: string }) => d.running === "sim");
+        const netnsAtivo = data?.netns === true;
+        const status = discords.length === 0 ? "NOT_FOUND" : (netnsAtivo && anyRunning ? "ACTIVE" : "INACTIVE");
+        // O status pode ser consultado por bandeja, janela e watchdog ao mesmo tempo.
+        // Registra detalhes somente quando a assinatura muda ou a cada 30s, evitando
+        // que a varredura do bootstrap volte a formar um loop de logs.
+        const assinatura = JSON.stringify({ status, netns: netnsAtivo, discords: discords.map((d: Record<string, unknown>) => [d.path, d.state, d.running]) });
+        if (linuxStatusLogAllowed(assinatura)) {
+          const stderrLimpo = (stderr ?? "").replace(/\x1b\[[0-9;]*m/g, "");
+          for (const linha of stderrLimpo.split("\n")) {
+            const t = linha.replace(/^[[:space:]]*\[\!\]\s*/, "").trim();
+            if (!t || /^(GoLiveBypass standalone|Go Live e camera de volta|CachyOS|Ubuntu|Arch|Fedora|Debian)/.test(t)) continue;
+            discordscan.scriptTrace(t);
+          }
+          const flavours = new Set<string>();
+          for (const d of discords) {
+            if (typeof d?.path !== "string") continue;
             const extras: { flavour?: string; detected_by?: string; flatpak_id?: string } = {};
-            if (typeof d.flavour === "string") {
-              extras.flavour = d.flavour;
-              flavours.add(d.flavour);
-            }
+            if (typeof d.flavour === "string") { extras.flavour = d.flavour; flavours.add(d.flavour); }
             if (typeof d.detected_by === "string") extras.detected_by = d.detected_by;
             if (typeof d.flatpak_id === "string") extras.flatpak_id = d.flatpak_id;
             discordscan.scriptInstall(d.path, String(d.state ?? "?"), extras);
           }
+          ultimosFlavoursLinux = [...flavours].join(",");
+          discordscan.scriptStatus(code, true);
         }
-        ultimosFlavoursLinux = [...flavours].join(",");
-        if (discords.length === 0) return "NOT_FOUND";
-        const anyRunning = discords.some(
-          (d: { running?: string }) => d.running === "sim",
-        );
-        const netnsAtivo = data?.netns === true;
-        // Fonte de verdade: namespace WireGuard + cliente Discord vivo. O estado do
-        // app.asar/_app.asar é legado e não participa mais do status.
-        if (netnsAtivo && anyRunning) return "ACTIVE";
-        return discords.length > 0 ? "INACTIVE" : "NOT_FOUND";
+        return status;
       } catch {
-        discordscan.scriptJsonInvalido(stdout);
+        if (linuxStatusLogAllowed("json-invalido")) discordscan.scriptJsonInvalido(stdout);
         return "NOT_FOUND";
       }
     })
     .catch((e) => {
-      discordscan.scriptStatus(-1, false);
-      discordscan.scriptTrace(`script nao executou: ${(e as Error)?.message ?? ""}`);
+      if (linuxStatusLogAllowed("exec-falhou")) {
+        discordscan.scriptStatus(-1, false);
+        discordscan.scriptTrace(`script nao executou: ${(e as Error)?.message ?? ""}`);
+      }
       return "NOT_FOUND";
+    })
+    .then((value) => {
+      if (generation === linuxStatusGeneration) linuxStatusCache = { value, expiresAt: Date.now() + 1000 };
+      return value;
+    })
+    .finally(() => {
+      if (linuxStatusInFlight === operation) linuxStatusInFlight = null;
     });
+  linuxStatusInFlight = operation;
+  return operation;
+}
+
+function linuxPreflight(force = false): Promise<LinuxPreflight> {
+  const now = Date.now();
+  if (!force && linuxPreflightInFlight) return linuxPreflightInFlight;
+  if (!force && linuxPreflightCache && linuxPreflightCache.expiresAt > now) return Promise.resolve(linuxPreflightCache.value);
+  const operation = runScript(["--preflight", "--json"])
+    .then(({ code, stdout, stderr }) => {
+      if (code !== 0) throw new Error(tailErroScript(stderr, 4) || "Falha ao verificar as dependências do Linux.");
+      return parseLinuxPreflight(stdout);
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false, platform: "linux", distro: "Linux", archLike: false,
+        dependencies: { missing: [], required: ["wg", "ip", "curl"] },
+        elevation: { available: false, method: "none" }, netns: { available: false },
+        kernel: { wireguard: "unknown" }, discord: { found: false, count: 0, firstPath: "" },
+        errors: [message], installCommand: "",
+      } satisfies LinuxPreflight;
+    })
+    .then((value) => {
+      linuxPreflightCache = { value, expiresAt: Date.now() + 5000 };
+      logger.info("linux", "preflight concluido", {
+        ok: value.ok,
+        missing: value.dependencies.missing.join(","),
+        elevation: value.elevation.method,
+        netns: value.netns.available,
+        discordCount: value.discord.count,
+      });
+      return value;
+    })
+    .finally(() => { if (linuxPreflightInFlight === operation) linuxPreflightInFlight = null; });
+  linuxPreflightInFlight = operation;
+  return operation;
 }
 
 // As ultimas linhas do stderr do script viram a mensagem de erro na UI. O ruido imutavel de
@@ -1634,6 +1720,18 @@ function tailErroScript(stderr: string, linhas: number): string {
 }
 
 async function linuxActivate(onChunk: (c: string) => void) {
+  const preflight = await linuxPreflight();
+  if (!preflight.ok) {
+    const comando = preflight.installCommand ? ` Execute: ${preflight.installCommand}` : "";
+    throw new Error(`${linuxPreflightMessage(preflight)}${comando}`);
+  }
+  // Dois cliques da bandeja podem ter lido INACTIVE antes de entrarem na fila.
+  // Reconfirma dentro da operação para que o segundo nunca suba uma segunda
+  // instância sobre um namespace já ativo.
+  if (await linuxStatus() === "ACTIVE") {
+    logger.info("linux", "ativacao duplicada ignorada; tunel ja ativo");
+    return;
+  }
   updateSharedSettings({ routeMode: "wireguard" });
   const { code, stderr } = await runScript(["--yes", "--cleanup-legacy"], onChunk);
   if (code !== 0) {
@@ -1672,6 +1770,7 @@ async function linuxActivate(onChunk: (c: string) => void) {
   // seguinte re-injeta pela flag). Zerada so no deactivate explicito.
   updateSharedSettings({ autoInject: false });
   iniciarWgStatsWatchdog(linuxWgStats);
+  linuxStatusCache = null;
 }
 
 async function linuxDeactivate(onChunk: (c: string) => void) {
@@ -1687,6 +1786,7 @@ async function linuxDeactivate(onChunk: (c: string) => void) {
   }
   pararWgStatsWatchdog();
   clearSessionMarker();
+  linuxStatusCache = null;
 }
 
 // A bandeja precisa refletir o que os botoes da janela fizeram, entao os handlers de IPC
@@ -1697,9 +1797,9 @@ ipcMain.handle("activate", async (event) => {
     // de deteccao de outromod e pede Confirm-Action quando acha Vencord/Equicord
     // (ver golivebypass-standalone.sh). O confirmOverride so faz sentido no fluxo
     // da GUI no Windows/macOS, onde o dialog.showMessageBox roda aqui.
-    await linuxActivate((c) =>
+    await withWireSockLifecycle("ativar-linux", () => linuxActivate((c) =>
       event.sender.send("bypass-log", c),
-    );
+    ));
   } else {
     await activateBypass(event);
   }
@@ -1711,7 +1811,7 @@ ipcMain.handle("deactivate", async (event) => {
   // usuario so fechou o app; o boot seguinte re-injeta pela flag).
   updateSharedSettings({ autoInject: false });
   if (IS_LINUX) {
-    await linuxDeactivate((c) => event.sender.send("bypass-log", c));
+    await withWireSockLifecycle("desativar-linux", () => linuxDeactivate((c) => event.sender.send("bypass-log", c)));
   } else {
     await deactivateAll();
   }
@@ -1747,6 +1847,10 @@ ipcMain.handle("get-app-version", () => app.getVersion());
 ipcMain.handle("get-status", async () => {
   if (IS_LINUX) return linuxStatus();
   return getStatus();
+});
+ipcMain.handle("get-linux-preflight", async () => {
+  if (!IS_LINUX) return null;
+  return linuxPreflight();
 });
 ipcMain.handle("get-startup", () => getStartup());
 ipcMain.handle("set-startup", (_event, enabled: unknown) => {
@@ -3676,6 +3780,10 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
           readiness = await waitForWindowsWgReady();
           if (readiness.state === "disconnected") throw new Error(readiness.detail || "WireSock desconectado");
         } else if (IS_LINUX) {
+          const preflight = await linuxPreflight();
+          if (!preflight.ok) {
+            throw new Error(`${linuxPreflightMessage(preflight)}${preflight.installCommand ? ` Execute: ${preflight.installCommand}` : ""}`);
+          }
           const refreshed = await runScript(["--refresh-route"]);
           if (refreshed.code !== 0) {
             throw new Error(tailErroScript(refreshed.stderr, 4) || "falha ao atualizar a rota WireGuard");

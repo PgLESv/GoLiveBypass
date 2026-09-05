@@ -11,6 +11,7 @@
 #   ./golivebypass-standalone.sh
 #   ./golivebypass-standalone.sh --uninstall
 #   ./golivebypass-standalone.sh --status
+#   ./golivebypass-standalone.sh --preflight --json
 #   ./golivebypass-standalone.sh --probe
 #   ./golivebypass-standalone.sh --refresh-route
 #   ./golivebypass-standalone.sh --check-update
@@ -659,6 +660,7 @@ while [ $# -gt 0 ]; do
         --uninstall) MODE="uninstall" ;;
         --restore) MODE="restore" ;;
         --status) MODE="status" ;;
+        --preflight) MODE="preflight" ;;
         --probe) MODE="probe" ;;
         --refresh-route) MODE="refresh" ;;
         --check-update) MODE="check-update" ;;
@@ -962,6 +964,69 @@ discord_dirs() {
 
     warn "trace: varridas 5 blocos de raizes, achei $count Discord(s)"
     return 0
+}
+
+# Preflight somente leitura para a GUI. Ele existe para que uma dependencia ausente
+# (em especial wireguard-tools no Arch) vire uma mensagem acionavel, em vez de um
+# loop de tentativas de ativacao. Nao instala pacotes nem pede senha.
+linux_preflight_json() {
+    local distro id_like missing="" errors="" install="" found_count=0 first_path="" netns_ok=false kernel="unknown" elevated=false
+    distro="$(os_field ID)"
+    id_like="$(os_field ID_LIKE)"
+
+    # command -> pacote Arch correspondente. O nome do comando e mantido no diagnostico
+    # porque e o que o usuario ve no erro; o pacote torna o comando de reparo copiavel.
+    if ! have wg; then missing="wireguard-tools"; errors="wg (wireguard-tools)"; fi
+    if ! have ip; then
+        [ -n "$missing" ] && missing="$missing "; missing="${missing}iproute2"
+        [ -n "$errors" ] && errors="$errors,"; errors="${errors}ip (iproute2)"
+    fi
+    if ! have curl; then
+        [ -n "$missing" ] && missing="$missing "; missing="${missing}curl"
+        [ -n "$errors" ] && errors="$errors,"; errors="${errors}curl"
+    fi
+
+    if [ "$(id -u)" -eq 0 ] || have sudo || have pkexec; then elevated=true; else errors="${errors}${errors:+,}elevacao (sudo ou pkexec)"; fi
+    if have ip && ip netns list >/dev/null 2>&1; then netns_ok=true; else errors="${errors}${errors:+,}ip netns"; fi
+    if [ -e /sys/module/wireguard ] || { have modinfo && modinfo wireguard >/dev/null 2>&1; }; then kernel="available"; fi
+
+    if [ -n "$missing" ]; then
+        case "$distro $id_like" in
+            *arch*) install="sudo pacman -S --needed wireguard-tools iproute2 curl" ;;
+            *) install="Instale $missing com o gerenciador de pacotes da sua distribuicao." ;;
+        esac
+    fi
+
+    # discord_dirs ja foi executado pelo chamador e permanece a fonte de verdade para
+    # instalacoes oficiais do Arch, bootstrap, AUR, PTB/Canary e Flatpak.
+    if [ -n "${FOUND:-}" ]; then
+        found_count="$(printf '%s\n' "$FOUND" | grep -c . || true)"
+        first_path="$(printf '%s\n' "$FOUND" | sed -n '1p' | cut -d'|' -f1)"
+    fi
+    if [ "$found_count" -eq 0 ]; then errors="${errors}${errors:+,}Discord nao encontrado"; fi
+
+    local missing_json="" error_json=""
+    if [ -n "$missing" ]; then
+        local item first=1
+        for item in $missing; do
+            [ "$first" -eq 1 ] || missing_json="$missing_json,"
+            missing_json="$missing_json\"$(json_escape "$item")\""
+            first=0
+        done
+    fi
+    if [ -n "$errors" ]; then
+        error_json="\"$(json_escape "$errors")\""
+    fi
+    local ok=true
+    [ -n "$missing" ] && ok=false
+    [ "$elevated" = true ] || ok=false
+    [ "$netns_ok" = true ] || ok=false
+    [ "$found_count" -gt 0 ] || ok=false
+    printf '{"ok":%s,"platform":"linux","distro":"%s","archLike":%s,"dependencies":{"missing":[%s],"required":["wg","ip","curl"]},"elevation":{"available":%s,"method":"%s"},"netns":{"available":%s},"kernel":{"wireguard":"%s"},"discord":{"found":%s,"count":%s,"firstPath":"%s"},"errors":[%s],"installCommand":"%s"}\n' \
+        "$ok" "$(json_escape "${distro:-Linux}")" \
+        "$(case "$distro $id_like" in *arch*) printf true ;; *) printf false ;; esac)" \
+        "$missing_json" "$elevated" "$(if [ "$(id -u)" -eq 0 ]; then printf root; elif have sudo; then printf sudo; elif have pkexec; then printf pkexec; else printf none; fi)" \
+        "$netns_ok" "$kernel" "$( [ "$found_count" -gt 0 ] && printf true || printf false )" "$found_count" "$(json_escape "$first_path")" "$error_json" "$(json_escape "$install")"
 }
 
 # O id do flatpak a que um caminho pertence, ou nada se o caminho nao for de flatpak.
@@ -1834,6 +1899,20 @@ start_discord() {
     printf '  Log do Discord: %s\n' "$discord_log" >&2
 }
 
+# systemd-run confirma apenas que a unidade foi aceita; o processo Electron pode
+# falhar logo depois (DISPLAY/Wayland, atualização em andamento ou Flatpak sem
+# override). Aguarde o processo real antes de declarar a ativação concluída.
+wait_discord_started() {
+    local linha="${1:-}" flav="" tentativas=20
+    flav="$(printf '%s' "$linha" | cut -d'|' -f2)"
+    while [ "$tentativas" -gt 0 ]; do
+        if running_flav "$flav"; then return 0; fi
+        tentativas=$((tentativas - 1))
+        [ "$tentativas" -gt 0 ] && sleep 0.5
+    done
+    return 1
+}
+
 printf '\n  %sGoLiveBypass standalone%s\n' "$C_CYAN" "$C_OFF" >&2
 printf '  %sGo Live e camera de volta, direto no Discord%s\n' "$C_DIM" "$C_OFF" >&2
 
@@ -1977,7 +2056,27 @@ EOF
 }
 
 FOUND="$(discord_dirs)"
+[ "$MODE" = "preflight" ] && {
+    if [ "$JSON" -eq 1 ]; then
+        linux_preflight_json
+    else
+        linux_preflight_json | sed -e 's/^{//' -e 's/}$/\n}/' >&2
+    fi
+    exit 0
+}
 [ -n "$FOUND" ] || fail "Nao achei nenhum Discord instalado."
+
+# Segunda barreira no proprio standalone: a GUI faz o mesmo preflight, mas as
+# dependencias podem mudar entre as duas chamadas. Nunca limpe legado nem feche
+# o Discord se o ambiente ja nao puder criar o namespace WireGuard.
+if [ "$MODE" = "install" ]; then
+    preflight_now="$(linux_preflight_json)"
+    preflight_ok="$(printf '%s' "$preflight_now" | sed -n 's/.*"ok":\(true\|false\).*/\1/p')"
+    if [ "$preflight_ok" != "true" ]; then
+        preflight_hint="$(printf '%s' "$preflight_now" | sed -n 's/.*"installCommand":"\([^"]*\)".*/\1/p')"
+        fail "Preflight Linux reprovado. Instale as dependencias e tente novamente.${preflight_hint:+ Comando: $preflight_hint}"
+    fi
+fi
 
 if [ "$MODE" = "probe" ]; then
     if wireguard_gateway_probe; then
@@ -2103,6 +2202,9 @@ fi
 # recebem o patch (um, varios ou todos).
 FOUND="$(escolher_alvos patchear)"
 printf '%s\n' "$FOUND" > "$lista"
+# O processo antigo precisa sair antes de qualquer alteracao do namespace. Isso
+# tambem impede que uma troca de rota deixe duas instancias compartilhando o host.
+stop_discord
 while IFS='|' read -r resources flav detect id; do
     state="$(injection_state "$resources")"
     printf '  %s (%s): %s\n' "$resources" "$flav" "$state" >&2
@@ -2136,8 +2238,6 @@ while IFS='|' read -r resources flav detect id; do
 
     setup_wireguard_netns
 
-    stop_discord
-
     # So desfazemos _app.asar quando a injecao la dentro e NOSSA (versao antiga, pre-WireGuard,
     # que patcheava o app.asar). Quando e outro mod (Vencord/Equicord), _app.asar e o backup
     # DELES -- restaurar por cima apagava o mod inteiro a toa, ja que o WireGuard nem precisa
@@ -2166,6 +2266,11 @@ wait_wireguard_ready || fail "WireGuard foi criado, mas nao ficou pronto para o 
 # Modo portatil: reabre o Discord ja com o bypass ativo (mesmo comportamento do app do Windows).
 # head -1 em vez de pipe para o while: nohup num subshell morreria junto com ele.
 start_discord "$(printf '%s\n' "$FOUND" | head -1)"
+if ! wait_discord_started "$(printf '%s\n' "$FOUND" | head -1)"; then
+    warn "O WireGuard ficou pronto, mas o processo do Discord nao iniciou."
+    teardown_wireguard_netns
+    fail "Discord nao iniciou dentro do namespace WireGuard. Verifique o log em $INSTALL_DIR/logs."
+fi
 printf '\n  %sDiscord aberto com o GoLiveBypass.%s\n' "$C_GREEN" "$C_OFF" >&2
 
 # O updater do Discord baixa a versao nova numa pasta app-<versao> inteiramente nova, entao a

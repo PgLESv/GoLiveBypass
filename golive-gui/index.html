@@ -110,6 +110,7 @@
               <span class="status-indicator" id="statusIndicator"></span>
               <span id="statusText">Verificando...</span>
               <span class="status-tag" id="statusTag">—</span>
+              <code id="linuxPreflightCommand" class="linux-preflight-command" hidden></code>
             </div>
 
             <button id="toggleBtn" class="toggle-btn" disabled>
@@ -351,7 +352,7 @@
 
         <footer class="footer">
           <p class="disclaimer">
-            O Discord só abre depois que o WireGuard confirma handshake e tráfego. Ao trocar a rota, saia e entre novamente na call.
+            O Discord abre já protegido pelo WireGuard; o túnel é confirmado durante a conexão. Ao trocar a rota, saia e entre novamente na call.
             <span id="closeHint"
               >Fechar a janela esconde o app na bandeja, junto do rel&oacute;gio
               &mdash; para reverter tudo, saia pelo &iacute;cone de

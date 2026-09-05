@@ -8,6 +8,17 @@ declare global {
       deactivate: () => Promise<void>;
       restoreInternet: () => Promise<{ ok: boolean; error?: string; residual?: string[]; dnsOk?: boolean; httpsOk?: boolean }>;
       getStatus: () => Promise<string>;
+      getLinuxPreflight: () => Promise<{
+        ok: boolean;
+        distro: string;
+        archLike: boolean;
+        dependencies: { missing: string[]; required: string[] };
+        elevation: { available: boolean; method: string };
+        netns: { available: boolean };
+        discord: { found: boolean; count: number; firstPath: string };
+        errors: string[];
+        installCommand: string;
+      } | null>;
       getVersion: () => Promise<string>;
       getPlatform: () => Promise<string>;
       getStartup: () => Promise<boolean>;
@@ -153,6 +164,7 @@ const statusIndicator = document.getElementById('statusIndicator')!;
 const statusText = document.getElementById('statusText')!;
 const statusTag = document.getElementById('statusTag')!;
 const statusCard = document.getElementById('statusCard')!;
+const linuxPreflightCommand = document.getElementById('linuxPreflightCommand') as HTMLElement | null;
 const toggleBtn = document.getElementById('toggleBtn') as HTMLButtonElement;
 const btnText = document.getElementById('btnText')!;
 const restoreInternetBtn = document.getElementById('restoreInternetBtn') as HTMLButtonElement | null;
@@ -172,6 +184,7 @@ const vpnDropZone = document.getElementById('vpnDropZone') as HTMLElement | null
 const vpnDropFeedback = document.getElementById('vpnDropFeedback') as HTMLElement | null;
 
 let currentState = 'INACTIVE';
+let linuxPreflight: Awaited<ReturnType<Window['api']['getLinuxPreflight']>> = null;
 
 // ---------------------------------------------------------------------------
 // Configurações: o botão de canto abre o dialog com tema + notificações de
@@ -229,6 +242,7 @@ function fitWindowToContent() {
 
 async function updateStatus() {
   try {
+    if (isLinux) linuxPreflight = await window.api.getLinuxPreflight();
     const status = await window.api.getStatus();
     currentState = status;
     
@@ -244,6 +258,7 @@ async function updateStatus() {
       toggleBtn.classList.add('deactivate');
       toggleBtn.disabled = false;
       statusCard.hidden = true;
+      if (linuxPreflightCommand) linuxPreflightCommand.hidden = true;
     } else if (status === 'NOT_FOUND') {
       statusText.innerText = 'Discord não encontrado';
       statusTag.textContent = 'Ausente';
@@ -251,6 +266,7 @@ async function updateStatus() {
       toggleBtn.disabled = true;
       btnText.innerText = 'Não Disponível';
       statusCard.hidden = false;
+      if (linuxPreflightCommand) linuxPreflightCommand.hidden = true;
     } else if (status === 'UNSUPPORTED') {
       statusText.innerText = isMac ? 'Bypass por WireGuard indisponível no macOS' : 'Plataforma não suportada';
       statusTag.textContent = 'Indisponível';
@@ -258,6 +274,23 @@ async function updateStatus() {
       toggleBtn.disabled = true;
       btnText.innerText = 'Não Disponível';
       statusCard.hidden = false;
+      if (linuxPreflightCommand) linuxPreflightCommand.hidden = true;
+    } else if (isLinux && linuxPreflight && !linuxPreflight.ok) {
+      const missing = linuxPreflight.dependencies.missing;
+      statusText.innerText = missing.length > 0
+        ? `Dependências do Linux ausentes: ${missing.join(', ')}`
+        : (linuxPreflight.errors[0] || 'Ambiente Linux não está pronto');
+      statusTag.textContent = 'Corrija antes de ativar';
+      statusTag.classList.add('tag--danger');
+      toggleBtn.disabled = true;
+      btnText.innerText = 'Não Disponível';
+      statusCard.hidden = false;
+      if (linuxPreflightCommand) {
+        linuxPreflightCommand.textContent = linuxPreflight.installCommand
+          ? `Comando: ${linuxPreflight.installCommand}`
+          : 'Verifique sudo/pkexec, iproute2 e o suporte a namespaces.';
+        linuxPreflightCommand.hidden = false;
+      }
     } else {
       if (!hasSelectedConf) {
         toggleBtn.disabled = true;
@@ -268,6 +301,7 @@ async function updateStatus() {
         statusTag.textContent = 'Configuração necessária';
         statusTag.classList.add('tag--warn');
         statusCard.hidden = false;
+        if (linuxPreflightCommand) linuxPreflightCommand.hidden = true;
       } else {
         toggleBtn.disabled = false;
         btnText.innerText = 'Ativar Bypass';
@@ -275,6 +309,7 @@ async function updateStatus() {
         statusTag.textContent = 'Pronto';
         statusTag.classList.add('tag--ok');
         statusCard.hidden = true;
+        if (linuxPreflightCommand) linuxPreflightCommand.hidden = true;
       }
     }
   } catch (err) {

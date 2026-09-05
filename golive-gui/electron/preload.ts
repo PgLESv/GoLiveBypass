@@ -6,6 +6,7 @@ import { ipcRenderer } from 'electron';
   deactivate: () => ipcRenderer.invoke('deactivate'),
   restoreInternet: () => ipcRenderer.invoke('restore-internet'),
   getStatus: () => ipcRenderer.invoke('get-status'),
+  getLinuxPreflight: () => ipcRenderer.invoke('get-linux-preflight'),
   getVersion: () => ipcRenderer.invoke('get-app-version'),
   getPlatform: () => ipcRenderer.invoke('get-platform'),
   getStartup: () => ipcRenderer.invoke('get-startup'),

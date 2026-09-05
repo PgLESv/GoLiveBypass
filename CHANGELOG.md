@@ -4,6 +4,35 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.2-beta.1] - 2026-09-04
+
+### Correção Windows
+
+- **Prontidão WireSock em duas fases:** instalações sem `wg.exe` nem CLI de status não entram
+  mais no ciclo em que o Discord aguardava tráfego que apenas ele próprio pode gerar. O
+  Discord inicia já protegido pelo filtro WireSock; em seguida o aplicativo confirma o túnel
+  usando o tráfego real. Caso a confirmação falhe, encerra o cliente e restaura a rede.
+
+### Correção Linux/Arch (issue #219)
+
+- **Preflight acionável:** a GUI verifica `wireguard-tools` (`wg`), `iproute2` (`ip`), `curl`,
+  autorização sudo/pkexec, namespaces de rede e a instalação do Discord antes de qualquer
+  limpeza ou encerramento do cliente.
+- **Sem loop de boot:** dependências ausentes agora deixam a ativação desabilitada e exibem o
+  comando `sudo pacman -S --needed ...`; nenhum pacote é instalado automaticamente.
+- **Instalações Arch descobertas:** bootstrap oficial, `discord_arch_electron`,
+  `discord-electron-openasar`, PTB/Canary, clientes paralelos e Flatpak continuam sendo
+  identificados sem tratar Equicord/Vencord como falha.
+- **Operações serializadas:** ativação, desativação, restauração e troca de rota não podem
+  iniciar duas instâncias WireGuard concorrentes; o status Linux usa single-flight, cache curto
+  e limitação de telemetria para não reabrir o loop de varredura.
+
+### Validação Linux
+
+- Preflight verificado em contêiner Arch Linux com bootstrap simulado do Discord, tanto com
+  dependências ausentes (erro acionável) quanto com `wireguard-tools`, `iproute2`, `curl` e
+  autorização disponíveis (ambiente aprovado).
+
 ## [2.0.1] - 2026-09-04
 
 ### Correções de confiabilidade
@@ -12,8 +41,9 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   de rota agora aguardam a operação anterior terminar antes de iniciar outra instância.
 - **Limpeza recuperável:** processos e serviços residuais são encerrados em árvore, o Network
   Lock é resetado e a limpeza elevada pode ser repetida quando o Windows mantém um residual.
-- **Validação antes do Discord:** o aplicativo só libera o Discord depois de confirmar o túnel
-  WireGuard/ProTUN, tráfego bidirecional quando disponível e DNS/HTTPS funcionais no Windows.
+- **Validação WireSock sem ciclo:** após confirmar que o filtro WireSock subiu, o aplicativo abre
+  o Discord já protegido e confirma o túnel pelo handshake/tráfego real do cliente. Isso funciona
+  mesmo sem `wg.exe` ou a CLI opcional; falhas encerram o Discord e restauram a rede.
 - **Restauração segura:** DNS só é limpo nos adaptadores WireSock/ProTUN; o DNS do host não é
   alterado permanentemente. O Discord só volta após limpeza e rede saudáveis.
 - **Telemetria honesta:** ausência de `wg.exe` é reportada como telemetria indisponível quando o

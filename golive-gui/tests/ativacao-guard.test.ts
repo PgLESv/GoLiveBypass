@@ -114,13 +114,28 @@ describe("guarda de ativacao duplicada", () => {
     expect(fnBody).toContain("const hadWireSock = isWireSockActive();");
   });
 
-  it("aplica rota Linux sem desmontar o Discord e aguarda WireSock no Windows", () => {
+  it("aplica rota Linux sem desmontar o Discord e valida o WireSock apos iniciar o cliente permitido", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     expect(src).toContain('runScript(["--refresh-route"])');
-    expect(src).toContain("await waitForWindowsWgReady();");
     expect(src).not.toContain('runScript(["--deactivate"]);\n        await runScript(["--activate"]);');
     expect(src).toContain('withWireSockLifecycle("troca-rota-proton"');
     expect(src).toContain('await killDiscord();');
+
+    const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
+    expect(activation.indexOf('startDiscordAndConfirm(installs, "ativacao")')).toBeLessThan(
+      activation.indexOf("await waitForWindowsWgReady()"),
+    );
+    expect(activation).toContain("let windowsDiscordStarted = false;");
+
+    const readinessStart = src.indexOf("async function waitForWindowsWgReady");
+    const readiness = src.slice(readinessStart, src.indexOf("function linuxStatus", readinessStart));
+    expect(readiness).toContain("hasWireSockAdapterTrafficIncrease");
+    expect(readiness).toContain('"rota.confirmada.protun"');
+    expect(readiness).not.toContain("verifyWindowsNetworkStable");
+
+    const ui = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    expect(ui).toContain("Discord abre já protegido pelo WireGuard");
+    expect(ui).not.toContain("Discord só abre depois que o WireGuard confirma handshake");
   });
 
   it("usa uma fila unica para operacoes concorrentes do WireSock", () => {
@@ -132,7 +147,7 @@ describe("guarda de ativacao duplicada", () => {
   it("aguarda a limpeza WireSock terminar antes de concluir o quit", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const beforeQuit = src.slice(src.indexOf('app.on("before-quit"'), src.indexOf('app.on("window-all-closed"'));
-    expect(beforeQuit).toContain("const restore = IS_LINUX ? linuxDeactivate(() => {}) : deactivateAll();");
+    expect(beforeQuit).toMatch(/const restore = IS_LINUX\s*\?\s*(?:withWireSockLifecycle\("encerrar-linux",\s*\(\) =>\s*)?linuxDeactivate\(\(\) => \{\}\)/);
     expect(beforeQuit).toContain(".finally(() => app.quit());");
     expect(beforeQuit).not.toMatch(/restore\.catch\(\(\) => \{\}\);[\s\S]*app\.quit\(\);/);
   });
@@ -206,10 +221,10 @@ describe("guarda de ativacao duplicada", () => {
     expect(restore).toContain("ok: false");
   });
 
-  it("confirma o Discord iniciado e desfaz WireSock quando o spawn nao produz processo", () => {
+  it("confirma o Discord iniciado antes de validar o tunel e desfaz WireSock quando o spawn nao produz processo", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
-    expect(activation).toContain("waitUntilDiscordRunning()");
+    expect(activation).toContain('startDiscordAndConfirm(installs, "ativacao")');
     expect(activation).toContain('withWireSockLifecycle("ativacao.rollback"');
     expect(activation).toContain("await recoverWireSockNetwork()");
     const start = src.slice(src.indexOf("function startDiscord"), src.indexOf("function isOurInjection"));
@@ -223,5 +238,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(activation).toContain('logger.error("wiresock", "ativacao.falhou_revertida"');
     expect(activation).toContain("clearSessionMarker();");
     expect(activation).toContain("pararWgStatsWatchdog();");
+    const rollback = activation.slice(activation.indexOf("} catch (cause)"), activation.indexOf("if (!windowsDiscordStarted)"));
+    expect(rollback.indexOf("await killDiscord()")).toBeLessThan(rollback.indexOf("recoverWireSockNetwork()"));
   });
 });
