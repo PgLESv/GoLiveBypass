@@ -4,6 +4,14 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.1] - 2026-09-05
+
+### Sincronização Upstream (2.0.1 e 2.0.2 hotfix)
+- **Estabilidade WireSock (Windows):** prontidão não-bloqueante na ativação, confirmação de tráfego pós-inicialização em duas fases e prevenção de corridas via ciclo de vida serializado.
+- **Robustez no Linux:** preflight acionável (verificação antecipada de `wireguard-tools`, `iproute2`, `curl`, `sudo`), suporte amplo a instâncias do Discord (Arch Linux, Flatpak, OpenAsar) e monitoramento com auto-recuperação de túnel degradado.
+- **Proton Sidecar:** suporte a verificação de segurança (CAPTCHA) interativa, gravação atômica da sessão e recuperação segura de identidade do usuário.
+- **Compatibilidade total:** todas as funcionalidades exclusivas da v2.1.0 (suporte a planos pagos da ProtonVPN, seleção de rota por continente/país e menor latência na América do Sul) mantidas intactas.
+
 ## [2.1.0] - 2026-09-04
 
 ### Adicionado
