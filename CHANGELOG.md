@@ -4,6 +4,16 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.2] - 2026-09-05
+
+### Hotfix WireGuard Windows/Linux
+
+- Consolidação das correções de estabilidade, ciclo de vida e recuperação do WireGuard.
+- WireSock não bloqueia a ativação quando a telemetria opcional não está disponível.
+- Falhas reais continuam acionando rollback e limpeza serializada.
+- Linux confirma namespace, processo do Discord, handshake, tráfego e gateway antes de considerar o túnel saudável.
+- Incluídas validações E2E e instaláveis oficiais para Windows e Linux.
+
 ## [2.0.2-beta.3] - 2026-09-04
 
 ### Teste E2E Linux e estabilidade
