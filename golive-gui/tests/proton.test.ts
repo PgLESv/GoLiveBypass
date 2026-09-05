@@ -11,12 +11,20 @@ import {
   loginProton,
   generateOptimalProtonConfig,
   getSavedSessionUsername,
+  confirmSavedSessionIdentity,
+  protonIdentityMatches,
   classifyProtonError,
   cleanProtonUsername,
   isSameProtonUsername,
 } from "../electron/proton";
 
 describe("ProtonVPN Integration & Sidecar", () => {
+  it("gera perfis Proton com IPv6 para impedir saida direta fora do AllowedIPs", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "electron/proton.ts"), "utf8");
+    const generation = source.slice(source.indexOf("export async function generateOptimalProtonConfig"));
+    expect(generation).toContain("'-ipv6'");
+  });
+
   it("processa o JSON final depois de uma mensagem de sessao salva", () => {
     const result = parseConfgenJson(
       'Using saved session (expires in 4 weeks)\n{"success":true,"server":"US-FREE#137","pingMs":34}\n',
@@ -48,6 +56,41 @@ describe("ProtonVPN Integration & Sidecar", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it("compara a identidade Proton sem falso negativo de caixa ou espacos", () => {
+    expect(protonIdentityMatches(" Conta@Proton.Me ", "conta@proton.me")).toBe(true);
+    expect(protonIdentityMatches("conta-a", "conta-b")).toBe(false);
+  });
+
+  it("confirma a sessao quando o arquivo fica visivel numa tentativa posterior", async () => {
+    const leituras = ["", "", "conta@proton.me"];
+    const confirmation = await confirmSavedSessionIdentity("/nao-usado", "Conta@Proton.Me", {
+      attempts: 4,
+      delayMs: 0,
+      readUsername: () => leituras.shift() ?? "",
+      wait: async () => {},
+    });
+    expect(confirmation).toEqual({ confirmed: true, savedUsername: "conta@proton.me", attempts: 3 });
+  });
+
+  it("mantem a ausencia como diagnostico depois das tentativas", async () => {
+    const confirmation = await confirmSavedSessionIdentity("/nao-usado", "conta@proton.me", {
+      attempts: 3,
+      delayMs: 0,
+      readUsername: () => "",
+      wait: async () => {},
+    });
+    expect(confirmation).toEqual({ confirmed: false, savedUsername: "", attempts: 3 });
+  });
+
+  it("nao converte sucesso do sidecar em falso erro por releitura imediata", () => {
+    const main = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const handler = main.slice(main.indexOf('ipcMain.handle("login-proton"'), main.indexOf('ipcMain.handle("logout-proton"'));
+    expect(handler).toContain("confirmSavedSessionIdentity");
+    expect(handler).toContain("void proton.confirmSavedSessionIdentity");
+    expect(handler).not.toContain("savedUsername !== payload.username");
+    expect(handler).not.toContain("a sessão não foi persistida");
   });
 
   it("classifica falhas de login em mensagens acionaveis", () => {

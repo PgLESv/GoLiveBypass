@@ -456,23 +456,24 @@ func (c *Client) sendAuthRequest(authReq map[string]any) (*api.Session, error) {
 // it serves), and that combined string is what the API accepts back. Replaying
 // the bare challenge token just earns a fresh challenge.
 func captchaError(session *api.Session, apiURL string, replayed bool) error {
-	if replayed {
-		return HumanVerificationError{Code: "CAPTCHA_INVALID", Retryable: true,
-			Message: "A verificação de segurança expirou ou foi recusada. Abra um novo CAPTCHA e tente novamente."}
-	}
+	code := "CAPTCHA_REQUIRED"
 	msg := "O Proton solicitou uma verificação de segurança."
+	if replayed {
+		code = "CAPTCHA_INVALID"
+		msg = "A verificação de segurança expirou ou foi recusada. Resolva o novo CAPTCHA para tentar novamente."
+	}
 	challenge := session.Details.HumanVerificationToken
 	if challenge == "" {
-		return HumanVerificationError{Code: "CAPTCHA_REQUIRED", Retryable: true, Message: msg}
+		return HumanVerificationError{Code: code, Retryable: true, Message: msg}
 	}
 	base, err := url.Parse(apiURL + constants.CaptchaPath)
 	if err != nil {
-		return HumanVerificationError{Code: "CAPTCHA_REQUIRED", Retryable: true, Message: msg}
+		return HumanVerificationError{Code: code, Retryable: true, Message: msg}
 	}
 	q := base.Query()
 	q.Set("Token", challenge)
 	base.RawQuery = q.Encode()
-	return HumanVerificationError{Code: "CAPTCHA_REQUIRED", CaptchaURL: base.String(), Retryable: true, Message: msg}
+	return HumanVerificationError{Code: code, CaptchaURL: base.String(), Retryable: true, Message: msg}
 }
 
 // submit2FA submits a 2FA code to upgrade the session with additional scopes (like VPN)

@@ -31,4 +31,14 @@ describe("elevacao sudo no Linux", () => {
     expect(systemdBlock).toContain('sh -c \'exec "$@"\' sh $target_cmd >>"$discord_log" 2>&1');
     expect(systemdBlock).not.toContain('>>"$discord_log" 2>&1 &');
   });
+
+  it("nunca pede senha nos probes automaticos do watchdog", () => {
+    expect(source).toContain('--non-interactive) NONINTERACTIVE=1');
+    expect(source).toContain('sudo -n "$@"');
+    expect(source).toContain('elevate_readonly ip netns exec "$NETNS_NAME" curl');
+
+    const main = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const health = main.slice(main.indexOf("async function checkLinuxTunnelHealth"), main.indexOf("function stopLinuxHealthWatchdog"));
+    expect(health).toContain('runScript(["--probe", "--json", "--non-interactive"])');
+  });
 });

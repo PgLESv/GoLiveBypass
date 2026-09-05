@@ -42,9 +42,10 @@ import { ipcRenderer } from 'electron';
   getVpnMode: () => ipcRenderer.invoke('get-vpn-mode'),
   setVpnMode: (mode: 'proton' | 'custom') => ipcRenderer.invoke('set-vpn-mode', mode),
   checkProtonSession: (username: string) => ipcRenderer.invoke('check-proton-session', username),
-  loginProton: (payload: { username: string; password?: string; twoFactorCode?: string; humanVerificationToken?: string }) =>
+  loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) =>
     ipcRenderer.invoke('login-proton', payload),
-  openProtonCaptcha: (url: string) => ipcRenderer.invoke('open-proton-captcha', url),
+  onProtonCaptchaStatus: (callback: (status: string) => void) =>
+    ipcRenderer.on('proton-captcha-status', (_event, status: string) => callback(status)),
   logoutProton: () => ipcRenderer.invoke('logout-proton'),
   optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) =>
     ipcRenderer.invoke('optimize-proton-route', options),

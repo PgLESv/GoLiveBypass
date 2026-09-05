@@ -4,6 +4,16 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.2] - 2026-09-05
+
+### Sincronização Upstream (GoLiveBypass 2.0.3)
+- **Automação Integrada do Proton CAPTCHA:** Quando a Proton exige verificação humana, a janela oficial do desafio abre de forma integrada no Electron, capturando e validando o token emitido automaticamente sem exigir que o usuário copie e cole strings na interface.
+- **Persistência Não-Bloqueante de Sessão (Windows):** O sucesso do `proton-confgen` passa a ser a fonte de verdade; a confirmação diagnóstica pelo Electron roda de forma assíncrona em segundo plano, evitando que latência de disco ou antivírus gerem falsos erros de login.
+- **Comprovação de Escopo WireSock (#@ws:AllowedApps):** Cada diretório `app-*` de instâncias do Discord é testado com helper co-localizado temporário para garantir que a regra de roteamento se aplica com o mesmo escopo antes de liberar o cliente, prevenindo falsos positivos de rota.
+- **Detecção Confiável de Drivers de Filtro de Rede:** Suporte aos drivers `ndiswg` (SDK 3.4+) e `NDISRD` legado, com prova de rota funcional como autoridade final.
+- **Health Probes Silenciosos no Linux:** Chamadas de verificação de integridade não disparam janelas de sudo/pkexec interativas em segundo plano.
+- **Compatibilidade Total do Fork PgLESv:** Mantido 100% o suporte a planos pagos ProtonVPN (Plus, Unlimited, Family), seleção mundial de rotas por país e continente com otimização regional para a América do Sul e pipelines de build/release do fork.
+
 ## [2.1.1] - 2026-09-05
 
 ### Sincronização Upstream (2.0.1 e 2.0.2 hotfix)
@@ -32,6 +42,99 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   falha imediata com código 2028 ao tentar autenticar a conta Proton na GUI.
 - **Reutilização de sessão salva sem prompt no terminal:**
   - O backend do `proton-confgen` agora recupera o usuário e valida o token persistente salvo sem solicitar entrada interativa no terminal stdin.
+
+## [2.0.3] - 2026-09-05
+
+### Hotfix de autenticação e rota segura
+
+- CAPTCHA oficial da Proton integrado ao aplicativo, sem cópia manual de token.
+- Login continua automaticamente após a verificação, com erros separados para
+  cancelamento, expiração, CAPTCHA inválido e credenciais incorretas.
+- Sessão Proton salva deixa de produzir falso erro de persistência no Windows.
+- O WireSock comprova a mesma regra de diretório usada pelo Discord antes de
+  liberar o cliente, evitando falso positivo de rota.
+- Probes automáticos do Linux não abrem prompts de sudo/pkexec em segundo plano.
+
+## [2.0.3-beta.3] - 2026-09-05
+
+### Login Proton no Windows
+
+- **CAPTCHA integrado:** quando o Proton exige verificação, o desafio oficial
+  abre em uma janela isolada do GoLiveBypass. A resposta é capturada e validada
+  automaticamente e o login continua sem pedir que o usuário copie token da
+  URL ou use o console do navegador.
+- **Erros corretos:** cancelamento, expiração e resposta rejeitada permanecem
+  erros de CAPTCHA; não são mais apresentados como usuário ou senha incorretos.
+- **Sem falso erro de persistência:** o sucesso do `proton-confgen`, que já só
+  ocorre depois de salvar a sessão, passa a ser a fonte de verdade. A releitura
+  do arquivo pelo Electron agora é uma confirmação diagnóstica assíncrona com
+  tentativas limitadas, evitando o caso em que reiniciar o GoLive revelava que
+  o login marcado como falho estava válido desde o início.
+- **Troca de conta protegida:** confirmações atrasadas de um login anterior não
+  sobrescrevem nem publicam estado para a conta autenticada depois.
+
+### Correção Windows — issue #232
+
+- **Prova do mesmo escopo do Discord:** a beta 1 comprovava somente que o
+  `proton-confgen.exe` central entrava no túnel. Agora cada diretório `app-*`
+  encontrado é incluído no `AllowedApps` e recebe um probe temporário. Esse
+  probe só pode usar o WireSock pela mesma regra de diretório que cobrirá o
+  `Discord.exe`, eliminando o falso positivo em que o helper aparecia no Canadá
+  enquanto o Discord continuava com IP brasileiro.
+- **Todas as instalações precisam passar:** Discord Stable, PTB, Canary e
+  clientes paralelos detectados são comprovados individualmente antes de serem
+  abertos. Um único diretório brasileiro, direto ou inconclusivo faz a ativação
+  falhar fechada e restaurar a rede.
+- **Sem arquivo residual:** os probes co-localizados são removidos antes de o
+  Discord abrir, tanto em sucesso quanto em erro. Falha de limpeza também impede
+  a abertura para não deixar um executável temporário abandonado na instalação.
+- **Handshake continua auxiliar:** a decisão permanece baseada em HTTPS real,
+  consenso entre fontes, comparação com o IP direto e acesso ao Discord, com
+  tentativas tolerantes a inicialização lenta do túnel. Handshake recente por si
+  só nunca aprova a rota.
+
+### Fora do escopo
+
+- A mudança continua específica da GUI Windows/WireSock. Linux já executa o
+  próprio Discord dentro do namespace de rede, e o plugin não controla o filtro
+  WFP. O standalone PowerShell ainda não distribui o sidecar necessário para a
+  mesma prova co-localizada.
+
+## [2.0.3-beta.1] - 2026-09-05
+
+### Correção Windows — issue #226
+
+- **Prova funcional antes do Discord:** a GUI mede a saída direta, inicia o
+  WireSock e usa o `proton-confgen.exe` no mesmo `AllowedApps` para comprovar um
+  IP público diferente, fora do Brasil, além de HTTPS até o Discord. O cliente
+  só é aberto depois dessa prova; `wg.exe`, CLI e ProTUN ficam como telemetria
+  auxiliar e sua ausência não causa falso negativo. Caminho absoluto e nome do
+  executável são gravados juntos, usando a extensão `#@ws:AllowedApps` esperada
+  pelo SDK 3.x, para compatibilidade entre versões do driver.
+- **Falha fechada e status honesto:** serviço WireSock em execução sem prova de
+  rota não é mais `ACTIVE`. IP direto/brasileiro ou resultado inconclusivo
+  encerra a tentativa e restaura a rede antes de devolver controle.
+- **Driver sem falso negativo:** a GUI reconhece tanto o filtro atual `ndiswg`
+  quanto o legado `NDISRD`, mas a consulta ao SCM é apenas diagnóstico (ela pode
+  ser ocultada a processos não elevados). Encontrar executável, driver ou serviço
+  isoladamente nunca libera o Discord; só a prova funcional de rota o faz.
+- **Troca sem janela direta:** trocar o servidor fecha Discord e updater, valida
+  a nova saída e só então reabre o cliente.
+- **IPv4 e IPv6 sem rota dividida:** o helper força as duas famílias de rede e
+  recusa a ativação se qualquer fonte continuar vendo a saída direta. Perfis
+  Proton novos passam a incluir `::/0` para não deixar o IPv6 fora do túnel.
+- **Vigia e reinício seguros:** falhas repetidas do probe funcional retiram o
+  estado `ACTIVE`, fecham o Discord e restauram a rede. Uma sessão WireSock que
+  sobreviva a crash da GUI é revalidada do zero no próximo boot.
+
+### Fora do escopo
+
+- O probe funcional desta correção é específico da GUI Windows, pois reutiliza
+  o sidecar `proton-confgen.exe` empacotado e o inclui no mesmo filtro WFP. O
+  standalone PowerShell não distribui esse sidecar e o plugin Vencord/Equicord
+  não controla WireSock; portar o comportamento exigirá um helper autenticado
+  próprio em cada pacote, sem ampliar `AllowedApps` para todo `powershell.exe`.
+>>>>>>> upstream/main
 
 ## [2.0.2] - 2026-09-05
 

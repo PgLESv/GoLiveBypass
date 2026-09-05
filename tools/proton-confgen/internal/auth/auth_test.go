@@ -71,6 +71,13 @@ func TestCaptchaError(t *testing.T) {
 		t.Fatal("challenge leaked into message")
 	}
 
+	// A resposta rejeitada traz um desafio novo; a GUI precisa dessa URL para
+	// reabrir o CAPTCHA sem pedir que o usuário copie tokens manualmente.
+	invalid := captchaError(session, "https://vpn-api.proton.me", true).(HumanVerificationError)
+	if invalid.Code != "CAPTCHA_INVALID" || invalid.CaptchaURL == "" {
+		t.Fatalf("invalid replay should offer a fresh challenge: %+v", invalid)
+	}
+
 	// With no token there is nothing to replay, so do not advertise the flag.
 	bare := &api.Session{Code: 9001}
 	if err := captchaError(bare, "https://vpn-api.proton.me", true); err.(HumanVerificationError).Code != "CAPTCHA_INVALID" {

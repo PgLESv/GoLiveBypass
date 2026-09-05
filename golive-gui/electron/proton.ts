@@ -5,6 +5,7 @@ import fs from 'fs';
 import { app } from 'electron';
 import { spawn } from 'child_process';
 import * as logger from './logger';
+import type { RouteProbeResult } from './route-proof';
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 
@@ -14,6 +15,7 @@ export type ProtonLoginErrorCode =
   | 'TWO_FACTOR_INVALID'
   | 'CAPTCHA_REQUIRED'
   | 'CAPTCHA_INVALID'
+  | 'CAPTCHA_CANCELLED'
   | 'NETWORK_ERROR'
   | 'TIMEOUT'
   | 'MISSING_EXECUTABLE'
@@ -23,6 +25,7 @@ export type ProtonLoginErrorCode =
 
 export interface ProtonLoginResult {
   success: boolean;
+  username?: string;
   code?: ProtonLoginErrorCode;
   message?: string;
   error?: string;
@@ -95,6 +98,7 @@ export function findProtonConfgenExe(): string {
 export interface RunConfgenOptions {
   args: string[];
   timeoutMs?: number;
+  exePath?: string;
 }
 
 export function parseConfgenJson(stdout: string): any | undefined {
@@ -114,7 +118,7 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
   return new Promise((resolve, reject) => {
     let exe: string;
     try {
-      exe = findProtonConfgenExe();
+      exe = options.exePath ? path.resolve(options.exePath) : findProtonConfgenExe();
     } catch (err) {
       reject(err);
       return;
@@ -155,6 +159,30 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
       resolve({ code, stdout, stderr, json: parsedJson });
     });
   });
+}
+
+export async function runRouteProbeFrom(exePath: string | undefined, timeoutMs = 10_000): Promise<RouteProbeResult> {
+  const res = await runConfgen({ args: ['--route-probe', '--json'], timeoutMs, exePath });
+  const value = res.json as Partial<RouteProbeResult> | undefined;
+  if (!value || typeof value.success !== 'boolean' || (value.observations !== undefined && !Array.isArray(value.observations))) {
+    return {
+      success: false,
+      observations: [],
+      discordOk: false,
+      error: (res.stderr || res.stdout || 'resposta inválida do probe de rota').trim().slice(0, 300),
+    };
+  }
+  return {
+    success: value.success,
+    observations: value.observations ?? [],
+    discordOk: value.discordOk === true,
+    discordMs: typeof value.discordMs === 'number' ? value.discordMs : undefined,
+    error: typeof value.error === 'string' ? value.error.slice(0, 300) : undefined,
+  };
+}
+
+export async function runRouteProbe(timeoutMs = 10_000): Promise<RouteProbeResult> {
+  return runRouteProbeFrom(undefined, timeoutMs);
 }
 
 export function classifyProtonError(error: unknown, stderr = '', stdout = ''): { code: ProtonLoginErrorCode; message: string; retryable: boolean } {
@@ -200,13 +228,53 @@ export function getSavedSessionUsername(installDir: string): string {
   }
 }
 
+export type ProtonSessionConfirmation = {
+  confirmed: boolean;
+  savedUsername: string;
+  attempts: number;
+};
+
+export function protonIdentityMatches(left: string, right: string): boolean {
+  return left.trim().toLocaleLowerCase('en-US') === right.trim().toLocaleLowerCase('en-US') || isSameProtonUsername(left, right);
+}
+
+/**
+ * Releitura diagnóstica da sessão. O sidecar só retorna sucesso depois de
+ * SessionStore.Save concluir; portanto, uma falha aqui não invalida o login.
+ * As tentativas cobrem atraso de visibilidade/antivírus no Windows.
+ */
+export async function confirmSavedSessionIdentity(
+  installDir: string,
+  expectedUsername: string,
+  options: {
+    attempts?: number;
+    delayMs?: number;
+    readUsername?: () => string;
+    wait?: (delayMs: number) => Promise<void>;
+  } = {},
+): Promise<ProtonSessionConfirmation> {
+  const attempts = Math.max(1, options.attempts ?? 4);
+  const delayMs = Math.max(0, options.delayMs ?? 100);
+  const readUsername = options.readUsername ?? (() => getSavedSessionUsername(installDir));
+  const wait = options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let savedUsername = '';
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    savedUsername = readUsername();
+    if (savedUsername && protonIdentityMatches(savedUsername, expectedUsername)) {
+      return { confirmed: true, savedUsername, attempts: attempt };
+    }
+    if (attempt < attempts) await wait(delayMs);
+  }
+  return { confirmed: false, savedUsername, attempts };
+}
+
 function ensureInstallDir(installDir: string) {
   fs.mkdirSync(installDir, { recursive: true });
 }
 
 export async function checkProtonSession(
   installDir: string,
-  username: string
+  username?: string
 ): Promise<{
   valid: boolean;
   username?: string;
@@ -216,39 +284,35 @@ export async function checkProtonSession(
   isPaid?: boolean;
   error?: string;
 }> {
-  if (!username) {
+  if (username !== undefined && !username.trim()) {
     return { valid: false, error: 'Usuário não especificado.' };
   }
-
-  const sessionFile = getProtonSessionFile(installDir);
   ensureInstallDir(installDir);
-  const res = await runConfgen({
-    args: [
-      '-username',
-      username,
-      '-session-file',
-      sessionFile,
-      '-check-session',
-      '-json',
-    ],
-    timeoutMs: 10000,
-  });
+  const args = ['-session-check', '-install-dir', installDir, '-json'];
+  if (username && username.trim()) args.push('-user', username.trim());
 
-  if (res.json && res.json.valid) {
+  try {
+    const res = await runConfgen({ args, timeoutMs: 15000 });
+    if (res.json && res.json.valid) {
+      return {
+        valid: true,
+        username: res.json.username,
+        expiresIn: res.json.expiresIn,
+        tier: res.json.tier,
+        planTitle: res.json.planTitle,
+        isPaid: res.json.isPaid,
+      };
+    }
     return {
-      valid: true,
-      username: res.json.username || username,
-      expiresIn: res.json.expiresIn,
-      tier: res.json.tier,
-      planTitle: res.json.planTitle,
-      isPaid: res.json.isPaid,
+      valid: false,
+      error: res.json?.error || 'Sessão inválida ou expirada.',
+    };
+  } catch (error) {
+    return {
+      valid: false,
+      error: error instanceof Error ? error.message : String(error),
     };
   }
-
-  return {
-    valid: false,
-    error: res.json?.error || res.stderr || 'Sessão inválida ou não encontrada.',
-  };
 }
 
 export async function loginProton(
@@ -258,32 +322,14 @@ export async function loginProton(
   twoFactorCode?: string,
   humanVerificationToken?: string
 ): Promise<ProtonLoginResult> {
-  try {
-    ensureInstallDir(installDir);
-  } catch (error) {
-    const classified = classifyProtonError(error);
-    return { success: false, ...classified, code: 'SESSION_PERSISTENCE', message: 'Não foi possível preparar a pasta de dados para salvar a sessão ProtonVPN.', retryable: false, error: error instanceof Error ? error.message : String(error) };
-  }
-  const sessionFile = getProtonSessionFile(installDir);
-  const args = [
-    '-username',
-    username,
-    '-session-file',
-    sessionFile,
-    '-login-only',
-    '-json',
-  ];
-
-  if (password) {
-    args.push('-password', password);
-  }
-  if (twoFactorCode) {
-    args.push('-2fa', twoFactorCode);
-  }
+  ensureInstallDir(installDir);
+  const args = ['-login', '-user', username, '-install-dir', installDir, '-json'];
+  if (password) args.push('-pass', password);
+  if (twoFactorCode) args.push('-2fa', twoFactorCode);
   if (humanVerificationToken) args.push('-hv-token', humanVerificationToken);
 
-  logger.info('proton', 'iniciando autenticação ProtonVPN');
-  let res;
+  logger.info('proton', 'iniciando login via proton-confgen', { usuario: username });
+  let res: { code: number | null; stdout: string; stderr: string; json?: any };
   try {
     res = await runConfgen({ args, timeoutMs: 25000 });
   } catch (error) {
@@ -294,11 +340,13 @@ export async function loginProton(
 
   if (res.json && res.json.success) {
     logger.info('proton', 'autenticação bem-sucedida', { planTitle: res.json.planTitle, tier: res.json.tier });
-    const saved = getSavedSessionUsername(installDir);
+    const resolvedUsername = typeof res.json.username === 'string' && res.json.username.trim()
+      ? res.json.username.trim()
+      : (getSavedSessionUsername(installDir) || username.trim());
     return {
       success: true,
+      username: resolvedUsername,
       message: 'Autenticação concluída.',
-      username: res.json.username || saved || username,
       tier: res.json.tier,
       planTitle: res.json.planTitle,
       isPaid: res.json.isPaid,
@@ -359,6 +407,7 @@ export async function generateOptimalProtonConfig(
     '-output',
     outputFile,
     '-json',
+    '-ipv6',
   ];
 
   if (options.autoPing !== false) {
