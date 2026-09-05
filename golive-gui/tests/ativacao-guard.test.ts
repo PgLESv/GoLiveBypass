@@ -123,7 +123,7 @@ describe("guarda de ativacao duplicada", () => {
 
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
     expect(activation.indexOf('startDiscordAndConfirm(installs, "ativacao")')).toBeLessThan(
-      activation.indexOf("await waitForWindowsWgReady()"),
+      activation.indexOf("void waitForWindowsWgReady()"),
     );
     expect(activation).toContain("let windowsDiscordStarted = false;");
 
@@ -132,6 +132,8 @@ describe("guarda de ativacao duplicada", () => {
     expect(readiness).toContain("hasWireSockAdapterTrafficIncrease");
     expect(readiness).toContain('"rota.confirmada.protun"');
     expect(readiness).not.toContain("verifyWindowsNetworkStable");
+    expect(readiness).not.toContain("throw new Error(`WireGuard iniciou");
+    expect(readiness).toContain('"disconnected" : "unverified"');
 
     const ui = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
     expect(ui).toContain("Discord abre já protegido pelo WireGuard");

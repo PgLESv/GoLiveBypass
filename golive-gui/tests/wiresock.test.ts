@@ -117,6 +117,15 @@ describe("WireSock no Windows", () => {
     expect(hasWireSockAdapterTrafficIncrease(before, { ...before, sentBytes: 201 })).toBe(false);
   });
 
+  it("mantem a prontidao WireSock como diagnostico, sem reprovar a ativacao", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const readinessStart = src.indexOf("async function waitForWindowsWgReady");
+    const readiness = src.slice(readinessStart, src.indexOf("function linuxStatus", readinessStart));
+    expect(readiness).toContain('"disconnected" : "unverified"');
+    expect(readiness).not.toContain("throw new Error(`WireGuard iniciou");
+    expect(src).toContain("void waitForWindowsWgReady()");
+  });
+
   it("procura o executavel no layout do WinGet e na variante sem sdk", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiresock-winget-"));
     try {

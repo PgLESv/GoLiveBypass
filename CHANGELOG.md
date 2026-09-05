@@ -8,6 +8,12 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ### Correção Windows
 
+- **Prontidão WireSock não bloqueante:** a ativação e a troca de rota não falham
+  mais apenas porque `wg.exe`, a CLI opcional, o handshake ou os contadores ProTUN
+  não ficaram disponíveis a tempo. O WireSock ativo e o Discord iniciado concluem
+  a operação; a confirmação de tráfego continua sendo registrada nos logs para
+  diagnóstico. Falhas reais de inicialização e limpeza continuam acionando rollback.
+
 - **Prontidão WireSock em duas fases:** instalações sem `wg.exe` nem CLI de status não entram
   mais no ciclo em que o Discord aguardava tráfego que apenas ele próprio pode gerar. O
   Discord inicia já protegido pelo filtro WireSock; em seguida o aplicativo confirma o túnel

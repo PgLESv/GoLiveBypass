@@ -1325,7 +1325,14 @@ async function executarAtivacao(event: any) {
           throw new Error("O Discord não iniciou após preparar o túnel.");
         }
         windowsDiscordStarted = true;
-        await waitForWindowsWgReady();
+        // A confirmação de handshake/tráfego é apenas telemetria. Ela pode ser
+        // atrasada ou indisponível em instalações sem wg.exe/CLI, e não deve
+        // segurar a ativação de um WireSock que já foi iniciado.
+        void waitForWindowsWgReady().then((readiness) => {
+          logger.info("wiresock", "prontidao.diagnostica", readiness);
+        }).catch((error) => {
+          logger.warn("wiresock", "prontidao.diagnostica.erro", { erro: String((error as Error)?.message ?? error) });
+        });
       });
     } catch (cause) {
       // startWireSockService pode parar o servico anterior antes de descobrir
@@ -1615,8 +1622,8 @@ export interface WindowsRouteReadiness {
 }
 
 // A CLI do WireSock confirma o estado administrativo, mas nao prova que pacotes
-// chegaram ao peer. Abrir o Discord somente depois de wg.exe confirmar handshake
-// recente e bytes RX/TX evita que o cliente nasca numa rota que entra em loop de update.
+// chegaram ao peer. Esta rotina observa as fontes disponiveis para diagnostico;
+// ela nunca bloqueia nem reprova uma ativacao que ja iniciou o WireSock.
 async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteReadiness> {
   const deadline = Date.now() + timeoutMs;
   let last: WgTunnelStats | undefined;
@@ -1627,7 +1634,12 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
   while (Date.now() < deadline) {
     lastWireSock = getWireSockConnectionStatus();
     if (lastWireSock.source === "cli" && lastWireSock.state === "disconnected") {
-      throw new Error(`WireSock informou que a rota está desconectada. ${lastWireSock.detail ?? "Verifique o endpoint e a configuração WireGuard."}`);
+      return {
+        verified: false,
+        state: "disconnected",
+        source: "cli",
+        detail: "WireSock informou que a rota está desconectada",
+      };
     }
     last = getWgStats();
     const readiness = classifyWgReadiness(last, true);
@@ -1668,8 +1680,13 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
   }
   const motivo = last?.handshakeAgoS === null
     ? "nenhum handshake WireGuard foi confirmado"
-    : (last?.error || lastWireSock.detail || "o peer WireGuard não ficou pronto");
-  throw new Error(`WireGuard iniciou, mas não comprovou tráfego bidirecional: ${motivo}. Instale wireguard-tools (wg.exe), verifique endpoint/firewall e tente novamente.`);
+    : (last?.error || "o peer WireGuard não ficou pronto");
+  return {
+    verified: false,
+    state: lastWireSock.state === "disconnected" ? "disconnected" : "unverified",
+    source: lastWireSock.source === "none" ? "none" : lastWireSock.source,
+    detail: motivo,
+  };
 }
 
 function linuxStatus(): Promise<string> {
@@ -3851,8 +3868,15 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
             throw new Error(`a rota anterior não encerrou com segurança (${recovery.residual.join(", ") || recovery.error || "rede não validada"}). Use "Restaurar internet".`);
           }
           await startWireSockService(settingsDir());
-          readiness = await waitForWindowsWgReady();
-          if (readiness.state === "disconnected") throw new Error(readiness.detail || "WireSock desconectado");
+          // A prontidão é diagnóstica e não bloqueia a troca: o WireSock já foi
+          // iniciado, e uma ausência temporária de telemetria não deve derrubar
+          // a rota recém-aplicada.
+          void waitForWindowsWgReady().then((result) => {
+            readiness = result;
+            logger.info("wiresock", "prontidao.diagnostica", result);
+          }).catch((error) => {
+            logger.warn("wiresock", "prontidao.diagnostica.erro", { erro: String((error as Error)?.message ?? error) });
+          });
         } else if (IS_LINUX) {
           const preflight = await linuxPreflight();
           if (!preflight.ok) {
