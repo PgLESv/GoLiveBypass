@@ -60,6 +60,7 @@ STANDALONE_VERSION="1.1.12-beta.13"
 WG_CONF_CLI=""
 NETNS_NAME="discord-vpn"
 WG_IF="wg-discord"
+NONINTERACTIVE=0
 # ---------------------------------------------------------------------------
 # Home do usuario real
 #
@@ -662,6 +663,10 @@ while [ $# -gt 0 ]; do
         --status) MODE="status" ;;
         --preflight) MODE="preflight" ;;
         --probe) MODE="probe" ;;
+        # Probes disparados por watchdog nunca podem abrir zenity/kdialog,
+        # pkexec ou sudo interativo. Se nao houver autorizacao ja reutilizavel,
+        # falham como telemetria indisponivel e deixam a sessao intacta.
+        --non-interactive) NONINTERACTIVE=1 ;;
         --refresh-route) MODE="refresh" ;;
         --check-update) MODE="check-update" ;;
         --update) MODE="update" ;;
@@ -780,6 +785,20 @@ elevate() {
     else
         printf '%s\n' 'Falha: sudo nao esta instalado neste sistema.' >&2
         return 127
+    fi
+}
+
+# Variante somente-leitura para polling automatico. Diferente de elevate(),
+# esta funcao jamais solicita credenciais quando --non-interactive foi usado.
+# Acoes iniciadas pelo usuario continuam usando elevate() normalmente.
+elevate_readonly() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif [ "$NONINTERACTIVE" -eq 1 ]; then
+        have sudo || return 1
+        sudo -n "$@"
+    else
+        elevate "$@"
     fi
 }
 
@@ -1190,7 +1209,7 @@ wg_stats_json() {
     elif [ "$SUDO_AUTH_READY" -eq 1 ]; then
         dump="$(elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
     elif have sudo && sudo -n true 2>/dev/null; then
-        dump="$(sudo ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
+        dump="$(sudo -n ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
     else
         printf '{"ok":false,"error":"sem privilegio para ler (precisa root ou sudo sem senha)"}'
         return 0
@@ -1765,11 +1784,11 @@ wireguard_gateway_probe() {
         printf '%s\n' '{"ready":false,"state":"tunnel_down","error":"namespace inativo"}'
         return 1
     fi
-    if ! elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" >/dev/null 2>&1; then
+    if ! elevate_readonly ip netns exec "$NETNS_NAME" wg show "$WG_IF" >/dev/null 2>&1; then
         printf '%s\n' '{"ready":false,"state":"tunnel_down","error":"interface WireGuard inativa"}'
         return 1
     fi
-    code="$(elevate ip netns exec "$NETNS_NAME" curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 8 https://gateway.discord.gg 2>/dev/null || true)"
+    code="$(elevate_readonly ip netns exec "$NETNS_NAME" curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 8 https://gateway.discord.gg 2>/dev/null || true)"
     case "$code" in
         1??|2??|3??|4??|5??) ;;
         *)

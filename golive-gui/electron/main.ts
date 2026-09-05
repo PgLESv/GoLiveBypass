@@ -1792,7 +1792,7 @@ async function checkLinuxTunnelHealth(): Promise<{ healthy: boolean; reason: str
   const discordInNamespace = discords.some((d: Record<string, unknown>) => d.running === "sim" && d.inNamespace === "sim");
   let probeReady = false;
   try {
-    const probe = await runScript(["--probe", "--json"]);
+    const probe = await runScript(["--probe", "--json", "--non-interactive"]);
     if (probe.stdout) probeReady = JSON.parse(probe.stdout).ready === true;
   } catch { /* classificador produz a razão acionável */ }
   const wg = data?.wg ?? {};
