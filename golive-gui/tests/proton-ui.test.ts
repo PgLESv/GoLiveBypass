@@ -6,7 +6,7 @@ describe("controles Proton", () => {
   it("explica quando a rota otimizada passa a valer", () => {
     const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
     const button = html.match(/<button[^>]*id="protonOptimizeBtn"[^>]*>/)?.[0] ?? "";
-    expect(button).toContain("title=\"A rota otimizada entra em vigor ao sair e voltar para a chamada.\"");
+    expect(button).toContain("title=\"Com o bypass ativo, o Discord fecha e só reabre depois que a nova rota for comprovada.\"");
     expect(button).toContain("aria-label=");
   });
 
@@ -17,7 +17,7 @@ describe("controles Proton", () => {
     expect(fnBody).toContain("const rotaEmUso = currentState === 'ACTIVE';");
     expect(fnBody).toContain("Rota ${res.server} selecionada!");
     expect(fnBody).toContain("rotaEmUso");
-    expect(fnBody).toContain("Rota ${res.server} aplicada!");
+    expect(fnBody).toContain("Rota ${res.server} aplicada e comprovada!");
   });
 
   it("oferece o fluxo interativo para CAPTCHA", () => {
@@ -30,14 +30,14 @@ describe("controles Proton", () => {
     expect(source).toContain("CAPTCHA_INVALID");
   });
 
-  it("orienta renovar a call depois de aplicar uma rota ativa", () => {
-    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
-    expect(source).toContain("Saia e entre novamente na call para usá-la.");
+  it("explica que a troca ativa fecha e reabre o Discord somente apos a prova", () => {
+    const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    expect(html).toContain("o Discord fecha e só reabre depois que a nova rota for comprovada");
   });
 
-  it("trata telemetria indisponivel como aviso, sem negar uma rota WireSock ativa", () => {
+  it("distingue a prova funcional da telemetria auxiliar", () => {
     const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(source).toContain("res.readiness?.verified === false");
-    expect(source).toContain("A telemetria do WireSock não está disponível nesta instalação, mas o túnel está ativo.");
+    expect(source).toContain("Não foi possível confirmar a telemetria auxiliar do WireSock.");
   });
 });

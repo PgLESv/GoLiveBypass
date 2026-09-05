@@ -2,9 +2,31 @@ import { describe, expect, it } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { findWireSockInKnownRoots, hasWireSockAdapterTrafficIncrease, parseWireSockCliExternalAddress, parseWireSockCliStatus, verifyWindowsNetworkStable, wireSockSearchRoots } from "../electron/wiresock";
+import { findWireSockInKnownRoots, formatAllowedApps, hasWireSockAdapterTrafficIncrease, parseWireSockCliExternalAddress, parseWireSockCliStatus, verifyWindowsNetworkStable, wireSockDriverQueryShowsInstalled, wireSockSearchRoots } from "../electron/wiresock";
 
 describe("WireSock no Windows", () => {
+  it("reconhece drivers WireSock atual e legado sem confundir servico comum", () => {
+    expect(wireSockDriverQueryShowsInstalled("SERVICE_NAME: NDISRD\n        STATE: 4 RUNNING")).toBe(true);
+    expect(wireSockDriverQueryShowsInstalled("SERVICE_NAME: ndiswg\nDISPLAY_NAME: WireSock VPN Client Filter Driver\nSTATE: 4 RUNNING")).toBe(true);
+    expect(wireSockDriverQueryShowsInstalled("OpenService FAILED 1060: service does not exist")).toBe(false);
+    expect(wireSockDriverQueryShowsInstalled("SERVICE_NAME: wiresock-client-service")).toBe(false);
+  });
+
+  it("gera AllowedApps por caminho absoluto sem duplicatas ambiguas", () => {
+    expect(formatAllowedApps([
+      "C:\\Apps\\Discord.exe",
+      "c:\\apps\\discord.exe",
+      "C:\\GoLiveBypass\\proton-confgen.exe",
+    ])).toBe("C:\\Apps\\Discord.exe, C:\\GoLiveBypass\\proton-confgen.exe");
+    expect(() => formatAllowedApps(["C:\\Apps, Inc\\Discord.exe"])).toThrow("AllowedApps");
+  });
+
+  it("emite a extensao AllowedApps com o prefixo aceito pelo SDK 3.x", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
+    expect(src).toContain("#@ws:AllowedApps = ${allowedApps}");
+    expect(src).not.toContain("return `AllowedApps = ${allowedApps}`");
+  });
+
   it("oculta os processos auxiliares e as elevacoes do WireGuard", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("windowsHide: true");
@@ -18,11 +40,14 @@ describe("WireSock no Windows", () => {
     expect(src).toContain("https://v3.wiresock.net/wiresock-sdk");
   });
 
-  it("preserva a saida do winget e exige a fonte oficial", () => {
+  it("preserva a saida do winget e deixa o driver como diagnostico", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("--source winget");
     expect(src).toContain("detalheErro(err)");
     expect(src).toContain("instalacao pelo winget falhou; tentando UAC");
+    expect(src).toContain("driver nao ficou visivel ao processo; seguindo para prova funcional");
+    expect(src).toContain("a prova funcional confirmara o resultado");
+    expect(src).not.toContain("driver de filtro de rede (ndiswg/NDISRD) não foi carregado");
   });
 
   it("nao deixa DNS global nem network lock residual no fluxo normal", () => {

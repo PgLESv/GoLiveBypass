@@ -15,6 +15,12 @@ import {
 } from "../electron/proton";
 
 describe("ProtonVPN Integration & Sidecar", () => {
+  it("gera perfis Proton com IPv6 para impedir saida direta fora do AllowedIPs", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "electron/proton.ts"), "utf8");
+    const generation = source.slice(source.indexOf("export async function generateOptimalProtonConfig"));
+    expect(generation).toContain("'-ipv6'");
+  });
+
   it("processa o JSON final depois de uma mensagem de sessao salva", () => {
     const result = parseConfgenJson(
       'Using saved session (expires in 4 weeks)\n{"success":true,"server":"US-FREE#137","pingMs":34}\n',

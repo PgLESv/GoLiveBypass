@@ -5,6 +5,7 @@ import fs from 'fs';
 import { app } from 'electron';
 import { spawn } from 'child_process';
 import * as logger from './logger';
+import type { RouteProbeResult } from './route-proof';
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 
@@ -151,6 +152,26 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
       resolve({ code, stdout, stderr, json: parsedJson });
     });
   });
+}
+
+export async function runRouteProbe(timeoutMs = 10_000): Promise<RouteProbeResult> {
+  const res = await runConfgen({ args: ['--route-probe', '--json'], timeoutMs });
+  const value = res.json as Partial<RouteProbeResult> | undefined;
+  if (!value || typeof value.success !== 'boolean' || (value.observations !== undefined && !Array.isArray(value.observations))) {
+    return {
+      success: false,
+      observations: [],
+      discordOk: false,
+      error: (res.stderr || res.stdout || 'resposta inválida do probe de rota').trim().slice(0, 300),
+    };
+  }
+  return {
+    success: value.success,
+    observations: value.observations ?? [],
+    discordOk: value.discordOk === true,
+    discordMs: typeof value.discordMs === 'number' ? value.discordMs : undefined,
+    error: typeof value.error === 'string' ? value.error.slice(0, 300) : undefined,
+  };
 }
 
 export function classifyProtonError(error: unknown, stderr = '', stdout = ''): { code: ProtonLoginErrorCode; message: string; retryable: boolean } {
@@ -320,6 +341,7 @@ export async function generateOptimalProtonConfig(
     '-output',
     outputFile,
     '-json',
+    '-ipv6',
   ];
 
   if (options.autoPing !== false) {

@@ -4,6 +4,41 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Correção Windows — issue #226
+
+- **Prova funcional antes do Discord:** a GUI mede a saída direta, inicia o
+  WireSock e usa o `proton-confgen.exe` no mesmo `AllowedApps` para comprovar um
+  IP público diferente, fora do Brasil, além de HTTPS até o Discord. O cliente
+  só é aberto depois dessa prova; `wg.exe`, CLI e ProTUN ficam como telemetria
+  auxiliar e sua ausência não causa falso negativo. Caminho absoluto e nome do
+  executável são gravados juntos, usando a extensão `#@ws:AllowedApps` esperada
+  pelo SDK 3.x, para compatibilidade entre versões do driver.
+- **Falha fechada e status honesto:** serviço WireSock em execução sem prova de
+  rota não é mais `ACTIVE`. IP direto/brasileiro ou resultado inconclusivo
+  encerra a tentativa e restaura a rede antes de devolver controle.
+- **Driver sem falso negativo:** a GUI reconhece tanto o filtro atual `ndiswg`
+  quanto o legado `NDISRD`, mas a consulta ao SCM é apenas diagnóstico (ela pode
+  ser ocultada a processos não elevados). Encontrar executável, driver ou serviço
+  isoladamente nunca libera o Discord; só a prova funcional de rota o faz.
+- **Troca sem janela direta:** trocar o servidor fecha Discord e updater, valida
+  a nova saída e só então reabre o cliente.
+- **IPv4 e IPv6 sem rota dividida:** o helper força as duas famílias de rede e
+  recusa a ativação se qualquer fonte continuar vendo a saída direta. Perfis
+  Proton novos passam a incluir `::/0` para não deixar o IPv6 fora do túnel.
+- **Vigia e reinício seguros:** falhas repetidas do probe funcional retiram o
+  estado `ACTIVE`, fecham o Discord e restauram a rede. Uma sessão WireSock que
+  sobreviva a crash da GUI é revalidada do zero no próximo boot.
+
+### Fora do escopo
+
+- O probe funcional desta correção é específico da GUI Windows, pois reutiliza
+  o sidecar `proton-confgen.exe` empacotado e o inclui no mesmo filtro WFP. O
+  standalone PowerShell não distribui esse sidecar e o plugin Vencord/Equicord
+  não controla WireSock; portar o comportamento exigirá um helper autenticado
+  próprio em cada pacote, sem ampliar `AllowedApps` para todo `powershell.exe`.
+
 ## [2.0.2] - 2026-09-05
 
 ### Hotfix WireGuard Windows/Linux

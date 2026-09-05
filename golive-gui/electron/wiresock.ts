@@ -21,6 +21,10 @@ PersistentKeepalive = 25
 const WIRESOCK_PACKAGE_ID = "NTKERNEL.WireSockVPNClientCLI";
 const WIRESOCK_DOWNLOAD_PAGE = "https://v3.wiresock.net/wiresock-sdk";
 const WIRESOCK_SERVICE_NAMES = ["wiresock-client-service", "wiresock-pro-client-service"] as const;
+// O SDK 3.4.x instala o filtro WireGuard como `ndiswg`; releases antigas do
+// mecanismo por aplicativo expunham `NDISRD`. Ambos são nomes oficiais vistos
+// em campo. A prova funcional de rota continua sendo a autoridade final.
+const WIRESOCK_DRIVER_SERVICE_NAMES = ["ndiswg", "NDISRD"] as const;
 
 export type WireSockConnectionState = "connected" | "connecting" | "disconnected" | "unknown";
 
@@ -75,6 +79,24 @@ function abrirDownloadWireSock(): void {
     // oficial evita baixar e executar um binario sem checksum fixado pelo app.
     spawn("explorer.exe", [WIRESOCK_DOWNLOAD_PAGE], { detached: true, stdio: "ignore", windowsHide: true }).unref();
   } catch {}
+}
+
+export function wireSockDriverQueryShowsInstalled(output: string): boolean {
+  return /SERVICE_NAME:\s*(?:ndiswg|NDISRD)\b/i.test(output) && !/\b1060\b/.test(output);
+}
+
+export function isWireSockPacketFilterDriverInstalled(): boolean {
+  if (process.platform !== "win32") return false;
+  return WIRESOCK_DRIVER_SERVICE_NAMES.some((name) => {
+    try {
+      const output = execSync(`sc.exe query ${name}`, {
+        stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", windowsHide: true,
+      });
+      return wireSockDriverQueryShowsInstalled(output);
+    } catch {
+      return false;
+    }
+  });
 }
 
 export function isWireSockRunning(): boolean {
@@ -335,7 +357,16 @@ export function findWireSockExe(): string | null {
 
 export async function ensureWireSockInstalled(): Promise<string> {
   const found = findWireSockExe();
-  if (found) return found;
+  if (found) {
+    // Consultar o SCM a partir de um Electron não elevado pode ocultar drivers
+    // que estão carregados (confirmado com `ndiswg` no SDK 3.4.x). Isso é
+    // telemetria, não autorização: a prova funcional após o start decide se a
+    // rota realmente mudou e falha fechado se o filtro não atuar.
+    if (!isWireSockPacketFilterDriverInstalled()) {
+      logger.warn("wiresock", "driver nao ficou visivel ao processo; seguindo para prova funcional", {});
+    }
+    return found;
+  }
 
   if (!temWinget()) {
     abrirDownloadWireSock();
@@ -346,8 +377,9 @@ export async function ensureWireSockInstalled(): Promise<string> {
   }
 
   let erroInstalacao = "";
+  const wingetArgs = `install --id ${WIRESOCK_PACKAGE_ID} --exact --source winget --accept-package-agreements --accept-source-agreements --silent --disable-interactivity`;
   try {
-    execSync(`winget install --id ${WIRESOCK_PACKAGE_ID} --exact --source winget --accept-package-agreements --accept-source-agreements --silent --disable-interactivity`, {
+    execSync(`winget ${wingetArgs}`, {
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
       windowsHide: true,
@@ -356,7 +388,7 @@ export async function ensureWireSockInstalled(): Promise<string> {
     erroInstalacao = detalheErro(err);
     logger.warn("wiresock", "instalacao pelo winget falhou; tentando UAC", { erro: erroInstalacao });
     try {
-      execSync(`powershell.exe -NoProfile -Command "$p = Start-Process winget -ArgumentList 'install --id ${WIRESOCK_PACKAGE_ID} --exact --source winget --accept-package-agreements --accept-source-agreements --silent --disable-interactivity' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) { exit $p.ExitCode }"`, {
+      execSync(`powershell.exe -NoProfile -Command "$p = Start-Process winget -ArgumentList '${wingetArgs}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) { exit $p.ExitCode }"`, {
         stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", windowsHide: true,
       });
     } catch (elevatedErr) {
@@ -366,7 +398,12 @@ export async function ensureWireSockInstalled(): Promise<string> {
   }
 
   const retry = findWireSockExe();
-  if (retry) return retry;
+  if (retry) {
+    if (!isWireSockPacketFilterDriverInstalled()) {
+      logger.warn("wiresock", "instalacao terminou sem driver visivel; a prova funcional confirmara o resultado", {});
+    }
+    return retry;
+  }
   logger.error("wiresock", "winget terminou, mas o executavel nao foi localizado", {
     pacote: WIRESOCK_PACKAGE_ID,
     etapa: "pos-instalacao",
@@ -377,12 +414,29 @@ export async function ensureWireSockInstalled(): Promise<string> {
   );
 }
 
-export async function startWireSockService(installDir: string, customConf?: string): Promise<void> {
+export function formatAllowedApps(paths: string[]): string {
+  const unique = new Map<string, string>();
+  for (const raw of paths) {
+    const value = raw.trim();
+    if (!value) continue;
+    if (/[\r\n,]/.test(value)) {
+      throw new Error(`Caminho incompatível com AllowedApps: ${value.replace(/[\r\n]/g, " ")}`);
+    }
+    const key = value.toLowerCase();
+    if (!unique.has(key)) unique.set(key, value);
+  }
+  const values = [...unique.values()];
+  if (values.length === 0) return "Discord, Discord.exe, Update.exe";
+  return values.join(", ");
+}
+
+export async function startWireSockService(installDir: string, customConf?: string, allowedAppPaths: string[] = []): Promise<void> {
   const wsExe = await ensureWireSockInstalled();
   logger.info("wiresock", "executavel encontrado", { caminho: wsExe });
   const rawConf = ensureWireGuardConf(installDir, customConf);
   const targetConf = path.join(installDir, "wiresock-discord.conf");
 
+  const allowedApps = formatAllowedApps(allowedAppPaths);
   const rawLines = fs.readFileSync(rawConf, "utf8").split(/\r?\n/);
   let hasAllowedApps = false;
   const newLines = rawLines.map((l) => {
@@ -392,14 +446,14 @@ export async function startWireSockService(installDir: string, customConf?: stri
       // resolvido pelo adaptador do usuario, nao por 10.2.0.1.
       return "";
     }
-    if (/^\s*AllowedApps\s*=/i.test(l)) {
+    if (/^\s*(?:#@ws:)?AllowedApps\s*=/i.test(l)) {
       hasAllowedApps = true;
-      return "AllowedApps = Discord, Discord.exe, Update.exe";
+      return `#@ws:AllowedApps = ${allowedApps}`;
     }
     return l;
   });
   if (!hasAllowedApps) {
-    newLines.push("AllowedApps = Discord, Discord.exe, Update.exe");
+    newLines.push(`#@ws:AllowedApps = ${allowedApps}`);
   }
   fs.writeFileSync(targetConf, newLines.join("\r\n"), "utf8");
 

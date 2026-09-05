@@ -259,6 +259,20 @@ async function updateStatus() {
       toggleBtn.disabled = false;
       statusCard.hidden = true;
       if (linuxPreflightCommand) linuxPreflightCommand.hidden = true;
+    } else if (status === 'CONNECTING') {
+      statusText.innerText = 'Comprovando a saída protegida…';
+      statusTag.textContent = 'Validando';
+      statusTag.classList.add('tag--warn');
+      toggleBtn.disabled = true;
+      btnText.innerText = 'Validando rota…';
+      statusCard.hidden = false;
+    } else if (status === 'RECOVERY_REQUIRED') {
+      statusText.innerText = 'A rota não pôde ser restaurada automaticamente';
+      statusTag.textContent = 'Recuperação necessária';
+      statusTag.classList.add('tag--danger');
+      toggleBtn.disabled = true;
+      btnText.innerText = 'Use Restaurar internet';
+      statusCard.hidden = false;
     } else if (status === 'NOT_FOUND') {
       statusText.innerText = 'Discord não encontrado';
       statusTag.textContent = 'Ausente';
@@ -760,7 +774,7 @@ async function optimizeProtonRoute(onStartup = false) {
       const rotaEmUso = currentState === 'ACTIVE';
       setProtonFeedback(
         rotaEmUso
-          ? `Rota ${res.server} aplicada!${pingStr} Saia e entre novamente na call para usá-la.${res.readiness?.verified === false ? ' A telemetria do WireSock não está disponível nesta instalação, mas o túnel está ativo.' : ''}`
+          ? `Rota ${res.server} aplicada e comprovada!${pingStr}${res.readiness?.verified === false ? ' Não foi possível confirmar a telemetria auxiliar do WireSock.' : ''}`
           : `Rota ${res.server} selecionada!${pingStr} Ative o Bypass para usá-la.`,
         'ok',
       );

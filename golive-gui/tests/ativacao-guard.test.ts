@@ -114,7 +114,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(fnBody).toContain("const hadWireSock = isWireSockActive();");
   });
 
-  it("aplica rota Linux sem desmontar o Discord e valida o WireSock apos iniciar o cliente permitido", () => {
+  it("aplica rota Linux sem desmontar o Discord e prova o WireSock antes do cliente no Windows", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     expect(src).toContain('runScript(["--refresh-route"])');
     expect(src).not.toContain('runScript(["--deactivate"]);\n        await runScript(["--activate"]);');
@@ -122,8 +122,10 @@ describe("guarda de ativacao duplicada", () => {
     expect(src).toContain('await killDiscord();');
 
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
-    expect(activation.indexOf('startDiscordAndConfirm(installs, "ativacao")')).toBeLessThan(
-      activation.indexOf("void waitForWindowsWgReady()"),
+    const proofCall = 'await requireFunctionalWindowsRoute(direct, windowsGeneration)';
+    expect(activation).toContain(proofCall);
+    expect(activation.indexOf(proofCall)).toBeLessThan(
+      activation.indexOf('startDiscordAndConfirm(installs, "ativacao")'),
     );
     expect(activation).toContain("let windowsDiscordStarted = false;");
 
@@ -136,14 +138,26 @@ describe("guarda de ativacao duplicada", () => {
     expect(readiness).toContain('"disconnected" : "unverified"');
 
     const ui = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
-    expect(ui).toContain("Discord abre já protegido pelo WireGuard");
-    expect(ui).not.toContain("Discord só abre depois que o WireGuard confirma handshake");
+    expect(ui).toContain("Discord só abre depois que o IP de saída WireGuard é comprovado");
   });
 
   it("usa uma fila unica para operacoes concorrentes do WireSock", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     expect(src).toContain("let wireSockLifecycleQueue: Promise<void> = Promise.resolve();");
     expect(src).toContain("wireSockLifecycleQueue = run.then(() => undefined, () => undefined);");
+  });
+
+  it("descarta provas atrasadas e nao herda ACTIVE depois de reinicio", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    expect(src).toContain("windowsRouteGeneration += 1;");
+    expect(src).toContain("assertWindowsRouteGeneration(generation)");
+    expect(src).toContain('if (IS_WINDOWS && sessaoAtiva())');
+    expect(src).toContain('await activateBypass({});');
+    const statusStart = src.indexOf("function getStatus():");
+    const status = src.slice(statusStart, src.indexOf("async function linuxStatus", statusStart));
+    expect(status).toContain('return "CONNECTING"');
+    expect(status).toContain('return "RECOVERY_REQUIRED"');
+    expect(status).toContain("windowsRouteVerified && isWireSockActive() && discordIsRunning()");
   });
 
   it("aguarda a limpeza WireSock terminar antes de concluir o quit", () => {
@@ -172,7 +186,8 @@ describe("guarda de ativacao duplicada", () => {
   it("no Windows ativa WireSock sem ler, esperar ou alterar app.asar", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
-    expect(activation).toContain("await startWireSockService(settingsDir())");
+    expect(activation).toContain("await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs))");
+    expect(src).toContain("apps.add(path.basename(probeExe));");
     expect(activation).not.toContain("app.asar");
     expect(activation).not.toContain("assertResourcesWritable");
     expect(activation).not.toContain("isOurInjection");
@@ -185,7 +200,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(kill).toContain("discordDidNotStop()");
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
     expect(activation.indexOf("await killDiscord()")).toBeLessThan(
-      activation.indexOf("await startWireSockService(settingsDir())"),
+      activation.indexOf("await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs))"),
     );
   });
 
@@ -223,10 +238,15 @@ describe("guarda de ativacao duplicada", () => {
     expect(restore).toContain("ok: false");
   });
 
-  it("confirma o Discord iniciado antes de validar o tunel e desfaz WireSock quando o spawn nao produz processo", () => {
+  it("valida o tunel antes de iniciar o Discord e desfaz WireSock quando o spawn nao produz processo", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
     expect(activation).toContain('startDiscordAndConfirm(installs, "ativacao")');
+    const proofCall = 'await requireFunctionalWindowsRoute(direct, windowsGeneration)';
+    expect(activation).toContain(proofCall);
+    expect(activation.indexOf(proofCall)).toBeLessThan(
+      activation.indexOf('startDiscordAndConfirm(installs, "ativacao")'),
+    );
     expect(activation).toContain('withWireSockLifecycle("ativacao.rollback"');
     expect(activation).toContain("await recoverWireSockNetwork()");
     const start = src.slice(src.indexOf("function startDiscord"), src.indexOf("function isOurInjection"));

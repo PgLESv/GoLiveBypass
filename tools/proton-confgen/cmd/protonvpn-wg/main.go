@@ -3,6 +3,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"protonvpn-wg-confgen/internal/auth"
 	"protonvpn-wg-confgen/internal/config"
 	"protonvpn-wg-confgen/internal/constants"
+	"protonvpn-wg-confgen/internal/routeprobe"
 	"protonvpn-wg-confgen/internal/vpn"
 	"protonvpn-wg-confgen/internal/wireguard"
 
@@ -53,6 +55,13 @@ func main() {
 }
 
 func run() error {
+	if hasArg("-route-probe", "--route-probe") {
+		result := routeprobe.Run(context.Background())
+		data, _ := json.Marshal(result)
+		fmt.Println(string(data))
+		return nil
+	}
+
 	cfg, err := config.Parse()
 	if err != nil {
 		config.PrintUsage()
@@ -122,6 +131,17 @@ func run() error {
 	default:
 		return generateConfig(cfg, vpnClient)
 	}
+}
+
+func hasArg(names ...string) bool {
+	for _, arg := range os.Args[1:] {
+		for _, name := range names {
+			if arg == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func generateConfig(cfg *config.Config, vpnClient *vpn.Client) error {

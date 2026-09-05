@@ -275,7 +275,7 @@
                   <option value="NL">Holanda</option>
                   <option value="JP">Japão</option>
                 </select>
-                <button type="button" id="protonOptimizeBtn" class="proton-btn proton-btn--action" title="A rota otimizada entra em vigor ao sair e voltar para a chamada." aria-label="Otimizar rota. A rota otimizada entra em vigor ao sair e voltar para a chamada.">
+                <button type="button" id="protonOptimizeBtn" class="proton-btn proton-btn--action" title="Com o bypass ativo, o Discord fecha e só reabre depois que a nova rota for comprovada." aria-label="Otimizar rota. Com o bypass ativo, o Discord fecha e só reabre depois que a nova rota for comprovada.">
                   <svg class="icon-refresh" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <polyline points="23 4 23 10 17 10"/>
                     <polyline points="1 20 1 14 7 14"/>
@@ -352,7 +352,7 @@
 
         <footer class="footer">
           <p class="disclaimer">
-            O Discord abre já protegido pelo WireGuard; o túnel é confirmado durante a conexão. Ao trocar a rota, saia e entre novamente na call.
+            O Discord só abre depois que o IP de saída WireGuard é comprovado. A troca de rota fecha, valida e reabre o Discord automaticamente.
             <span id="closeHint"
               >Fechar a janela esconde o app na bandeja, junto do rel&oacute;gio
               &mdash; para reverter tudo, saia pelo &iacute;cone de
