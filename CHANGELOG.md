@@ -4,6 +4,18 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.3] - 2026-09-05
+
+### Hotfix de autenticação e rota segura
+
+- CAPTCHA oficial da Proton integrado ao aplicativo, sem cópia manual de token.
+- Login continua automaticamente após a verificação, com erros separados para
+  cancelamento, expiração, CAPTCHA inválido e credenciais incorretas.
+- Sessão Proton salva deixa de produzir falso erro de persistência no Windows.
+- O WireSock comprova a mesma regra de diretório usada pelo Discord antes de
+  liberar o cliente, evitando falso positivo de rota.
+- Probes automáticos do Linux não abrem prompts de sudo/pkexec em segundo plano.
+
 ## [2.0.3-beta.3] - 2026-09-05
 
 ### Login Proton no Windows
