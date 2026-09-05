@@ -35,7 +35,7 @@ describe("startup helper (source checks)", () => {
     // serve dentro de um AppImage (o caminho e o mountpoint FUSE temporario
     // /tmp/.mount_GoLiveXXX/golive-gui que some quando o AppImage desmonta),
     // entao o helper realExecPath() cai para a env APPIMAGE.
-    expect(helper).toMatch(/\\"\$\{realExecPath\(\)\}\\"/);
+    expect(helper).toMatch(/\\"\$\{executable\}\\"/);
     expect(helper).toContain("realExecPath");
     expect(helper).toMatch(/APPIMAGE/);
   });

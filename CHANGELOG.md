@@ -25,16 +25,131 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Reutilização de sessão salva sem prompt no terminal:**
   - O backend do `proton-confgen` agora recupera o usuário e valida o token persistente salvo sem solicitar entrada interativa no terminal stdin.
 
+## [2.0.2] - 2026-09-05
+
+### Hotfix WireGuard Windows/Linux
+
+- Consolidação das correções de estabilidade, ciclo de vida e recuperação do WireGuard.
+- WireSock não bloqueia a ativação quando a telemetria opcional não está disponível.
+- Falhas reais continuam acionando rollback e limpeza serializada.
+- Linux confirma namespace, processo do Discord, handshake, tráfego e gateway antes de considerar o túnel saudável.
+- Incluídas validações E2E e instaláveis oficiais para Windows e Linux.
+
+## [2.0.2-beta.3] - 2026-09-04
+
+### Teste E2E Linux e estabilidade
+
+- Confirmada ativação no Discord real com namespace WireGuard, gateway acessível e tráfego RX/TX crescente.
+- Status Linux agora distingue Discord fora do namespace de uma sessão realmente protegida.
+- Inclui recuperação limitada para túnel degradado e correções de prontidão WireSock sem bloquear instalações sem telemetria opcional.
+
+## [2.0.2-beta.2] - 2026-09-04
+
+### Correção Windows
+
+- **Prontidão WireSock não bloqueante:** a ativação e a troca de rota não falham
+  mais apenas porque `wg.exe`, a CLI opcional, o handshake ou os contadores ProTUN
+  não ficaram disponíveis a tempo. O WireSock ativo e o Discord iniciado concluem
+  a operação; a confirmação de tráfego continua sendo registrada nos logs para
+  diagnóstico. Falhas reais de inicialização e limpeza continuam acionando rollback.
+
+- **Prontidão WireSock em duas fases:** instalações sem `wg.exe` nem CLI de status não entram
+  mais no ciclo em que o Discord aguardava tráfego que apenas ele próprio pode gerar. O
+  Discord inicia já protegido pelo filtro WireSock; em seguida o aplicativo confirma o túnel
+  usando o tráfego real. Caso a confirmação falhe, encerra o cliente e restaura a rede.
+- **Prazo de ativação respeitado:** a confirmação pelo ProTUN não executa sondagens HTTPS do
+  host dentro do loop do WireSock. Duas amostras RX/TX crescentes, geradas após o Discord
+  iniciar, confirmam a rota sem manter a GUI em carregamento por minutos.
+
+### Correção Linux/Arch (issue #219)
+
+- **Preflight acionável:** a GUI verifica `wireguard-tools` (`wg`), `iproute2` (`ip`), `curl`,
+  autorização sudo/pkexec, namespaces de rede e a instalação do Discord antes de qualquer
+  limpeza ou encerramento do cliente.
+- **Sem loop de boot:** dependências ausentes agora deixam a ativação desabilitada e exibem o
+  comando `sudo pacman -S --needed ...`; nenhum pacote é instalado automaticamente.
+- **Instalações Arch descobertas:** bootstrap oficial, `discord_arch_electron`,
+  `discord-electron-openasar`, PTB/Canary, clientes paralelos e Flatpak continuam sendo
+  identificados sem tratar Equicord/Vencord como falha.
+- **Operações serializadas:** ativação, desativação, restauração e troca de rota não podem
+  iniciar duas instâncias WireGuard concorrentes; o status Linux usa single-flight, cache curto
+  e limitação de telemetria para não reabrir o loop de varredura.
+
+### Validação Linux
+
+- Preflight verificado em contêiner Arch Linux com bootstrap simulado do Discord, tanto com
+  dependências ausentes (erro acionável) quanto com `wireguard-tools`, `iproute2`, `curl` e
+  autorização disponíveis (ambiente aprovado).
+
+## [2.0.1] - 2026-09-04
+
+### Correções de confiabilidade
+
+- **Ciclo de vida WireSock serializado:** ativação, desativação, restauração de internet e troca
+  de rota agora aguardam a operação anterior terminar antes de iniciar outra instância.
+- **Limpeza recuperável:** processos e serviços residuais são encerrados em árvore, o Network
+  Lock é resetado e a limpeza elevada pode ser repetida quando o Windows mantém um residual.
+- **Validação WireSock sem ciclo:** após confirmar que o filtro WireSock subiu, o aplicativo abre
+  o Discord já protegido e confirma o túnel pelo handshake/tráfego real do cliente. Isso funciona
+  mesmo sem `wg.exe` ou a CLI opcional; falhas encerram o Discord e restauram a rede.
+- **Restauração segura:** DNS só é limpo nos adaptadores WireSock/ProTUN; o DNS do host não é
+  alterado permanentemente. O Discord só volta após limpeza e rede saudáveis.
+- **Telemetria honesta:** ausência de `wg.exe` é reportada como telemetria indisponível quando o
+  túnel está funcionando; falhas reais continuam sendo desconexão explícita ou teste funcional
+  reprovado.
+- **Encerramento correto:** o app aguarda a desativação antes de sair, evitando deixar WireSock
+  ou o Network Lock presos no Windows.
+
+### Correções do loop de recuperação
+
+- **Watchdog sem sobreposição:** callbacks de uma geração anterior não podem agir depois de uma
+  parada ou reinício.
+- **Gateway sem reload duplicado:** a espera por uma saída reserva mantém seu próprio mutex e
+  não permite dois reloads concorrentes.
+- **RTC sem callback obsoleto:** respostas de uma sessão antiga são descartadas quando o Discord
+  já iniciou outra navegação.
+- **Paridade standalone/GUI:** o bundle do bypass é gerado a partir da fonte standalone e o
+  build falha se as duas cópias divergirem.
+
+### Proton, sessão e distribuição
+
+- Persistência da conta Proton validada após login e gravação atômica da sessão.
+- Fluxo de CAPTCHA permite concluir o login sem reiniciar a GUI e sem registrar credenciais.
+- Diagnóstico registra serviço, PID residual, reset de lock, DNS, HTTPS e origem da confirmação
+  do túnel sem expor endpoint privado.
+- Build Windows portátil preparado para a versão 2.0.1.
+
+### Validação
+
+- 165 testes Vitest aprovados.
+- 31 verificações de paridade aprovadas.
+- Testes de gateway zumbi, recuperação RTC, corrida do viewer e re-seleção de saída aprovados.
+- E2E em Windows 11: ativação aguardou a conexão real antes de abrir o Discord; desativação
+  restaurou o cliente sem reiniciar o Windows.
+
+### Agradecimentos
+
+Obrigado aos beta testers e a todos os usuários que reportaram bugs, enviaram diagnósticos
+sanitizados e repetiram cenários difíceis até conseguirmos reproduzi-los. Os relatos de queda
+de rota, WireSock residual, loop de atualização e Discord preso em chamada foram essenciais para
+esta estabilização.
+
 ## [2.0.0] - 2026-09-04
 
 ### Destaques
+
+- **Mods no Windows:** a descoberta do Discord para WireSock usa somente `Discord.exe`; ela
+  não lê, espera, cria ou altera `app.asar`/`resources`, preservando BetterDiscord e outros
+  carregadores de mods.
 
 - **WireGuard por aplicativo:** Windows usa WireSock/WFP para encaminhar somente o Discord (`Discord.exe`, `Discord` e `Update.exe`) pelo túnel. O restante do computador permanece na rede normal.
 - **Namespace dedicado no Linux:** a GUI inicia o Discord dentro de `discord-vpn`, com a interface WireGuard isolada do restante do sistema.
 - **Discord vanilla no Windows/Linux:** a GUI 2.0.0 não substitui nem injeta o `app.asar` do Discord. Ativar e desativar reinicia o cliente para aplicar ou remover o túnel com segurança.
 - **ProtonVPN integrado:** login com sessão persistente, geração de configuração WireGuard, seleção automática por menor ping, suporte a 2FA e importação de configurações `.conf` próprias.
+- **Persistência da conta Proton reforçada:** o GUI recupera o usuário da sessão salva no Windows/Linux, valida a gravação após o login e o sidecar grava sessões atomicamente, criando a pasta de dados quando necessário.
 - **Privacidade na GUI:** endereço de e-mail Proton desfocado por padrão durante compartilhamento de tela e revelado apenas sob interação do usuário.
 - **Diagnóstico de túnel:** logs e reports registram estado do handshake e volume de tráfego sem incluir o endpoint privado da VPN.
+- **Login Proton com verificação humana:** quando o Proton exige CAPTCHA, a GUI abre o desafio oficial e permite reenviar o resultado sem reiniciar o aplicativo; tokens e senhas não são persistidos nem registrados.
 
 ### Compatibilidade e limites conhecidos
 

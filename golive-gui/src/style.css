@@ -450,6 +450,21 @@ html[data-theme='dark'] .report-btn {
   line-height: 1.4;
 }
 
+.linux-preflight-command {
+  grid-column: 2;
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 5px 6px;
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.35;
+  user-select: text;
+}
+
 .status-tag {
   flex-shrink: 0;
   font-family: var(--mono);
@@ -2337,6 +2352,23 @@ html[data-theme='dark'] .settings-switch input:checked + .switch-track .switch-t
   font-size: 10px;
 }
 
+.restore-network-btn {
+  align-self: center;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 6px 10px;
+  color: var(--muted);
+  background: var(--surface-muted);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.restore-network-btn:hover:not(:disabled) {
+  color: var(--ink-strong);
+  border-color: var(--ok-ink);
+}
+
 @media (max-width: 640px) {
   .container {
     max-width: 560px;
@@ -2521,6 +2553,28 @@ html[data-theme='dark'] .settings-switch input:checked + .switch-track .switch-t
 
 .proton-form-fields .proton-input {
   height: 30px;
+}
+
+.proton-captcha-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.proton-captcha-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.proton-captcha-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .proton-password-control {

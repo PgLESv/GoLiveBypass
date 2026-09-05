@@ -27,6 +27,21 @@ export interface WgTunnelStats {
   error?: string;
 }
 
+export type WgReadinessState =
+  | "starting"
+  | "tunnel_up"
+  | "handshake_missing"
+  | "traffic_missing"
+  | "gateway_unreachable"
+  | "ready"
+  | "degraded";
+
+export interface WgReadiness {
+  ready: boolean;
+  state: WgReadinessState;
+  error?: string;
+}
+
 const SEM_DADOS: WgTunnelStats = {
   ok: false,
   handshakeAgoS: null,
@@ -34,6 +49,29 @@ const SEM_DADOS: WgTunnelStats = {
   txBytes: null,
   endpoint: null,
 };
+
+/** Classifica a saúde observável do peer antes de liberar o Discord. */
+export function classifyWgReadiness(stats: WgTunnelStats, gatewayOk: boolean): WgReadiness {
+  if (!stats.ok) {
+    return { ready: false, state: "starting", error: stats.error ?? "tunel indisponivel" };
+  }
+  if (stats.handshakeAgoS === null) {
+    return { ready: false, state: "handshake_missing", error: "nenhum handshake WireGuard" };
+  }
+  if (stats.handshakeAgoS > WG_STALE_HANDSHAKE_S) {
+    return { ready: false, state: "degraded", error: `handshake com ${stats.handshakeAgoS}s` };
+  }
+  // O serviço/CLI pode dizer Connected antes de qualquer pacote atravessar o
+  // peer. Exigir bytes nos dois sentidos evita abrir o Discord num túnel que
+  // em seguida cai no ciclo de update/conexão.
+  if (stats.rxBytes === null || stats.txBytes === null || stats.rxBytes <= 0 || stats.txBytes <= 0) {
+    return { ready: false, state: "traffic_missing", error: "nenhum tráfego WireGuard bidirecional confirmado" };
+  }
+  if (!gatewayOk) {
+    return { ready: false, state: "gateway_unreachable", error: "gateway.discord.gg sem resposta" };
+  }
+  return { ready: true, state: "ready" };
+}
 
 // `wg show <iface> dump` e tab-separated:
 //   linha 1 (interface): private-key public-key listen-port fwmark
@@ -104,6 +142,8 @@ export function getWgStats(): WgTunnelStats {
 let timer: ReturnType<typeof setInterval> | null = null;
 let ultimoRx: number | null = null;
 let ultimoTx: number | null = null;
+let watchdogGeneration = 0;
+let watchdogInFlight = false;
 
 // Intervalo do watchdog de diagnostico. 45s: frequente o bastante para pegar uma degradacao
 // antes de virar "carregando infinito" ha 10 minutos, sem inflar o ring buffer do log.
@@ -119,42 +159,65 @@ export type WgStatsProvider = () => Promise<WgTunnelStats> | WgTunnelStats;
 // em vez do getWgStats() direto daqui, que so funciona quando a propria GUI roda como root.
 export function iniciarWgStatsWatchdog(provider: WgStatsProvider = getWgStats) {
   if (timer !== null) return;
+  const generation = ++watchdogGeneration;
   ultimoRx = null;
   ultimoTx = null;
-  timer = setInterval(async () => {
-    const s = await provider();
-    if (!s.ok) {
-      logger.warn("wg", "stats.indisponivel", { erro: s.error ?? "?" });
-      return;
-    }
-    const dadosCampo: Record<string, unknown> = {
-      handshake_ha_s: s.handshakeAgoS ?? "nunca",
-      endpoint: s.endpoint ?? "?",
-    };
-    if (s.rxBytes !== null && s.txBytes !== null) {
-      dadosCampo.rx_total_kb = Math.round(s.rxBytes / 1024);
-      dadosCampo.tx_total_kb = Math.round(s.txBytes / 1024);
-      if (ultimoRx !== null && ultimoTx !== null) {
-        const intervaloS = WG_STATS_INTERVAL_MS / 1000;
-        dadosCampo.rx_taxa_kbps = Math.round(((s.rxBytes - ultimoRx) / intervaloS) / 1024 * 8);
-        dadosCampo.tx_taxa_kbps = Math.round(((s.txBytes - ultimoTx) / intervaloS) / 1024 * 8);
-      }
-      ultimoRx = s.rxBytes;
-      ultimoTx = s.txBytes;
-    }
-    if (s.handshakeAgoS !== null && s.handshakeAgoS > WG_STALE_HANDSHAKE_S) {
-      logger.warn("wg", "handshake.velho", dadosCampo);
-    } else {
-      logger.info("wg", "stats", dadosCampo);
-    }
+  timer = setInterval(() => {
+    // O provider Linux pode envolver um processo elevado e, em uma máquina
+    // congestionada, durar mais que o intervalo. Nunca sobreponha leituras:
+    // além de desperdiçar processos, uma amostra velha poderia sobrescrever
+    // os contadores da sessão atual.
+    if (watchdogInFlight) return;
+    watchdogInFlight = true;
+    void Promise.resolve()
+      .then(() => provider())
+      .then((s) => {
+        // stop + start cria uma nova geração; o callback antigo não pode
+        // publicar diagnóstico nem atualizar contadores da sessão nova.
+        if (generation !== watchdogGeneration || timer === null) return;
+        if (!s.ok) {
+          logger.warn("wg", "stats.indisponivel", { erro: s.error ?? "?" });
+          return;
+        }
+        const dadosCampo: Record<string, unknown> = {
+          handshake_ha_s: s.handshakeAgoS ?? "nunca",
+          endpoint: s.endpoint ?? "?",
+        };
+        if (s.rxBytes !== null && s.txBytes !== null) {
+          dadosCampo.rx_total_kb = Math.round(s.rxBytes / 1024);
+          dadosCampo.tx_total_kb = Math.round(s.txBytes / 1024);
+          if (ultimoRx !== null && ultimoTx !== null) {
+            const intervaloS = WG_STATS_INTERVAL_MS / 1000;
+            dadosCampo.rx_taxa_kbps = Math.round(((s.rxBytes - ultimoRx) / intervaloS) / 1024 * 8);
+            dadosCampo.tx_taxa_kbps = Math.round(((s.txBytes - ultimoTx) / intervaloS) / 1024 * 8);
+          }
+          ultimoRx = s.rxBytes;
+          ultimoTx = s.txBytes;
+        }
+        if (s.handshakeAgoS !== null && s.handshakeAgoS > WG_STALE_HANDSHAKE_S) {
+          logger.warn("wg", "handshake.velho", dadosCampo);
+        } else {
+          logger.info("wg", "stats", dadosCampo);
+        }
+      })
+      .catch((error) => {
+        if (generation === watchdogGeneration && timer !== null) {
+          logger.warn("wg", "stats.erro", { erro: String((error as Error)?.message ?? error) });
+        }
+      })
+      .finally(() => {
+        if (generation === watchdogGeneration) watchdogInFlight = false;
+      });
   }, WG_STATS_INTERVAL_MS);
 }
 
 export function pararWgStatsWatchdog() {
+  watchdogGeneration++;
   if (timer !== null) {
     clearInterval(timer);
     timer = null;
   }
+  watchdogInFlight = false;
   ultimoRx = null;
   ultimoTx = null;
 }

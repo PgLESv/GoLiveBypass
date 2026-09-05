@@ -502,6 +502,20 @@ function testGuardaRajadaNoFonte() {
   } else {
     bad("runtime ainda le opt-out autoRevive");
   }
+  if (src.includes("let directReloadPending = false") &&
+      src.includes("reloading || directReloadPending || reloadCount") &&
+      src.includes("const release = () => { directReloadPending = false; }")) {
+    ok("espera por reserva mantém mutex próprio e libera após decidir o reload");
+  } else {
+    bad("fase de reserva do reload ainda permite concorrência");
+  }
+  if (src.includes("let voiceProbeEpoca = 0") &&
+      src.includes("if (epoca !== voiceProbeEpoca) return;") &&
+      src.includes("if (epoca === voiceProbeEpoca) voiceProbeRodando = false;")) {
+    ok("probe RTC antigo não contamina a sessão após reload");
+  } else {
+    bad("probe RTC não está isolado por época");
+  }
 }
 
 // --- 10b: trocas proativas nao atravessam uma call/Live ---

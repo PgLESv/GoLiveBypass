@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -27,6 +28,17 @@ type Client struct {
 	httpClient   *http.Client
 	sessionStore *SessionStore
 }
+
+// HumanVerificationError is intentionally safe to serialize: it never carries
+// the solved token, only the challenge URL that the user must open.
+type HumanVerificationError struct {
+	Code       string
+	CaptchaURL string
+	Retryable  bool
+	Message    string
+}
+
+func (e HumanVerificationError) Error() string { return e.Message }
 
 // NewClient creates a new authentication client
 func NewClient(cfg *config.Config) *Client {
@@ -157,7 +169,9 @@ func (c *Client) Authenticate() (*api.Session, error) {
 		return nil, err
 	}
 
-	c.saveSessionIfEnabled(session)
+	if err := c.saveSessionIfEnabled(session); err != nil {
+		return nil, fmt.Errorf("authentication succeeded but session persistence failed: %w", err)
+	}
 	return session, nil
 }
 
@@ -298,9 +312,9 @@ func (c *Client) checkSessionScopes(session *api.Session) (hasVPN, hasTwoFactor 
 }
 
 // saveSessionIfEnabled saves the session if persistence is enabled
-func (c *Client) saveSessionIfEnabled(session *api.Session) {
+func (c *Client) saveSessionIfEnabled(session *api.Session) error {
 	if c.config.NoSession {
-		return
+		return nil
 	}
 
 	sessionDuration, err := timeutil.ParseSessionDuration(c.config.SessionDuration)
@@ -310,8 +324,9 @@ func (c *Client) saveSessionIfEnabled(session *api.Session) {
 	}
 
 	if err := c.sessionStore.Save(session, c.config.Username, sessionDuration); err != nil {
-		fmt.Printf("Warning: Failed to save session: %v\n", err)
+		return err
 	}
+	return nil
 }
 
 func (c *Client) ensureUsername() error {
@@ -421,7 +436,7 @@ func (c *Client) sendAuthRequest(authReq map[string]any) (*api.Session, error) {
 	}
 
 	if session.Code == CodeCaptchaRequired {
-		return nil, captchaError(&session, c.config.APIURL)
+		return nil, captchaError(&session, c.config.APIURL, c.config.HVToken != "")
 	}
 
 	if session.Code != CodeSuccess {
@@ -440,39 +455,24 @@ func (c *Client) sendAuthRequest(authReq map[string]any) (*api.Session, error) {
 // The widget emits "<challenge>:<solved-response>" (see sendToken in the page
 // it serves), and that combined string is what the API accepts back. Replaying
 // the bare challenge token just earns a fresh challenge.
-func captchaError(session *api.Session, apiURL string) error {
-	msg := "CAPTCHA verification required by Proton (code 9001)"
-	if methods := session.Details.HumanVerificationMethods; len(methods) > 0 {
-		msg += fmt.Sprintf("\nAccepted verification methods: %s", strings.Join(methods, ", "))
+func captchaError(session *api.Session, apiURL string, replayed bool) error {
+	if replayed {
+		return HumanVerificationError{Code: "CAPTCHA_INVALID", Retryable: true,
+			Message: "A verificação de segurança expirou ou foi recusada. Abra um novo CAPTCHA e tente novamente."}
 	}
-
-	if token := session.Details.HumanVerificationToken; token != "" {
-		return errors.New(msg + "\n\n" +
-			"Solve the CAPTCHA in a browser, then replay the token it produces:\n\n" +
-			"  1. Open " + apiURL + constants.CaptchaPath + "?Token=" + token + "\n" +
-			"  2. Paste this in the browser console BEFORE solving, so the result is\n" +
-			"     not lost among messages from browser extensions:\n" +
-			"       window.addEventListener('message', e => {\n" +
-			"         const t = e.data?.type\n" +
-			"         if (t === 'pm_captcha' || t === 'proton_captcha')\n" +
-			"           console.log('HV TOKEN:', e.data.token)\n" +
-			"       })\n" +
-			"  3. Solve the CAPTCHA. The logged token looks like\n" +
-			"       " + token + ":<long-response>\n" +
-			"     that is, the challenge above, a colon, then the solved response.\n" +
-			"  4. Re-run with the whole string, quoted, as -hv-token:\n" +
-			"       -hv-token '" + token + ":<long-response>'\n\n" +
-			"Challenge tokens expire, so if step 4 reports 9001 again, start over\n" +
-			"from the fresh token in the new error.\n\n" +
-			"Proton challenges logins that look automated, most often from datacenter\n" +
-			"or VPS addresses. Signing in once at https://account.proton.me from the\n" +
-			"same network, or retrying from a residential connection, may also clear it.")
+	msg := "O Proton solicitou uma verificação de segurança."
+	challenge := session.Details.HumanVerificationToken
+	if challenge == "" {
+		return HumanVerificationError{Code: "CAPTCHA_REQUIRED", Retryable: true, Message: msg}
 	}
-
-	return errors.New(msg + "\n" +
-		"Proton returned no verification token, so the challenge cannot be replayed.\n" +
-		"Signing in once at https://account.proton.me from the same network, or\n" +
-		"retrying from a residential connection, may clear it.")
+	base, err := url.Parse(apiURL + constants.CaptchaPath)
+	if err != nil {
+		return HumanVerificationError{Code: "CAPTCHA_REQUIRED", Retryable: true, Message: msg}
+	}
+	q := base.Query()
+	q.Set("Token", challenge)
+	base.RawQuery = q.Encode()
+	return HumanVerificationError{Code: "CAPTCHA_REQUIRED", CaptchaURL: base.String(), Retryable: true, Message: msg}
 }
 
 // submit2FA submits a 2FA code to upgrade the session with additional scopes (like VPN)

@@ -99,8 +99,8 @@ describe("wiring do canal no updater e no workflow", () => {
       "utf8",
     );
     expect(workflow).toContain("canal:");
-    expect(workflow).toContain("-c.publish.releaseType=prerelease");
-    expect(workflow).toContain("beta-marcar");
+    expect(workflow).toContain("prerelease: true");
+    expect(workflow).toContain("inputs.canal == 'beta'");
   });
 
   it("o updater nunca usa showMessageBoxSync (bloqueia o watchdog do Tor enquanto o dialogo espera resposta)", () => {

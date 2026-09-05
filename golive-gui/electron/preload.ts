@@ -2,11 +2,11 @@ import { ipcRenderer } from 'electron';
 
 (window as any).api = {
   platform: process.platform,
-  activate: (proxy?: string, confirmOverride?: boolean) =>
-    ipcRenderer.invoke('activate', proxy, !!confirmOverride),
+  activate: () => ipcRenderer.invoke('activate'),
   deactivate: () => ipcRenderer.invoke('deactivate'),
+  restoreInternet: () => ipcRenderer.invoke('restore-internet'),
   getStatus: () => ipcRenderer.invoke('get-status'),
-  getProxy: () => ipcRenderer.invoke('get-proxy'),
+  getLinuxPreflight: () => ipcRenderer.invoke('get-linux-preflight'),
   getVersion: () => ipcRenderer.invoke('get-app-version'),
   getPlatform: () => ipcRenderer.invoke('get-platform'),
   getStartup: () => ipcRenderer.invoke('get-startup'),
@@ -15,11 +15,6 @@ import { ipcRenderer } from 'electron';
   setAutoUpdate: (enabled: boolean) => ipcRenderer.invoke('set-auto-update', enabled),
   getUpdateChannel: () => ipcRenderer.invoke('get-update-channel'),
   setUpdateChannel: (canal: string) => ipcRenderer.invoke('set-update-channel', canal),
-  getNetMode: () => ipcRenderer.invoke('get-net-mode'),
-  setNetMode: (mode: string) => ipcRenderer.invoke('set-net-mode', mode),
-  getTorStatus: () => ipcRenderer.invoke('get-tor-status'),
-  installTor: () => ipcRenderer.invoke('install-tor'),
-  testProxy: (proxy: string) => ipcRenderer.invoke('test-proxy', proxy),
   importWgConf: () => ipcRenderer.invoke('import-wg-conf'),
   importWgConfFile: (filePath: string) => ipcRenderer.invoke('import-wg-conf-file', filePath),
   getWgConfName: () => ipcRenderer.invoke('get-wg-conf-name'),
@@ -41,17 +36,15 @@ import { ipcRenderer } from 'electron';
   onRefreshStartup: (callback: () => void) => ipcRenderer.on('refresh-startup', callback),
   onRefreshAutoUpdate: (callback: () => void) => ipcRenderer.on('refresh-auto-update', callback),
   onRefreshStatus: (callback: () => void) => ipcRenderer.on('refresh-status', callback),
-  // O watchdog do Tor ressuscitou o daemon no meio da sessao: a janela reabre o aviso do
-  // Ctrl+R (a reconexao do gateway pode travar o video ate um reload).
-  onTorWatchdogRecuperado: (callback: () => void) => ipcRenderer.on('tor-watchdog-recuperado', callback),
   resizeWindow: (height: number) => ipcRenderer.send('resize-window', height),
   setTheme: (theme: string) => ipcRenderer.send('set-theme', theme),
   reportBug: (payload: { title: string; description: string; includeLogs: boolean }) => ipcRenderer.invoke('report-bug', payload),
   getVpnMode: () => ipcRenderer.invoke('get-vpn-mode'),
   setVpnMode: (mode: 'proton' | 'custom') => ipcRenderer.invoke('set-vpn-mode', mode),
   checkProtonSession: (username: string) => ipcRenderer.invoke('check-proton-session', username),
-  loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) =>
+  loginProton: (payload: { username: string; password?: string; twoFactorCode?: string; humanVerificationToken?: string }) =>
     ipcRenderer.invoke('login-proton', payload),
+  openProtonCaptcha: (url: string) => ipcRenderer.invoke('open-proton-captcha', url),
   logoutProton: () => ipcRenderer.invoke('logout-proton'),
   optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) =>
     ipcRenderer.invoke('optimize-proton-route', options),

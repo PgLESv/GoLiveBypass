@@ -3,7 +3,7 @@
 //
 // Garantias de privacidade (testadas em tests/redact.test.ts):
 //   L1 - padroes regex: credenciais em URL, headers de auth, tokens Discord, query do gateway
-//   L2 - ocorrencias literais da proxy personalizada salva pelo usuario
+//   L2 - ocorrencias literais das credenciais Proton salvas pelo usuario
 //   L3 - varredura final: segredo sobrevivente = NADA sai da maquina
 
 import { app } from "electron";
@@ -14,7 +14,6 @@ import * as logsDir from "./logsDir";
 import type { WgTunnelStats } from "./wgstats";
 import {
   cortarDoFim,
-  extrairSegredosDaProxy,
   redigir,
   segredosRemanescentes,
   type SegredosConhecidos,
@@ -72,24 +71,18 @@ function lerArquivoSeguro(file: string, maxBytes = LOG_TAIL_BYTES): string {
   }
 }
 
-// A proxy personalizada e a conta Proton vivem no settings.json da pasta compartilhada (e,
-// em instalacoes antigas, dentro do app.asar injetado). Sao usados APENAS como segredos para
+// A conta Proton vive no settings.json da pasta compartilhada. Os dados sao usados APENAS para
 // a varredura local; nunca entram no payload.
 export function coletarSegredos(dadosRaiz: string): SegredosConhecidos {
   const dir = settingsDir(dadosRaiz);
   const segredos: string[] = [dadosRaiz];
   const candidatos = [
     path.join(dir, "settings.json"),
-    // installs antigos guardavam settings dentro do asar; varre os resources marcados na sessao
-    ...installsDaSessao(dir).map((r) => path.join(r, "app.asar", "settings.json")),
   ];
   for (const file of candidatos) {
     try {
       if (!fs.existsSync(file)) continue;
       const data = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (typeof data.proxy === "string" && data.proxy.trim()) {
-        segredos.push(...extrairSegredosDaProxy(data.proxy));
-      }
       if (typeof data.protonUsername === "string" && data.protonUsername.trim()) {
         segredos.push(data.protonUsername.trim());
       }
@@ -170,30 +163,19 @@ export function montarLog(
 }
 
 // Metadados tecnicos: diagnostico sem identificar a pessoa nem expor a saida escolhida.
-export function montarMeta(
-  netMode: string,
-  statusBypass: string,
-  torAtivo: boolean,
-  torPorta: number | null,
-  routeModeDisco: string,
-  wgTunel?: WgTunnelStats,
-): Record<string, string> {
+export function montarMeta(statusBypass: string, wgTunel?: WgTunnelStats): Record<string, string> {
   return {
     versao: app.getVersion(),
     plataforma: `${process.platform}-${process.arch}`,
     electron: process.versions.electron ?? "?",
     node: process.versions.node ?? "?",
     locale: app.getLocale() || "?",
-    modoRoteamento: netMode === "auto" ? "personalizado" : netMode === "free" ? "gratuitas" : "tor",
-    // O modo que o runtime VAI ler (settings.json no disco). Divergencia daqui com o
-    // modoRoteamento de cima = drift de configuracao (o cenario da issue #108, que
-    // dizia tor com o runtime rodando auto).
-    routeModeDisco: routeModeDisco === "" ? "ausente" : routeModeDisco,
+    modoRoteamento: "wireguard",
+    routeModeDisco: "wireguard",
     // Recuperacao e critica e nao possui mais opt-out. Mantemos a chave para
     // distinguir reports de builds anteriores sem induzir leitura de settings.
     autoRevive: "obrigatorio",
     bypass: statusBypass.toLowerCase(),
-    tor: torAtivo ? `ativo:${torPorta ?? "?"}` : "inativo",
     // Snapshot do tunel WireGuard NO MOMENTO do report — a causa mais provavel de "carregando
     // infinito" pos-migracao e o tunel morto/saturado, nao mais o gateway zumbi do proxy legado.
     // handshake_ha_s velho (>180s) com bypass ativo = tunel morto ou endpoint inalcancavel;
@@ -213,12 +195,9 @@ export function montarMeta(
 export async function submitBugReport(
   payload: ReportPayload,
   ctx: {
-    netMode: string;
-    routeModeDisco?: string;
     statusBypass: string;
-    torAtivo: boolean;
-    torPorta: number | null;
     installsFlavours?: string;
+    graphics?: string;
     wgTunel?: WgTunnelStats;
   },
 ): Promise<ReportResult> {
@@ -235,10 +214,11 @@ export async function submitBugReport(
     title: redigir(title, segredos, BUG_API_TOKEN),
     description: redigir(description, segredos, BUG_API_TOKEN),
     meta: {
-      ...montarMeta(ctx.netMode, ctx.statusBypass, ctx.torAtivo, ctx.torPorta, ctx.routeModeDisco ?? "", ctx.wgTunel),
+      ...montarMeta(ctx.statusBypass, ctx.wgTunel),
       // Flavours vistos na varredura (discord,vesktop,...) — mostra na hora se
       // um cliente paralelo foi achado ou se o report e de "nao achei o Vesktop".
       ...(ctx.installsFlavours ? { installs_flavours: ctx.installsFlavours } : {}),
+      ...(ctx.graphics ? { graphics: ctx.graphics } : {}),
     },
   };
   if (payload.includeLogs) corpo.log = cortarDoFim(montarLog(home, segredos, BUG_API_TOKEN), LOG_TOTAL_MAX);
@@ -251,7 +231,7 @@ export async function submitBugReport(
       logger.error("report", "envio bloqueado: segredo remanescente no payload");
       return {
         ok: false,
-        error: "Envio bloqueado por seguranca: sua proxy apareceu nos logs. O report NAO foi enviado.",
+        error: "Envio bloqueado por seguranca: um dado sensível apareceu nos logs. O report NAO foi enviado.",
       };
     }
   }

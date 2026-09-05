@@ -110,6 +110,7 @@
               <span class="status-indicator" id="statusIndicator"></span>
               <span id="statusText">Verificando...</span>
               <span class="status-tag" id="statusTag">—</span>
+              <code id="linuxPreflightCommand" class="linux-preflight-command" hidden></code>
             </div>
 
             <button id="toggleBtn" class="toggle-btn" disabled>
@@ -143,6 +144,7 @@
               <span id="startupLabel">Iniciar com o Windows</span>
             </label>
             <p class="bypass-note"><span aria-hidden="true">●</span> Só o Discord usa o túnel.</p>
+            <button id="restoreInternetBtn" class="restore-network-btn" type="button" hidden>Restaurar internet</button>
           </section>
 
           <section class="connection-column" aria-label="Opções de conexão">
@@ -205,6 +207,18 @@
                     </span>
                   </label>
                 </div>
+              </div>
+              <div id="protonCaptchaPanel" class="proton-captcha-panel" hidden>
+                <strong>O Proton solicitou uma verificação de segurança.</strong>
+                <p>Abra o desafio oficial, conclua o CAPTCHA e cole aqui o resultado fornecido.</p>
+                <div class="proton-captcha-actions">
+                  <button type="button" id="protonCaptchaOpenBtn" class="proton-btn proton-btn--action">Abrir CAPTCHA</button>
+                  <button type="button" id="protonCaptchaCancelBtn" class="proton-2fa-dialog__cancel">Cancelar</button>
+                </div>
+                <label class="proton-field">
+                  <span>Token da verificação</span>
+                  <input type="password" id="protonCaptchaToken" class="proton-input" autocomplete="off" spellcheck="false" />
+                </label>
               </div>
               <div id="proton2FADialog" class="proton-2fa-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="proton2FADialogTitle">
                 <div id="proton2FABackdrop" class="proton-2fa-dialog__backdrop"></div>
@@ -341,7 +355,7 @@
 
         <footer class="footer">
           <p class="disclaimer">
-            O Discord reiniciar&aacute; automaticamente.
+            O Discord abre já protegido pelo WireGuard; o túnel é confirmado durante a conexão. Ao trocar a rota, saia e entre novamente na call.
             <span id="closeHint"
               >Fechar a janela esconde o app na bandeja, junto do rel&oacute;gio
               &mdash; para reverter tudo, saia pelo &iacute;cone de

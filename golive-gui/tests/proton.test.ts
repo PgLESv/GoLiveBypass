@@ -10,6 +10,8 @@ import {
   checkProtonSession,
   loginProton,
   generateOptimalProtonConfig,
+  getSavedSessionUsername,
+  classifyProtonError,
 } from "../electron/proton";
 
 describe("ProtonVPN Integration & Sidecar", () => {
@@ -31,6 +33,40 @@ describe("ProtonVPN Integration & Sidecar", () => {
     const tmpDir = "/tmp/golive-test";
     const sessionFile = getProtonSessionFile(tmpDir);
     expect(sessionFile).toBe(path.join(tmpDir, "proton-session.json"));
+  });
+
+  it("recupera somente o usuario da sessao persistida", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "proton-session.json"), JSON.stringify({
+        username: "conta@example.com",
+        session: { AccessToken: "nao deve ser retornado" },
+      }));
+      expect(getSavedSessionUsername(tmpDir)).toBe("conta@example.com");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("classifica falhas de login em mensagens acionaveis", () => {
+    expect(classifyProtonError("2FA_REQUIRED").code).toBe("TWO_FACTOR_REQUIRED");
+    expect(classifyProtonError("CAPTCHA_REQUIRED").code).toBe("CAPTCHA_REQUIRED");
+    expect(classifyProtonError("CAPTCHA_INVALID").code).toBe("CAPTCHA_INVALID");
+    expect(classifyProtonError("invalid password").code).toBe("INVALID_CREDENTIALS");
+    expect(classifyProtonError("Tempo limite excedido").code).toBe("TIMEOUT");
+    expect(classifyProtonError("spawn proton-confgen ENOENT").code).toBe("MISSING_EXECUTABLE");
+  });
+
+  it("cria a pasta de dados antes de executar o login", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
+    const nested = path.join(root, "nested", "data");
+    try {
+      const res = await checkProtonSession(nested, "usuario_inexistente");
+      expect(res.valid).toBe(false);
+      expect(fs.existsSync(nested)).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("executa proton-confgen e processa JSON retornado", async () => {
@@ -72,6 +108,9 @@ describe("ProtonVPN Integration & Sidecar", () => {
     }
   });
 
+  // O sidecar faz uma chamada real ao endpoint Proton; em CI/VM o DNS/TLS pode
+  // demorar mais que o timeout padrão de 5s do Vitest. O timeout do produto é
+  // 25s, portanto o teste deve aguardar essa mesma janela sem mascarar travas.
   it("loginProton reporta erro quando credenciais sao invalidas", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
@@ -81,7 +120,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
-  });
+  }, 30000);
 
   it("generateOptimalProtonConfig falha graciosamente se nao houver sessao ativa", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));

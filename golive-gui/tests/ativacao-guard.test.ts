@@ -16,12 +16,10 @@ function devePularReativacao(args: {
   assinatura: string;
   assinaturaAnterior: string;
   status: string;
-  injetadas: boolean[];
 }): boolean {
   return (
     args.assinatura === args.assinaturaAnterior &&
-    args.status === "ACTIVE" &&
-    args.injetadas.every(Boolean)
+    args.status === "ACTIVE"
   );
 }
 
@@ -29,10 +27,9 @@ describe("guarda de ativacao duplicada", () => {
   const base = {
     assinaturaAnterior: assinaturaAtivacao("", "tor"),
     status: "ACTIVE",
-    injetadas: [true],
   };
 
-  it("pula quando ja ativo, injetado e com a mesma proxy/modo", () => {
+  it("pula quando ja ativo com a mesma configuracao", () => {
     expect(
       devePularReativacao({ ...base, assinatura: assinaturaAtivacao("", "tor") }),
     ).toBe(true);
@@ -67,21 +64,15 @@ describe("guarda de ativacao duplicada", () => {
     ).toBe(false);
   });
 
-  it("nao pula quando algum install perdeu a injecao", () => {
-    expect(
-      devePularReativacao({
-        ...base,
-        injetadas: [true, false],
-        assinatura: assinaturaAtivacao("", "tor"),
-      }),
-    ).toBe(false);
+  it("pula sem consultar o estado de injecao legado", () => {
+    expect(devePularReativacao({ ...base, assinatura: assinaturaAtivacao("", "tor") })).toBe(true);
   });
 
   it("o main.ts realmente serializa ativacoes e compara a assinatura antes de injetar", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     expect(src).toContain("if (ativacaoCorrente !== null)");
     expect(src).toContain("assinaturaUltimaAtivacao = assinatura;");
-    expect(src).toContain("getStatus() === \"ACTIVE\" &&");
+    expect(src).toContain('getStatus() === "ACTIVE"');
   });
 
   it("a reativacao de boot atualiza janela e bandeja no fim (sucesso ou falha)", () => {
@@ -92,25 +83,164 @@ describe("guarda de ativacao duplicada", () => {
     expect(src).toMatch(/autoInject falhou:[\s\S]{0,600}refreshWindowStatus\(\);/);
   });
 
-  it("o boot nao reativa nem re-semeia o sistema legado de injecao", () => {
+  it("o boot migra o estado legado para WireGuard", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    expect(src).toContain("sistema WireGuard ativo; legado de injecao ignorado");
+    expect(src).toContain("sistema WireGuard ativo; configuracao legada removida");
   });
 
-  it("saveTorAddr atualiza tanto as settings compartilhadas quanto as injecoes existentes no Windows/macOS", () => {
+  it("remove dados de proxy e Tor da configuracao compartilhada", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    const fnStart = src.indexOf("function saveTorAddr(addr: string)");
-    expect(fnStart).toBeGreaterThan(0);
-    const fnBody = src.slice(fnStart, fnStart + 300);
-    expect(fnBody).toContain("updateSharedSettings({ torAddr: addr });");
-    expect(fnBody).toContain("reescreverSettingsInjetado({ torAddr: addr });");
+    expect(src).toContain("delete novo.proxy;");
+    expect(src).toContain("delete novo.torAddr;");
   });
 
-  it("desativar WireSock reinicia o Discord mesmo sem app.asar injetado", () => {
+  it("desativar WireSock serializa a recuperacao e so relanca o Discord apos validacao", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const fnStart = src.indexOf("async function deactivateAll()");
     const fnBody = src.slice(fnStart, fnStart + 2200);
     expect(fnBody).toContain("const hadWireSock = IS_WINDOWS && isWireSockActive();");
-    expect(fnBody).toMatch(/if \(ours\.length === 0\) \{[\s\S]{0,500}await killDiscord\(\);[\s\S]{0,300}stopWireSockService\(\);[\s\S]{0,500}startDiscord\(install\)/);
+    expect(fnBody).toContain('withWireSockLifecycle("desativacao"');
+    expect(fnBody).toMatch(/await killDiscord\(\);[\s\S]{0,300}await recoverWireSockNetwork\(\);[\s\S]{0,500}startDiscordAndConfirm\(installs, "desativacao"\)/);
+    expect(fnBody).toContain("if (!recovery.ok)");
+  });
+
+  it("nao relanca o Discord enquanto a restauracao do WireSock ou da rede falhou", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const fnStart = src.indexOf('ipcMain.handle("restore-internet"');
+    const fnBody = src.slice(fnStart, fnStart + 1100);
+    expect(fnBody).toContain('withWireSockLifecycle("restaurar-internet"');
+    expect(fnBody).toContain("const recovery = await recoverWireSockNetwork();");
+    expect(fnBody).toContain("if (hadWireSock && recovery.ok)");
+    expect(fnBody).toContain("const hadWireSock = isWireSockActive();");
+  });
+
+  it("aplica rota Linux sem desmontar o Discord e valida o WireSock apos iniciar o cliente permitido", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    expect(src).toContain('runScript(["--refresh-route"])');
+    expect(src).not.toContain('runScript(["--deactivate"]);\n        await runScript(["--activate"]);');
+    expect(src).toContain('withWireSockLifecycle("troca-rota-proton"');
+    expect(src).toContain('await killDiscord();');
+
+    const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
+    expect(activation.indexOf('startDiscordAndConfirm(installs, "ativacao")')).toBeLessThan(
+      activation.indexOf("void waitForWindowsWgReady()"),
+    );
+    expect(activation).toContain("let windowsDiscordStarted = false;");
+
+    const readinessStart = src.indexOf("async function waitForWindowsWgReady");
+    const readiness = src.slice(readinessStart, src.indexOf("function linuxStatus", readinessStart));
+    expect(readiness).toContain("hasWireSockAdapterTrafficIncrease");
+    expect(readiness).toContain('"rota.confirmada.protun"');
+    expect(readiness).not.toContain("verifyWindowsNetworkStable");
+    expect(readiness).not.toContain("throw new Error(`WireGuard iniciou");
+    expect(readiness).toContain('"disconnected" : "unverified"');
+
+    const ui = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    expect(ui).toContain("Discord abre já protegido pelo WireGuard");
+    expect(ui).not.toContain("Discord só abre depois que o WireGuard confirma handshake");
+  });
+
+  it("usa uma fila unica para operacoes concorrentes do WireSock", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    expect(src).toContain("let wireSockLifecycleQueue: Promise<void> = Promise.resolve();");
+    expect(src).toContain("wireSockLifecycleQueue = run.then(() => undefined, () => undefined);");
+  });
+
+  it("aguarda a limpeza WireSock terminar antes de concluir o quit", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const beforeQuit = src.slice(src.indexOf('app.on("before-quit"'), src.indexOf('app.on("window-all-closed"'));
+    expect(beforeQuit).toMatch(/const restore = IS_LINUX\s*\?\s*(?:withWireSockLifecycle\("encerrar-linux",\s*\(\) =>\s*)?linuxDeactivate\(\(\) => \{\}\)/);
+    expect(beforeQuit).toContain(".finally(() => app.quit());");
+    expect(beforeQuit).not.toMatch(/restore\.catch\(\(\) => \{\}\);[\s\S]*app\.quit\(\);/);
+  });
+
+  it("serializa a geracao Proton antes de persistir e aplicar a rota", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const fnStart = src.indexOf('ipcMain.handle("optimize-proton-route"');
+    const fnBody = src.slice(fnStart, fnStart + 5200);
+    expect(fnBody).toMatch(/return withWireSockLifecycle\("troca-rota-proton", async \(\) => \{/);
+    expect(fnBody.indexOf("return withWireSockLifecycle")).toBeLessThan(fnBody.indexOf("proton.generateOptimalProtonConfig"));
+    expect(fnBody).not.toMatch(/withWireSockLifecycle\("troca-rota-proton"[\s\S]*withWireSockLifecycle\("troca-rota-proton"/);
+  });
+
+  it("mantem o diagnostico centrado no WireGuard", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    expect(src).toContain('updateSharedSettings({ routeMode: "wireguard" });');
+    expect(src).toContain("getWireSockConnectionStatus");
+  });
+
+  it("no Windows ativa WireSock sem ler, esperar ou alterar app.asar", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
+    expect(activation).toContain("await startWireSockService(settingsDir())");
+    expect(activation).not.toContain("app.asar");
+    expect(activation).not.toContain("assertResourcesWritable");
+    expect(activation).not.toContain("isOurInjection");
+  });
+
+  it("nao altera a rota enquanto o Discord anterior ainda esta vivo", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const kill = src.slice(src.indexOf("async function killDiscord"), src.indexOf("function assertResourcesWritable"));
+    expect(src).toContain('logger.error("discord", "encerramento.timeout"');
+    expect(kill).toContain("discordDidNotStop()");
+    const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
+    expect(activation.indexOf("await killDiscord()")).toBeLessThan(
+      activation.indexOf("await startWireSockService(settingsDir())"),
+    );
+  });
+
+  it("trata falha de tasklist como estado desconhecido, nunca como Discord encerrado", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const probe = src.slice(src.indexOf("function discordProcessState"), src.indexOf("function discordDidNotStop"));
+    expect(probe).toContain('return probeFailed ? "unknown" : "stopped"');
+    expect(probe).toContain("waitForProcessStopped(() => discordProcessState()");
+  });
+
+  it("confirma que o Update.exe do Discord saiu antes de trocar a rota", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const updaterProbe = src.slice(src.indexOf("function discordUpdaterProcessState"), src.indexOf("function killMacProcesses"));
+    expect(updaterProbe).toContain("$_ .CommandLine".replace("$_ .", "$_."));
+    expect(updaterProbe).toContain('return "unknown"');
+    expect(updaterProbe).toContain("waitUntilDiscordUpdaterGone");
+
+    const kill = src.slice(src.indexOf("async function killDiscord"), src.indexOf("function assertResourcesWritable"));
+    expect(kill).toMatch(/killDiscordUpdater\(\);[\s\S]{0,500}waitUntilDiscordUpdaterGone/);
+    expect(kill).toContain("discordUpdaterDidNotStop()");
+  });
+
+  it("nao declara recuperacao concluida se o Discord nao voltar depois da rede", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const restart = src.slice(src.indexOf("async function startDiscordAndConfirm"), src.indexOf("function isOurInjection"));
+    expect(restart).toContain("waitUntilDiscordRunning()");
+    expect(restart).toContain('"reinicio.timeout"');
+
+    const deactivation = src.slice(src.indexOf("async function deactivateAll"), src.indexOf("function getStatus"));
+    expect(deactivation).toContain('startDiscordAndConfirm(installs, "desativacao")');
+    expect(deactivation).toContain("A rede foi restaurada, mas o Discord não iniciou");
+
+    const restore = src.slice(src.indexOf('ipcMain.handle("restore-internet"'), src.indexOf('ipcMain.handle("get-platform"'));
+    expect(restore).toContain('startDiscordAndConfirm(getDiscordInstalls(), "restaurar-internet")');
+    expect(restore).toContain("ok: false");
+  });
+
+  it("confirma o Discord iniciado antes de validar o tunel e desfaz WireSock quando o spawn nao produz processo", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
+    expect(activation).toContain('startDiscordAndConfirm(installs, "ativacao")');
+    expect(activation).toContain('withWireSockLifecycle("ativacao.rollback"');
+    expect(activation).toContain("await recoverWireSockNetwork()");
+    const start = src.slice(src.indexOf("function startDiscord"), src.indexOf("function isOurInjection"));
+    expect(start).toContain('child.once("error"');
+  });
+
+  it("reverte WireSock parcialmente instalado quando a ativacao falha antes do Discord iniciar", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
+    expect(activation).toContain('withWireSockLifecycle("ativacao.rollback", () => recoverWireSockNetwork())');
+    expect(activation).toContain('logger.error("wiresock", "ativacao.falhou_revertida"');
+    expect(activation).toContain("clearSessionMarker();");
+    expect(activation).toContain("pararWgStatsWatchdog();");
+    const rollback = activation.slice(activation.indexOf("} catch (cause)"), activation.indexOf("if (!windowsDiscordStarted)"));
+    expect(rollback.indexOf("await killDiscord()")).toBeLessThan(rollback.indexOf("recoverWireSockNetwork()"));
   });
 });

@@ -32,6 +32,11 @@ const IS_MAC = process.platform === "darwin";
 const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const ENTRY_NAME = "GoLiveBypass";
 
+export interface StartupResult {
+  success: boolean;
+  error?: string;
+}
+
 /**
  * Retorna o caminho do executavel que deve ser usado para iniciar o app no boot.
  *
@@ -62,6 +67,12 @@ function realExecPath(): string {
   return process.execPath;
 }
 
+// Escape minimo exigido pelo formato Desktop Entry para caminhos com espacos,
+// aspas, barras invertidas ou caracteres especiais.
+function desktopExecPath(value: string): string {
+  return `"${value.replace(/([\\"`$])/g, "\\$1")}"`;
+}
+
 /**
  * Marca o app para iniciar com o login do usuario.
  * - Windows: HKCU\...\Run via reg.exe (funciona em portable)
@@ -72,15 +83,19 @@ function realExecPath(): string {
  * a janela do GUI. A primeira coisa que o main faz com --hidden e a checagem
  * launchedHidden() (ver main.ts), que decide se cria a janela visivel.
  */
-export function setStartup(enabled: boolean): void {
+export function setStartup(enabled: boolean): StartupResult {
   if (IS_WINDOWS) {
     if (enabled) {
+      const executable = realExecPath();
+      if (!executable || !fs.existsSync(executable)) {
+        return { success: false, error: "O executável atual do GoLiveBypass não foi encontrado." };
+      }
       // Aspas escapadas: o caminho do exe pode ter espacos (o portable e
       // "GoLiveBypass-1.1.9.exe" em C:\Program Files\ por exemplo). reg.exe
       // interpreta a string como valor REG_SZ, e espacos sem aspas quebram
       // o registro. O prefixo " so serve se o valor comecar com aspas;
       // aqui o caminho e o valor inteiro do registro.
-      const value = `\"${realExecPath()}\" --hidden`;
+      const value = `\"${executable}\" --hidden`;
       try {
         execFileSync("reg.exe", [
           "add",
@@ -95,7 +110,9 @@ export function setStartup(enabled: boolean): void {
         // mas pode acontecer em kiosk). Silencioso -- a UI nao foi projetada
         // para mostrar erro, e o usuario pode re-tentar.
         console.error("falha ao adicionar entrada de Run:", error);
+        return { success: false, error: "O Windows recusou a criação da inicialização automática." };
       }
+      if (!getStartup()) return { success: false, error: "A entrada foi criada, mas não pôde ser confirmada no registro do Windows." };
     } else {
       try {
         execFileSync("reg.exe", [
@@ -111,7 +128,7 @@ export function setStartup(enabled: boolean): void {
         // jeito.
       }
     }
-    return;
+    return { success: true };
   }
 
   if (IS_LINUX) {
@@ -120,26 +137,34 @@ export function setStartup(enabled: boolean): void {
       const dir = path.dirname(file);
       try {
         fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(file, [
+        const content = [
           "[Desktop Entry]",
           "Type=Application",
           "Name=GoLiveBypass",
           "Comment=Devolve o Go Live e a camera no Discord",
-          `Exec=${realExecPath()} --hidden`,
+          `Exec=${desktopExecPath(realExecPath())} --hidden`,
+          `TryExec=${desktopExecPath(realExecPath())}`,
           "X-GNOME-Autostart-enabled=true",
+          "X-GNOME-Autostart-Delay=5",
           "",
-        ].join("\n"));
+        ].join("\n");
+        const temp = `${file}.tmp-${process.pid}`;
+        fs.writeFileSync(temp, content);
+        fs.renameSync(temp, file);
+        if (!fs.existsSync(file)) return { success: false, error: "O arquivo de inicialização não foi criado." };
       } catch (error) {
         console.error("falha ao escrever .desktop:", error);
+        return { success: false, error: "Não foi possível criar a inicialização automática do Linux." };
       }
     } else if (fs.existsSync(file)) {
       try {
         fs.unlinkSync(file);
       } catch (error) {
         console.error("falha ao remover .desktop:", error);
+        return { success: false, error: "Não foi possível desativar a inicialização automática do Linux." };
       }
     }
-    return;
+    return { success: true };
   }
 
   if (IS_MAC) {
@@ -150,8 +175,9 @@ export function setStartup(enabled: boolean): void {
       openAtLogin: enabled,
       args: ["--hidden"],
     });
-    return;
+    return { success: true };
   }
+  return { success: true };
 }
 
 /**
