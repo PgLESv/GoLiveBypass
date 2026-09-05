@@ -10,7 +10,7 @@ import { terminalCommands } from '../data/install'
 describe('release downloads', () => {
   it('monta um asset direto da release configurada', () => {
     expect(githubReleaseAssetUrl(release.assets.plugin)).toBe(
-      'https://github.com/PgLESv/GoLiveBypass/releases/download/v2.1.1/goLiveBypass-vencord.zip',
+      'https://github.com/PgLESv/GoLiveBypass/releases/download/v2.1.3/goLiveBypass-vencord.zip',
     )
   })
 
@@ -22,7 +22,7 @@ describe('release downloads', () => {
   })
 
   it('expõe os caminhos usados pelas páginas', () => {
-    expect(downloads.windowsGui).toContain('/releases/download/v2.1.1/')
+    expect(downloads.windowsGui).toContain('/releases/download/v2.1.3/')
     expect(downloads.installerPosix).toContain('/main/installer/golivebypass-installer.sh')
   })
 

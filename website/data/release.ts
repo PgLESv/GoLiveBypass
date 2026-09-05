@@ -11,14 +11,14 @@ export type ReleaseAssetKey =
 export const release = {
   owner: 'PgLESv',
   repo: 'GoLiveBypass',
-  tag: 'v2.1.1',
-  version: '2.1.1',
+  tag: 'v2.1.3',
+  version: '2.1.3',
   channel: 'stable',
   assets: {
-    windowsGui: 'GoLiveBypass-2.1.1.exe',
+    windowsGui: 'GoLiveBypass-2.1.3.exe',
     macDmg: '',
     macZip: '',
-    linuxGui: 'GoLiveBypass-2.1.1.AppImage',
+    linuxGui: 'GoLiveBypass-2.1.3.AppImage',
     plugin: 'goLiveBypass-vencord.zip',
     pluginSha: 'goLiveBypass-vencord.zip.sha256',
     standaloneJs: 'GoLiveBypass-1.1.11-bypass.js',

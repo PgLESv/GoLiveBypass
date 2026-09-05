@@ -4,6 +4,11 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.3] - 2026-09-05
+
+### Corrigido
+- **Auto-Update no Windows Portable (EBUSY / Código 32):** Corrigido o erro `EBUSY: resource busy or locked` que impedia a atualização automática de versões portáveis (`GoLiveBypass-*.exe`). Como o executável raiz do wrapper NSIS do electron-builder mantém um handle aberto para leitura (`FILE_SHARE_READ`) enquanto a aplicação está rodando, a substituição do binário foi desacoplada para o helper externo pós-encerramento (`.bat` executado de forma oculta via `wscript.exe`). O helper aguarda o término do processo pai, substitui o arquivo com sucesso via loop com `move /y` e reinicia o aplicativo atualizado de forma totalmente transparente e automática.
+
 ## [2.1.2] - 2026-09-05
 
 ### Sincronização Upstream (GoLiveBypass 2.0.3)
