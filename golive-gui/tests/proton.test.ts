@@ -12,6 +12,8 @@ import {
   generateOptimalProtonConfig,
   getSavedSessionUsername,
   classifyProtonError,
+  cleanProtonUsername,
+  isSameProtonUsername,
 } from "../electron/proton";
 
 describe("ProtonVPN Integration & Sidecar", () => {
@@ -136,5 +138,17 @@ describe("ProtonVPN Integration & Sidecar", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it("normaliza e compara nomes de usuário Proton com e sem sufixo de email", () => {
+    expect(cleanProtonUsername("pglesv@proton.me")).toBe("pglesv");
+    expect(cleanProtonUsername("PgLESv@protonmail.com")).toBe("pglesv");
+    expect(cleanProtonUsername("teste@pm.me")).toBe("teste");
+    expect(cleanProtonUsername("  usuario  ")).toBe("usuario");
+
+    expect(isSameProtonUsername("pglesv", "pglesv@proton.me")).toBe(true);
+    expect(isSameProtonUsername("PgLESv", "pglesv@protonmail.com")).toBe(true);
+    expect(isSameProtonUsername("pglesv@proton.me", "PGLESV")).toBe(true);
+    expect(isSameProtonUsername("outro", "pglesv@proton.me")).toBe(false);
   });
 });

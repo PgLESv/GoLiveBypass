@@ -28,6 +28,7 @@ export interface ProtonLoginResult {
   error?: string;
   retryable?: boolean;
   captchaUrl?: string;
+  username?: string;
   tier?: number;
   planTitle?: string;
   isPaid?: boolean;
@@ -173,6 +174,22 @@ export function getProtonSessionFile(installDir: string): string {
   return path.join(installDir, 'proton-session.json');
 }
 
+/**
+ * Remove sufixos de domínio de e-mail do Proton (@proton.me, @protonmail.com, @pm.me)
+ * e normaliza para comparação insensível a maiúsculas/minúsculas.
+ */
+export function cleanProtonUsername(username: string): string {
+  return (username || '')
+    .trim()
+    .toLowerCase()
+    .replace(/@(protonmail\.com|proton\.me|pm\.me)$/i, '');
+}
+
+export function isSameProtonUsername(a?: string, b?: string): boolean {
+  if (!a || !b) return false;
+  return cleanProtonUsername(a) === cleanProtonUsername(b);
+}
+
 /** Read only the non-secret identity metadata from the cached session. */
 export function getSavedSessionUsername(installDir: string): string {
   try {
@@ -277,9 +294,11 @@ export async function loginProton(
 
   if (res.json && res.json.success) {
     logger.info('proton', 'autenticação bem-sucedida', { planTitle: res.json.planTitle, tier: res.json.tier });
+    const saved = getSavedSessionUsername(installDir);
     return {
       success: true,
       message: 'Autenticação concluída.',
+      username: res.json.username || saved || username,
       tier: res.json.tier,
       planTitle: res.json.planTitle,
       isPaid: res.json.isPaid,

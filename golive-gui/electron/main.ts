@@ -3791,8 +3791,17 @@ ipcMain.handle("check-proton-session", async (_event, username?: string) => {
 ipcMain.handle("login-proton", async (_event, payload: { username: string; password?: string; twoFactorCode?: string; humanVerificationToken?: string }) => {
   const res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode, payload.humanVerificationToken);
   if (res.success) {
+    const savedUsername = proton.getSavedSessionUsername(settingsDir());
+    if (!savedUsername || !proton.isSameProtonUsername(savedUsername, payload.username)) {
+      logger.error("proton", "sessao autenticada nao foi encontrada apos login", {
+        savedUsername,
+        payloadUsername: payload.username,
+      });
+      return { success: false, code: "SESSION_PERSISTENCE", retryable: false, message: "Login concluído, mas a sessão não foi persistida.", error: "Tente novamente." };
+    }
+    const effectiveUsername = savedUsername || res.username || payload.username;
     if (!updateSharedSettings({
-      protonUsername: payload.username,
+      protonUsername: effectiveUsername,
       protonTier: res.tier,
       protonPlanTitle: res.planTitle,
       protonIsPaid: res.isPaid,
@@ -3800,15 +3809,10 @@ ipcMain.handle("login-proton", async (_event, payload: { username: string; passw
     })) {
       return { success: false, code: "SESSION_PERSISTENCE", retryable: false, message: "Login concluído, mas não foi possível salvar a conta neste computador.", error: "Verifique as permissões da pasta de dados e tente novamente." };
     }
-    const savedUsername = proton.getSavedSessionUsername(settingsDir());
-    if (savedUsername !== payload.username) {
-      logger.error("proton", "sessao autenticada nao foi encontrada apos login");
-      return { success: false, code: "SESSION_PERSISTENCE", retryable: false, message: "Login concluído, mas a sessão não foi persistida.", error: "Tente novamente." };
-    }
     const s = readSharedSettings() as any;
     try {
       const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
-        username: payload.username,
+        username: effectiveUsername,
         countries: (s.protonCountry as string) || undefined,
         freeOnly: !res.isPaid,
         autoPing: s.protonAutoPing !== false,
