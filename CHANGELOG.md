@@ -4,6 +4,14 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.2-beta.3] - 2026-09-04
+
+### Teste E2E Linux e estabilidade
+
+- Confirmada ativação no Discord real com namespace WireGuard, gateway acessível e tráfego RX/TX crescente.
+- Status Linux agora distingue Discord fora do namespace de uma sessão realmente protegida.
+- Inclui recuperação limitada para túnel degradado e correções de prontidão WireSock sem bloquear instalações sem telemetria opcional.
+
 ## [2.0.2-beta.2] - 2026-09-04
 
 ### Correção Windows
