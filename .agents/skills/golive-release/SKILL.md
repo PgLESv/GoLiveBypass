@@ -19,7 +19,7 @@ Determine se o pedido é preparar, publicar ou diagnosticar uma release. Inspeci
 
 Prepare primeiro versão, notas e evidência para revisão. Se a autorização de publicação já estiver na conversa, prossiga sem nova confirmação; se o pedido cobrir só preparação, entregue os artefatos/diff e a ação que falta autorizar.
 
-Use a tag exata no `workflow_dispatch` de `build-gui.yml` com o canal correspondente. Após a execução, confira os resultados dos jobs, assets esperados, estado draft/prerelease e a resposta de `/releases/latest`. Para beta, verifique que latest continua estável. Em falha parcial, inspecione o estado remoto antes de repetir; não promova beta nem sobrescreva outra versão para contornar erro.
+Use a tag exata no `workflow_dispatch` de `build-gui.yml` com o canal correspondente. Para conferir todos os artefatos antes de publicar, use `rascunho=true`; depois dos jobs e da conferência, publique o draft quando já autorizado. Após a execução, confira os resultados dos jobs, assets esperados, estado draft/prerelease e a resposta de `/releases/latest`. Para beta, verifique que latest continua estável. Em falha parcial, inspecione o estado remoto antes de repetir; não promova beta nem sobrescreva outra versão para contornar erro.
 
 Entregue versão/canal, validação realizada e, se publicada, link e resultado dos artefatos. Distinga build local de publicação confirmada.
 
