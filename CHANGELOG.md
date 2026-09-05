@@ -4,7 +4,7 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [Não lançado]
+## [2.0.3-beta.1] - 2026-09-05
 
 ### Correção Windows — issue #226
 
