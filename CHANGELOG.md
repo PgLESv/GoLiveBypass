@@ -49,6 +49,13 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - E2E em Windows 11: ativação aguardou a conexão real antes de abrir o Discord; desativação
   restaurou o cliente sem reiniciar o Windows.
 
+### Agradecimentos
+
+Obrigado aos beta testers e a todos os usuários que reportaram bugs, enviaram diagnósticos
+sanitizados e repetiram cenários difíceis até conseguirmos reproduzi-los. Os relatos de queda
+de rota, WireSock residual, loop de atualização e Discord preso em chamada foram essenciais para
+esta estabilização.
+
 ## [2.0.0] - 2026-09-04
 
 ### Destaques
