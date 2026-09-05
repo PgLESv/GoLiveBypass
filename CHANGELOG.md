@@ -4,6 +4,35 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.3-beta.2] - 2026-09-05
+
+### Correção Windows — issue #232
+
+- **Prova do mesmo escopo do Discord:** a beta 1 comprovava somente que o
+  `proton-confgen.exe` central entrava no túnel. Agora cada diretório `app-*`
+  encontrado é incluído no `AllowedApps` e recebe um probe temporário. Esse
+  probe só pode usar o WireSock pela mesma regra de diretório que cobrirá o
+  `Discord.exe`, eliminando o falso positivo em que o helper aparecia no Canadá
+  enquanto o Discord continuava com IP brasileiro.
+- **Todas as instalações precisam passar:** Discord Stable, PTB, Canary e
+  clientes paralelos detectados são comprovados individualmente antes de serem
+  abertos. Um único diretório brasileiro, direto ou inconclusivo faz a ativação
+  falhar fechada e restaurar a rede.
+- **Sem arquivo residual:** os probes co-localizados são removidos antes de o
+  Discord abrir, tanto em sucesso quanto em erro. Falha de limpeza também impede
+  a abertura para não deixar um executável temporário abandonado na instalação.
+- **Handshake continua auxiliar:** a decisão permanece baseada em HTTPS real,
+  consenso entre fontes, comparação com o IP direto e acesso ao Discord, com
+  tentativas tolerantes a inicialização lenta do túnel. Handshake recente por si
+  só nunca aprova a rota.
+
+### Fora do escopo
+
+- A mudança continua específica da GUI Windows/WireSock. Linux já executa o
+  próprio Discord dentro do namespace de rede, e o plugin não controla o filtro
+  WFP. O standalone PowerShell ainda não distribui o sidecar necessário para a
+  mesma prova co-localizada.
+
 ## [2.0.3-beta.1] - 2026-09-05
 
 ### Correção Windows — issue #226

@@ -21,6 +21,13 @@ describe("WireSock no Windows", () => {
     expect(() => formatAllowedApps(["C:\\Apps, Inc\\Discord.exe"])).toThrow("AllowedApps");
   });
 
+  it("inclui o diretorio app do Discord para cobrir todos os subprocessos", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const fn = src.slice(src.indexOf("function windowsAllowedAppPaths"), src.indexOf("function logRouteProbe"));
+    expect(fn).toContain("path.dirname(path.resolve(install.exePath))");
+    expect(fn).toContain("proton.findProtonConfgenExe()");
+  });
+
   it("emite a extensao AllowedApps com o prefixo aceito pelo SDK 3.x", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("#@ws:AllowedApps = ${allowedApps}");

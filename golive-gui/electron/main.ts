@@ -31,6 +31,7 @@ import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } 
 import { parseLinuxPreflight, linuxPreflightMessage, type LinuxPreflight } from "./linux-preflight";
 import { classifyLinuxHealth, shouldRecoverLinuxTunnel } from "./linux-health";
 import { decideRouteProof, maskedIP, type RouteProbeResult } from "./route-proof";
+import { prepareDiscordScopeProbes, type DiscordScopeProbe } from "./discord-scope-proof";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1110,6 +1111,9 @@ function windowsAllowedAppPaths(installs: DiscordInstall[]): string[] {
   for (const install of installs) {
     if (!install.exePath) continue;
     apps.add(path.resolve(install.exePath));
+    // WireSock interpreta caminho de diretorio como todos os executaveis
+    // contidos nele. A prova co-localizada abaixo valida exatamente esta regra.
+    apps.add(path.dirname(path.resolve(install.exePath)));
     apps.add(path.basename(install.exePath));
     apps.add(path.join(path.dirname(path.dirname(install.exePath)), "Update.exe"));
     apps.add("Update.exe");
@@ -1120,10 +1124,11 @@ function windowsAllowedAppPaths(installs: DiscordInstall[]): string[] {
   return [...apps];
 }
 
-function logRouteProbe(stage: "direct" | "tunnel", attempt: number, result: RouteProbeResult) {
+function logRouteProbe(stage: "direct" | "tunnel", attempt: number, result: RouteProbeResult, target = "central") {
   logger.info("wiresock", "route.probe", {
     stage,
     attempt,
+    target,
     success: result.success,
     discord_ok: result.discordOk,
     observations: result.observations.map((item) => ({
@@ -1152,30 +1157,43 @@ async function directRouteBaseline(generation: number): Promise<RouteProbeResult
   return null;
 }
 
-async function requireFunctionalWindowsRoute(direct: RouteProbeResult | null, generation: number): Promise<void> {
+async function requireFunctionalWindowsRoute(direct: RouteProbeResult | null, generation: number, probes: DiscordScopeProbe[]): Promise<void> {
+  if (probes.length === 0) throw new Error("Nenhum diretório do Discord foi preparado para a prova de escopo.");
   let lastReason = "inconclusive";
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    assertWindowsRouteGeneration(generation);
-    try {
-      const tunneled = await proton.runRouteProbe(12_000);
+  let verifiedTargets = 0;
+  for (const probe of probes) {
+    const target = probe.flavours.join("+");
+    let verified = false;
+    for (let attempt = 1; attempt <= 4; attempt++) {
       assertWindowsRouteGeneration(generation);
-      logRouteProbe("tunnel", attempt, tunneled);
-      const decision = decideRouteProof(direct, tunneled);
-      lastReason = decision.reason;
-      logger.info("wiresock", "route.proof", {
-        attempt,
-        verified: decision.verified,
-        reason: decision.reason,
-        source: decision.source || "?",
-        country: decision.country || "?",
-      });
-      if (decision.verified) return;
-    } catch (error) {
-      lastReason = "probe_failed";
-      logger.warn("wiresock", "route.probe.tunnel.error", { attempt, erro: String((error as Error)?.message ?? error).slice(0, 300) });
+      try {
+        const tunneled = await proton.runRouteProbeFrom(probe.probePath, 12_000);
+        assertWindowsRouteGeneration(generation);
+        logRouteProbe("tunnel", attempt, tunneled, target);
+        const decision = decideRouteProof(direct, tunneled);
+        lastReason = decision.reason;
+        logger.info("wiresock", "route.proof", {
+          attempt,
+          target,
+          verified: decision.verified,
+          reason: decision.reason,
+          source: decision.source || "?",
+          country: decision.country || "?",
+        });
+        if (decision.verified) {
+          verified = true;
+          verifiedTargets += 1;
+          break;
+        }
+      } catch (error) {
+        lastReason = "probe_failed";
+        logger.warn("wiresock", "route.probe.tunnel.error", { attempt, target, erro: String((error as Error)?.message ?? error).slice(0, 300) });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (!verified) break;
   }
+  if (verifiedTargets === probes.length) return;
 
   const message = lastReason === "brazil"
     ? "A saída do WireSock continuou no Brasil. O Discord não foi aberto para evitar o bloqueio regional."
@@ -1510,13 +1528,17 @@ async function executarAtivacao(event: any) {
         }
         assertWindowsRouteGeneration(windowsGeneration);
         const direct = await directRouteBaseline(windowsGeneration);
-        await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
-        windowsRouteState = "probing";
-        refreshWindowStatus();
-        // O helper esta no mesmo AllowedApps por caminho absoluto. Ele prova o
-        // IP de saida e o acesso ao Discord antes de o primeiro pacote do
-        // cliente real existir, sem depender de wg.exe/CLI/ProTUN.
-        await requireFunctionalWindowsRoute(direct, windowsGeneration);
+        const scope = prepareDiscordScopeProbes(installs, proton.findProtonConfgenExe());
+        try {
+          await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
+          windowsRouteState = "probing";
+          refreshWindowStatus();
+          // O probe temporario roda de dentro de cada app-* do Discord e so
+          // pode entrar no tunel pela mesma regra de diretorio do cliente real.
+          await requireFunctionalWindowsRoute(direct, windowsGeneration, scope.probes);
+        } finally {
+          await scope.cleanup();
+        }
         if (!(await startDiscordAndConfirm(installs, "ativacao"))) {
           throw new Error("O Discord não iniciou após preparar o túnel.");
         }
@@ -4095,10 +4117,15 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
           }
           assertWindowsRouteGeneration(generation);
           const direct = await directRouteBaseline(generation);
-          await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
-          windowsRouteState = "probing";
-          refreshWindowStatus();
-          await requireFunctionalWindowsRoute(direct, generation);
+          const scope = prepareDiscordScopeProbes(installs, proton.findProtonConfgenExe());
+          try {
+            await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
+            windowsRouteState = "probing";
+            refreshWindowStatus();
+            await requireFunctionalWindowsRoute(direct, generation, scope.probes);
+          } finally {
+            await scope.cleanup();
+          }
           readiness = { verified: true, state: "connected", source: "functional", detail: "IP de saída e Discord comprovados pelo helper isolado" };
           if (!(await startDiscordAndConfirm(installs, "troca-rota-proton"))) {
             throw new Error("a nova rota foi comprovada, mas o Discord não iniciou");

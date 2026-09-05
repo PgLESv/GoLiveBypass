@@ -92,6 +92,7 @@ export function findProtonConfgenExe(): string {
 export interface RunConfgenOptions {
   args: string[];
   timeoutMs?: number;
+  exePath?: string;
 }
 
 export function parseConfgenJson(stdout: string): any | undefined {
@@ -111,7 +112,7 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
   return new Promise((resolve, reject) => {
     let exe: string;
     try {
-      exe = findProtonConfgenExe();
+      exe = options.exePath ? path.resolve(options.exePath) : findProtonConfgenExe();
     } catch (err) {
       reject(err);
       return;
@@ -154,8 +155,8 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
   });
 }
 
-export async function runRouteProbe(timeoutMs = 10_000): Promise<RouteProbeResult> {
-  const res = await runConfgen({ args: ['--route-probe', '--json'], timeoutMs });
+export async function runRouteProbeFrom(exePath: string | undefined, timeoutMs = 10_000): Promise<RouteProbeResult> {
+  const res = await runConfgen({ args: ['--route-probe', '--json'], timeoutMs, exePath });
   const value = res.json as Partial<RouteProbeResult> | undefined;
   if (!value || typeof value.success !== 'boolean' || (value.observations !== undefined && !Array.isArray(value.observations))) {
     return {
@@ -172,6 +173,10 @@ export async function runRouteProbe(timeoutMs = 10_000): Promise<RouteProbeResul
     discordMs: typeof value.discordMs === 'number' ? value.discordMs : undefined,
     error: typeof value.error === 'string' ? value.error.slice(0, 300) : undefined,
   };
+}
+
+export async function runRouteProbe(timeoutMs = 10_000): Promise<RouteProbeResult> {
+  return runRouteProbeFrom(undefined, timeoutMs);
 }
 
 export function classifyProtonError(error: unknown, stderr = '', stdout = ''): { code: ProtonLoginErrorCode; message: string; retryable: boolean } {
