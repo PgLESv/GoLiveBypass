@@ -30,6 +30,7 @@ import { findWindowsDiscordInstall } from "./windows-discord-install";
 import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } from "./wait-condition";
 import { parseLinuxPreflight, linuxPreflightMessage, type LinuxPreflight } from "./linux-preflight";
 import { classifyLinuxHealth, shouldRecoverLinuxTunnel } from "./linux-health";
+import { PROTON_CAPTCHA_CAPTURE_SCRIPT, isAllowedProtonCaptchaNavigation, parseProtonCaptchaChallenge, validateProtonCaptchaResponse } from "./proton-captcha";
 import { decideRouteProof, maskedIP, type RouteProbeResult } from "./route-proof";
 import { prepareDiscordScopeProbes, type DiscordScopeProbe } from "./discord-scope-proof";
 
@@ -4018,10 +4019,124 @@ ipcMain.handle("check-proton-session", async (_event, username?: string) => {
   return await proton.checkProtonSession(settingsDir(), user);
 });
 
+type ProtonCaptchaSolveResult =
+  | { ok: true; token: string }
+  | { ok: false; code: "CAPTCHA_CANCELLED" | "CAPTCHA_INVALID"; message: string };
+
+async function solveProtonCaptcha(rawUrl: string, parent: BrowserWindow | null): Promise<ProtonCaptchaSolveResult> {
+  const challenge = parseProtonCaptchaChallenge(rawUrl);
+  if (!challenge) {
+    return { ok: false, code: "CAPTCHA_INVALID", message: "O Proton forneceu um endereço de CAPTCHA inválido." };
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let invalidMessages = 0;
+    const captchaWindow = new BrowserWindow({
+      width: 520,
+      height: 700,
+      minWidth: 420,
+      minHeight: 560,
+      parent: parent ?? undefined,
+      modal: parent !== null,
+      show: false,
+      autoHideMenuBar: true,
+      title: "Verificação de segurança Proton",
+      backgroundColor: "#17171c",
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        devTools: false,
+        safeDialogs: true,
+        spellcheck: false,
+        partition: `proton-captcha-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      },
+    });
+
+    const preventDownload = (event: Electron.Event) => event.preventDefault();
+    captchaWindow.webContents.session.on("will-download", preventDownload);
+    captchaWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    captchaWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    captchaWindow.webContents.on("will-attach-webview", (event) => event.preventDefault());
+    const guardNavigation = (event: Electron.Event, targetUrl: string) => {
+      if (!isAllowedProtonCaptchaNavigation(targetUrl, challenge)) event.preventDefault();
+    };
+    captchaWindow.webContents.on("will-navigate", guardNavigation);
+    captchaWindow.webContents.on("will-redirect", guardNavigation);
+
+    const timeout = setTimeout(() => {
+      finish({ ok: false, code: "CAPTCHA_INVALID", message: "A verificação expirou. Inicie o login novamente." });
+    }, 120_000);
+
+    const finish = (result: ProtonCaptchaSolveResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      captchaWindow.webContents.session.removeListener("will-download", preventDownload);
+      resolve(result);
+      if (!captchaWindow.isDestroyed()) captchaWindow.destroy();
+    };
+
+    const armCapture = () => {
+      if (settled || captchaWindow.isDestroyed()) return;
+      void captchaWindow.webContents.executeJavaScript(PROTON_CAPTCHA_CAPTURE_SCRIPT, true)
+        .then((message: { token?: unknown } | undefined) => {
+          if (settled) return;
+          if (validateProtonCaptchaResponse(message?.token, challenge.challenge)) {
+            finish({ ok: true, token: message.token });
+            return;
+          }
+          invalidMessages += 1;
+          if (invalidMessages >= 10) {
+            finish({ ok: false, code: "CAPTCHA_INVALID", message: "O CAPTCHA retornou uma resposta inválida. Tente novamente." });
+          } else {
+            setTimeout(armCapture, 50);
+          }
+        })
+        .catch(() => {
+          if (!settled && !captchaWindow.isDestroyed()) {
+            finish({ ok: false, code: "CAPTCHA_INVALID", message: "Não foi possível capturar a resposta do CAPTCHA." });
+          }
+        });
+    };
+
+    captchaWindow.once("ready-to-show", () => {
+      if (!settled) captchaWindow.show();
+    });
+    captchaWindow.webContents.on("did-finish-load", armCapture);
+    captchaWindow.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
+      if (isMainFrame && errorCode !== -3) {
+        finish({ ok: false, code: "CAPTCHA_INVALID", message: "Não foi possível carregar o CAPTCHA oficial da Proton." });
+      }
+    });
+    captchaWindow.on("closed", () => {
+      if (!settled) finish({ ok: false, code: "CAPTCHA_CANCELLED", message: "Verificação cancelada. Nenhuma credencial foi alterada." });
+    });
+    void captchaWindow.loadURL(challenge.url).catch(() => {
+      finish({ ok: false, code: "CAPTCHA_INVALID", message: "Não foi possível abrir o CAPTCHA oficial da Proton." });
+    });
+  });
+}
+
 let protonLoginGeneration = 0;
-ipcMain.handle("login-proton", async (_event, payload: { username: string; password?: string; twoFactorCode?: string; humanVerificationToken?: string }) => {
+ipcMain.handle("login-proton", async (event, payload: { username: string; password?: string; twoFactorCode?: string }) => {
   const generation = ++protonLoginGeneration;
-  const res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode, payload.humanVerificationToken);
+  let res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode);
+  for (let attempt = 1; !res.success && (res.code === "CAPTCHA_REQUIRED" || res.code === "CAPTCHA_INVALID") && attempt <= 3; attempt++) {
+    if (!res.captchaUrl) break;
+    if (generation !== protonLoginGeneration) {
+      return { success: false, code: "CAPTCHA_CANCELLED", retryable: true, message: "Esta tentativa de login foi substituída por outra." };
+    }
+    event.sender.send("proton-captcha-status", attempt === 1 ? "opening" : "retrying");
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const solved = await solveProtonCaptcha(res.captchaUrl, parent);
+    if (!solved.ok) {
+      return { success: false, code: solved.code, retryable: true, message: solved.message };
+    }
+    event.sender.send("proton-captcha-status", "verifying");
+    res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode, solved.token);
+  }
   if (res.success) {
     const authenticatedUsername = res.username || payload.username.trim();
     if (!updateSharedSettings({ protonUsername: authenticatedUsername })) {
@@ -4062,19 +4177,6 @@ ipcMain.handle("login-proton", async (_event, payload: { username: string; passw
     }
   }
   return res;
-});
-
-ipcMain.handle("open-proton-captcha", async (_event, rawUrl: string) => {
-  try {
-    const parsed = new URL(rawUrl);
-    const allowed = parsed.protocol === "https:" &&
-      ["vpn-api.proton.me", "account.proton.me", "proton.me"].includes(parsed.hostname);
-    if (!allowed) return { ok: false, error: "Endereço de CAPTCHA não reconhecido como oficial da Proton." };
-    await shell.openExternal(parsed.toString());
-    return { ok: true };
-  } catch {
-    return { ok: false, error: "Endereço de CAPTCHA inválido." };
-  }
 });
 
 ipcMain.handle("logout-proton", async () => {

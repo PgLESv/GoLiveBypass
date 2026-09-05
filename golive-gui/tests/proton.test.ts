@@ -84,7 +84,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
 
   it("nao converte sucesso do sidecar em falso erro por releitura imediata", () => {
     const main = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    const handler = main.slice(main.indexOf('ipcMain.handle("login-proton"'), main.indexOf('ipcMain.handle("open-proton-captcha"'));
+    const handler = main.slice(main.indexOf('ipcMain.handle("login-proton"'), main.indexOf('ipcMain.handle("logout-proton"'));
     expect(handler).toContain("confirmSavedSessionIdentity");
     expect(handler).toContain("void proton.confirmSavedSessionIdentity");
     expect(handler).not.toContain("savedUsername !== payload.username");

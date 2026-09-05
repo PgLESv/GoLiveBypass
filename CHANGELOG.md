@@ -8,6 +8,12 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ### Login Proton no Windows
 
+- **CAPTCHA integrado:** quando o Proton exige verificação, o desafio oficial
+  abre em uma janela isolada do GoLiveBypass. A resposta é capturada e validada
+  automaticamente e o login continua sem pedir que o usuário copie token da
+  URL ou use o console do navegador.
+- **Erros corretos:** cancelamento, expiração e resposta rejeitada permanecem
+  erros de CAPTCHA; não são mais apresentados como usuário ou senha incorretos.
 - **Sem falso erro de persistência:** o sucesso do `proton-confgen`, que já só
   ocorre depois de salvar a sessão, passa a ser a fonte de verdade. A releitura
   do arquivo pelo Electron agora é uma confirmação diagnóstica assíncrona com

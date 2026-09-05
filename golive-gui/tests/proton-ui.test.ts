@@ -20,13 +20,14 @@ describe("controles Proton", () => {
     expect(fnBody).toContain("Rota ${res.server} aplicada e comprovada!");
   });
 
-  it("oferece o fluxo interativo para CAPTCHA", () => {
+  it("automatiza o CAPTCHA sem pedir token manual", () => {
     const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
-    expect(html).toContain('id="protonCaptchaPanel"');
-    expect(html).toContain('id="protonCaptchaOpenBtn"');
-    expect(html).toContain('id="protonCaptchaToken"');
+    expect(html).not.toContain('id="protonCaptchaPanel"');
+    expect(html).not.toContain('id="protonCaptchaOpenBtn"');
+    expect(html).not.toContain('id="protonCaptchaToken"');
     const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
-    expect(source).toContain("humanVerificationToken: hvToken");
+    expect(source).toContain("onProtonCaptchaStatus");
+    expect(source).not.toContain("humanVerificationToken: hvToken");
     expect(source).toContain("CAPTCHA_INVALID");
   });
 

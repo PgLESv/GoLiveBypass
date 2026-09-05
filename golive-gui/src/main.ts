@@ -81,8 +81,8 @@ declare global {
       getVpnMode: () => Promise<'proton' | 'custom'>;
       setVpnMode: (mode: 'proton' | 'custom') => Promise<string>;
       checkProtonSession: (username?: string) => Promise<{ valid: boolean; username?: string; expiresIn?: string; error?: string }>;
-      loginProton: (payload: { username: string; password?: string; twoFactorCode?: string; humanVerificationToken?: string }) => Promise<{ success: boolean; code?: string; message?: string; error?: string; retryable?: boolean; captchaUrl?: string }>;
-      openProtonCaptcha: (url: string) => Promise<{ ok: boolean; error?: string }>;
+      loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) => Promise<{ success: boolean; code?: string; message?: string; error?: string; retryable?: boolean }>;
+      onProtonCaptchaStatus: (callback: (status: string) => void) => void;
       logoutProton: () => Promise<boolean>;
       optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) => Promise<{
         success: boolean;
@@ -464,11 +464,6 @@ const proton2FAConfirmBtn = document.getElementById('proton2FAConfirmBtn') as HT
 const protonLoginBtn = document.getElementById('protonLoginBtn') as HTMLButtonElement | null;
 const protonLoginBtnText = document.getElementById('protonLoginBtnText') as HTMLElement | null;
 const protonLoginSpinner = document.getElementById('protonLoginSpinner') as HTMLElement | null;
-const protonCaptchaPanel = document.getElementById('protonCaptchaPanel') as HTMLElement | null;
-const protonCaptchaToken = document.getElementById('protonCaptchaToken') as HTMLInputElement | null;
-const protonCaptchaOpenBtn = document.getElementById('protonCaptchaOpenBtn') as HTMLButtonElement | null;
-const protonCaptchaCancelBtn = document.getElementById('protonCaptchaCancelBtn') as HTMLButtonElement | null;
-let protonCaptchaUrl = '';
 let protonLoginInFlight = false;
 
 const protonUserDisplay = document.getElementById('protonUserDisplay') as HTMLElement | null;
@@ -558,8 +553,9 @@ function protonLoginMessage(res: { code?: string; message?: string; error?: stri
     case 'INVALID_CREDENTIALS': return 'Usuário ou senha incorretos. Confira os dados e tente novamente.';
     case 'TWO_FACTOR_REQUIRED': return 'Esta conta exige autenticação em duas etapas. Digite o código do aplicativo autenticador.';
     case 'TWO_FACTOR_INVALID': return 'O código 2FA está incorreto ou expirou. Gere um novo código e tente novamente.';
-    case 'CAPTCHA_REQUIRED': return 'O Proton solicitou uma verificação de segurança. Abra o CAPTCHA, conclua-o e cole o resultado abaixo.';
-    case 'CAPTCHA_INVALID': return 'A verificação de segurança expirou ou foi recusada. Abra um novo CAPTCHA e tente novamente.';
+    case 'CAPTCHA_REQUIRED': return 'O Proton solicitou uma verificação de segurança, mas não forneceu um desafio válido.';
+    case 'CAPTCHA_INVALID': return 'A verificação de segurança expirou ou foi recusada. Tente fazer login novamente.';
+    case 'CAPTCHA_CANCELLED': return 'Verificação cancelada. Tente fazer login novamente quando estiver pronto.';
     case 'NETWORK_ERROR': return 'Não foi possível conectar aos servidores ProtonVPN. Verifique sua internet e tente novamente.';
     case 'TIMEOUT': return 'O ProtonVPN demorou demais para responder. Tente novamente em alguns instantes.';
     case 'MISSING_EXECUTABLE': return 'O componente de conexão ProtonVPN não foi encontrado. Reinstale o GoLiveBypass ou atualize para a versão mais recente.';
@@ -644,7 +640,6 @@ async function submitProtonLogin() {
     const user = protonUsername?.value.trim() || '';
     const pass = protonPassword?.value || '';
     const twoFa = proton2FA?.value.trim() || undefined;
-    const hvToken = protonCaptchaToken?.value.trim() || undefined;
 
     if (!user) {
       setProtonFeedback('Informe o usuário Proton.', 'err');
@@ -666,27 +661,18 @@ async function submitProtonLogin() {
         username: user,
         password: pass,
         twoFactorCode: twoFa,
-        humanVerificationToken: hvToken,
       });
 
       if (res.success) {
         setProtonFeedback('Conectado com sucesso! Servidor rápido selecionado.', 'ok');
         if (protonPassword) protonPassword.value = '';
         if (proton2FA) proton2FA.value = '';
-        if (protonCaptchaToken) protonCaptchaToken.value = '';
-        if (protonCaptchaPanel) protonCaptchaPanel.hidden = true;
-        protonCaptchaUrl = '';
         closeProton2FADialog(false);
         await refreshProtonState();
         await atualizarStatusWgConf();
         await updateStatus();
       } else {
-        if (res.code === 'CAPTCHA_REQUIRED' || res.code === 'CAPTCHA_INVALID') {
-          protonCaptchaUrl = res.captchaUrl || '';
-          if (protonCaptchaPanel) protonCaptchaPanel.hidden = false;
-          setProtonFeedback(protonLoginMessage(res), 'err');
-          protonCaptchaToken?.focus();
-        } else if (res.code === 'TWO_FACTOR_REQUIRED' || res.code === 'TWO_FACTOR_INVALID' || protonNeeds2FA(res.error)) {
+        if (res.code === 'TWO_FACTOR_REQUIRED' || res.code === 'TWO_FACTOR_INVALID' || protonNeeds2FA(res.error)) {
           setProtonFeedback(
             twoFa ? 'Código 2FA inválido ou expirado. Tente novamente.' : 'Esta conta exige um código 2FA.',
             'err'
@@ -702,23 +688,16 @@ async function submitProtonLogin() {
       protonLoginInFlight = false;
       if (protonLoginBtn) protonLoginBtn.disabled = false;
       if (protonLoginSpinner) protonLoginSpinner.hidden = true;
-      if (protonLoginBtnText) protonLoginBtnText.textContent = protonCaptchaPanel?.hidden === false ? 'Continuar login' : 'Conectar conta Proton';
+      if (protonLoginBtnText) protonLoginBtnText.textContent = 'Conectar conta Proton';
     }
 }
 
 protonLoginBtn?.addEventListener('click', () => void submitProtonLogin());
-protonCaptchaOpenBtn?.addEventListener('click', async () => {
-  if (!protonCaptchaUrl) { setProtonFeedback('O Proton não forneceu um endereço de CAPTCHA. Tente iniciar o login novamente.', 'err'); return; }
-  const result = await window.api.openProtonCaptcha(protonCaptchaUrl);
-  if (!result.ok) setProtonFeedback(result.error || 'Não foi possível abrir o CAPTCHA.', 'err');
-});
-protonCaptchaCancelBtn?.addEventListener('click', () => {
-  if (protonCaptchaToken) protonCaptchaToken.value = '';
-  if (protonPassword) protonPassword.value = '';
-  protonCaptchaUrl = '';
-  if (protonCaptchaPanel) protonCaptchaPanel.hidden = true;
-  if (protonLoginBtnText) protonLoginBtnText.textContent = 'Conectar conta Proton';
-  setProtonFeedback('');
+window.api.onProtonCaptchaStatus((status) => {
+  if (!protonLoginInFlight) return;
+  if (status === 'opening') setProtonFeedback('Resolva a verificação oficial da Proton na janela que abriu.', 'busy');
+  else if (status === 'retrying') setProtonFeedback('O desafio expirou. Resolva o novo CAPTCHA para continuar.', 'busy');
+  else if (status === 'verifying') setProtonFeedback('CAPTCHA concluído. Confirmando o login com a Proton...', 'busy');
 });
 proton2FAConfirmBtn?.addEventListener('click', () => {
   const code = proton2FA?.value.trim() || '';
