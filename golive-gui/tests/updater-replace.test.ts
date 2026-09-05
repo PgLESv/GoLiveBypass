@@ -68,33 +68,38 @@ describe("updater-replace", () => {
     const script = buildWindowsUpdateScript();
     // cmd le .bat no codepage OEM: qualquer nao-ASCII no conteudo e lido errado.
     expect(script).toMatch(/^[\x20-\x7E\r\n]+$/);
-    // Os caminhos NUNCA sao embutidos: chegam como %1 (exe novo), %2 (.old, sonda de
-    // espera/limpeza) e %3 (.vbs a limpar).
+    // Os caminhos NUNCA sao embutidos: chegam como %1 (exe alvo), %2 (update baixado)
+    // e %3 (.vbs a limpar).
     expect(script).toContain('start "" "%~1"');
-    expect(script).toContain('del "%~2" >NUL 2>&1');
+    expect(script).toContain('move /y "%~2" "%~1" >NUL 2>&1');
     expect(script).toContain('del "%~3" >NUL 2>&1');
     // Depois de lancar, o bat apaga a si mesmo.
     expect(script).toContain('del "%~f0"');
     // Linhas CRLF: e um arquivo para o cmd do Windows (todo \n precedido de \r).
     expect(script).not.toMatch(/(^|[^\r])\n/);
     expect(script.split("\r\n").length).toBeGreaterThan(10);
-    // Esgotou as tentativas, lanca mesmo assim (nao deixa o usuario sem app).
-    expect(script).toContain("goto launch");
+    // Loop com verificacao de errorlevel e fallback
+    expect(script).toContain("if not errorlevel 1 goto launch");
+    expect(script).toContain("goto fallback");
+    expect(script).toContain("copy /y");
   });
 
   it("vbs do helper comeca com BOM UTF-16LE e cita os quatro caminhos", () => {
     const bat = "C:\\Users\\João\\AppData\\Local\\Temp\\g-1.bat";
     const exe = "C:\\Users\\João\\Desktop\\GoLiveBypass-1.1.12.exe";
+    const update = "C:\\Users\\João\\AppData\\Local\\Temp\\GoLiveBypass-update.exe";
     const vbs = "C:\\Users\\João\\AppData\\Local\\Temp\\g-1.vbs";
-    const launcher = buildWindowsUpdateLauncher(bat, exe, exe + OLD_SUFFIX, vbs);
+    const launcher = buildWindowsUpdateLauncher(bat, exe, update, vbs);
     // Sem o BOM o wscript le o arquivo como ANSI e o acento corrompe o script.
     expect(launcher.charCodeAt(0)).toBe(0xfeff);
     // Conteudo do arquivo sera gravado em utf16le (o teste cobre o texto logico).
     expect(launcher).toContain(bat);
     expect(launcher).toContain(exe);
+    expect(launcher).toContain(update);
     expect(launcher).toContain(vbs);
     // Cada caminho entre Chr(34): espaco e acento nao quebram a linha de comando.
     expect(launcher).toContain(`Chr(34) & "${exe}" & Chr(34)`);
+    expect(launcher).toContain(`Chr(34) & "${update}" & Chr(34)`);
     expect(launcher).toContain(", 0, False");
   });
 });

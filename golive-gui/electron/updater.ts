@@ -18,10 +18,9 @@ import { createHash } from "crypto";
 import { rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
-import { spawn } from "child_process";
 import { autoUpdater } from "electron-updater";
 import { request } from "https";
-import { attemptReplace, cleanupOldExe, OLD_SUFFIX, spawnWindowsUpdateHelper } from "./updater-replace";
+import { cleanupOldExe, spawnWindowsUpdateHelper } from "./updater-replace";
 import { escolherRelease, type Canal, type ReleaseCandidata } from "./updater-channel";
 
 const REPO = "PgLESv/GoLiveBypass";
@@ -29,8 +28,6 @@ const REPO = "PgLESv/GoLiveBypass";
 // outros integradores nao sobrescrevem o arquivo quando o nome muda por versao.
 const EXE_PREFIX = "GoLiveBypass-";
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // re-checa a cada 4h
-const RETRY_COUNT = 10; // antivirus costuma segurar o exe novo/o alvo por alguns segundos
-const RETRY_DELAY_MS = 1000;
 
 let lastCheckAt = 0;
 let checking = false;
@@ -169,24 +166,6 @@ function portableExePath(): string | null {
   return current && current.trim() !== "" ? current : null;
 }
 
-function tryReplace(target: string, downloaded: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const attempt = (tries: number) => {
-      try {
-        attemptReplace(target, downloaded);
-        resolve(true);
-      } catch (error) {
-        if (tries <= 0) {
-          console.error("[updater] substituicao falhou:", error);
-          return resolve(false);
-        }
-        setTimeout(() => attempt(tries - 1), RETRY_DELAY_MS);
-      }
-    };
-    attempt(RETRY_COUNT);
-  });
-}
-
 async function updateWindowsPortable(url: string, digest: string | null): Promise<boolean> {
   const current = portableExePath();
   if (current === null) {
@@ -202,33 +181,27 @@ async function updateWindowsPortable(url: string, digest: string | null): Promis
     return false;
   }
 
-  // Conferido antes de encostar no exe em uso: depois do rename nao ha volta, o app se
-  // substituiu. Um arquivo que nao bate e apagado e a versao atual continua valendo.
+  // Conferido antes de qualquer acao: um arquivo que nao bate e apagado e a versao
+  // atual continua valendo.
   if (!digestMatches(downloaded, digest)) {
     await rm(downloaded, { force: true }).catch(() => {});
-    return false;
-  }
-
-  if (!(await tryReplace(current, downloaded))) {
-    console.error("[updater] nao consegui substituir o exe em uso.");
     return false;
   }
 
   // Abre a versao nova e encerra a atual. O quit nao reverte o bypass: o novo
   // processo assume e o before-quit do processo antigo desfaria a injecao.
   markQuittingForUpdate();
-  // A troca ja aconteceu (o novo esta no lugar, o velho virou ".old" e segue rodando).
-  // Quem reabre e o helper externo: espera o processo velho morrer de verdade — a sonda
-  // e o delete do proprio ".old", que o Windows recusa enquanto a imagem roda — antes de
-  // lancar o exe novo, sem correr contra o lock de instancia unica (o "fecha mas nao
-  // abre"), e limpa a sobra. Se o helper nao subir (tmp fora do ar, rarissimo), cai para
-  // o spawn direto: corre contra o lock, mas e melhor do que nunca reabrir.
-  if (!spawnWindowsUpdateHelper(current, current + OLD_SUFFIX)) {
-    console.warn("[updater] helper de relanco nao subiu; usando spawn direto.");
-    spawn(current, [], { detached: true, stdio: "ignore" })
-      .on("error", (error) => console.error("[updater] exe novo nao abriu:", error))
-      .unref();
+
+  // No Windows portable, o executavel em uso fica travado pelo processo wrapper NSIS
+  // (FILE_SHARE_READ sem delete/rename, gerando EBUSY / erro 32). Delegamos a substituicao
+  // e o relanco para o helper externo (.bat via wscript oculto). Assim que o Electron
+  // chamar app.quit(), o processo antigo encerra, o helper move o novo exe para o lugar e o reabre.
+  if (!spawnWindowsUpdateHelper(current, downloaded)) {
+    console.error("[updater] erro ao agendar o helper de atualizacao.");
+    await rm(downloaded, { force: true }).catch(() => {});
+    return false;
   }
+
   return true;
 }
 
