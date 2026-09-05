@@ -38,6 +38,20 @@ export interface WireSockAdapterTraffic {
   sentBytes: number;
 }
 
+// No split tunnel o processo da GUI fica fora de AllowedApps. Portanto, o
+// crescimento destes contadores depois de o Discord abrir e' a evidencia que
+// realmente pertence ao tunel, ao contrario de um HTTPS feito pela propria GUI.
+export function hasWireSockAdapterTrafficIncrease(
+  previous: WireSockAdapterTraffic | null,
+  current: WireSockAdapterTraffic | null,
+): boolean {
+  return Boolean(
+    previous && current &&
+    current.receivedBytes > previous.receivedBytes &&
+    current.sentBytes > previous.sentBytes,
+  );
+}
+
 function detalheErro(err: unknown): string {
   const texto = String((err as { stderr?: string; stdout?: string; message?: string })?.stderr ||
     (err as { stdout?: string })?.stdout ||

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { findWireSockInKnownRoots, parseWireSockCliExternalAddress, parseWireSockCliStatus, verifyWindowsNetworkStable, wireSockSearchRoots } from "../electron/wiresock";
+import { findWireSockInKnownRoots, hasWireSockAdapterTrafficIncrease, parseWireSockCliExternalAddress, parseWireSockCliStatus, verifyWindowsNetworkStable, wireSockSearchRoots } from "../electron/wiresock";
 
 describe("WireSock no Windows", () => {
   it("oculta os processos auxiliares e as elevacoes do WireGuard", () => {
@@ -107,6 +107,14 @@ describe("WireSock no Windows", () => {
     expect(parseWireSockCliExternalAddress("Status: Connected")).toBeUndefined();
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("externalAddress");
+  });
+
+  it("aceita somente crescimento bidirecional do ProTUN como prova de fluxo pelo tunel", () => {
+    const before = { adapter: "ProTUN", receivedBytes: 100, sentBytes: 200 };
+    expect(hasWireSockAdapterTrafficIncrease(null, before)).toBe(false);
+    expect(hasWireSockAdapterTrafficIncrease(before, { ...before, receivedBytes: 101, sentBytes: 201 })).toBe(true);
+    expect(hasWireSockAdapterTrafficIncrease(before, { ...before, receivedBytes: 101 })).toBe(false);
+    expect(hasWireSockAdapterTrafficIncrease(before, { ...before, sentBytes: 201 })).toBe(false);
   });
 
   it("procura o executavel no layout do WinGet e na variante sem sdk", () => {

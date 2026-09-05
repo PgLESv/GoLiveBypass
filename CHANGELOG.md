@@ -4,7 +4,7 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [2.0.2-beta.1] - 2026-09-04
+## [2.0.2-beta.2] - 2026-09-04
 
 ### Correção Windows
 
@@ -12,6 +12,9 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   mais no ciclo em que o Discord aguardava tráfego que apenas ele próprio pode gerar. O
   Discord inicia já protegido pelo filtro WireSock; em seguida o aplicativo confirma o túnel
   usando o tráfego real. Caso a confirmação falhe, encerra o cliente e restaura a rede.
+- **Prazo de ativação respeitado:** a confirmação pelo ProTUN não executa sondagens HTTPS do
+  host dentro do loop do WireSock. Duas amostras RX/TX crescentes, geradas após o Discord
+  iniciar, confirmam a rota sem manter a GUI em carregamento por minutos.
 
 ### Correção Linux/Arch (issue #219)
 
