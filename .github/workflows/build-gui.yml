@@ -41,6 +41,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/proton-confgen/go.mod
+          cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
       # --publish always: gera o GoLiveBypass.exe + latest.yml e faz upload na release
@@ -67,6 +71,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/proton-confgen/go.mod
+          cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
       # No canal beta publica AppImage + beta.yml (electron-updater com
@@ -95,6 +103,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: tools/proton-confgen/go.mod
+          cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
       # Com CSC_LINK/CSC_KEY_PASSWORD o electron-builder assina o app; sem eles, builda
