@@ -47,7 +47,7 @@ import { ipcRenderer } from 'electron';
   onProtonCaptchaStatus: (callback: (status: string) => void) =>
     ipcRenderer.on('proton-captcha-status', (_event, status: string) => callback(status)),
   logoutProton: () => ipcRenderer.invoke('logout-proton'),
-  optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) =>
+  optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean; speedTest?: boolean }) =>
     ipcRenderer.invoke('optimize-proton-route', options),
   getProtonSettings: () => ipcRenderer.invoke('get-proton-settings'),
   setProtonSettings: (settings: any) => ipcRenderer.invoke('set-proton-settings', settings),

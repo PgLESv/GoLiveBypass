@@ -1806,18 +1806,16 @@ wireguard_gateway_probe() {
     return 0
 }
 
-wait_wireguard_ready() {
-    local tentativas=8 probe
-    while [ "$tentativas" -gt 0 ]; do
-        if probe="$(wireguard_gateway_probe 2>/dev/null)"; then
-            printf '  %sReadiness WireGuard confirmado: gateway alcancavel.%s\n' "$C_GREEN" "$C_OFF" >&2
-            return 0
-        fi
-        tentativas=$((tentativas - 1))
-        [ "$tentativas" -gt 0 ] && sleep 2
-    done
-    printf '  %sReadiness WireGuard falhou: %s%s\n' "$C_RED" "${probe:-sem resposta}" "$C_OFF" >&2
-    return 1
+log_wireguard_readiness() {
+    # Background diagnostics never delay launch, prompt for privilege, or tear
+    # down a real tunnel just because HTTP/handshake observation failed.
+    mkdir -p "$INSTALL_DIR/logs" 2>/dev/null || return 0
+    (
+        NONINTERACTIVE=1
+        probe="$(wireguard_gateway_probe 2>/dev/null)" || true
+        printf '%s route.diagnostic mode=log-only %s\n' "$(date -Iseconds)" "${probe:-sem resposta}"
+    ) >> "$INSTALL_DIR/logs/wireguard-diagnostics.log" 2>&1 < /dev/null &
+    return 0
 }
 
 teardown_wireguard_netns() {
@@ -2138,7 +2136,7 @@ fi
 
 if [ "$MODE" = "refresh" ]; then
     refresh_wireguard_route
-    wait_wireguard_ready || fail "A nova rota subiu, mas nao conseguiu alcancar o gateway do Discord."
+    log_wireguard_readiness
     exit 0
 fi
 
@@ -2315,10 +2313,8 @@ if [ "$injected" -eq 0 ]; then
     fail "NADA foi injetado — a elevacao falhou ou nenhum Discord foi tocado."
 fi
 
-# O Discord so deve nascer depois de o peer ter negociado e o caminho real ate o gateway ter
-# respondido. Sem esta barreira, namespace criado + processo aberto apareciam como sucesso e o
-# cliente ficava eternamente em carregamento.
-wait_wireguard_ready || fail "WireGuard foi criado, mas nao ficou pronto para o gateway do Discord."
+# HTTP/handshake probes are informational and must not gate Discord startup.
+log_wireguard_readiness
 
 # Modo portatil: reabre o Discord ja com o bypass ativo (mesmo comportamento do app do Windows).
 # head -1 em vez de pipe para o while: nohup num subshell morreria junto com ele.

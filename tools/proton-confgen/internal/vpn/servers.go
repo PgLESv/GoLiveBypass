@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -42,6 +43,9 @@ func isEligible(cfg *config.Config, server *api.LogicalServer) bool {
 	}
 	// Free tier is opt-in: -free-only selects it exclusively, otherwise it is excluded.
 	if cfg.FreeOnly != (server.Tier == api.TierFree) {
+		return false
+	}
+	if slices.Contains(cfg.ExcludedCountries, server.ExitCountry) {
 		return false
 	}
 	if len(cfg.Countries) > 0 && !slices.Contains(cfg.Countries, server.ExitCountry) {
@@ -100,39 +104,127 @@ func (s *ServerSelector) SelectBestWithPing(servers []api.LogicalServer) (*api.L
 		return &filtered[0], 0, nil
 	}
 
-	// Probe up to top 10 candidates
-	const maxCandidates = 10
-	candidatesCount := len(filtered)
-	if candidatesCount > maxCandidates {
-		candidatesCount = maxCandidates
-	}
-	candidates := filtered[:candidatesCount]
-	pings := ProbeCandidatesPing(candidates, candidatesCount)
+	// Represent every eligible location rather than letting the API's global
+	// top ten hide entire regions. Two low-load choices per location provide a
+	// fallback without probing thousands of near-identical logical servers.
+	candidates := regionalCandidates(filtered)
+	pings := ProbeCandidatesPing(candidates, len(candidates))
+	return bestMeasuredCandidate(candidates, pings)
 
-	type scoredServer struct {
-		server *api.LogicalServer
-		score  float64
-		ping   int
-	}
+}
 
-	scored := make([]scoredServer, len(candidates))
+// regionalCandidates considers every eligible server and retains the two
+// lowest-load choices in each country/region/city. Input is not mutated.
+func regionalCandidates(servers []api.LogicalServer) []api.LogicalServer {
+	ordered := slices.Clone(servers)
+	slices.SortFunc(ordered, func(a, b api.LogicalServer) int {
+		if c := cmp.Compare(a.Load, b.Load); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Score, b.Score); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+	type location struct{ country, region, city string }
+	counts := make(map[location]int)
+	var first, second []api.LogicalServer
+	for _, srv := range ordered {
+		phys := GetBestPhysicalServer(&srv)
+		if phys == nil || phys.EntryIP == "" {
+			continue
+		}
+		key := location{strings.ToUpper(srv.ExitCountry), strings.ToLower(strings.TrimSpace(srv.Region)), strings.ToLower(strings.TrimSpace(srv.City))}
+		switch counts[key] {
+		case 0:
+			first = append(first, srv)
+		case 1:
+			second = append(second, srv)
+		}
+		counts[key]++
+	}
+	// First cover all locations, then their alternate candidates.
+	return append(first, second...)
+}
+
+// Lower load is an estimate of available capacity, NOT measured bandwidth.
+// Normalize both signals so 70% capacity / 30% latency has a stable meaning.
+// API Score breaks ties only; its undocumented scale must not dominate RTT.
+func routeCost(load, ping int) float64 {
+	capacityPenalty := math.Max(0, math.Min(100, float64(load))) / 100
+	latencyPenalty := math.Min(float64(ping), 500) / 500
+	return 0.7*capacityPenalty + 0.3*latencyPenalty
+}
+
+func bestMeasuredCandidate(candidates []api.LogicalServer, pings map[string]int) (*api.LogicalServer, int, error) {
+	var best *api.LogicalServer
+	bestPing := 0
+	bestCost := math.Inf(1)
 	for i := range candidates {
 		srv := &candidates[i]
-		pingMs, ok := pings[srv.Name]
-		if !ok || pingMs <= 0 || pingMs > 990 {
-			pingMs = 999
+		ping := pings[srv.Name]
+		if ping <= 0 || ping >= 999 {
+			continue
 		}
-		// Combined score: lower is better
-		// Weighting: Proton Score (x20) + Ping (x0.5) + Load (x0.3)
-		comb := (srv.Score * 20.0) + (float64(pingMs) * 0.5) + (float64(srv.Load) * 0.3)
-		scored[i] = scoredServer{server: srv, score: comb, ping: pingMs}
+		cost := routeCost(srv.Load, ping)
+		if best == nil || cost < bestCost || (cost == bestCost && (ping < bestPing || (ping == bestPing && (srv.Score < best.Score || (srv.Score == best.Score && srv.Name < best.Name))))) {
+			best, bestPing, bestCost = srv, ping, cost
+		}
 	}
+	if best == nil {
+		return nil, 0, errors.New("nenhum servidor respondeu ao teste de latência; tente novamente ou escolha outra região")
+	}
+	return best, bestPing, nil
+}
 
-	slices.SortFunc(scored, func(a, b scoredServer) int {
-		return cmp.Compare(a.score, b.score)
+// SpeedCandidates uses the global regional scan as a shortlist, not as a
+// substitute for throughput. Prefer distinct locations before filling slots.
+func (s *ServerSelector) SpeedCandidates(servers []api.LogicalServer, limit int) ([]api.LogicalServer, error) {
+	candidates := regionalCandidates(EligibleServers(s.config, servers))
+	pings := ProbeCandidatesPing(candidates, len(candidates))
+	return speedFinalists(candidates, pings, limit)
+}
+
+func speedFinalists(candidates []api.LogicalServer, pings map[string]int, limit int) ([]api.LogicalServer, error) {
+	candidates = slices.Clone(candidates)
+	slices.SortFunc(candidates, func(a, b api.LogicalServer) int {
+		pa, pb := pings[a.Name], pings[b.Name]
+		if pa <= 0 {
+			pa = 999
+		}
+		if pb <= 0 {
+			pb = 999
+		}
+		va, vb := pa < 999, pb < 999
+		if va != vb {
+			if va {
+				return -1
+			}
+			return 1
+		}
+		if c := cmp.Compare(routeCost(a.Load, pa), routeCost(b.Load, pb)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
 	})
-
-	return scored[0].server, scored[0].ping, nil
+	var selected, rest []api.LogicalServer
+	seen := make(map[string]bool)
+	for _, srv := range candidates {
+		// ICMP/TCP failure is not proof that WireGuard is unusable. Keep such
+		// candidates as fallbacks; only the real transfer can qualify the winner.
+		key := srv.ExitCountry + "/" + srv.Region + "/" + srv.City
+		if seen[key] {
+			rest = append(rest, srv)
+		} else {
+			selected = append(selected, srv)
+			seen[key] = true
+		}
+	}
+	selected = append(selected, rest...)
+	if len(selected) == 0 {
+		return nil, errors.New("nenhum candidato elegível na busca regional")
+	}
+	return selected[:min(max(0, limit), len(selected))], nil
 }
 
 func (s *ServerSelector) buildNoServersError() error {

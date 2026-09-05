@@ -17,6 +17,7 @@ import (
 	"protonvpn-wg-confgen/internal/config"
 	"protonvpn-wg-confgen/internal/constants"
 	"protonvpn-wg-confgen/internal/routeprobe"
+	"protonvpn-wg-confgen/internal/speedtest"
 	"protonvpn-wg-confgen/internal/vpn"
 	"protonvpn-wg-confgen/internal/wireguard"
 
@@ -162,9 +163,36 @@ func generateConfig(cfg *config.Config, vpnClient *vpn.Client) error {
 	}
 
 	selector := vpn.NewServerSelector(cfg)
-	server, pingMs, err := selector.SelectBestWithPing(servers)
-	if err != nil {
-		return err
+	var server *api.LogicalServer
+	var pingMs int
+	var measured *speedtest.Result
+	if cfg.SpeedTest {
+		var candidates []api.LogicalServer
+		if cfg.ServerName != "" {
+			requested, _, selectErr := selector.SelectBestWithPing(servers)
+			if selectErr != nil {
+				return selectErr
+			}
+			candidates = []api.LogicalServer{*requested}
+		} else {
+			candidates, err = selector.SpeedCandidates(servers, 6)
+			if err != nil {
+				return err
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+		result, measureErr := speedtest.Select(ctx, cfg.ClientPrivateKey, candidates)
+		cancel()
+		if measureErr != nil {
+			return measureErr
+		}
+		measured = &result
+		server, pingMs = &result.Server, result.LatencyMs
+	} else {
+		server, pingMs, err = selector.SelectBestWithPing(servers)
+		if err != nil {
+			return err
+		}
 	}
 
 	features := api.GetFeatureNames(server.Features)
@@ -212,11 +240,20 @@ func generateConfig(cfg *config.Config, vpnClient *vpn.Client) error {
 			"confFile":  cfg.OutputFile,
 			"expiresAt": vpnInfo.ExpirationTime,
 		}
+		if measured != nil {
+			resp["downloadMbps"] = measured.DownloadMbps
+			resp["uploadMbps"] = measured.UploadMbps
+			resp["speedTested"] = measured.Tested
+			resp["speedSucceeded"] = measured.Succeeded
+		}
 		data, _ := json.Marshal(resp)
 		fmt.Println(string(data))
 		return nil
 	}
 
+	if measured != nil {
+		fmt.Printf("Measured through tunnel: download %.2f Mbps, upload %.2f Mbps (%d/%d candidates completed)\n", measured.DownloadMbps, measured.UploadMbps, measured.Succeeded, measured.Tested)
+	}
 	fmt.Printf("WireGuard configuration written to: %s\n", cfg.OutputFile)
 	if vpnInfo.DeviceName != "" {
 		fmt.Printf("Device name: %s (visible in ProtonVPN dashboard)\n", vpnInfo.DeviceName)

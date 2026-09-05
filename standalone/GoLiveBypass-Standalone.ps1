@@ -199,34 +199,40 @@ function Install-WireSockTunnel {
     foreach ($line in $lines) {
         if ($line -match '^\s*DNS\s*=') {
             continue
-        } elseif ($line -match '^\s*AllowedApps\s*=') {
+        } elseif ($line -match '^\s*(?:#@ws:)?AllowedApps\s*=') {
             $hasAllowedApps = $true
-            $newLines += 'AllowedApps = Discord, Discord.exe, Update.exe'
+            $newLines += '#@ws:AllowedApps = Discord, Discord.exe, Update.exe'
         } else {
             $newLines += $line
         }
     }
     if (-not $hasAllowedApps) {
-        $newLines += 'AllowedApps = Discord, Discord.exe, Update.exe'
+        $newLines += '#@ws:AllowedApps = Discord, Discord.exe, Update.exe'
     }
     [IO.File]::WriteAllLines($wsConf, $newLines, (New-Object Text.UTF8Encoding $false))
 
     Write-Step "Configurando servico WireSock..."
-    Stop-Service -Name 'wiresock-client-service' -Force -ErrorAction SilentlyContinue
-    
-    & $wsExe install -start-type 3 -config $wsConf -log-level info -network-lock disabled | Out-Null
-    Start-Sleep -Seconds 1
-    Start-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-
-    $svc = Get-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq 'Running') {
-        Write-Ok "Servico WireSock ativo. Todo o Discord esta envelopado na VPN!"
+    $name = 'wiresock-client-service'
+    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+    if ($svc) {
+        if ($svc.Status -ne 'Stopped') {
+            Stop-Service -Name $name -Force -ErrorAction Stop
+            $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+        }
     } else {
-        Write-Warn "Iniciando WireSock em modo processo avulso..."
-        Start-Process -FilePath $wsExe -ArgumentList 'run', '-config', "`"$wsConf`"", '-log-level', 'info', '-network-lock', 'disabled' -WindowStyle Hidden
-        Write-Ok "WireSock iniciado em segundo plano."
+        & $wsExe install -start-type 3 -config $wsConf -log-level info -network-lock disabled | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Falha ao instalar o servico WireSock." }
     }
+    $expected = '"' + $wsExe + '" service -config "' + $wsConf + '" -log-level info -network-lock disabled'
+    $serviceInfo = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+    if (-not $serviceInfo) { throw "Servico WireSock nao encontrado." }
+    $change = Invoke-CimMethod -InputObject $serviceInfo -MethodName Change -Arguments @{PathName=$expected; StartMode='Manual'} -ErrorAction Stop
+    if ($change.ReturnValue -ne 0) { throw "Falha ao atualizar o perfil do servico: $($change.ReturnValue)" }
+    $actual = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+    if ($actual.PathName -cne $expected) { throw "O servico WireSock permaneceu com outra configuracao." }
+    Start-Service -Name $name -ErrorAction Stop
+    (Get-Service -Name $name).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+    Write-Ok "Servico WireSock iniciado com a configuracao selecionada."
 }
 
 function Stop-WireSockTunnel {

@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"fmt"
 	"testing"
 
 	"protonvpn-wg-confgen/internal/api"
@@ -174,3 +175,83 @@ func TestSelectBestWithPing(t *testing.T) {
 	}
 }
 
+func TestRegionalCandidatesCoverLocationsBeyondGlobalTopTen(t *testing.T) {
+	var all []api.LogicalServer
+	for i := range 12 {
+		srv := server("US", api.TierFree, 0)
+		srv.Name = fmt.Sprintf("US#%d", i)
+		srv.Load = i
+		srv.Servers[0].EntryIP = "192.0.2.1"
+		all = append(all, srv)
+	}
+	for _, city := range []string{"Tokyo", "Osaka"} {
+		srv := server("JP", api.TierFree, 0)
+		srv.City, srv.Name, srv.Score = city, city, 1000
+		srv.Servers[0].EntryIP = "192.0.2.2"
+		all = append(all, srv)
+	}
+	got := regionalCandidates(all)
+	if len(got) != 4 {
+		t.Fatalf("expected two US candidates and both Japanese cities, got %v", got)
+	}
+	if got[1].City != "Osaka" || got[2].City != "Tokyo" {
+		t.Fatalf("locations must precede alternate candidates: %v", got)
+	}
+	if all[0].Name != "US#0" {
+		t.Fatal("input was mutated")
+	}
+}
+
+func TestCapacityPriorityAndLatencyTiebreak(t *testing.T) {
+	tests := []struct {
+		name         string
+		loads, pings [2]int
+		want         string
+	}{
+		{"low load beats much lower ping", [2]int{80, 10}, [2]int{20, 200}, "B"},
+		{"same load prefers lower ping", [2]int{20, 20}, [2]int{160, 80}, "B"},
+		{"small load difference does not justify huge latency", [2]int{20, 21}, [2]int{400, 30}, "B"},
+		{"failed ping never beats reachable server", [2]int{0, 95}, [2]int{999, 200}, "B"},
+		{"unknown ping never beats reachable server", [2]int{0, 95}, [2]int{0, 200}, "B"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidates := []api.LogicalServer{{Name: "A", Load: tt.loads[0]}, {Name: "B", Load: tt.loads[1], Score: 10000}}
+			got, ping, err := bestMeasuredCandidate(candidates, map[string]int{"A": tt.pings[0], "B": tt.pings[1]})
+			if err != nil || got.Name != tt.want || ping != tt.pings[1] {
+				t.Fatalf("got %v, %d, %v", got, ping, err)
+			}
+		})
+	}
+	if got, _, err := bestMeasuredCandidate([]api.LogicalServer{{Name: "A"}}, nil); err == nil || got != nil {
+		t.Fatal("all failed probes must fail selection")
+	}
+}
+
+func TestSpeedFinalistsPrioritizeDiversityAndAllowBlockedICMP(t *testing.T) {
+	candidates := []api.LogicalServer{
+		{Name: "US1", ExitCountry: "US", City: "NY", Load: 10},
+		{Name: "US2", ExitCountry: "US", City: "NY", Load: 11},
+		{Name: "JP", ExitCountry: "JP", City: "Tokyo", Load: 20},
+	}
+	got, err := speedFinalists(candidates, map[string]int{"US1": 50, "US2": 50, "JP": 999}, 2)
+	if err != nil || len(got) != 2 || got[0].Name != "US1" || got[1].Name != "JP" {
+		t.Fatalf("got %v %v", got, err)
+	}
+	if candidates[1].Name != "US2" {
+		t.Fatal("mutated input")
+	}
+}
+
+func TestExcludedCountriesCannotWinAutomaticSelection(t *testing.T) {
+	servers := []api.LogicalServer{server("BR", api.TierFree, 0), server("US", api.TierFree, 0)}
+	cfg := &config.Config{FreeOnly: true, ExcludedCountries: []string{"BR"}}
+	got := EligibleServers(cfg, servers)
+	if len(got) != 1 || got[0].ExitCountry != "US" {
+		t.Fatalf("blocked exit eligible: %v", got)
+	}
+	cfg.Countries = []string{"BR"}
+	if len(EligibleServers(cfg, servers)) != 0 {
+		t.Fatal("country preference must not override exclusion")
+	}
+}

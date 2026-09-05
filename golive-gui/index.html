@@ -180,7 +180,7 @@
               <p class="proton-auto-hint">
                 <span class="proton-panel-title">Rota automática</span>
                 <span class="proton-recommended">Recomendado</span>
-                <span class="proton-panel-copy">A Proton escolhe o servidor com menor ping.</span>
+                <span class="proton-panel-copy">Buscamos candidatos nas regiões disponíveis. Em Otimizar rota, medimos download e upload pelo túnel para priorizar velocidade.</span>
               </p>
 
               <div class="proton-form-fields">
@@ -258,12 +258,12 @@
               <div class="proton-step-label">2 <span>Escolha sua rota</span></div>
               <div class="proton-controls-row">
                 <select id="protonCountrySelect" class="proton-select">
-                  <option value="">Automático · menor ping</option>
+                  <option value="">Automático · todas as regiões</option>
                   <option value="US">Estados Unidos · recomendado</option>
                   <option value="NL">Holanda</option>
                   <option value="JP">Japão</option>
                 </select>
-                <button type="button" id="protonOptimizeBtn" class="proton-btn proton-btn--action" title="Com o bypass ativo, o Discord fecha e só reabre depois que a nova rota for comprovada." aria-label="Otimizar rota. Com o bypass ativo, o Discord fecha e só reabre depois que a nova rota for comprovada.">
+                <button type="button" id="protonOptimizeBtn" class="proton-btn proton-btn--action" title="Com o bypass ativo, o Discord fecha durante a medição e reabre após iniciar a nova rota." aria-label="Otimizar rota. Com o bypass ativo, o Discord fecha durante a medição e reabre após iniciar a nova rota.">
                   <svg class="icon-refresh" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <polyline points="23 4 23 10 17 10"/>
                     <polyline points="1 20 1 14 7 14"/>
@@ -340,7 +340,7 @@
 
         <footer class="footer">
           <p class="disclaimer">
-            O Discord só abre depois que o IP de saída WireGuard é comprovado. A troca de rota fecha, valida e reabre o Discord automaticamente.
+            O Discord abre quando o túnel é iniciado. A troca de rota fecha e reabre o Discord automaticamente.
             <span id="closeHint"
               >Fechar a janela esconde o app na bandeja, junto do rel&oacute;gio
               &mdash; para reverter tudo, saia pelo &iacute;cone de
