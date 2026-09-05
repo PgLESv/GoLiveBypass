@@ -1575,7 +1575,8 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
       cliFlowSamples = 0;
     }
     // Algumas instalações oficiais expõem apenas wiresock-client.exe + ProTUN.
-    // Exigimos tráfego nos dois sentidos e uma sondagem DNS/HTTPS antes do Discord.
+    // Depois de abrir o Discord (que está em AllowedApps), duas amostras RX/TX
+    // provam o fluxo real pelo túnel sem depender do tráfego da própria GUI.
     const traffic = getWireSockAdapterTraffic();
     const adapterTrafficIncreasing = hasWireSockAdapterTrafficIncrease(previousAdapterTraffic, traffic);
     previousAdapterTraffic = traffic;
