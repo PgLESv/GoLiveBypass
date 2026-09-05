@@ -1,7 +1,7 @@
 {
   "name": "golive-gui",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "desktopName": "com.golivebypass.gui.desktop",
   "description": "Devolve o Go Live e a camera do Discord para contas que cairam no bloqueio regional brasileiro",
   "author": "bezumiya",
@@ -16,6 +16,7 @@
     "build:mac": "npm run compile && electron-builder --mac --arm64 --publish never",
     "preview": "vite preview",
     "sync-bypass": "node scripts/sync-bypass.mjs",
+    "check-bypass": "node scripts/sync-bypass.mjs --check",
     "test": "vitest run",
     "build:linux": "npm run compile && electron-builder --linux AppImage --publish never",
     "publish:win": "npm run compile && electron-builder --win --x64 --publish always",
@@ -51,8 +52,7 @@
         "from": "../standalone",
         "to": "extra/standalone",
         "filter": [
-          "golivebypass-standalone.sh",
-          "golivebypass.js"
+          "golivebypass-standalone.sh"
         ]
       },
       {

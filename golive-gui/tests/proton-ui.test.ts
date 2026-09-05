@@ -16,6 +16,28 @@ describe("controles Proton", () => {
     const fnBody = source.slice(fnStart, fnStart + 1800);
     expect(fnBody).toContain("const rotaEmUso = currentState === 'ACTIVE';");
     expect(fnBody).toContain("Rota ${res.server} selecionada!");
-    expect(fnBody).toMatch(/rotaEmUso\s*\?\s*`Servidor \$\{res\.server\} conectado!/);
+    expect(fnBody).toContain("rotaEmUso");
+    expect(fnBody).toContain("Rota ${res.server} aplicada!");
+  });
+
+  it("oferece o fluxo interativo para CAPTCHA", () => {
+    const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    expect(html).toContain('id="protonCaptchaPanel"');
+    expect(html).toContain('id="protonCaptchaOpenBtn"');
+    expect(html).toContain('id="protonCaptchaToken"');
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("humanVerificationToken: hvToken");
+    expect(source).toContain("CAPTCHA_INVALID");
+  });
+
+  it("orienta renovar a call depois de aplicar uma rota ativa", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("Saia e entre novamente na call para usá-la.");
+  });
+
+  it("trata telemetria indisponivel como aviso, sem negar uma rota WireSock ativa", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("res.readiness?.verified === false");
+    expect(source).toContain("A telemetria do WireSock não está disponível nesta instalação, mas o túnel está ativo.");
   });
 });

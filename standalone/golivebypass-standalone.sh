@@ -9,10 +9,10 @@
 #
 # Uso:
 #   ./golivebypass-standalone.sh
-#   ./golivebypass-standalone.sh --net-mode tor --tor-addr 127.0.0.1:9050
-#   ./golivebypass-standalone.sh --proxy socks5://127.0.0.1:9050
 #   ./golivebypass-standalone.sh --uninstall
 #   ./golivebypass-standalone.sh --status
+#   ./golivebypass-standalone.sh --probe
+#   ./golivebypass-standalone.sh --refresh-route
 #   ./golivebypass-standalone.sh --check-update
 #   ./golivebypass-standalone.sh --update
 
@@ -122,11 +122,9 @@ MODE="install"
 PROXY=""
 EXCLUDED="BR"
 TOR_MODE=0
-# Modo de rede passado por flag (--net-mode) e endereco do Tor (--tor-addr). Vazios =
-# sem flag; a GUI manda os dois em toda ativacao para o modo dela chegar ao settings.json
-# mesmo que um escritor antigo/terceiro o tenha regravado sem a chave (issue #108).
-NET_MODE=""
+NET_MODE="wireguard"
 TOR_ADDR_CLI=""
+CLEANUP_LEGACY=0
 ASSUME_YES=0
 JSON=0
 
@@ -649,19 +647,20 @@ st_tui_done() { printf '\033[2K\r%s%s[OK]%s\n' "$ST_BG" "$ST_OK" "$ST_RSET" >&2;
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --proxy) PROXY="${2:-}"; shift ;;
+        --proxy) fail "Proxy nao e mais suportada; use uma configuracao WireGuard." ;;
         --wg-conf) WG_CONF_CLI="${2:-}"; shift ;;
         --excluded-countries) EXCLUDED="${2:-BR}"; shift ;;
-        --net-mode) NET_MODE="${2:-}"; shift ;;
-        --tor-addr) TOR_ADDR_CLI="${2:-}"; shift ;;
-        # Acucar retrocompativel: o modo tor do proprio script, na porta dedicada.
-        --tor) TOR_MODE=1; NET_MODE="tor" ;;
+        --net-mode) shift ;;
+        --tor-addr|--tor) fail "Tor foi removido; use uma configuracao WireGuard." ;;
+        --cleanup-legacy) CLEANUP_LEGACY=1 ;;
         # Parametro interno: home guardada quando o script re-executa a si mesmo
         # como usuario (ou em fase elevada via pkexec/sudo), para nunca adivinhar.
         --real-home) _REAL_HOME="${2:-}"; shift ;;
         --uninstall) MODE="uninstall" ;;
         --restore) MODE="restore" ;;
         --status) MODE="status" ;;
+        --probe) MODE="probe" ;;
+        --refresh-route) MODE="refresh" ;;
         --check-update) MODE="check-update" ;;
         --update) MODE="update" ;;
         --json) JSON=1 ;;
@@ -672,11 +671,6 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-case "$NET_MODE" in
-    ""|auto|tor|free) ;;
-    *) fail "Valor invalido para --net-mode: $NET_MODE (use auto, tor ou free)" ;;
-esac
-
 # Em automacao (--yes) o report automatico nao deve spammar a API: quase sempre essas
 # rodadas sao de teste/CI. Usuario de verdade sem --yes reporta.
 [ "$ASSUME_YES" -eq 1 ] && REPORT_NO_AUTO=1 || REPORT_NO_AUTO=0
@@ -686,6 +680,17 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Senha digitada numa janela (zenity/kdialog) para o sudo -S. Cacheada em arquivo
 # temporario para nao repetir a pergunta a cada operacao da injecao (mv, mkdir, cp).
 SUDO_PASS_FILE=""
+SUDO_AUTH_READY=0
+SUDO_USE_CACHED_PASS=0
+
+cleanup_sudo_pass() {
+    if [ -n "$SUDO_PASS_FILE" ] && [ -f "$SUDO_PASS_FILE" ]; then
+        rm -f "$SUDO_PASS_FILE"
+    fi
+    SUDO_PASS_FILE=""
+}
+
+trap cleanup_sudo_pass EXIT INT TERM
 sudo_pass_get() {
     if [ -n "$SUDO_PASS_FILE" ] && [ -f "$SUDO_PASS_FILE" ]; then
         return 0
@@ -703,29 +708,75 @@ sudo_pass_get() {
     return 0
 }
 
-# Roda um comando como root. O sudo e o padrao, mas em desktops com polkit (Fedora KDE/GNOME,
-# Ubuntu com sudo desativado) ele falha sem TTY ou sem senha configurada — e o pkexec mostra o
-# dialogo grafico do sistema. Tentar os dois cobre os dois mundos; quem falhar, avisa.
-# Sem TTY e sem agente polkit (niri/hyprland headless-ish), nem sudo interativo nem pkexec
-# funcionam — ai a senha e pedida numa janela (zenity deve existir na GUI) e o sudo -S resolve.
+# Valida a senha uma unica vez na janela grafica. Algumas politicas de sudo usam
+# timestamp por TTY ou timeout zero: `sudo -v` aceita a senha, mas o proximo
+# `sudo -n comando` ainda a exige. Nesses casos o elevate reenvia a mesma senha
+# temporaria para cada comando, sem abrir uma nova janela.
+sudo_authenticate_once() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    [ "$SUDO_AUTH_READY" -eq 1 ] && return 0
+
+    if have sudo && sudo -n true 2>/dev/null; then
+        SUDO_AUTH_READY=1
+        return 0
+    fi
+
+    if have sudo && [ "${GOLIVE_GUI:-0}" = "1" ]; then
+        if ! sudo_pass_get; then
+            printf '%s\n' 'Falha: nao foi possivel obter a senha do sudo. A ativacao foi cancelada sem alterar o sistema.' >&2
+            return 1
+        fi
+        if sudo -S -k -v < "$SUDO_PASS_FILE" >/dev/null 2>&1; then
+            SUDO_AUTH_READY=1
+            SUDO_USE_CACHED_PASS=1
+            return 0
+        fi
+        cleanup_sudo_pass
+        printf '%s\n' 'Falha: a senha do sudo foi recusada. A ativacao foi cancelada sem repetir o pedido.' >&2
+        return 1
+    fi
+
+    if have sudo && [ -t 0 ]; then
+        if sudo -v; then
+            SUDO_AUTH_READY=1
+            return 0
+        fi
+        printf '%s\n' 'Falha: nao foi possivel autenticar o sudo.' >&2
+        return 1
+    fi
+
+    printf '%s\n' 'Falha: este ambiente nao tem uma autorizacao sudo reutilizavel (sem TTY/agente grafico).' >&2
+    return 1
+}
+
+# Na GUI/AppImage nao existe fallback para sudo interativo ou pkexec por comando.
+# Quando a senha veio da janela grafica, `-k -S` a reapresenta silenciosamente a
+# cada chamada. Comandos comuns leem somente o arquivo de senha: isso impede que
+# um `cat` espere para sempre pelo stdin herdado do processo Electron destacado.
+# `tee` e a unica chamada que recebe dados pelo stdin; nela anexamos o conteudo
+# original depois da senha, para o resolv.conf chegar intacto ao comando elevado.
+sudo_with_cached_password() {
+    if [ "${1:-}" = "tee" ]; then
+        (cat "$SUDO_PASS_FILE"; cat) | sudo -S -k -p '' "$@"
+    else
+        sudo -S -k -p '' "$@" < "$SUDO_PASS_FILE"
+    fi
+}
+
 elevate() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
-    elif have sudo && sudo -n true 2>/dev/null; then
-        # NOPASSWD: sudo direto, sem dialogo.
-        sudo "$@"
-    elif have sudo && sudo_pass_get; then
-        # Sem NOPASSWD e sem TTY (GUI/AppImage no niri), o pkexec falha sem agente polkit e o
-        # sudo interativo sem TTY idem. A senha pedida em janela resolve os dois casos. Cacheada
-        # em SUDO_PASS_FILE para nao repetir. Senha errada: invalida o cache e tenta de novo.
-        sudo -S "$@" < "$SUDO_PASS_FILE" || { rm -f "$SUDO_PASS_FILE"; SUDO_PASS_FILE=""; return 1; }
-    elif have pkexec; then
-        # Dialogo grafico do polkit (GNOME/KDE com agente). Sem agente ele falha com 127.
-        pkexec "$@"
     elif have sudo; then
-        # Ultimo caso: sudo interativo (terminal). Sem TTY ele falha e o chamador avisa.
-        sudo "$@"
+        sudo_authenticate_once || return 1
+        if [ "$SUDO_USE_CACHED_PASS" -eq 1 ]; then
+            sudo_with_cached_password "$@"
+            return $?
+        fi
+        sudo -n "$@"
+    elif have pkexec && [ "${GOLIVE_GUI:-0}" = "1" ]; then
+        pkexec "$@"
     else
+        printf '%s\n' 'Falha: sudo nao esta instalado neste sistema.' >&2
         return 127
     fi
 }
@@ -1067,6 +1118,12 @@ wg_stats_json() {
     local dump
     if [ "$(id -u)" -eq 0 ]; then
         dump="$(ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
+    # Durante a ativacao a senha pode ter sido aceita pela janela, mas a politica
+    # local pode recusar `sudo -n` no comando seguinte (timestamp por TTY/zero).
+    # Reutiliza a mesma elevacao apenas nesta execucao; uma chamada isolada de
+    # --status continua sem pedir senha nem alterar o sistema.
+    elif [ "$SUDO_AUTH_READY" -eq 1 ]; then
+        dump="$(elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
     elif have sudo && sudo -n true 2>/dev/null; then
         dump="$(sudo ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
     else
@@ -1441,6 +1498,15 @@ remove_tor() {
     rm -f "$HOME/.config/systemd/user/$TOR_SERVICE"
 }
 
+# Migra somente recursos que uma versao antiga do GoLiveBypass criou. Nunca
+# para `tor.service`, nem remove binarios/configuracoes de Tor de terceiros.
+cleanup_legacy_tor() {
+    remove_tor
+    rm -rf "$TOR_BASE"
+    rm -f "$INSTALL_DIR/$PATCHER_NAME"
+    ok "Recursos legados de Tor/proxy do GoLiveBypass removidos."
+}
+
 # Devolve 1 em qualquer falha, sem matar o script (set -eu mataria o processo inteiro se
 # fosse chamada sem guarda -- e com varios Discords paralelos numa mesma rodada, um so falhar
 # em elevar (dialogo do polkit recusado, sem TTY, disco cheio) nao pode levar os outros junto.
@@ -1569,6 +1635,75 @@ setup_wireguard_netns() {
     ok "Tunel WireGuard 100% ativo no namespace '$NETNS_NAME'."
 }
 
+# Reaplica somente o peer na interface existente. O namespace, a interface e o processo do
+# Discord permanecem vivos; isso permite que a proxima chamada use a nova rota sem derrubar a
+# chamada atual. Se a interface ainda nao existir, o chamador deve usar a instalacao normal.
+refresh_wireguard_route() {
+    have ip || fail "Comando 'ip' nao encontrado no sistema."
+    have wg || fail "Comando 'wg' (wireguard-tools) nao encontrado."
+    if ! ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
+        fail "Namespace WireGuard '$NETNS_NAME' nao esta ativo."
+    fi
+    if ! elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" >/dev/null 2>&1; then
+        fail "Interface WireGuard '$WG_IF' nao esta ativa."
+    fi
+
+    local wg_file="$INSTALL_DIR/wireguard.conf" tmp_conf
+    [ -f "$wg_file" ] || fail "Nenhuma configuracao WireGuard encontrada."
+    tmp_conf="$(mktemp)"
+    grep -vE "^(Address|DNS)" "$wg_file" > "$tmp_conf"
+    if ! elevate ip netns exec "$NETNS_NAME" wg setconf "$WG_IF" "$tmp_conf"; then
+        rm -f "$tmp_conf"
+        fail "Nao consegui reaplicar a nova rota WireGuard."
+    fi
+    rm -f "$tmp_conf"
+    ok "Rota WireGuard atualizada sem reiniciar o Discord."
+}
+
+# Um namespace/interface existente nao prova que existe caminho funcional. O probe gera
+# trafego real pelo peer e confirma DNS + TCP + TLS ate o host usado pelo gateway do Discord.
+wireguard_gateway_probe() {
+    local code hs info
+    if ! ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
+        printf '%s\n' '{"ready":false,"state":"tunnel_down","error":"namespace inativo"}'
+        return 1
+    fi
+    if ! elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" >/dev/null 2>&1; then
+        printf '%s\n' '{"ready":false,"state":"tunnel_down","error":"interface WireGuard inativa"}'
+        return 1
+    fi
+    code="$(elevate ip netns exec "$NETNS_NAME" curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 8 https://gateway.discord.gg 2>/dev/null || true)"
+    case "$code" in
+        1??|2??|3??|4??|5??) ;;
+        *)
+            printf '{"ready":false,"state":"gateway_unreachable","httpCode":"%s"}\n' "${code:-000}"
+            return 1
+            ;;
+    esac
+    info="$(wg_stats_json)"
+    hs="$(printf '%s' "$info" | sed -n 's/.*"handshakeAgoS":\([^,}]*\).*/\1/p')"
+    if [ -z "$hs" ] || [ "$hs" = "null" ]; then
+        printf '{"ready":false,"state":"handshake_missing","httpCode":"%s"}\n' "$code"
+        return 1
+    fi
+    printf '{"ready":true,"state":"ready","httpCode":"%s","handshakeAgoS":%s}\n' "$code" "$hs"
+    return 0
+}
+
+wait_wireguard_ready() {
+    local tentativas=8 probe
+    while [ "$tentativas" -gt 0 ]; do
+        if probe="$(wireguard_gateway_probe 2>/dev/null)"; then
+            printf '  %sReadiness WireGuard confirmado: gateway alcancavel.%s\n' "$C_GREEN" "$C_OFF" >&2
+            return 0
+        fi
+        tentativas=$((tentativas - 1))
+        [ "$tentativas" -gt 0 ] && sleep 2
+    done
+    printf '  %sReadiness WireGuard falhou: %s%s\n' "$C_RED" "${probe:-sem resposta}" "$C_OFF" >&2
+    return 1
+}
+
 teardown_wireguard_netns() {
     if ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then
         step "Removendo namespace de rede '$NETNS_NAME' e interface WireGuard"
@@ -1576,6 +1711,42 @@ teardown_wireguard_netns() {
         elevate rm -rf "/etc/netns/$NETNS_NAME" 2>/dev/null || true
         ok "Tunel WireGuard encerrado."
     fi
+}
+
+# Diagnostico do backend grafico usado pelo Discord dentro do namespace. Nao
+# altera a sessao: apenas registra os sockets/portais que podem afetar captura
+# de tela no Wayland.
+graphics_backend() {
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$WAYLAND_DISPLAY" ]; then
+        printf '%s' "wayland"
+    elif [ -n "${DISPLAY:-}" ]; then
+        printf '%s' "x11/xwayland"
+    else
+        printf '%s' "indisponivel"
+    fi
+}
+
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
+}
+
+graphics_portal_state() {
+    if command -v xdg-desktop-portal >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        printf '%s' "presente"
+    elif command -v xdg-desktop-portal >/dev/null 2>&1; then
+        printf '%s' "presente-sem-dbus"
+    else
+        printf '%s' "ausente"
+    fi
+}
+
+graphics_json() {
+    local backend="$(graphics_backend)"
+    local portal="$(graphics_portal_state)"
+    local wayland="${WAYLAND_DISPLAY:-}"
+    printf '{"backend":"%s","waylandDisplay":"%s","sessionType":"%s","portal":"%s"}' \
+        "$(json_escape "$backend")" "$(json_escape "$wayland")" \
+        "$(json_escape "${XDG_SESSION_TYPE:-}")" "$(json_escape "$portal")"
 }
 
 # Reabre o Discord envelopado dentro do namespace WireGuard (sem proxy).
@@ -1590,7 +1761,16 @@ start_discord() {
 
     local run_user="${SUDO_USER:-$(id -un 2>/dev/null || whoami)}"
     local run_uid="$(id -u "$run_user" 2>/dev/null || id -u)"
-    local run_env="HOME=$_USER_HOME USER=$run_user LOGNAME=$run_user DISPLAY=${DISPLAY:-:1} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$run_uid} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus} PULSE_SERVER=unix:/run/user/$run_uid/pulse/native"
+    local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$run_uid}"
+    local discord_log_dir="$INSTALL_DIR/logs"
+    local discord_log="$discord_log_dir/discord-vpn-$(date +%Y%m%d-%H%M%S).log"
+    mkdir -p "$discord_log_dir"
+
+    # Nao inventar wayland-1: em muitas sessoes o socket e wayland-0, e um
+    # valor falso faz o Electron cair silenciosamente em XWayland.
+    local run_env="HOME=$_USER_HOME USER=$run_user LOGNAME=$run_user DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority} XDG_RUNTIME_DIR=$runtime_dir DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus} PULSE_SERVER=${PULSE_SERVER:-unix:$runtime_dir/pulse/native} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-} XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-} XDG_SESSION_DESKTOP=${XDG_SESSION_DESKTOP:-} DESKTOP_SESSION=${DESKTOP_SESSION:-} GDK_BACKEND=${GDK_BACKEND:-} QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-} PIPEWIRE_REMOTE=${PIPEWIRE_REMOTE:-} ELECTRON_OZONE_PLATFORM_HINT=${ELECTRON_OZONE_PLATFORM_HINT:-auto}"
+    printf '  Backend grafico: %s | Wayland=%s | portal=%s\n' "$(graphics_backend)" "${WAYLAND_DISPLAY:-nenhum}" "$(graphics_portal_state)" >&2
+    printf '[%s] backend=%s wayland=%s session=%s portal=%s\n' "$(date -Is)" "$(graphics_backend)" "${WAYLAND_DISPLAY:-}" "${XDG_SESSION_TYPE:-}" "$(graphics_portal_state)" >>"$discord_log"
 
     # Remove travas Singleton orfas que fazem o Chromium fechar imediatamente com before-quit
     rm -f "$_USER_HOME/.config/discord/Singleton"* 2>/dev/null || true
@@ -1629,10 +1809,29 @@ start_discord() {
     [ -n "$target_cmd" ] || return 1
 
     if have systemd-run; then
-        elevate systemd-run --unit="discord-vpn-$(date +%s)" ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env $target_cmd >/dev/null 2>&1
+        # O arquivo captura o stderr/stdout do cliente para diferenciar crash,
+        # atualizacao e encerramento pelo portal. --collect evita unidades
+        # antigas acumuladas sem habilitar restart automatico.
+        # systemd-run so enfileira a unidade e retorna logo. Nao o coloque em
+        # background: o trap de fim do script apaga a senha temporaria, e o
+        # processo destacado tentava le-la tarde demais, deixando o Discord
+        # fechado apesar de o tunel estar ativo.
+        elevate systemd-run --collect --unit="discord-vpn-$(date +%s)" \
+            ip netns exec "$NETNS_NAME" sudo -u "$run_user" env \
+            "HOME=$_USER_HOME" "USER=$run_user" "LOGNAME=$run_user" "DISPLAY=${DISPLAY:-}" \
+            "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" "XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority}" \
+            "XDG_RUNTIME_DIR=$runtime_dir" "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus}" \
+            "PULSE_SERVER=${PULSE_SERVER:-unix:$runtime_dir/pulse/native}" "XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-}" \
+            "XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-}" "XDG_SESSION_DESKTOP=${XDG_SESSION_DESKTOP:-}" \
+            "DESKTOP_SESSION=${DESKTOP_SESSION:-}" "GDK_BACKEND=${GDK_BACKEND:-}" \
+            "QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-}" "PIPEWIRE_REMOTE=${PIPEWIRE_REMOTE:-}" \
+            "ELECTRON_OZONE_PLATFORM_HINT=${ELECTRON_OZONE_PLATFORM_HINT:-auto}" \
+            sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1
     else
-        elevate ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env nohup $target_cmd >/dev/null 2>&1 &
+        elevate ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env \
+            sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 &
     fi
+    printf '  Log do Discord: %s\n' "$discord_log" >&2
 }
 
 printf '\n  %sGoLiveBypass standalone%s\n' "$C_CYAN" "$C_OFF" >&2
@@ -1780,13 +1979,26 @@ EOF
 FOUND="$(discord_dirs)"
 [ -n "$FOUND" ] || fail "Nao achei nenhum Discord instalado."
 
+if [ "$MODE" = "probe" ]; then
+    if wireguard_gateway_probe; then
+        exit 0
+    fi
+    exit 1
+fi
+
+if [ "$MODE" = "refresh" ]; then
+    refresh_wireguard_route
+    wait_wireguard_ready || fail "A nova rota subiu, mas nao conseguiu alcancar o gateway do Discord."
+    exit 0
+fi
+
 if [ "$MODE" = "status" ]; then
     if [ "$JSON" -eq 1 ]; then
         route_mode_disk="wireguard"
         tor_addr_disk=""
         netns_json=false
         if ip netns list 2>/dev/null | grep -q "^$NETNS_NAME[[:space:]]"; then netns_json=true; fi
-        printf '{"routeMode":"%s","torAddr":"%s","netns":%s,"wg":%s,"discords":[' "$route_mode_disk" "$tor_addr_disk" "$netns_json" "$(wg_stats_json)"
+        printf '{"routeMode":"wireguard","torAddr":"","netns":%s,"wg":%s,"graphics":%s,"discords":[' "$netns_json" "$(wg_stats_json)" "$(graphics_json)"
         first=1
         printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav detect id; do
             [ "$first" -eq 1 ] || printf ','
@@ -1843,6 +2055,10 @@ if [ "$MODE" = "status" ]; then
         esac
     done
     exit 0
+fi
+
+if [ "$CLEANUP_LEGACY" -eq 1 ]; then
+    cleanup_legacy_tor
 fi
 
 if [ "$MODE" = "uninstall" ] || [ "$MODE" = "restore" ]; then
@@ -1941,6 +2157,11 @@ if [ "$injected" -eq 0 ]; then
     # falhar de verdade para o chamador enxergar.
     fail "NADA foi injetado — a elevacao falhou ou nenhum Discord foi tocado."
 fi
+
+# O Discord so deve nascer depois de o peer ter negociado e o caminho real ate o gateway ter
+# respondido. Sem esta barreira, namespace criado + processo aberto apareciam como sucesso e o
+# cliente ficava eternamente em carregamento.
+wait_wireguard_ready || fail "WireGuard foi criado, mas nao ficou pronto para o gateway do Discord."
 
 # Modo portatil: reabre o Discord ja com o bypass ativo (mesmo comportamento do app do Windows).
 # head -1 em vez de pipe para o while: nohup num subshell morreria junto com ele.

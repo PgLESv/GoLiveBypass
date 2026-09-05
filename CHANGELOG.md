@@ -4,16 +4,67 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.0.1] - 2026-09-04
+
+### Correções de confiabilidade
+
+- **Ciclo de vida WireSock serializado:** ativação, desativação, restauração de internet e troca
+  de rota agora aguardam a operação anterior terminar antes de iniciar outra instância.
+- **Limpeza recuperável:** processos e serviços residuais são encerrados em árvore, o Network
+  Lock é resetado e a limpeza elevada pode ser repetida quando o Windows mantém um residual.
+- **Validação antes do Discord:** o aplicativo só libera o Discord depois de confirmar o túnel
+  WireGuard/ProTUN, tráfego bidirecional quando disponível e DNS/HTTPS funcionais no Windows.
+- **Restauração segura:** DNS só é limpo nos adaptadores WireSock/ProTUN; o DNS do host não é
+  alterado permanentemente. O Discord só volta após limpeza e rede saudáveis.
+- **Telemetria honesta:** ausência de `wg.exe` é reportada como telemetria indisponível quando o
+  túnel está funcionando; falhas reais continuam sendo desconexão explícita ou teste funcional
+  reprovado.
+- **Encerramento correto:** o app aguarda a desativação antes de sair, evitando deixar WireSock
+  ou o Network Lock presos no Windows.
+
+### Correções do loop de recuperação
+
+- **Watchdog sem sobreposição:** callbacks de uma geração anterior não podem agir depois de uma
+  parada ou reinício.
+- **Gateway sem reload duplicado:** a espera por uma saída reserva mantém seu próprio mutex e
+  não permite dois reloads concorrentes.
+- **RTC sem callback obsoleto:** respostas de uma sessão antiga são descartadas quando o Discord
+  já iniciou outra navegação.
+- **Paridade standalone/GUI:** o bundle do bypass é gerado a partir da fonte standalone e o
+  build falha se as duas cópias divergirem.
+
+### Proton, sessão e distribuição
+
+- Persistência da conta Proton validada após login e gravação atômica da sessão.
+- Fluxo de CAPTCHA permite concluir o login sem reiniciar a GUI e sem registrar credenciais.
+- Diagnóstico registra serviço, PID residual, reset de lock, DNS, HTTPS e origem da confirmação
+  do túnel sem expor endpoint privado.
+- Build Windows portátil preparado para a versão 2.0.1.
+
+### Validação
+
+- 165 testes Vitest aprovados.
+- 31 verificações de paridade aprovadas.
+- Testes de gateway zumbi, recuperação RTC, corrida do viewer e re-seleção de saída aprovados.
+- E2E em Windows 11: ativação aguardou a conexão real antes de abrir o Discord; desativação
+  restaurou o cliente sem reiniciar o Windows.
+
 ## [2.0.0] - 2026-09-04
 
 ### Destaques
+
+- **Mods no Windows:** a descoberta do Discord para WireSock usa somente `Discord.exe`; ela
+  não lê, espera, cria ou altera `app.asar`/`resources`, preservando BetterDiscord e outros
+  carregadores de mods.
 
 - **WireGuard por aplicativo:** Windows usa WireSock/WFP para encaminhar somente o Discord (`Discord.exe`, `Discord` e `Update.exe`) pelo túnel. O restante do computador permanece na rede normal.
 - **Namespace dedicado no Linux:** a GUI inicia o Discord dentro de `discord-vpn`, com a interface WireGuard isolada do restante do sistema.
 - **Discord vanilla no Windows/Linux:** a GUI 2.0.0 não substitui nem injeta o `app.asar` do Discord. Ativar e desativar reinicia o cliente para aplicar ou remover o túnel com segurança.
 - **ProtonVPN integrado:** login com sessão persistente, geração de configuração WireGuard, seleção automática por menor ping, suporte a 2FA e importação de configurações `.conf` próprias.
+- **Persistência da conta Proton reforçada:** o GUI recupera o usuário da sessão salva no Windows/Linux, valida a gravação após o login e o sidecar grava sessões atomicamente, criando a pasta de dados quando necessário.
 - **Privacidade na GUI:** endereço de e-mail Proton desfocado por padrão durante compartilhamento de tela e revelado apenas sob interação do usuário.
 - **Diagnóstico de túnel:** logs e reports registram estado do handshake e volume de tráfego sem incluir o endpoint privado da VPN.
+- **Login Proton com verificação humana:** quando o Proton exige CAPTCHA, a GUI abre o desafio oficial e permite reenviar o resultado sem reiniciar o aplicativo; tokens e senhas não são persistidos nem registrados.
 
 ### Compatibilidade e limites conhecidos
 

@@ -1,8 +1,34 @@
 import path from 'path';
+import { dirname } from 'path';
+import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { app } from 'electron';
 import { spawn } from 'child_process';
 import * as logger from './logger';
+
+const moduleDir = dirname(fileURLToPath(import.meta.url));
+
+export type ProtonLoginErrorCode =
+  | 'INVALID_CREDENTIALS'
+  | 'TWO_FACTOR_REQUIRED'
+  | 'TWO_FACTOR_INVALID'
+  | 'CAPTCHA_REQUIRED'
+  | 'CAPTCHA_INVALID'
+  | 'NETWORK_ERROR'
+  | 'TIMEOUT'
+  | 'MISSING_EXECUTABLE'
+  | 'SESSION_PERSISTENCE'
+  | 'CONFIGURATION_ERROR'
+  | 'UNKNOWN';
+
+export interface ProtonLoginResult {
+  success: boolean;
+  code?: ProtonLoginErrorCode;
+  message?: string;
+  error?: string;
+  retryable?: boolean;
+  captchaUrl?: string;
+}
 
 export interface ProtonSettings {
   vpnMode: 'proton' | 'custom';
@@ -40,11 +66,11 @@ export function findProtonConfgenExe(): string {
     }
   } catch {}
 
-  // 3. Fallback dev mode relative to process.cwd() or __dirname
+  // 3. Fallback dev mode relative to process.cwd() or the ESM module directory
   const cwdDev = path.resolve(process.cwd(), '..', 'tools', 'proton-confgen', 'build', exeName);
   if (fs.existsSync(cwdDev)) return cwdDev;
 
-  const localDev = path.resolve(__dirname, '..', '..', 'tools', 'proton-confgen', 'build', exeName);
+  const localDev = path.resolve(moduleDir, '..', '..', 'tools', 'proton-confgen', 'build', exeName);
   if (fs.existsSync(localDev)) return localDev;
 
   const directDev = path.resolve(process.cwd(), 'tools', 'proton-confgen', 'build', exeName);
@@ -127,8 +153,35 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
   });
 }
 
+export function classifyProtonError(error: unknown, stderr = '', stdout = ''): { code: ProtonLoginErrorCode; message: string; retryable: boolean } {
+  const raw = `${error instanceof Error ? error.message : String(error)} ${stderr} ${stdout}`.toLowerCase();
+  if (/captcha_invalid|captcha.*expired|human verification.*(invalid|expired)/.test(raw)) return { code: 'CAPTCHA_INVALID', message: 'A verificação de segurança expirou ou foi recusada. Abra um novo CAPTCHA e tente novamente.', retryable: true };
+  if (/captcha_required|captcha verification required|human verification required|code 9001/.test(raw)) return { code: 'CAPTCHA_REQUIRED', message: 'O Proton solicitou uma verificação de segurança. Abra o CAPTCHA e tente novamente.', retryable: true };
+  if (/2fa_required|two.?factor|required.*2fa/.test(raw)) return { code: 'TWO_FACTOR_REQUIRED', message: 'Esta conta exige autenticação em duas etapas.', retryable: false };
+  if (/2fa|two.?factor|totp|verification code/.test(raw)) return { code: 'TWO_FACTOR_INVALID', message: 'O código 2FA está incorreto ou expirou.', retryable: false };
+  if (/invalid credential|invalid password|wrong password|authentication failed|incorrect/.test(raw)) return { code: 'INVALID_CREDENTIALS', message: 'Usuário ou senha incorretos.', retryable: false };
+  if (/timeout|tempo limite|timed out/.test(raw)) return { code: 'TIMEOUT', message: 'O ProtonVPN demorou demais para responder. Tente novamente em alguns instantes.', retryable: true };
+  if (/encontrado|not found|enoent|spawn/.test(raw)) return { code: 'MISSING_EXECUTABLE', message: 'O componente de conexão ProtonVPN não foi encontrado nesta instalação. Reinstale o GoLiveBypass ou atualize para a versão mais recente.', retryable: false };
+  if (/network|connection|dns|tls|temporary|unreachable|reset/.test(raw)) return { code: 'NETWORK_ERROR', message: 'Não foi possível conectar aos servidores ProtonVPN. Verifique sua internet e tente novamente.', retryable: true };
+  return { code: 'UNKNOWN', message: 'Não foi possível concluir o login ProtonVPN. Tente novamente ou envie um relatório de diagnóstico.', retryable: true };
+}
+
 export function getProtonSessionFile(installDir: string): string {
   return path.join(installDir, 'proton-session.json');
+}
+
+/** Read only the non-secret identity metadata from the cached session. */
+export function getSavedSessionUsername(installDir: string): string {
+  try {
+    const raw = JSON.parse(fs.readFileSync(getProtonSessionFile(installDir), 'utf8'));
+    return typeof raw?.username === 'string' ? raw.username.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+function ensureInstallDir(installDir: string) {
+  fs.mkdirSync(installDir, { recursive: true });
 }
 
 export async function checkProtonSession(
@@ -140,6 +193,7 @@ export async function checkProtonSession(
   }
 
   const sessionFile = getProtonSessionFile(installDir);
+  ensureInstallDir(installDir);
   const res = await runConfgen({
     args: [
       '-username',
@@ -170,8 +224,15 @@ export async function loginProton(
   installDir: string,
   username: string,
   password?: string,
-  twoFactorCode?: string
-): Promise<{ success: boolean; error?: string }> {
+  twoFactorCode?: string,
+  humanVerificationToken?: string
+): Promise<ProtonLoginResult> {
+  try {
+    ensureInstallDir(installDir);
+  } catch (error) {
+    const classified = classifyProtonError(error);
+    return { success: false, ...classified, code: 'SESSION_PERSISTENCE', message: 'Não foi possível preparar a pasta de dados para salvar a sessão ProtonVPN.', retryable: false, error: error instanceof Error ? error.message : String(error) };
+  }
   const sessionFile = getProtonSessionFile(installDir);
   const args = [
     '-username',
@@ -188,18 +249,42 @@ export async function loginProton(
   if (twoFactorCode) {
     args.push('-2fa', twoFactorCode);
   }
+  if (humanVerificationToken) args.push('-hv-token', humanVerificationToken);
 
   logger.info('proton', 'iniciando autenticação ProtonVPN');
-  const res = await runConfgen({ args, timeoutMs: 25000 });
+  let res;
+  try {
+    res = await runConfgen({ args, timeoutMs: 25000 });
+  } catch (error) {
+    const classified = classifyProtonError(error);
+    logger.error('proton', 'falha ao iniciar proton-confgen', { codigo: classified.code, erro: error instanceof Error ? error.message : String(error) });
+    return { success: false, ...classified, error: error instanceof Error ? error.message : String(error) };
+  }
 
   if (res.json && res.json.success) {
     logger.info('proton', 'autenticação bem-sucedida');
-    return { success: true };
+    return { success: true, message: 'Autenticação concluída.' };
+  }
+
+  if (res.json?.code === 'CAPTCHA_REQUIRED' || res.json?.code === 'CAPTCHA_INVALID') {
+    return {
+      success: false,
+      code: res.json.code,
+      message: res.json.error || (res.json.code === 'CAPTCHA_INVALID'
+        ? 'A verificação de segurança expirou ou foi recusada.'
+        : 'O Proton solicitou uma verificação de segurança.'),
+      retryable: res.json.retryable !== false,
+      captchaUrl: typeof res.json.captchaUrl === 'string' ? res.json.captchaUrl : undefined,
+      error: res.json.error || (res.json.code === 'CAPTCHA_INVALID'
+        ? 'A verificação de segurança expirou ou foi recusada.'
+        : 'O Proton solicitou uma verificação de segurança.'),
+    };
   }
 
   const errorMsg = res.json?.error || res.stderr || res.stdout || 'Falha na autenticação ProtonVPN.';
+  const classified = classifyProtonError(errorMsg, res.stderr, res.stdout);
   logger.warn('proton', 'falha na autenticação ProtonVPN', { codigo_saida: res.code, resposta_json: Boolean(res.json) });
-  return { success: false, error: errorMsg };
+  return { success: false, ...classified, error: classified.message };
 }
 
 export async function generateOptimalProtonConfig(
@@ -225,6 +310,7 @@ export async function generateOptimalProtonConfig(
 }> {
   const sessionFile = getProtonSessionFile(installDir);
   const outputFile = path.join(installDir, 'wireguard.conf');
+  ensureInstallDir(installDir);
 
   const args = [
     '-username',

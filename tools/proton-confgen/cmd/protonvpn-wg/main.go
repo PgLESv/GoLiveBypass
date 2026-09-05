@@ -4,6 +4,7 @@ package main
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -30,10 +31,19 @@ func main() {
 			}
 		}
 		if isJSON {
-			data, _ := json.Marshal(map[string]any{
+			response := map[string]any{
 				"success": false,
 				"error":   err.Error(),
-			})
+			}
+			var hvErr auth.HumanVerificationError
+			if errors.As(err, &hvErr) {
+				response["code"] = hvErr.Code
+				response["retryable"] = hvErr.Retryable
+				if hvErr.CaptchaURL != "" {
+					response["captchaUrl"] = hvErr.CaptchaURL
+				}
+			}
+			data, _ := json.Marshal(response)
 			fmt.Println(string(data))
 		} else {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

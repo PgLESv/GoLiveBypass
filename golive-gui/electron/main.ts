@@ -16,8 +16,6 @@ import { homedir, EOL } from "os";
 import fs from "fs";
 import { createHash } from "crypto";
 import { execFileSync, execSync, spawn, spawnSync } from "child_process";
-import { bypassCode } from "./bypass";
-import { createTorWatchdog, TOR_WATCHDOG_PORT_MS, type TorWatchdog } from "./torwatchdog";
 import { runScript } from "./linux-helper";
 import { setupUpdater, isQuittingForUpdate } from "./updater";
 import * as logger from "./logger";
@@ -25,10 +23,12 @@ import * as discordscan from "./discordscan";
 import * as netevents from "./netevents";
 import * as logsDir from "./logsDir";
 import { submitBugReport } from "./bugreport";
-import { isWireSockActive, startWireSockService, stopWireSockService } from "./wiresock";
-import { getWgStats, iniciarWgStatsWatchdog, pararWgStatsWatchdog, type WgTunnelStats } from "./wgstats";
+import { getWireSockConnectionStatus, getWireSockAdapterTraffic, isWireSockActive, startWireSockService, recoverWireSockNetwork, verifyWindowsNetworkStable, type WireSockConnectionStatus } from "./wiresock";
+import { classifyWgReadiness, getWgStats, iniciarWgStatsWatchdog, pararWgStatsWatchdog, type WgTunnelStats } from "./wgstats";
 import { validateWgConfContent } from "./wg-validator";
 import * as proton from "./proton";
+import { findWindowsDiscordInstall } from "./windows-discord-install";
+import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } from "./wait-condition";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -37,6 +37,23 @@ const isMac = process.platform === "darwin";
 const IS_LINUX = process.platform === "linux";
 const IS_WINDOWS = process.platform === "win32";
 const MAIN_WINDOW_WIDTH = 720;
+
+// Parar, resetar o lock e instalar outro perfil mexe no mesmo servico/driver
+// global. Uma fila unica impede que clique, bandeja e troca Proton criem duas
+// instancias ou que uma validacao aprove a rede enquanto outra ainda a desmonta.
+let wireSockLifecycleQueue: Promise<void> = Promise.resolve();
+function withWireSockLifecycle<T>(operation: string, task: () => Promise<T>): Promise<T> {
+  const run = wireSockLifecycleQueue.then(async () => {
+    logger.info("wiresock", "inicio de operacao serializada", { operation });
+    try {
+      return await task();
+    } finally {
+      logger.info("wiresock", "fim de operacao serializada", { operation });
+    }
+  });
+  wireSockLifecycleQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
 
 // Cores da barra de titulo (Windows, titleBarOverlay) — casam com os tokens
 // --canvas e --ink do renderer em cada tema.
@@ -539,41 +556,13 @@ if (!gotLock) {
     // Beta 16: esta nao e mais uma preferencia. Corrige na abertura tanto o
     // settings compartilhado (Linux) quanto o settings de injecoes existentes
     // (Windows/macOS), inclusive se uma beta anterior deixou autoRevive=false.
-    updateSharedSettings({});
-    logger.info("recuperacao", "sistema WireGuard ativo; legado de injecao ignorado", {});
+    updateSharedSettings({ routeMode: "wireguard" });
+    logger.info("recuperacao", "sistema WireGuard ativo; configuracao legada removida", {});
     // Se uma sessao anterior morreu sem o quit limpo (PC desligado, crash), a injecao
     // ficou orfa: reverte agora para o status nao mentir (bug: "Ativo" sem ter ativado).
     // O sistema atual usa somente WireGuard por processo. Não reverter nem interpretar
     // app.asar/_app.asar: esses arquivos podem pertencer ao Discord ou a outro mod.
-    // Se o modo salvo e Tor, comeca a subir o daemon JA na abertura. Sem isto ha um impasse:
-    // o botao de ativar so libera com o Tor verificado, e o Tor so subia ao ativar ou ao
-    // clicar no seletor -- mas quem abre o app com Tor ja selecionado nao clica em nada, e
-    // ficava olhando "Aguardando o Tor..." com ninguem tentando. Vale para toda instalacao
-    // nova, porque Tor e o padrao. Roda solto: o garantirTor ja insiste sozinho se falhar, e
-    // a tela libera o botao quando ficar pronto.
-    if (readNetMode() === "tor") {
-      garantirTor()
-        .then((r) => {
-          if (!r.ok) console.warn("[tor] nao subiu na abertura:", r.error);
-          // Se o Discord ja esta injetado (sessao viva do boot anterior), o watchdog retoma
-          // a vigia — sem ele, um daemon que morreu na sessao antiga seguiria cego. O marcador
-          // (session.json) sozinho e fragil: reproduzido ao vivo no laboratorio um Discord
-          // continuava rodando com a injecao no disco (getStatus() === "ACTIVE") sem o
-          // marcador (ausente ou limpo por um quit/deactivate anterior que nao chegou a
-          // encerrar o Discord de fato) -- o boot seguinte via sessaoAtiva()==false, nunca
-          // armava o watchdog, e um Tor morto ficava morto pelo resto da sessao (o Discord
-          // preso recusando o gateway para sempre, sem ninguem ressuscitando o daemon).
-          // getStatus() le o disco (a injecao esta la de verdade?), entao cobre esse caso sem
-          // depender do marcador efêmero.
-          if (sessaoAtiva() || getStatus() === "ACTIVE") torWatchdogIniciar();
-        })
-        .catch((error) => console.error("[tor] falha ao preparar na abertura:", error));
-    } else {
-      // Modo nao-tor: nada a vigiar.
-      torWatchdogParar();
-    }
-
-    // Mesma logica do watchdog do Tor acima: se a GUI reabriu com o bypass ja ativo (netns/
+    // Se a GUI reabriu com o bypass ja ativo (netns/
     // WireSock de uma sessao anterior sobrevivendo ao restart da janela), o vigia do tunel
     // precisa retomar aqui — sem isto, so uma ativacao nova (clique) o arma.
     if (!isMac) {
@@ -657,12 +646,6 @@ app.on("before-quit", (event) => {
   // executado e precisa do lock de instancia unica. Sem esta saida, o app
   // antigo fica vivo e o novo morre — o "fecha mas nao abre".
   //
-  // De proposito SEM stopTor aqui: o Tor embutido fica rodando e o processo novo
-  // o adota pela porta 9060 (detectTor), entao o gateway nunca cai na troca — o
-  // novo exe nasce em ~2s e o tunnel segue de pe. Matar o Tor neste quit derruba
-  // o websocket no meio do que quer que o usuario esteja fazendo (e reconexao de
-  // gateway em chamada congela o video). Se o relanço falhar, o Tor orfao morre
-  // no reboot ou e adotado na proxima abertura da GUI.
   if (isQuittingForUpdate()) return;
   // A segunda instancia so acorda a primeira e morre: sem esta guarda ela restauraria o
   // Discord na saida, desfazendo o bypass que a instancia principal acabou de aplicar.
@@ -670,20 +653,23 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   quitting = true;
   cleaningUp = true;
-  // O Tor embutido morre junto com o app (e o Discord restaurado nao fica dependente dele).
-  stopTor();
-  torWatchdogParar();
   // O quit e limpo: o marcador de sessao morre aqui, para o boot seguinte nao tentar
   // reverter nada (a reversao abaixo e a que vale).
   clearSessionMarker();
   closeLogWindow();
   stopLogWatch();
-  // Reversao em background: o runScript roda detached/unref, entao o filho sobrevive ao
-  // app.quit() e o Discord nao fica com a injecao pendurada. Sem esperar: o "Sair" sai na
-  // hora mesmo se o script demorar (fechar o Discord, flatpak, sudo...).
+  // A limpeza precisa terminar antes do processo morrer. Antes, o app.quit() imediato
+  // podia encerrar o Electron no meio do stop/reset/flush do WireSock e deixar WFP ou o
+  // processo filho residual bloqueando a rede. A segunda entrada em before-quit passa pela
+  // guarda cleaningUp e permite a saída somente depois deste promise concluir.
   const restore = IS_LINUX ? linuxDeactivate(() => {}) : deactivateAll();
-  restore.catch(() => {});
-  app.quit();
+  restore
+    .catch((error) => {
+      logger.error("app", "limpeza no encerramento falhou", {
+        erro: String((error as Error)?.message ?? error),
+      });
+    })
+    .finally(() => app.quit());
 });
 
 // A bandeja e a "dona" do app: fechar a janela so esconde (em qualquer SO), e o processo
@@ -710,29 +696,6 @@ interface DiscordInstall {
   bundlePath?: string;
 }
 
-function winAppHasDiscordResources(resourcesPath: string): boolean {
-  const asar = path.join(resourcesPath, "app.asar");
-  const originalAsar = path.join(resourcesPath, "_app.asar");
-  return diskFs.existsSync(asar) || diskFs.existsSync(originalAsar);
-}
-
-// O Squirrel baixa updates numa pasta app-VERSAO nova antes de terminar; enquanto isso ela
-// pode existir sem app.asar/_app.asar. Pegar so a "mais nova" cega falha com NOT_FOUND.
-function findLatestValidWinAppDir(rootPath: string): string | null {
-  let dirs: string[];
-  try {
-    dirs = diskFs.readdirSync(rootPath).filter((d) => d.startsWith("app-"));
-  } catch {
-    return null;
-  }
-  dirs.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
-  for (const dir of dirs) {
-    const resourcesPath = path.join(rootPath, dir, "resources");
-    if (winAppHasDiscordResources(resourcesPath)) return dir;
-  }
-  return null;
-}
-
 function getWinDiscordInstalls(): DiscordInstall[] {
   const localAppData = process.env.LOCALAPPDATA;
   discordscan.scanInicio("win32", localAppData);
@@ -745,17 +708,16 @@ function getWinDiscordInstalls(): DiscordInstall[] {
     discordscan.scanRaiz(rootPath, existe, flavour);
     if (!existe) continue;
 
-    const latestApp = findLatestValidWinAppDir(rootPath);
-    if (!latestApp) continue;
+    const candidate = findWindowsDiscordInstall(
+      rootPath,
+      flavour,
+      diskFs.existsSync,
+      (target) => diskFs.readdirSync(target) as string[],
+    );
+    if (!candidate) continue;
 
-    const resourcesPath = path.join(rootPath, latestApp, "resources");
-    const exePath = path.join(rootPath, latestApp, `${flavour}.exe`);
-    const asar = path.join(resourcesPath, "app.asar");
-    const originalAsar = path.join(resourcesPath, "_app.asar");
-    if (diskFs.existsSync(asar) || diskFs.existsSync(originalAsar)) {
-      discordscan.scanInstall(resourcesPath, flavour);
-    }
-    installs.push({ flavour, resources: resourcesPath, exePath });
+    discordscan.scanInstall(candidate.resources, flavour);
+    installs.push({ flavour, ...candidate });
   }
   discordscan.scanResultado(installs.length);
   return installs;
@@ -797,20 +759,28 @@ function getDiscordInstalls(): DiscordInstall[] {
   );
 }
 
-function discordIsRunning(): boolean {
+function discordProcessState(): ProcessProbeState {
   if (isMac) {
+    let probeFailed = false;
     for (const { processName } of MAC_APPS) {
       try {
         execFileSync("pgrep", ["-x", processName], { stdio: "ignore" });
         discordscan.runningPgrep(processName, true);
-        return true;
+        return "running";
       } catch (e) {
-        discordscan.runningPgrep(processName, false, (e as Error)?.message);
+        // pgrep usa exit 1 para "nenhum processo", que e uma resposta valida.
+        const code = (e as NodeJS.ErrnoException)?.status;
+        if (code === 1) discordscan.runningPgrep(processName, false);
+        else {
+          probeFailed = true;
+          discordscan.runningPgrep(processName, false, (e as Error)?.message);
+        }
       }
     }
-    return false;
+    return probeFailed ? "unknown" : "stopped";
   }
 
+  let probeFailed = false;
   for (const flavour of ALL_APPS) {
     try {
       const out = execSync(`tasklist /FI "IMAGENAME eq ${flavour}.exe" /NH`, {
@@ -819,22 +789,81 @@ function discordIsRunning(): boolean {
       });
       if (out.toLowerCase().includes(`${flavour}.exe`.toLowerCase())) {
         discordscan.runningTasklist(flavour, true);
-        return true;
+        return "running";
       }
       discordscan.runningTasklist(flavour, false);
     } catch (e) {
+      probeFailed = true;
       discordscan.runningTasklist(flavour, false, (e as Error)?.message);
     }
   }
-  return false;
+  return probeFailed ? "unknown" : "stopped";
+}
+
+function discordIsRunning(): boolean {
+  return discordProcessState() === "running";
 }
 
 async function waitUntilDiscordGone(tries = 40, delayMs = 250) {
-  for (let i = 0; i < tries; i++) {
-    if (!discordIsRunning()) return true;
-    await new Promise((r) => setTimeout(r, delayMs));
+  return waitForProcessStopped(() => discordProcessState(), { attempts: tries, delayMs });
+}
+
+async function waitUntilDiscordRunning(tries = 40, delayMs = 250) {
+  return waitForProcessRunning(() => discordProcessState(), { attempts: tries, delayMs });
+}
+
+function discordDidNotStop(): never {
+  logger.error("discord", "encerramento.timeout", { timeout_ms: 10_000 });
+  throw new Error("Não foi possível encerrar completamente o Discord. Feche o cliente e tente novamente antes de alterar a rota.");
+}
+
+/**
+ * O updater do Discord usa o nome genérico Update.exe e não aparece como
+ * Discord*.exe. Se ele sobrevive ao encerramento, pode reabrir uma sessão velha
+ * e ficar preso em “Checking for updates...”, disputando a sessão recém-criada.
+ * Filtramos pelo command line para não matar atualizadores de outros produtos.
+ */
+function killDiscordUpdater() {
+  if (!IS_WINDOWS) return;
+  try {
+    const script = "$procs = Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'Discord' }; $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: "ignore", windowsHide: true, timeout: 5000 });
+  } catch (err) {
+    logger.warn("discord", "nao consegui encerrar o updater do Discord", { erro: String((err as Error)?.message ?? err) });
   }
-  return !discordIsRunning();
+}
+
+// Update.exe e' compartilhado por apps Squirrel. Por isso a identificacao usa a
+// command line, nunca somente o nome do executavel. Uma falha na consulta nao e'
+// tratada como ausencia: alterar a rota com um updater desconhecido ainda vivo
+// pode relancar o Discord fora da janela controlada.
+function discordUpdaterProcessState(): ProcessProbeState {
+  if (!IS_WINDOWS) return "stopped";
+  try {
+    const script = "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction Stop | Where-Object { $_.CommandLine -match 'Discord' }); if ($procs.Count -gt 0) { exit 0 }; exit 1";
+    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      stdio: "ignore",
+      windowsHide: true,
+      timeout: 5000,
+    });
+    return "running";
+  } catch (err) {
+    // O exit 1 e' a resposta esperada do script para nenhuma instancia Discord.
+    if ((err as NodeJS.ErrnoException)?.status === 1) return "stopped";
+    logger.warn("discord", "updater.estado_desconhecido", {
+      erro: String((err as Error)?.message ?? err),
+    });
+    return "unknown";
+  }
+}
+
+async function waitUntilDiscordUpdaterGone(tries = 10, delayMs = 250) {
+  return waitForProcessStopped(() => discordUpdaterProcessState(), { attempts: tries, delayMs });
+}
+
+function discordUpdaterDidNotStop(): never {
+  logger.error("discord", "updater.encerramento.timeout", { timeout_ms: 5_000 });
+  throw new Error("Não foi possível encerrar o atualizador do Discord. Feche o cliente e tente novamente antes de alterar a rota.");
 }
 
 function killMacProcesses(names: readonly string[], signal?: "-9") {
@@ -855,7 +884,7 @@ async function killDiscord() {
     if (!(await waitUntilDiscordGone())) {
       killMacProcesses(mains, "-9");
       killMacProcesses(MAC_HELPER_PROCESSES, "-9");
-      await waitUntilDiscordGone(20, 250);
+      if (!(await waitUntilDiscordGone(20, 250))) discordDidNotStop();
     }
     return;
   }
@@ -865,7 +894,20 @@ async function killDiscord() {
       execSync(`taskkill /F /T /IM ${flavour}.exe`, { stdio: "ignore" });
     } catch {}
   }
-  await waitUntilDiscordGone();
+  killDiscordUpdater();
+  if (!(await waitUntilDiscordGone())) {
+    // Um Update.exe pode recriar o processo principal depois do primeiro taskkill.
+    // Mata-o mais uma vez e falha de forma segura se a sessao antiga persistir.
+    killDiscordUpdater();
+    if (!(await waitUntilDiscordGone(20, 250))) discordDidNotStop();
+  }
+  // O updater pode ter sido recriado no intervalo em que o processo principal
+  // saiu; repete a verificação antes de qualquer nova instalação/rota.
+  killDiscordUpdater();
+  if (!(await waitUntilDiscordUpdaterGone())) {
+    killDiscordUpdater();
+    if (!(await waitUntilDiscordUpdaterGone(20, 250))) discordUpdaterDidNotStop();
+  }
 }
 
 function assertResourcesWritable(install: DiscordInstall) {
@@ -979,9 +1021,31 @@ function startDiscord(install: DiscordInstall) {
     if (isMac && install.bundlePath) {
       spawn("open", [install.bundlePath], { stdio: "ignore" }).unref();
     } else if (install.exePath) {
-      spawn(install.exePath, [], { stdio: "ignore", windowsHide: true }).unref();
+      const child = spawn(install.exePath, [], { stdio: "ignore", windowsHide: true });
+      // spawn pode falhar depois de retornar (exe removido pelo updater/antivirus).
+      // Sem listener, o EventEmitter gera excecao nao tratada e derruba a GUI.
+      child.once("error", (error) => {
+        logger.error("discord", "inicio.falhou", {
+          flavour: install.flavour,
+          erro: String((error as Error)?.message ?? error),
+        });
+      });
+      child.unref();
     }
   } catch {}
+}
+
+// Nas transicoes que restauram a rede, nao basta pedir o spawn: sem esse ack a
+// UI dizia que a recuperacao terminou, mas o usuario ficava com o Discord
+// fechado (por exemplo, se o updater removeu o exe entre scan e spawn).
+async function startDiscordAndConfirm(installs: DiscordInstall[], operation: string): Promise<boolean> {
+  for (const install of installs) startDiscord(install);
+  if (!IS_WINDOWS || installs.length === 0) return true;
+  const started = await waitUntilDiscordRunning();
+  if (!started) {
+    logger.error("discord", "reinicio.timeout", { operation, timeout_ms: 10_000 });
+  }
+  return started;
 }
 
 // O _app.asar so existe quando alguem ja injetou: e o Discord original guardado de lado. Se ele
@@ -1146,20 +1210,20 @@ function assinaturaAtivacao(proxyAddress: string): string {
   return JSON.stringify({ proxy: proxyAddress.trim(), modo: readNetMode() });
 }
 
-async function activateBypass(event: any, proxyAddress: string = "", confirmOverride: boolean = false) {
+async function activateBypass(event: any) {
   if (ativacaoCorrente !== null) {
     logger.info("ativacao", "ja ha uma ativacao em andamento; aguardando a mesma conclusao");
     return ativacaoCorrente;
   }
   ativacaoCorrente = serializarBypassOp(() =>
-    executarAtivacao(event, proxyAddress, confirmOverride),
+    executarAtivacao(event),
   ).finally(() => {
     ativacaoCorrente = null;
   });
   return ativacaoCorrente;
 }
 
-async function executarAtivacao(event: any, proxyAddress: string, confirmOverride: boolean) {
+async function executarAtivacao(event: any) {
   if (isMac) throw new Error("O bypass por WireGuard ainda não está disponível no macOS.");
   const installs = getDiscordInstalls();
   if (installs.length === 0) {
@@ -1167,14 +1231,12 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
     throw new Error("Nenhum Discord encontrado.");
   }
 
-  // Ja ativo, injetado em todo mundo e com a mesma assinatura (proxy + modo): nada a
-  // fazer — re-injetar mataria o gateway a toa. Assinatura diferente (proxy ou modo
-  // mudou) passa e re-injeta de verdade.
-  const assinatura = assinaturaAtivacao(proxyAddress);
+  // Com WireSock, o estado ativo e somente tunel + Discord rodando. Reativar com a mesma
+  // configuracao derrubaria conexoes a toa; nao consultamos nem alteramos o cliente.
+  const assinatura = assinaturaAtivacao("");
   if (
     assinatura === assinaturaUltimaAtivacao &&
-    getStatus() === "ACTIVE" &&
-    installs.every((install) => isOurInjection(install.resources))
+    getStatus() === "ACTIVE"
   ) {
     logger.info("ativacao", "bypass ja ativo com a mesma proxy/modo; re-injecao ignorada");
     return;
@@ -1210,85 +1272,60 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
 
   netevents.gatewayConectando("gateway.discord.gg", "desconhecida");
 
-  // Salvo antes de mexer no Discord: mesmo que a injecao falhe, o que a pessoa digitou nao se
-  // perde, e o campo continua preenchido na proxima abertura.
-  saveProxy(proxyAddress);
-
-  // Windows envelopa via WireSock (WFP): a rota e a config .conf ja validada acima, e um Tor
-  // embutido nao muda nada nela. So o macOS ainda roda o mecanismo legado de PAC+asar (sem
-  // WireSock/netns equivalente por la) e depende do Tor de pe ANTES de escrever o
-  // settings.json injetado -- por isso a guarda continua, mas so para ele. No Windows isto so
-  // fazia uma ativacao com WireGuard perfeitamente valido falhar por causa de um download de
-  // Tor que nao tinha efeito nenhum na rota.
-  const modo = readNetMode();
-  if (!IS_WINDOWS && modo === "tor") {
-    const tor = await garantirTor();
-    if (!tor.ok) throw new Error(`Nao consegui preparar o Tor: ${tor.error ?? "erro desconhecido"}`);
-    torWatchdogIniciar();
-  }
-
-  for (const install of installs) {
-    assertDiscordSignature(install.bundlePath);
-    assertResourcesWritable(install);
-  }
-
   await killDiscord();
 
-  for (const install of installs) {
-    const asar = path.join(install.resources, "app.asar");
-    const originalAsar = path.join(install.resources, "_app.asar");
-
-    const hasOriginal = withNoAsar(() => diskFs.existsSync(originalAsar));
-    const hasAsar = withNoAsar(() => diskFs.existsSync(asar));
-
-    if (IS_WINDOWS) {
-      // Windows envelopa via WireSock (WFP) — o roteamento e por processo, nao por asar, entao
-      // nao ha mais razao para tocar no app.asar de ninguem aqui. So restauramos quando o
-      // _app.asar e sobra de uma versao pre-WireGuard do PROPRIO GoLiveBypass: se hasOriginal
-      // e verdade mas isOurInjection e falso, quem esta ali e Vencord/Equicord (ou outro mod) e
-      // ficava sem chance nenhuma — "hasOriginal" sozinho restaurava por cima e apagava o mod
-      // do usuario a toda ativacao, silenciosamente.
-      if (hasOriginal && isOurInjection(install.resources)) {
-        await safeRemove(asar);
-        await safeRename(originalAsar, asar);
-      }
-    } else {
-      // macOS ainda nao tem um equivalente de Per-App VPN (sem WireSock/netns), entao aqui a
-      // injecao de app.asar continua sendo o mecanismo real — e por isso, ao contrario do
-      // Windows, precisa da guarda de confirmacao antes de sobrescrever um mod protegido.
-      const otherMod = hasOriginal && !isOurInjection(install.resources)
-        ? detectOtherMod(install.resources, install.flavour)
-        : null;
-      if (isProtectedMod(otherMod) && !confirmOverride) {
-        throw new Error(`OUTRO_MOD:${otherMod}:${install.resources}`);
-      }
-
-      if (!hasOriginal && hasAsar) {
-        // Discord intocado: o app.asar atual e o original, entao ele vira _app.asar.
-        await safeRename(asar, originalAsar);
-        writeInjection(asar, proxyAddress);
-      } else if (hasOriginal && !isOurInjection(install.resources)) {
-        // Outro mod ocupa o lugar (confirmado pelo usuario, ou nao-protegido como
-        // Vesktop/Equibop/Legcord — ver isProtectedMod). O _app.asar ja e o Discord original,
-        // entao so o carregador do outro mod e trocado pelo nosso.
-        await safeRemove(asar);
-        writeInjection(asar, proxyAddress);
-      } else if (hasOriginal) {
-        // Ja e o nosso: so reescreve, para a proxy nova valer.
-        await safeRemove(asar);
-        writeInjection(asar, proxyAddress);
-      }
-    }
-
-    clearBundleQuarantine(install.bundlePath);
-  }
-
   if (IS_WINDOWS) {
-    await startWireSockService(settingsDir());
+    try {
+      await withWireSockLifecycle("ativacao", async () => {
+        // Uma sessao anterior pode ter sobrevivido ao fechamento da GUI. So
+        // instala o perfil novo depois de comprovar que ela saiu por completo.
+        if (isWireSockActive()) {
+          const recovery = await recoverWireSockNetwork();
+          if (!recovery.ok) throw new Error(`Não consegui limpar a sessão WireSock anterior (${recovery.residual.join(", ") || recovery.error || "rede não validada"}). Use "Restaurar internet".`);
+        }
+        await startWireSockService(settingsDir());
+        await waitForWindowsWgReady();
+      });
+    } catch (cause) {
+      // startWireSockService pode parar o servico anterior antes de descobrir
+      // que a nova configuracao/handshake falhou. Nunca deixe WFP nessa meia
+      // transicao: o Discord ja foi fechado e a proxima tentativa deve partir
+      // de uma rede normal comprovada.
+      pararWgStatsWatchdog();
+      clearSessionMarker();
+      let recoveryError = "";
+      try {
+        const recovery = await withWireSockLifecycle("ativacao.rollback", () => recoverWireSockNetwork());
+        if (!recovery.ok) recoveryError = recovery.residual.join(", ") || recovery.error || "rede não validada";
+      } catch (rollbackError) {
+        recoveryError = String((rollbackError as Error)?.message ?? rollbackError);
+      }
+      const detail = String((cause as Error)?.message ?? cause);
+      logger.error("wiresock", "ativacao.falhou_revertida", { erro: detail, rollback: recoveryError || "ok" });
+      throw new Error(
+        recoveryError
+          ? `A ativação falhou (${detail}) e não consegui restaurar a rede (${recoveryError}). Use "Restaurar internet".`
+          : `A ativação falhou (${detail}). A rota WireSock foi removida; corrija a configuração e tente novamente.`,
+      );
+    }
   }
 
   for (const install of installs) {
     startDiscord(install);
+  }
+
+  // O spawn ter sido solicitado nao significa que o Electron do Discord sobreviveu ao
+  // updater/antivirus. Sem este ack, a sessao ficava marcada como ativa mesmo sem cliente.
+  if (IS_WINDOWS && !(await waitUntilDiscordRunning())) {
+    logger.error("discord", "inicio.timeout", { timeout_ms: 10_000 });
+    await withWireSockLifecycle("ativacao.rollback", async () => {
+      await killDiscord();
+      const recovery = await recoverWireSockNetwork();
+      if (!recovery.ok) {
+        throw new Error(`Discord não iniciou e a rota WireSock não foi restaurada (${recovery.residual.join(", ") || recovery.error || "estado desconhecido"}). Use "Restaurar internet".`);
+      }
+    });
+    throw new Error("O Discord não iniciou após preparar o túnel. A rota foi restaurada; verifique a instalação do Discord e tente novamente.");
   }
 
   // Registra a sessao: o bypass so se desfaz no quit limpo; se o PC desligar no meio, o
@@ -1308,8 +1345,6 @@ async function executarAtivacao(event: any, proxyAddress: string, confirmOverrid
 }
 
 async function deactivateAll() {
-  stopTor();
-  torWatchdogParar();
   pararWgStatsWatchdog();
   // Na arquitetura WireSock o app.asar fica propositalmente vanilla. Guarda o estado antes
   // de parar o servico: getStatus() deixa de ver o bypass assim que ele desce.
@@ -1320,12 +1355,23 @@ async function deactivateAll() {
   // O estado atual é exclusivamente o túnel. Nunca restaure ou remova app.asar/_app.asar
   // durante a desativação; isso eliminava mods do usuário e causava falsos positivos.
   if (IS_WINDOWS) {
-    if (hadWireSock) {
-      await killDiscord();
-      stopWireSockService();
-      for (const install of installs) startDiscord(install);
-    }
-    clearSessionMarker();
+    await withWireSockLifecycle("desativacao", async () => {
+      // Rele a condicao ja dentro da fila: uma troca de rota pode ter entrado
+      // pouco antes desta desativacao e nao pode sobreviver a ela.
+      if (hadWireSock || isWireSockActive()) {
+        await killDiscord();
+        const recovery = await recoverWireSockNetwork();
+        if (!recovery.ok) {
+          throw new Error(`Não consegui restaurar a rede: WireSock=${recovery.residual.join(", ") || "limpeza incompleta"}; rede=${recovery.error || "não validada"}. Use "Restaurar internet" e tente novamente.`);
+        }
+        const restarted = await startDiscordAndConfirm(installs, "desativacao");
+        clearSessionMarker();
+        if (!restarted) {
+          throw new Error("A rede foi restaurada, mas o Discord não iniciou. Verifique a instalação do Discord e abra-o novamente.");
+        }
+      }
+      clearSessionMarker();
+    });
     return;
   }
   if (isMac) return;
@@ -1345,7 +1391,7 @@ async function deactivateAll() {
   if (ours.length === 0) {
     if (hadWireSock) {
       await killDiscord();
-      stopWireSockService();
+      await recoverWireSockNetwork();
       for (const install of installs) startDiscord(install);
       clearSessionMarker();
     }
@@ -1356,7 +1402,7 @@ async function deactivateAll() {
 
   await killDiscord();
 
-  if (IS_WINDOWS) stopWireSockService();
+  if (IS_WINDOWS) await recoverWireSockNetwork();
 
   for (const install of ours) {
     const asar = path.join(install.resources, "app.asar");
@@ -1411,6 +1457,7 @@ function getStatus(): string {
 // Flavours (discord/vesktop/equibop/legcord) achados na ultima varredura Linux —
 // exposto no report para mostrar na hora se um cliente paralelo foi visto.
 let ultimosFlavoursLinux = "";
+let ultimosGraficosLinux = "";
 
 // Handshake/trafego do tunel WireGuard no Linux: le do `--status --json` do script (que ja
 // roda elevado quando precisa), nao de um execSync direto na GUI, que normalmente nao tem
@@ -1441,6 +1488,76 @@ function wgStatsProvider(): Promise<WgTunnelStats> | WgTunnelStats {
   return IS_LINUX ? linuxWgStats() : getWgStats();
 }
 
+export interface WindowsRouteReadiness {
+  verified: boolean;
+  state: "connected" | "unverified" | "disconnected";
+  source: WireSockConnectionStatus["source"] | "wg" | "none";
+  detail?: string;
+}
+
+// A CLI do WireSock confirma o estado administrativo, mas nao prova que pacotes
+// chegaram ao peer. Abrir o Discord somente depois de wg.exe confirmar handshake
+// recente e bytes RX/TX evita que o cliente nasca numa rota que entra em loop de update.
+async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteReadiness> {
+  const deadline = Date.now() + timeoutMs;
+  let last: WgTunnelStats | undefined;
+  let lastWireSock: WireSockConnectionStatus = getWireSockConnectionStatus();
+  let cliFlowSamples = 0;
+  let adapterFlowSamples = 0;
+  let previousAdapterTraffic: ReturnType<typeof getWireSockAdapterTraffic> = null;
+  let lastNetworkCheckAt = 0;
+  let lastNetworkOk = false;
+  while (Date.now() < deadline) {
+    lastWireSock = getWireSockConnectionStatus();
+    if (lastWireSock.source === "cli" && lastWireSock.state === "disconnected") {
+      throw new Error(`WireSock informou que a rota está desconectada. ${lastWireSock.detail ?? "Verifique o endpoint e a configuração WireGuard."}`);
+    }
+    last = getWgStats();
+    const readiness = classifyWgReadiness(last, true);
+    if (readiness.ready) {
+      return { verified: true, state: "connected", source: "wg", detail: "handshake recente e tráfego WireGuard bidirecional confirmados" };
+    }
+    // Instalações oficiais nem sempre incluem wg.exe. Dois estados Connected
+    // consecutivos com endereço externo são a confirmação funcional da CLI;
+    // quando wg.exe existe, a validação de handshake/RX/TX acima é preferida.
+    if (lastWireSock.source === "cli" && lastWireSock.state === "connected" && lastWireSock.externalAddress) {
+      cliFlowSamples++;
+      if (cliFlowSamples >= 2) {
+        return { verified: true, state: "connected", source: "cli", detail: `túnel conectado; endereço externo ${lastWireSock.externalAddress}` };
+      }
+    } else {
+      cliFlowSamples = 0;
+    }
+    // Algumas instalações oficiais expõem apenas wiresock-client.exe + ProTUN.
+    // Exigimos tráfego nos dois sentidos e uma sondagem DNS/HTTPS antes do Discord.
+    const traffic = getWireSockAdapterTraffic();
+    const adapterTrafficIncreasing = Boolean(
+      traffic && previousAdapterTraffic &&
+      traffic.receivedBytes > previousAdapterTraffic.receivedBytes &&
+      traffic.sentBytes > previousAdapterTraffic.sentBytes,
+    );
+    previousAdapterTraffic = traffic;
+    if (lastWireSock.source === "service" && lastWireSock.state === "unknown" && traffic && adapterTrafficIncreasing) {
+      adapterFlowSamples++;
+      if (Date.now() - lastNetworkCheckAt >= 3000) {
+        const network = await verifyWindowsNetworkStable();
+        lastNetworkCheckAt = Date.now();
+        lastNetworkOk = network.ok;
+      }
+      if (adapterFlowSamples >= 2 && lastNetworkOk) {
+        return { verified: true, state: "connected", source: "service", detail: `ProTUN ativo com tráfego RX/TX (${traffic.receivedBytes}/${traffic.sentBytes}) e DNS/HTTPS funcionais` };
+      }
+    } else {
+      adapterFlowSamples = 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  const motivo = last?.handshakeAgoS === null
+    ? "nenhum handshake WireGuard foi confirmado"
+    : (last?.error || lastWireSock.detail || "o peer WireGuard não ficou pronto");
+  throw new Error(`WireGuard iniciou, mas não comprovou tráfego bidirecional: ${motivo}. Instale wireguard-tools (wg.exe), verifique endpoint/firewall e tente novamente.`);
+}
+
 function linuxStatus(): Promise<string> {
   return runScript(["--status", "--json"])
     .then(({ code, stdout, stderr }) => {
@@ -1452,6 +1569,10 @@ function linuxStatus(): Promise<string> {
       }
       try {
         const data = JSON.parse(stdout);
+        if (data?.graphics && typeof data.graphics === "object") {
+          const g = data.graphics as Record<string, unknown>;
+          ultimosGraficosLinux = `backend=${String(g.backend ?? "?")} wayland=${String(g.waylandDisplay ?? "")} session=${String(g.sessionType ?? "")} portal=${String(g.portal ?? "?")}`;
+        }
         // O script manda banner + avisos pro stderr; extrai so as linhas de
         // trace/aviso (as que tem conteudo) e loga cada uma como evento.
         // O banner (nome do app, subtitulo, distro) e ruido — filtra.
@@ -1512,24 +1633,9 @@ function tailErroScript(stderr: string, linhas: number): string {
   return uteis.slice(-linhas).join("\n");
 }
 
-async function linuxActivate(
-  proxyAddress: string,
-  onChunk: (c: string) => void,
-) {
-  // O modo Tor/proxy-gratuita era do mecanismo legado de PAC (o script bootstrapava um Tor
-  // embutido e apontava o proxy manual pra ele antes de injetar no app.asar). O Linux envelopa
-  // via WireGuard netns hoje: a rota e sempre a config .conf ja importada, e nem a GUI nem o
-  // script tem seletor de modo algum na UI. Pedir "tor" aqui so servia pra: (1) baixar/bootstrap
-  // um Tor embutido sem efeito nenhum na rota real, e (2) se isso falhasse, abortar uma
-  // ativacao com WireGuard perfeitamente valido -- e o default de leitura de settings.json
-  // antigo (sem routeMode gravado) e justamente "tor". "auto" e o unico valor que o script
-  // aceita e nunca aciona esse bootstrap.
-  const netMode = "auto";
-  updateSharedSettings({ routeMode: netMode });
-
-  const args = ["--yes", "--net-mode", netMode];
-  if (proxyAddress.trim() !== "") args.push("--proxy", proxyAddress.trim());
-  const { code, stderr } = await runScript(args, onChunk);
+async function linuxActivate(onChunk: (c: string) => void) {
+  updateSharedSettings({ routeMode: "wireguard" });
+  const { code, stderr } = await runScript(["--yes", "--cleanup-legacy"], onChunk);
   if (code !== 0) {
     throw new Error(
       tailErroScript(stderr, 3) ||
@@ -1585,17 +1691,17 @@ async function linuxDeactivate(onChunk: (c: string) => void) {
 
 // A bandeja precisa refletir o que os botoes da janela fizeram, entao os handlers de IPC
 // tambem remontam o menu ao terminar.
-ipcMain.handle("activate", async (event, proxyAddress: string = "", confirmOverride: boolean = false) => {
+ipcMain.handle("activate", async (event) => {
   if (IS_LINUX) {
     // No Linux, a GUI delega pro script standalone; o script.sh ja tem a heuristica
     // de deteccao de outromod e pede Confirm-Action quando acha Vencord/Equicord
     // (ver golivebypass-standalone.sh). O confirmOverride so faz sentido no fluxo
     // da GUI no Windows/macOS, onde o dialog.showMessageBox roda aqui.
-    await linuxActivate(proxyAddress, (c) =>
+    await linuxActivate((c) =>
       event.sender.send("bypass-log", c),
     );
   } else {
-    await activateBypass(event, proxyAddress, confirmOverride);
+    await activateBypass(event);
   }
   refreshTray().catch(() => {});
 });
@@ -1611,6 +1717,31 @@ ipcMain.handle("deactivate", async (event) => {
   }
   refreshTray().catch(() => {});
 });
+ipcMain.handle("restore-internet", async () => {
+  if (!IS_WINDOWS) return { ok: false, error: "Esta recuperação só está disponível no Windows." };
+  return withWireSockLifecycle("restaurar-internet", async () => {
+    // Releia dentro da fila: uma ativação concorrente pode ter subido o túnel
+    // depois da leitura original, e restaurar não pode sair deixando essa sessão
+    // viva por causa de um snapshot obsoleto.
+    const hadWireSock = isWireSockActive();
+    if (hadWireSock) await killDiscord();
+    const recovery = await recoverWireSockNetwork();
+    // Nao relancar o Discord enquanto o WFP ainda pode estar instalado ou a
+    // resolucao/HTTPS nao foi comprovada saudavel.
+    if (hadWireSock && recovery.ok) {
+      const restarted = await startDiscordAndConfirm(getDiscordInstalls(), "restaurar-internet");
+      if (!restarted) {
+        return {
+          ...recovery,
+          ok: false,
+          error: "A rede foi restaurada, mas o Discord não iniciou. Abra o Discord novamente.",
+        };
+      }
+    }
+    refreshTray().catch(() => {});
+    return recovery;
+  });
+});
 ipcMain.handle("get-platform", () => (IS_LINUX ? "linux" : isMac ? "mac" : "windows"));
 ipcMain.handle("get-app-version", () => app.getVersion());
 ipcMain.handle("get-status", async () => {
@@ -1619,8 +1750,9 @@ ipcMain.handle("get-status", async () => {
 });
 ipcMain.handle("get-startup", () => getStartup());
 ipcMain.handle("set-startup", (_event, enabled: unknown) => {
-  setStartup(enabled === true);
+  const result = setStartup(enabled === true);
   refreshTray().catch(() => {});
+  return result;
 });
 
 // A pasta compartilhada do bypass — a mesma que o standalone/golivebypass.js e os instaladores
@@ -2415,22 +2547,47 @@ function readSharedSettings(): Record<string, unknown> {
 // preferencias da GUI que vivem nesse arquivo passam por aqui: um escritor parcial
 // (o saveTorAddr antigo criava o arquivo so com torAddr) apagava a routeMode e o
 // runtime injetado nascia "auto" enquanto a GUI mostrava Tor (issue #108).
-function updateSharedSettings(patch: Record<string, unknown>) {
+function updateSharedSettings(patch: Record<string, unknown>): boolean {
   try {
     const dir = settingsDir();
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, "settings.json");
     // O runtime Linux le este arquivo e Windows/mac leem a copia injetada.
     // A preferencia legada false nunca pode voltar a desligar a recuperacao.
-    const novo = { ...readSharedSettings(), ...patch, autoRevive: true };
+    const novo = { ...readSharedSettings(), ...patch, routeMode: "wireguard", autoRevive: true } as Record<string, unknown>;
+    // PAC/SOCKS/Tor era estado exclusivo do mecanismo removido. A migracao
+    // preserva a conta Proton, o .conf e as preferencias da aplicacao.
+    delete novo.proxy;
+    delete novo.torAddr;
+    delete novo.torPort;
     // Tmp + rename: um crash no meio da escrita nao pode deixar um settings.json
     // pela metade, senao o modo se perderia de novo por outro caminho.
     const tmp = `${file}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(novo, null, 4));
     fs.renameSync(tmp, file);
+    return true;
   } catch (error) {
     console.error("[settings] nao consegui gravar o settings.json compartilhado:", error);
+    logger.error("settings", "falha ao persistir preferencias", {
+      arquivo: path.join(settingsDir(), "settings.json"),
+      erro: error instanceof Error ? error.message : String(error),
+    });
+    return false;
   }
+}
+
+function recoverProtonUsername(): string {
+  const saved = proton.getSavedSessionUsername(settingsDir());
+  if (!saved) return "";
+  const current = readSharedSettings().protonUsername;
+  if (current !== saved) {
+    if (updateSharedSettings({ protonUsername: saved })) {
+      logger.info("proton", "identidade recuperada da sessao persistida");
+    } else {
+      logger.warn("proton", "sessao encontrada, mas nao consegui reparar o usuario salvo");
+    }
+  }
+  return saved;
 }
 
 // Guardado fora da pasta do Discord de proposito: o settings.json que o bypass le vive dentro do
@@ -2455,10 +2612,11 @@ function saveTorAddr(addr: string) {
 // "auto" com proxy preenchida = personalizado (o bypass usa a proxy do campo). O PADRAO e
 // "tor": o app baixa e usa o Tor sempre, para nunca cair no IP brasileiro.
 function saveNetMode(mode: string) {
-  updateSharedSettings({ routeMode: mode });
+  updateSharedSettings({ routeMode: IS_WINDOWS ? "wireguard" : mode });
 }
 
 function readNetMode(): string {
+  if (IS_WINDOWS) return "wireguard";
   try {
     const file = path.join(settingsDir(), "settings.json");
     // Padrao "tor". Saida gratuita e instavel por natureza -- morre no meio da sessao, tem RTT
@@ -2524,39 +2682,6 @@ ipcMain.handle("set-auto-update", (_event, enabled: unknown) => {
 ipcMain.handle("get-update-channel", () => readUpdateChannel());
 ipcMain.handle("set-update-channel", (_event, canal: unknown) => {
   saveUpdateChannel(typeof canal === "string" ? canal : "stable");
-});
-
-// IPC do modo de rede + Tor embutido.
-ipcMain.handle("get-net-mode", () => readNetMode());
-ipcMain.handle("set-net-mode", (_event, mode: unknown) => {
-  // A UI manda "auto" para o modo Personalizado (o campo de proxy define a saida).
-  const m = typeof mode === "string" && ["auto", "tor", "free"].includes(mode) ? mode : "tor";
-  saveNetMode(m);
-  // No modo tor so reescrevo a injecao com o Tor de pe: apontar o runtime pra uma
-  // porta morta faria o gateway segurar (recusa direta) ate o Tor subir.
-  const reescritos = m !== "tor" || torVerificado ? updateInjectedNetSettings(m) : 0;
-  return { mode: m, reescritos };
-});
-ipcMain.handle("get-tor-status", async () => {
-  // "Presente" cobre os dois casos em que nao ha nada a baixar: o nosso ja extraido e um tor
-  // instalado no sistema.
-  //
-  // "Ativo" se apoia na flag: o garantirTor so a liga depois de abrir um tunel de verdade,
-  // entao aqui basta confirmar que a porta continua atendendo -- 400ms. Repetir o teste de
-  // tunel a cada atualizacao da tela custaria segundos e travaria a janela.
-  const ativo = torVerificado && (await portaViva(torPortaEmUso));
-  return {
-    presente: fs.existsSync(torExePath()) || torDoSistema() !== null,
-    ativo,
-    porta: torPortaEmUso,
-  };
-});
-ipcMain.handle("install-tor", async () => {
-  // Nao baixa nada quando ja ha um Tor de pe ou instalado: o garantirTor tenta, nessa ordem,
-  // reaproveitar quem ja atende, subir o nosso ja extraido, subir o do sistema e, so entao,
-  // baixar o pacote oficial.
-  const r = await garantirTor();
-  return r.ok ? { ok: true, porta: r.porta } : { ok: false, error: r.error };
 });
 
 // ------------------------------------------------------------------ teste de proxy (Personalizado / VPS)
@@ -2792,6 +2917,9 @@ async function exitCountryViaSocks(
 }
 
 ipcMain.handle("test-proxy", async (_event, proxyRaw: unknown) => {
+  // Canal mantido apenas para clientes antigos: nunca abre SOCKS nem inicia Tor.
+  return { ok: false, error: "Proxy foi removida. Use uma configuração WireGuard." };
+  /* c8 ignore start -- compatibilidade morta, removida do preload/UI */
   const raw = typeof proxyRaw === "string" ? proxyRaw.trim() : "";
   if (raw === "") {
     return { ok: false, error: "Cole o endereco da proxy (socks5://host:porta)." };
@@ -2857,6 +2985,7 @@ ipcMain.handle("test-proxy", async (_event, proxyRaw: unknown) => {
     host: parsed.host,
     port: parsed.port,
   };
+  /* c8 ignore stop */
 });
 
 // ------------------------------------------------------------------ diagnostico / modo dev
@@ -2913,10 +3042,13 @@ async function formatWgTunelDiagnostico(status: string): Promise<string> {
   return `handshake ${handshake} · ${trafego}`;
 }
 
+function formatWireSockDiagnostico(): string {
+  if (!IS_WINDOWS) return "n/a";
+  const s = getWireSockConnectionStatus();
+  return `${s.state} · fonte=${s.source}${s.detail ? ` · ${s.detail}` : ""}`;
+}
+
 async function buildDiagnostic(status: string, extraNote = ""): Promise<string> {
-  const proxy = maskSecrets(
-    readProxyFrom(path.join(settingsDir(), "settings.json")) || "(vazio)",
-  );
   const lines = [
     "### Diagnóstico GoLiveBypass (GUI)",
     "",
@@ -2926,9 +3058,8 @@ async function buildDiagnostic(status: string, extraNote = ""): Promise<string> 
     `| os | ${process.platform} ${process.arch} |`,
     `| electron | ${process.versions.electron} |`,
     `| status | ${status} |`,
-    `| routeMode | ${readNetMode()} |`,
-    `| proxy | ${proxy} |`,
-    `| torPort | ${torPortaEmUso} (verificado=${torVerificado}) |`,
+    `| routeMode | wireguard |`,
+    `| wireSock | ${formatWireSockDiagnostico()} |`,
     // "Carregando infinito" pos-WireGuard costuma ser tunel morto/saturado, nao mais gateway
     // zumbi de proxy: handshake velho ou trafego zerado com bypass ativo aponta pra isso direto.
     `| tunelWg | ${await formatWgTunelDiagnostico(status)} |`,
@@ -3336,9 +3467,22 @@ ipcMain.handle("test-wg-conf", async () => {
 
     const status = IS_LINUX ? await linuxStatus() : getStatus();
     let exitInfo: { ip?: string; country?: string } | undefined;
+    let readiness: Record<string, unknown> | undefined;
+
+    if (status === "ACTIVE" && IS_WINDOWS) {
+      const ws = getWireSockConnectionStatus();
+      readiness = {
+        ready: ws.verified,
+        state: ws.state,
+        source: ws.source,
+        error: ws.verified ? undefined : ws.detail,
+      };
+    }
 
     if (status === "ACTIVE" && IS_LINUX) {
       try {
+        const probe = await runScript(["--probe", "--json"]);
+        readiness = JSON.parse(probe.stdout || "{}");
         const out = execSync(
           "ip netns exec discord-vpn curl -m 3 -s https://cloudflare.com/cdn-cgi/trace",
           { encoding: "utf8" }
@@ -3361,6 +3505,7 @@ ipcMain.handle("test-wg-conf", async () => {
       address: validation.interfaceAddress,
       dns: validation.dns,
       exitInfo,
+      readiness,
       active: status === "ACTIVE",
     };
   } catch (err) {
@@ -3403,9 +3548,10 @@ ipcMain.handle("set-vpn-mode", async (_event, mode: "proton" | "custom") => {
 
 ipcMain.handle("get-proton-settings", async () => {
   const s = readSharedSettings() as any;
+  const recoveredUsername = recoverProtonUsername() || (s.protonUsername as string) || "";
   return {
     vpnMode: (s.vpnMode as string) || "proton",
-    username: (s.protonUsername as string) || "",
+    username: recoveredUsername,
     country: (s.protonCountry as string) || "",
     freeOnly: s.protonFreeOnly !== false,
     autoPing: s.protonAutoPing !== false,
@@ -3425,15 +3571,22 @@ ipcMain.handle("set-proton-settings", async (_event, settings: any) => {
 
 ipcMain.handle("check-proton-session", async (_event, username?: string) => {
   const s = readSharedSettings() as any;
-  const user = username || (s.protonUsername as string) || "";
+  const user = username || recoverProtonUsername() || (s.protonUsername as string) || "";
   if (!user) return { valid: false, error: "Usuário não especificado" };
   return await proton.checkProtonSession(settingsDir(), user);
 });
 
-ipcMain.handle("login-proton", async (_event, payload: { username: string; password?: string; twoFactorCode?: string }) => {
-  const res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode);
+ipcMain.handle("login-proton", async (_event, payload: { username: string; password?: string; twoFactorCode?: string; humanVerificationToken?: string }) => {
+  const res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode, payload.humanVerificationToken);
   if (res.success) {
-    updateSharedSettings({ protonUsername: payload.username });
+    if (!updateSharedSettings({ protonUsername: payload.username })) {
+      return { success: false, code: "SESSION_PERSISTENCE", retryable: false, message: "Login concluído, mas não foi possível salvar a conta neste computador.", error: "Verifique as permissões da pasta de dados e tente novamente." };
+    }
+    const savedUsername = proton.getSavedSessionUsername(settingsDir());
+    if (savedUsername !== payload.username) {
+      logger.error("proton", "sessao autenticada nao foi encontrada apos login");
+      return { success: false, code: "SESSION_PERSISTENCE", retryable: false, message: "Login concluído, mas a sessão não foi persistida.", error: "Tente novamente." };
+    }
     const s = readSharedSettings() as any;
     try {
       const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
@@ -3452,6 +3605,19 @@ ipcMain.handle("login-proton", async (_event, payload: { username: string; passw
   return res;
 });
 
+ipcMain.handle("open-proton-captcha", async (_event, rawUrl: string) => {
+  try {
+    const parsed = new URL(rawUrl);
+    const allowed = parsed.protocol === "https:" &&
+      ["vpn-api.proton.me", "account.proton.me", "proton.me"].includes(parsed.hostname);
+    if (!allowed) return { ok: false, error: "Endereço de CAPTCHA não reconhecido como oficial da Proton." };
+    await shell.openExternal(parsed.toString());
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "Endereço de CAPTCHA inválido." };
+  }
+});
+
 ipcMain.handle("logout-proton", async () => {
   const sessionFile = proton.getProtonSessionFile(settingsDir());
   try {
@@ -3462,24 +3628,30 @@ ipcMain.handle("logout-proton", async () => {
 });
 
 ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) => {
-  const s = readSharedSettings() as any;
-  const username = (s.protonUsername as string) || "";
-  if (!username) {
-    return { success: false, error: "Nenhuma conta ProtonVPN conectada." };
-  }
+  // A geração também precisa ser serializada: ela grava o mesmo perfil
+  // compartilhado que a instalação lê. Se duas requisições concorrentes
+  // gerarem antes da fila, a primeira resposta pode acabar aplicando o perfil
+  // da segunda e declarar sucesso para a rota errada.
+  return withWireSockLifecycle("troca-rota-proton", async () => {
+    const s = readSharedSettings() as any;
+    const username = (s.protonUsername as string) || "";
+    if (!username) {
+      return { success: false, error: "Nenhuma conta ProtonVPN conectada." };
+    }
 
-  const country = options?.country !== undefined ? options.country : ((s.protonCountry as string) || "");
-  const freeOnly = options?.freeOnly !== undefined ? options.freeOnly : (s.protonFreeOnly !== false);
-  const autoPing = options?.autoPing !== undefined ? options.autoPing : (s.protonAutoPing !== false);
+    const country = options?.country !== undefined ? options.country : ((s.protonCountry as string) || "");
+    const freeOnly = options?.freeOnly !== undefined ? options.freeOnly : (s.protonFreeOnly !== false);
+    const autoPing = options?.autoPing !== undefined ? options.autoPing : (s.protonAutoPing !== false);
 
-  const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
-    username,
-    countries: country || undefined,
-    freeOnly,
-    autoPing,
-  });
+    const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
+      username,
+      countries: country || undefined,
+      freeOnly,
+      autoPing,
+    });
 
-  if (gen.success) {
+    if (!gen.success) return gen;
+
     updateSharedSettings({
       protonCountry: country,
       protonFreeOnly: freeOnly,
@@ -3488,72 +3660,48 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
     });
 
     const status = IS_LINUX ? await linuxStatus() : getStatus();
+    let readiness: WindowsRouteReadiness | undefined;
     if (status === "ACTIVE") {
-      logger.info("proton", "bypass ativo, recarregando túnel com novo servidor ótimo", { server: gen.server });
-      if (IS_WINDOWS) {
-        stopWireSockService();
-        await startWireSockService(settingsDir());
-      } else if (IS_LINUX) {
-        await runScript(["--deactivate"]);
-        await runScript(["--activate"]);
+      logger.info("proton", "bypass ativo, aplicando nova rota sem reiniciar o Discord", { server: gen.server });
+      try {
+        if (IS_WINDOWS) {
+          const recovery = await recoverWireSockNetwork();
+          if (!recovery.ok) {
+            // Com residuo WFP, deixar o Discord aberto pode prender suas
+            // conexoes numa rota hibrida. Nao tente uma segunda instancia.
+            await killDiscord();
+            throw new Error(`a rota anterior não encerrou com segurança (${recovery.residual.join(", ") || recovery.error || "rede não validada"}). Use "Restaurar internet".`);
+          }
+          await startWireSockService(settingsDir());
+          readiness = await waitForWindowsWgReady();
+          if (readiness.state === "disconnected") throw new Error(readiness.detail || "WireSock desconectado");
+        } else if (IS_LINUX) {
+          const refreshed = await runScript(["--refresh-route"]);
+          if (refreshed.code !== 0) {
+            throw new Error(tailErroScript(refreshed.stderr, 4) || "falha ao atualizar a rota WireGuard");
+          }
+        }
+      } catch (err) {
+        const error = String((err as Error)?.message ?? err);
+        logger.error("proton", "nova rota nao ficou pronta", { server: gen.server, erro: error });
+        return { ...gen, success: false, error: `A rota ${gen.server ?? "selecionada"} nao ficou pronta: ${error}`, readiness };
       }
     }
-  }
-
-  return gen;
+    return { ...gen, readiness };
+  });
 });
-
-// O modo que o runtime VAI ler. No Linux e o settings compartilhado; no Windows/mac
-// e o settings.json DENTRO do asar injetado — o arquivo compartilhado la e so a
-// preferencia da GUI, e o report dizia "tor" com o runtime rodando free (issue #121).
-function readRuntimeRouteMode(): string {
-  if (IS_LINUX) {
-    const v = readSharedSettings().routeMode;
-    return typeof v === "string" ? v : "";
-  }
-  for (const install of getDiscordInstalls()) {
-    const nosso = withNoAsar(() => {
-      if (!diskFs.existsSync(path.join(install.resources, "_app.asar"))) return false;
-      return isOurInjection(install.resources);
-    });
-    if (!nosso) continue;
-    try {
-      const data = withNoAsar(() =>
-        JSON.parse(
-          diskFs.readFileSync(path.join(install.resources, "app.asar", "settings.json"), "utf8"),
-        ),
-      );
-      return typeof data?.routeMode === "string" ? data.routeMode : "";
-    } catch {
-      return "";
-    }
-  }
-  return "";
-}
 
 ipcMain.handle("report-bug", async (_event, payload: unknown) => {
   const p = (payload ?? {}) as { title?: string; description?: string; includeLogs?: boolean };
-  const netMode = readNetMode();
-  // O modo que o runtime VAI ler (o que esta gravado na injecao), nao so o do
-  // seletor: o bug report classico da issue #108 dizia "tor" com o runtime no
-  // "auto", e o da #121 dizia "tor" com o runtime em "free".
-  const routeModeDisco = readRuntimeRouteMode();
   let statusBypass = "INACTIVE";
   try {
     statusBypass = IS_LINUX ? await linuxStatus() : getStatus();
   } catch {}
-  let torAtivo = false;
-  let torPorta: number | null = null;
-  try {
-    torAtivo = torVerificado && (await portaViva(torPortaEmUso));
-    torPorta = torPortaEmUso;
-  } catch {}
-  // Snapshot do tunel WireGuard NA HORA do report — nao mac (mecanismo legado la, sem
-  // interface wg) e so quando o bypass esta de fato ativo (senao so registraria "sem peer").
+  // Snapshot do tunel WireGuard no momento do report.
   const wgTunel = !isMac && statusBypass === "ACTIVE" ? await wgStatsProvider() : undefined;
   return submitBugReport(
     { title: String(p.title ?? ""), description: String(p.description ?? ""), includeLogs: !!p.includeLogs },
-    { netMode, routeModeDisco, statusBypass, torAtivo, torPorta, installsFlavours: ultimosFlavoursLinux, wgTunel },
+    { statusBypass, installsFlavours: ultimosFlavoursLinux, graphics: ultimosGraficosLinux, wgTunel },
   );
 });
 

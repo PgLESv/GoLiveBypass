@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"protonvpn-wg-confgen/internal/api"
@@ -43,6 +44,9 @@ type SavedSession struct {
 
 // Save stores the session to disk
 func (s *SessionStore) Save(session *api.Session, username string, duration time.Duration) error {
+	if err := os.MkdirAll(filepath.Dir(s.filePath), 0o700); err != nil {
+		return fmt.Errorf("failed to create session directory: %w", err)
+	}
 	savedSession := &SavedSession{
 		Session:  session,
 		Username: username,
@@ -70,12 +74,49 @@ func (s *SessionStore) Save(session *api.Session, username string, duration time
 		return fmt.Errorf("failed to marshal session: %w", err)
 	}
 
-	err = os.WriteFile(s.filePath, data, constants.SessionFileMode)
+	tmp, err := os.CreateTemp(filepath.Dir(s.filePath), ".protonvpn-session-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary session file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err = tmp.Chmod(constants.SessionFileMode); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return fmt.Errorf("failed to write session file: %w", err)
 	}
+	if err = os.Rename(tmpPath, s.filePath); err != nil {
+		// os.Rename cannot replace an existing file on Windows. The temporary
+		// file is complete and private, so remove only the old target and retry.
+		if removeErr := os.Remove(s.filePath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("failed to commit session file: %w", err)
+		}
+		if err = os.Rename(tmpPath, s.filePath); err != nil {
+			return fmt.Errorf("failed to commit session file: %w", err)
+		}
+	}
 
 	return nil
+}
+
+// Username returns the cached account identity without exposing session tokens.
+func (s *SessionStore) Username() (string, error) {
+	data, err := os.ReadFile(s.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var saved SavedSession
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return "", fmt.Errorf("failed to unmarshal session: %w", err)
+	}
+	return strings.TrimSpace(saved.Username), nil
 }
 
 // Load retrieves a saved session from disk

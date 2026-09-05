@@ -52,32 +52,28 @@ func TestSendAuthRequestHumanVerification(t *testing.T) {
 	}
 }
 
-// TestCaptchaError checks that a 9001 response surfaces the token the user needs
-// to solve and replay the challenge.
+// TestCaptchaError checks that a 9001 response is structured without leaking
+// the challenge token into diagnostics.
 func TestCaptchaError(t *testing.T) {
 	session := &api.Session{Code: 9001}
 	session.Details.HumanVerificationMethods = []string{constants.HVMethodCaptcha}
 	session.Details.HumanVerificationToken = "tok-123"
 
-	msg := captchaError(session, "https://vpn-api.proton.me").Error()
-	// The challenge token must appear in the widget URL, and the message must be
-	// explicit that the replayed token is a different one.
-	for _, want := range []string{
-		"https://vpn-api.proton.me/core/v4/captcha?Token=tok-123",
-		"-hv-token",
-		"pm_captcha",
-		"tok-123:<long-response>",
-		"proton_captcha",
-		constants.HVMethodCaptcha,
-	} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("captcha error missing %q:\n%s", want, msg)
-		}
+	err := captchaError(session, "https://vpn-api.proton.me", false)
+	hv, ok := err.(HumanVerificationError)
+	if !ok {
+		t.Fatalf("captcha error type = %T", err)
+	}
+	if hv.Code != "CAPTCHA_REQUIRED" || hv.CaptchaURL != "https://vpn-api.proton.me/core/v4/captcha?Token=tok-123" {
+		t.Fatalf("unexpected challenge: %+v", hv)
+	}
+	if strings.Contains(hv.Message, "tok-123") {
+		t.Fatal("challenge leaked into message")
 	}
 
 	// With no token there is nothing to replay, so do not advertise the flag.
 	bare := &api.Session{Code: 9001}
-	if msg := captchaError(bare, "https://vpn-api.proton.me").Error(); strings.Contains(msg, "-hv-token") {
-		t.Errorf("tokenless captcha error should not suggest -hv-token:\n%s", msg)
+	if err := captchaError(bare, "https://vpn-api.proton.me", true); err.(HumanVerificationError).Code != "CAPTCHA_INVALID" {
+		t.Fatal("replayed captcha should be invalid")
 	}
 }

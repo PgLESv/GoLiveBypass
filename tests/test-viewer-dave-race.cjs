@@ -408,7 +408,7 @@ async function reproduzirOrcamentoPorSessao(lab) {
   lab.lab.process(ctx);
   await lab.sincronizar();
   await lab.sincronizar();
-  if (lab.fechamentos.length !== 1 || lab.lab.state().orcamento !== "viewer:10:demanda:1") {
+  if (lab.fechamentos.length !== 1 || lab.lab.state().orcamento !== "viewer:10:stream:7:demanda:1") {
     throw new Error("primeira sessao nao consumiu exatamente seu proprio teto");
   }
 
@@ -431,7 +431,7 @@ async function reproduzirOrcamentoPorSessao(lab) {
   await lab.sincronizar();
   await lab.sincronizar();
   const state = lab.lab.state();
-  if (lab.fechamentos.length !== 2 || state.orcamento !== "viewer:10:demanda:2" || state.banner) {
+  if (lab.fechamentos.length !== 2 || state.orcamento !== "viewer:10:stream:7:demanda:2" || state.banner) {
     throw new Error("nova intencao herdou teto/bloqueio da Live anterior");
   }
 }
@@ -460,14 +460,14 @@ async function reproduzirOrcamentoSenderSemFonte(lab) {
   ctx.demanda.sender = {known: true, active: true, demandHa: 1_000, changedHa: 1_000, epoch: 1};
   ctx.demanda.viewer = {known: false, active: false, demandHa: -1, changedHa: -1, epoch: 0};
 
-  if (lab.lab.budgetKey(ctx) !== "sender:10:demanda:1") {
+  if (lab.lab.budgetKey(ctx) !== "sender:10:stream:7:demanda:1") {
     throw new Error("sender sem callback de fonte nao usou o fallback de demanda");
   }
   lab.lab.setNow(5_000_000);
   lab.lab.process(ctx);
   await lab.sincronizar();
   await lab.sincronizar();
-  if (lab.fechamentos.length !== 1 || lab.lab.state().orcamento !== "sender:10:demanda:1") {
+  if (lab.fechamentos.length !== 1 || lab.lab.state().orcamento !== "sender:10:stream:7:demanda:1") {
     throw new Error("primeira Live do sender nao consumiu o proprio teto");
   }
 
@@ -487,14 +487,14 @@ async function reproduzirOrcamentoSenderSemFonte(lab) {
   lab.lab.process(ctx);
   await lab.sincronizar();
   await lab.sincronizar();
-  if (lab.fechamentos.length !== 2 || lab.lab.state().orcamento !== "sender:10:demanda:2" ||
+  if (lab.fechamentos.length !== 2 || lab.lab.state().orcamento !== "sender:10:stream:7:demanda:2" ||
       lab.lab.state().banner) {
     throw new Error("Live nova do sender sem fonte herdou teto ou bloqueio");
   }
 
   // Quando o hook oferece a fonte, ela permanece o discriminador preferido.
   ctx.voice.sourceEpoch = 3;
-  if (lab.lab.budgetKey(ctx) !== "sender:10:fonte:3") {
+  if (lab.lab.budgetKey(ctx) !== "sender:10:stream:7:fonte:3") {
     throw new Error("fonte observavel deixou de ter prioridade sobre demanda");
   }
 }

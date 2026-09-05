@@ -271,6 +271,10 @@ let gatewayWentDirectAt = 0;   // quando o roteador abriu direto para um host de
 let reloadCount = 0;           // recargas nesta execucao (reseta quando a sessao volta roteada)
 let lastReloadAt = 0;          // cooldown
 let reloading = false;         // single-flight
+// O probe termina antes da espera por reserva. Este mutex cobre essa segunda fase;
+// sem ele, um segundo sinal de gateway direto podia agendar outro reload enquanto o
+// primeiro ainda aguardava a reserva viva.
+let directReloadPending = false;
 
 // Estado do arranque frio em modo tor: quando o Discord abre (ou o Windows liga) antes do
 // Tor da GUI terminar de subir, as conexoes de gateway ficam SEGURADAS (nunca vazam direto --
@@ -1268,13 +1272,15 @@ function maybeReloadAfterDirect() {
         gatewayWentDirectAt = 0;
         return;
     }
-    if (reloading || reloadCount >= RELOAD_MAX_RETRIES) return;
+    if (reloading || directReloadPending || reloadCount >= RELOAD_MAX_RETRIES) return;
     if (Date.now() - lastReloadAt < RELOAD_COOLDOWN_MS) return;
 
     const exit = chosenExit;
     if (exit === null) return;
 
     reloading = true;
+    directReloadPending = true;
+    let handedOff = false;
     // A saida tem que estar comprovadamente entregando AGORA: recarregar com saida morta
     // repetiria a mesma falha e gastaria uma tentativa a toa.
     probe(exit, 2500).then(ok => {
@@ -1291,25 +1297,30 @@ function maybeReloadAfterDirect() {
         // precisa de uma reserva para assumir na hora se a ativa morrer (o caso raro do ciclo
         // 7). Se o pool ja tem, segue direto. Se o gateway rotear no meio (corrida ganha),
         // cancela — a recarga nao e mais necessaria.
+        handedOff = true;
         ensureReserveThenReload(exit);
     }).catch(error => {
         log("a checagem antes da recarga falhou: " + error.message);
     }).finally(() => {
         reloading = false;
+        if (!handedOff) directReloadPending = false;
     });
 }
 
 function ensureReserveThenReload(exit) {
+    const release = () => { directReloadPending = false; };
     const tryReload = () => {
         // Cancela se a sessao se resolveu sozinha (gateway passou pela saida).
         if (Date.now() - lastRoutedAt < 3000) {
             log("gateway ja passou pela saida, recarga desnecessaria");
             gatewayWentDirectAt = 0;
+            release();
             return;
         }
         const win = clientWindow();
         if (win === null) {
             log("nao achei a janela do cliente Discord para recarregar");
+            release();
             return;
         }
         reloadCount++;
@@ -1317,6 +1328,7 @@ function ensureReserveThenReload(exit) {
         gatewayWentDirectAt = 0; // so recarrega uma vez por sinal
         log("o gateway tinha saido direto, recarregando atras de " + safeProxy(exit) + " (tentativa " + reloadCount + " de " + RELOAD_MAX_RETRIES + ")");
         win.webContents.reload();
+        release();
     };
 
     if (liveReserveCount() >= RELOAD_MIN_RESERVES) return tryReload();
@@ -1332,6 +1344,7 @@ function ensureReserveThenReload(exit) {
             clearInterval(poll);
             log("gateway ja passou pela saida, recarga desnecessaria");
             gatewayWentDirectAt = 0;
+            release();
             return;
         }
         if (liveReserveCount() >= RELOAD_MIN_RESERVES) {
@@ -1434,6 +1447,10 @@ function watchReloads() {
             // Invalida qualquer resultado assíncrono do documento anterior,
             // inclusive quando a conexão ainda não chegou a ser contada.
             gatewayProbeEpoca++;
+            // O probe RTC pode estar consultando o documento antigo. Invalida
+            // o resultado e impede que o finally dessa execução antiga libere
+            // o mutex de uma consulta já iniciada na sessão nova.
+            voiceProbeEpoca++;
             gatewayProbeBloqueadoAte = new WeakMap();
             if (gatewayConnCount > 0) {
                 log("a janela do Discord recarregou: contagem de reconexao zerada");
@@ -3234,6 +3251,7 @@ let viewerNativoUltimaSaudavelGeracao = '';
 let viewerNativoUltimaSaudavelEm = 0;
 let videoBannerAtivo = false;
 let voiceProbeRodando = false;
+let voiceProbeEpoca = 0;
 let voiceProbeUltimoLogEm = 0;
 let voiceProbeUltimaAssinatura = '';
 let voiceHookLogado = false;
@@ -3974,7 +3992,9 @@ function checarRtcNativo() {
     const janelas = janelasCliente();
     if (janelas.length === 0) return;
     voiceProbeRodando = true;
+    const epoca = voiceProbeEpoca;
     Promise.all(janelas.map(win => consultarRtcNativo(win).catch(error => ({ win, error })))).then(resultados => {
+        if (epoca !== voiceProbeEpoca) return;
         let escolhido = null;
         for (const resultado of resultados) {
             if (!resultado || resultado.error || !resultado.voice) continue;
@@ -4013,7 +4033,9 @@ function checarRtcNativo() {
         processarRtcNativo(escolhido);
     }).catch(error => {
         log("voice.probe | falha no vigia nativo: " + error.message);
-    }).finally(() => { voiceProbeRodando = false; });
+    }).finally(() => {
+        if (epoca === voiceProbeEpoca) voiceProbeRodando = false;
+    });
 }
 
 function idadeSeg(ha) {

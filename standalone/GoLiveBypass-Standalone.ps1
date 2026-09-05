@@ -153,20 +153,39 @@ function Ensure-WireGuardConf {
 function Ensure-WireSock {
     $wsCmd = Get-Command 'wiresock-client.exe' -ErrorAction SilentlyContinue
     if ($wsCmd) { return $wsCmd.Source }
-    
-    $commonPath = 'C:\Program Files\WireSock Secure Connect\sdk\wiresock-client.exe'
-    if (Test-Path -LiteralPath $commonPath) { return $commonPath }
+
+    $programFiles = @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}, 'C:\Program Files') |
+        Where-Object { $_ } | Select-Object -Unique
+    foreach ($base in $programFiles) {
+        $candidate = Join-Path $base 'WireSock Secure Connect\sdk\wiresock-client.exe'
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+
+    $winget = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        $downloadPage = 'https://v3.wiresock.net/wiresock-sdk'
+        try { Start-Process $downloadPage } catch { }
+        throw "Este Windows nao tem o winget (comum no Windows 10). A pagina oficial do WireSock CLI foi aberta: instale a versao do seu sistema, reabra o GoLiveBypass e ative novamente."
+    }
     
     Write-Step "Instalando WireSock VPN Client..."
+    $installError = ''
     try {
-        Start-Process winget -ArgumentList 'install', 'NTKERNEL.WireSockVPNClientCLI', '--accept-package-agreements', '--accept-source-agreements', '--silent' -Wait -NoNewWindow
-    } catch { }
+        & $winget.Source install --id 'NTKERNEL.WireSockVPNClientCLI' --exact --source winget --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+        if ($LASTEXITCODE -ne 0) { throw "winget terminou com codigo $LASTEXITCODE" }
+    } catch {
+        $installError = $_.Exception.Message
+        Write-Warn "A instalacao pelo winget falhou: $installError"
+    }
 
     $wsCmd = Get-Command 'wiresock-client.exe' -ErrorAction SilentlyContinue
     if ($wsCmd) { return $wsCmd.Source }
-    if (Test-Path -LiteralPath $commonPath) { return $commonPath }
+    foreach ($base in $programFiles) {
+        $candidate = Join-Path $base 'WireSock Secure Connect\sdk\wiresock-client.exe'
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
     
-    throw "WireSock nao encontrado. Instale via 'winget install NTKERNEL.WireSockVPNClientCLI'."
+    throw "Nao consegui instalar o WireSock VPN Client pelo winget. $installError Tente executar como administrador ou instale manualmente com: winget install --id NTKERNEL.WireSockVPNClientCLI --exact"
 }
 
 function Install-WireSockTunnel {
@@ -178,7 +197,9 @@ function Install-WireSockTunnel {
     $hasAllowedApps = $false
     $newLines = @()
     foreach ($line in $lines) {
-        if ($line -match '^\s*AllowedApps\s*=') {
+        if ($line -match '^\s*DNS\s*=') {
+            continue
+        } elseif ($line -match '^\s*AllowedApps\s*=') {
             $hasAllowedApps = $true
             $newLines += 'AllowedApps = Discord, Discord.exe, Update.exe'
         } else {
@@ -193,7 +214,7 @@ function Install-WireSockTunnel {
     Write-Step "Configurando servico WireSock..."
     Stop-Service -Name 'wiresock-client-service' -Force -ErrorAction SilentlyContinue
     
-    & $wsExe install -start-type 2 -config $wsConf -log-level info | Out-Null
+    & $wsExe install -start-type 3 -config $wsConf -log-level info -network-lock disabled | Out-Null
     Start-Sleep -Seconds 1
     Start-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
@@ -203,7 +224,7 @@ function Install-WireSockTunnel {
         Write-Ok "Servico WireSock ativo. Todo o Discord esta envelopado na VPN!"
     } else {
         Write-Warn "Iniciando WireSock em modo processo avulso..."
-        Start-Process -FilePath $wsExe -ArgumentList 'run', '-config', "`"$wsConf`"", '-log-level', 'info' -WindowStyle Hidden
+        Start-Process -FilePath $wsExe -ArgumentList 'run', '-config', "`"$wsConf`"", '-log-level', 'info', '-network-lock', 'disabled' -WindowStyle Hidden
         Write-Ok "WireSock iniciado em segundo plano."
     }
 }
@@ -211,6 +232,13 @@ function Install-WireSockTunnel {
 function Stop-WireSockTunnel {
     Stop-Service -Name 'wiresock-client-service' -Force -ErrorAction SilentlyContinue
     Stop-Process -Name 'wiresock-client' -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+    Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match 'ProTUN|WireSock' -or $_.InterfaceDescription -match 'WireSock|WireGuard' } | ForEach-Object {
+        Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+    }
+    $wsCmd = Get-Command 'wiresock-client.exe' -ErrorAction SilentlyContinue
+    if ($wsCmd) { & $wsCmd.Source reset-network-lock 2>$null | Out-Null }
+    ipconfig.exe /flushdns | Out-Null
     Write-Ok "Tunel WireSock parado."
 }
 
