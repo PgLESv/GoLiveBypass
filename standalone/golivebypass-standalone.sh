@@ -1277,6 +1277,38 @@ running_flav() {
     esac
 }
 
+# Retorna o PID do cliente deste flavour. Usado pelo status para nao confundir um
+# Discord normal (fora do namespace) com a sessao protegida pelo WireGuard.
+discord_pid_flav() {
+    local flav="$1" pid pattern
+    case "$flav" in
+        vesktop|equibop|legcord)
+            for pattern in "/$flav/app.asar" "/$flav/arrpc"; do
+                pid="$(pgrep -f "$pattern" 2>/dev/null | head -n1 || true)"
+                [ -n "$pid" ] && { printf '%s\n' "$pid"; return 0; }
+            done
+            ;;
+        discord|discordptb|discordcanary)
+            for pattern in Discord DiscordPTB discord discordptb discord-canary; do
+                pid="$(pgrep -x "$pattern" 2>/dev/null | head -n1 || true)"
+                [ -n "$pid" ] && { printf '%s\n' "$pid"; return 0; }
+            done
+            ;;
+    esac
+    return 1
+}
+
+discord_pid_in_netns() {
+    local pid="$1" identified
+    [ -n "$pid" ] || return 1
+    identified="$(ip netns identify "$pid" 2>/dev/null || true)"
+    [ "$identified" = "$NETNS_NAME" ] && return 0
+    # ip netns identify nao existe em versoes antigas do iproute2; compare os
+    # inodes como fallback, sem exigir privilegio adicional.
+    [ -e "/proc/$pid/ns/net" ] && [ -e "/run/netns/$NETNS_NAME" ] || return 1
+    [ "$(readlink "/proc/$pid/ns/net" 2>/dev/null)" = "$(readlink "/run/netns/$NETNS_NAME" 2>/dev/null)" ]
+}
+
 # Mata os clientes paralelos pelo caminho do app.asar: o nome do processo nao basta
 # (o Electron generico nao tem o nome do cliente), mas o cmdline carrega a pasta instalada.
 kill_parallel_by_path() {
@@ -2103,8 +2135,14 @@ if [ "$MODE" = "status" ]; then
             [ "$first" -eq 1 ] || printf ','
             first=0
             running="nao"
-            if running_flav "$flav"; then running="sim"; fi
-            printf '{"path":"%s","state":"%s","flavour":"%s","detected_by":"%s","running":"%s"' "$resources" "$(injection_state "$resources")" "$flav" "$detect" "$running"
+            in_namespace="nao"
+            discord_pid=""
+            if discord_pid="$(discord_pid_flav "$flav" 2>/dev/null)"; then
+                running="sim"
+                if discord_pid_in_netns "$discord_pid"; then in_namespace="sim"; fi
+            fi
+            printf '{"path":"%s","state":"%s","flavour":"%s","detected_by":"%s","running":"%s","inNamespace":"%s"' "$resources" "$(injection_state "$resources")" "$flav" "$detect" "$running" "$in_namespace"
+            [ -n "$discord_pid" ] && printf ',"pid":"%s"' "$discord_pid"
             if [ -n "$id" ]; then
                 printf ',"flatpak_id":"%s"' "$id"
             fi

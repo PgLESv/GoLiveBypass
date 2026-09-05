@@ -30,6 +30,7 @@ import * as proton from "./proton";
 import { findWindowsDiscordInstall } from "./windows-discord-install";
 import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } from "./wait-condition";
 import { parseLinuxPreflight, linuxPreflightMessage, type LinuxPreflight } from "./linux-preflight";
+import { classifyLinuxHealth, shouldRecoverLinuxTunnel } from "./linux-health";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -407,6 +408,11 @@ let linuxStatusCache: { value: string; expiresAt: number } | null = null;
 let linuxStatusGeneration = 0;
 let linuxStatusLastLog = "";
 let linuxStatusLastLogAt = 0;
+let linuxHealthTimer: ReturnType<typeof setInterval> | null = null;
+let linuxHealthInFlight = false;
+let linuxHealthFailures = 0;
+let linuxLastRecoveryAt = 0;
+let linuxRecoveryCount = 0;
 function linuxStatusLogAllowed(signature: string): boolean {
   const now = Date.now();
   if (signature === linuxStatusLastLog && now - linuxStatusLastLogAt < 30_000) return false;
@@ -587,7 +593,10 @@ if (!gotLock) {
     if (!isMac) {
       try {
         const statusInicial = IS_LINUX ? await linuxStatus() : getStatus();
-        if (statusInicial === "ACTIVE") iniciarWgStatsWatchdog(wgStatsProvider);
+        if (statusInicial === "ACTIVE") {
+          iniciarWgStatsWatchdog(wgStatsProvider);
+          startLinuxHealthWatchdog();
+        }
       } catch {}
     }
 
@@ -1532,6 +1541,68 @@ async function linuxWgStats(): Promise<WgTunnelStats> {
   }
 }
 
+async function checkLinuxTunnelHealth(): Promise<{ healthy: boolean; reason: string }> {
+  const statusResult = await runScript(["--status", "--json"]);
+  if (statusResult.code !== 0) return { healthy: false, reason: "script de status indisponível" };
+  const data = JSON.parse(statusResult.stdout || "{}");
+  const discords = Array.isArray(data.discords) ? data.discords : [];
+  const discordInNamespace = discords.some((d: Record<string, unknown>) => d.running === "sim" && d.inNamespace === "sim");
+  let probeReady = false;
+  try {
+    const probe = await runScript(["--probe", "--json"]);
+    if (probe.stdout) probeReady = JSON.parse(probe.stdout).ready === true;
+  } catch { /* classificador produz a razão acionável */ }
+  const wg = data?.wg ?? {};
+  return classifyLinuxHealth({
+    netns: data?.netns === true,
+    discordInNamespace,
+    wg: {
+      ok: wg.ok === true,
+      handshakeAgoS: typeof wg.handshakeAgoS === "number" ? wg.handshakeAgoS : null,
+      rxBytes: typeof wg.rxBytes === "number" ? wg.rxBytes : null,
+      txBytes: typeof wg.txBytes === "number" ? wg.txBytes : null,
+    },
+    probeReady,
+  });
+}
+
+function stopLinuxHealthWatchdog() {
+  if (linuxHealthTimer !== null) clearInterval(linuxHealthTimer);
+  linuxHealthTimer = null;
+  linuxHealthInFlight = false;
+  linuxHealthFailures = 0;
+}
+
+function startLinuxHealthWatchdog() {
+  if (!IS_LINUX || linuxHealthTimer !== null) return;
+  linuxHealthTimer = setInterval(() => {
+    if (linuxHealthInFlight || quitting) return;
+    linuxHealthInFlight = true;
+    void checkLinuxTunnelHealth().then(async (result) => {
+      if (result.healthy) {
+        linuxHealthFailures = 0;
+        return;
+      }
+      // Falha de leitura sem privilégio é telemetria indisponível, não motivo
+      // para reiniciar o túnel a cada ciclo.
+      if (result.reason.includes("telemetria")) return;
+      linuxHealthFailures += 1;
+      logger.warn("linux", "tunel.degradado", { falhas: linuxHealthFailures, motivo: result.reason });
+      if (!shouldRecoverLinuxTunnel(linuxHealthFailures, Date.now(), linuxLastRecoveryAt) || linuxRecoveryCount >= 2) return;
+      linuxLastRecoveryAt = Date.now();
+      linuxRecoveryCount += 1;
+      await withWireSockLifecycle("recuperar-linux", async () => {
+        logger.info("linux", "recuperacao.inicio", { tentativa: linuxRecoveryCount, motivo: result.reason });
+        await linuxDeactivate(() => {});
+        await linuxActivate(() => {});
+        logger.info("linux", "recuperacao.ok", { tentativa: linuxRecoveryCount });
+      }).catch((error) => logger.error("linux", "recuperacao.falhou", { erro: String((error as Error)?.message ?? error) }));
+      linuxHealthFailures = 0;
+    }).catch((error) => logger.warn("linux", "health.erro", { erro: String((error as Error)?.message ?? error) }))
+      .finally(() => { linuxHealthInFlight = false; });
+  }, 15_000);
+}
+
 function wgStatsProvider(): Promise<WgTunnelStats> | WgTunnelStats {
   return IS_LINUX ? linuxWgStats() : getWgStats();
 }
@@ -1622,8 +1693,8 @@ function linuxStatus(): Promise<string> {
           ultimosGraficosLinux = `backend=${String(g.backend ?? "?")} wayland=${String(g.waylandDisplay ?? "")} session=${String(g.sessionType ?? "")} portal=${String(g.portal ?? "?")}`;
         }
         const discords = Array.isArray(data.discords) ? data.discords : [];
-        const anyRunning = discords.some((d: { running?: string }) => d.running === "sim");
         const netnsAtivo = data?.netns === true;
+        const anyRunning = discords.some((d: { running?: string; inNamespace?: string }) => d.running === "sim" && (!netnsAtivo || d.inNamespace === "sim"));
         const status = discords.length === 0 ? "NOT_FOUND" : (netnsAtivo && anyRunning ? "ACTIVE" : "INACTIVE");
         // O status pode ser consultado por bandeja, janela e watchdog ao mesmo tempo.
         // Registra detalhes somente quando a assinatura muda ou a cada 30s, evitando
@@ -1771,6 +1842,7 @@ async function linuxActivate(onChunk: (c: string) => void) {
   // seguinte re-injeta pela flag). Zerada so no deactivate explicito.
   updateSharedSettings({ autoInject: false });
   iniciarWgStatsWatchdog(linuxWgStats);
+  startLinuxHealthWatchdog();
   linuxStatusCache = null;
 }
 
@@ -1786,6 +1858,7 @@ async function linuxDeactivate(onChunk: (c: string) => void) {
     );
   }
   pararWgStatsWatchdog();
+  stopLinuxHealthWatchdog();
   clearSessionMarker();
   linuxStatusCache = null;
 }
