@@ -4018,21 +4018,38 @@ ipcMain.handle("check-proton-session", async (_event, username?: string) => {
   return await proton.checkProtonSession(settingsDir(), user);
 });
 
+let protonLoginGeneration = 0;
 ipcMain.handle("login-proton", async (_event, payload: { username: string; password?: string; twoFactorCode?: string; humanVerificationToken?: string }) => {
+  const generation = ++protonLoginGeneration;
   const res = await proton.loginProton(settingsDir(), payload.username, payload.password, payload.twoFactorCode, payload.humanVerificationToken);
   if (res.success) {
-    if (!updateSharedSettings({ protonUsername: payload.username })) {
+    const authenticatedUsername = res.username || payload.username.trim();
+    if (!updateSharedSettings({ protonUsername: authenticatedUsername })) {
       return { success: false, code: "SESSION_PERSISTENCE", retryable: false, message: "Login concluído, mas não foi possível salvar a conta neste computador.", error: "Verifique as permissões da pasta de dados e tente novamente." };
     }
-    const savedUsername = proton.getSavedSessionUsername(settingsDir());
-    if (savedUsername !== payload.username) {
-      logger.error("proton", "sessao autenticada nao foi encontrada apos login");
-      return { success: false, code: "SESSION_PERSISTENCE", retryable: false, message: "Login concluído, mas a sessão não foi persistida.", error: "Tente novamente." };
-    }
+    // O sidecar só retorna sucesso depois de gravar SessionStore.Save. A
+    // releitura imediata do Electron era redundante e, no Windows, podia ver o
+    // arquivo tarde e transformar um login válido em erro. Confirme em segundo
+    // plano apenas para diagnóstico; uma resposta atrasada nunca altera a conta.
+    void proton.confirmSavedSessionIdentity(settingsDir(), authenticatedUsername).then((confirmation) => {
+      if (generation !== protonLoginGeneration) return;
+      if (confirmation.confirmed) {
+        logger.info("proton", "sessao persistida confirmada", { tentativas: confirmation.attempts });
+      } else {
+        logger.warn("proton", "sessao persistida ainda nao visivel apos login", {
+          tentativas: confirmation.attempts,
+          identidade_encontrada: confirmation.savedUsername ? "diferente" : "ausente",
+        });
+      }
+    }).catch((error) => {
+      if (generation === protonLoginGeneration) {
+        logger.warn("proton", "falha na confirmacao diagnostica da sessao", { erro: String((error as Error)?.message ?? error) });
+      }
+    });
     const s = readSharedSettings() as any;
     try {
       const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
-        username: payload.username,
+        username: authenticatedUsername,
         countries: (s.protonCountry as string) || undefined,
         freeOnly: s.protonFreeOnly !== false,
         autoPing: s.protonAutoPing !== false,

@@ -24,6 +24,7 @@ export type ProtonLoginErrorCode =
 
 export interface ProtonLoginResult {
   success: boolean;
+  username?: string;
   code?: ProtonLoginErrorCode;
   message?: string;
   error?: string;
@@ -206,6 +207,46 @@ export function getSavedSessionUsername(installDir: string): string {
   }
 }
 
+export type ProtonSessionConfirmation = {
+  confirmed: boolean;
+  savedUsername: string;
+  attempts: number;
+};
+
+export function protonIdentityMatches(left: string, right: string): boolean {
+  return left.trim().toLocaleLowerCase('en-US') === right.trim().toLocaleLowerCase('en-US');
+}
+
+/**
+ * Releitura diagnóstica da sessão. O sidecar só retorna sucesso depois de
+ * SessionStore.Save concluir; portanto, uma falha aqui não invalida o login.
+ * As tentativas cobrem atraso de visibilidade/antivírus no Windows.
+ */
+export async function confirmSavedSessionIdentity(
+  installDir: string,
+  expectedUsername: string,
+  options: {
+    attempts?: number;
+    delayMs?: number;
+    readUsername?: () => string;
+    wait?: (delayMs: number) => Promise<void>;
+  } = {},
+): Promise<ProtonSessionConfirmation> {
+  const attempts = Math.max(1, options.attempts ?? 4);
+  const delayMs = Math.max(0, options.delayMs ?? 100);
+  const readUsername = options.readUsername ?? (() => getSavedSessionUsername(installDir));
+  const wait = options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let savedUsername = '';
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    savedUsername = readUsername();
+    if (savedUsername && protonIdentityMatches(savedUsername, expectedUsername)) {
+      return { confirmed: true, savedUsername, attempts: attempt };
+    }
+    if (attempt < attempts) await wait(delayMs);
+  }
+  return { confirmed: false, savedUsername, attempts };
+}
+
 function ensureInstallDir(installDir: string) {
   fs.mkdirSync(installDir, { recursive: true });
 }
@@ -289,7 +330,13 @@ export async function loginProton(
 
   if (res.json && res.json.success) {
     logger.info('proton', 'autenticação bem-sucedida');
-    return { success: true, message: 'Autenticação concluída.' };
+    return {
+      success: true,
+      username: typeof res.json.username === 'string' && res.json.username.trim()
+        ? res.json.username.trim()
+        : username.trim(),
+      message: 'Autenticação concluída.',
+    };
   }
 
   if (res.json?.code === 'CAPTCHA_REQUIRED' || res.json?.code === 'CAPTCHA_INVALID') {

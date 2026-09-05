@@ -4,7 +4,17 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [2.0.3-beta.2] - 2026-09-05
+## [2.0.3-beta.3] - 2026-09-05
+
+### Login Proton no Windows
+
+- **Sem falso erro de persistência:** o sucesso do `proton-confgen`, que já só
+  ocorre depois de salvar a sessão, passa a ser a fonte de verdade. A releitura
+  do arquivo pelo Electron agora é uma confirmação diagnóstica assíncrona com
+  tentativas limitadas, evitando o caso em que reiniciar o GoLive revelava que
+  o login marcado como falho estava válido desde o início.
+- **Troca de conta protegida:** confirmações atrasadas de um login anterior não
+  sobrescrevem nem publicam estado para a conta autenticada depois.
 
 ### Correção Windows — issue #232
 
