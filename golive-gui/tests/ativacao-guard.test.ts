@@ -114,7 +114,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(fnBody).toContain("const hadWireSock = isWireSockActive();");
   });
 
-  it("aplica rota Linux sem desmontar o Discord e prova o WireSock antes do cliente no Windows", () => {
+  it("inicia o túnel antes do cliente e observa a rota em segundo plano", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     expect(src).toContain('runScript(["--refresh-route"])');
     expect(src).not.toContain('runScript(["--deactivate"]);\n        await runScript(["--activate"]);');
@@ -122,16 +122,10 @@ describe("guarda de ativacao duplicada", () => {
     expect(src).toContain('await killDiscord();');
 
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
-    const proofCall = 'await requireFunctionalWindowsRoute(direct, windowsGeneration, scope.probes)';
-    expect(activation).toContain(proofCall);
-    expect(activation.indexOf(proofCall)).toBeLessThan(
-      activation.indexOf('startDiscordAndConfirm(installs, "ativacao")'),
-    );
-    expect(activation).toContain("let windowsDiscordStarted = false;");
-    expect(activation).toContain("prepareDiscordScopeProbes(installs, proton.findProtonConfgenExe())");
-    expect(activation.indexOf("await scope.cleanup()")).toBeLessThan(
-      activation.indexOf('startDiscordAndConfirm(installs, "ativacao")'),
-    );
+    expect(activation).not.toContain("requireFunctionalWindowsRoute");
+    expect(activation).not.toContain("prepareDiscordScopeProbes");
+    expect(activation.indexOf("await startWireSockService")).toBeLessThan(activation.indexOf('startDiscordAndConfirm(installs, "ativacao")'));
+    expect(activation.indexOf('startDiscordAndConfirm(installs, "ativacao")')).toBeLessThan(activation.indexOf("startWindowsRouteWatchdog()"));
 
     const readinessStart = src.indexOf("async function waitForWindowsWgReady");
     const readiness = src.slice(readinessStart, src.indexOf("function linuxStatus", readinessStart));
@@ -142,7 +136,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(readiness).toContain('"disconnected" : "unverified"');
 
     const ui = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
-    expect(ui).toContain("Discord só abre depois que o IP de saída WireGuard é comprovado");
+    expect(ui).toContain("O Discord abre quando o túnel é iniciado");
   });
 
   it("usa uma fila unica para operacoes concorrentes do WireSock", () => {
@@ -161,7 +155,7 @@ describe("guarda de ativacao duplicada", () => {
     const status = src.slice(statusStart, src.indexOf("async function linuxStatus", statusStart));
     expect(status).toContain('return "CONNECTING"');
     expect(status).toContain('return "RECOVERY_REQUIRED"');
-    expect(status).toContain("windowsRouteVerified && isWireSockActive() && discordIsRunning()");
+    expect(status).toContain("windowsRouteStarted && isWireSockActive() && discordIsRunning()");
   });
 
   it("aguarda a limpeza WireSock terminar antes de concluir o quit", () => {
@@ -191,7 +185,7 @@ describe("guarda de ativacao duplicada", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
     expect(activation).toContain("await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs))");
-    expect(src).toContain("apps.add(path.basename(probeExe));");
+    expect(src).not.toContain("apps.add(path.basename(probeExe));");
     expect(activation).not.toContain("app.asar");
     expect(activation).not.toContain("assertResourcesWritable");
     expect(activation).not.toContain("isOurInjection");
@@ -246,7 +240,7 @@ describe("guarda de ativacao duplicada", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const activation = src.slice(src.indexOf("async function executarAtivacao"), src.indexOf("async function deactivateAll"));
     expect(activation).toContain('startDiscordAndConfirm(installs, "ativacao")');
-    const proofCall = 'await requireFunctionalWindowsRoute(direct, windowsGeneration, scope.probes)';
+    const proofCall = 'await startWireSockService';
     expect(activation).toContain(proofCall);
     expect(activation.indexOf(proofCall)).toBeLessThan(
       activation.indexOf('startDiscordAndConfirm(installs, "ativacao")'),

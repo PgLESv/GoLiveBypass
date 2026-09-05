@@ -7,11 +7,12 @@ type Config struct {
 	Password string
 
 	// Server selection
-	Countries      []string
-	ServerName     string
-	P2PServersOnly bool
-	SecureCoreOnly bool
-	FreeOnly       bool
+	Countries         []string
+	ExcludedCountries []string
+	ServerName        string
+	P2PServersOnly    bool
+	SecureCoreOnly    bool
+	FreeOnly          bool
 
 	// Output configuration
 	OutputFile       string
@@ -58,6 +59,7 @@ type Config struct {
 	TwoFactorCode string
 	SessionFile   string
 	AutoPing      bool
+	SpeedTest     bool
 	JSONOutput    bool
 	CheckSession  bool
 	LoginOnly     bool

@@ -1,3 +1,4 @@
+import { protonMeasurementText } from './proton-measurement';
 import './style.css'
 
 declare global {
@@ -101,7 +102,7 @@ declare global {
       }>;
       onProtonCaptchaStatus: (callback: (status: string) => void) => void;
       logoutProton: () => Promise<boolean>;
-      optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) => Promise<{
+      optimizeProtonRoute: (options?: { country?: string; freeOnly?: boolean; autoPing?: boolean; speedTest?: boolean }) => Promise<{
         success: boolean;
         server?: string;
         country?: string;
@@ -110,6 +111,10 @@ declare global {
         load?: number;
         score?: number;
         pingMs?: number;
+        downloadMbps?: number;
+        uploadMbps?: number;
+        speedTested?: number;
+        speedSucceeded?: number;
         endpoint?: string;
         confFile?: string;
         readiness?: { verified?: boolean; state?: string; source?: string; detail?: string };
@@ -280,11 +285,11 @@ async function updateStatus() {
       statusCard.hidden = true;
       if (linuxPreflightCommand) linuxPreflightCommand.hidden = true;
     } else if (status === 'CONNECTING') {
-      statusText.innerText = 'Comprovando a saída protegida…';
-      statusTag.textContent = 'Validando';
+      statusText.innerText = 'Iniciando a conexão do Discord…';
+      statusTag.textContent = 'Iniciando';
       statusTag.classList.add('tag--warn');
       toggleBtn.disabled = true;
-      btnText.innerText = 'Validando rota…';
+      btnText.innerText = 'Iniciando túnel…';
       statusCard.hidden = false;
     } else if (status === 'RECOVERY_REQUIRED') {
       statusText.innerText = 'A rota não pôde ser restaurada automaticamente';
@@ -356,6 +361,7 @@ async function updateStatus() {
   if (restoreInternetBtn) {
     restoreInternetBtn.hidden = window.api.platform !== 'win32' || currentState === 'ACTIVE';
   }
+  if (protonOptimizationInFlight) toggleBtn.disabled = true;
   // Depois de mudar o estado, ajusta a janela ao novo tamanho do conteudo.
   fitWindowToContent();
 }
@@ -891,19 +897,20 @@ async function optimizeProtonRoute(onStartup = false) {
   if (protonOptimizationInFlight || !isProtonAuthenticated) return;
 
   protonOptimizationInFlight = true;
+  toggleBtn.disabled = true;
   if (protonOptimizeBtn) protonOptimizeBtn.disabled = true;
-  if (protonOptimizeBtnText) protonOptimizeBtnText.textContent = onStartup ? 'Otimizando...' : 'Medindo ping...';
+  if (protonOptimizeBtnText) protonOptimizeBtnText.textContent = onStartup ? 'Otimizando...' : 'Medindo velocidade...';
   setProtonFeedback(
-    onStartup ? 'Atualizando automaticamente a rota Proton...' : 'Testando servidores em tempo real para menor latência...',
+    onStartup ? 'Atualizando automaticamente a rota Proton...' : 'Medindo download e upload nos melhores candidatos. Pode levar até 2 minutos e usar cerca de 30 MB.',
     'busy',
   );
 
   try {
     const country = protonCountrySelect?.value || '';
-    const res = await window.api.optimizeProtonRoute({ country, autoPing: true });
+    const res = await window.api.optimizeProtonRoute({ country, autoPing: true, speedTest: !onStartup });
 
     if (res.success) {
-      const pingStr = res.pingMs && res.pingMs > 0 ? ` (${res.pingMs}ms)` : '';
+      const pingStr = protonMeasurementText(res);
       await refreshProtonState();
       await atualizarStatusWgConf();
       await updateStatus();
@@ -912,19 +919,22 @@ async function optimizeProtonRoute(onStartup = false) {
       const rotaEmUso = currentState === 'ACTIVE';
       setProtonFeedback(
         rotaEmUso
-          ? `Rota ${res.server} aplicada e comprovada!${pingStr}${res.readiness?.verified === false ? ' Não foi possível confirmar a telemetria auxiliar do WireSock.' : ''}`
+          ? `Rota ${res.server} aplicada!${pingStr}`
           : `Rota ${res.server} selecionada!${pingStr} Ative o Bypass para usá-la.`,
         'ok',
       );
     } else {
       setProtonFeedback(res.error || 'Falha ao buscar servidor.', 'err');
+      await updateStatus();
     }
   } catch (err) {
     setProtonFeedback((err as Error)?.message || String(err), 'err');
+    await updateStatus();
   } finally {
     protonOptimizationInFlight = false;
     if (protonOptimizeBtn) protonOptimizeBtn.disabled = false;
     if (protonOptimizeBtnText) protonOptimizeBtnText.textContent = 'Otimizar rota';
+    await updateStatus();
   }
 }
 

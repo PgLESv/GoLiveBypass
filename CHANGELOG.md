@@ -9,6 +9,13 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ### Corrigido
 - **Auto-Update no Windows Portable (EBUSY / Código 32):** Corrigido o erro `EBUSY: resource busy or locked` que impedia a atualização automática de versões portáveis (`GoLiveBypass-*.exe`). Como o executável raiz do wrapper NSIS do electron-builder mantém um handle aberto para leitura (`FILE_SHARE_READ`) enquanto a aplicação está rodando, a substituição do binário foi desacoplada para o helper externo pós-encerramento (`.bat` executado de forma oculta via `wscript.exe`). O helper aguarda o término do processo pai, substitui o arquivo com sucesso via loop com `move /y` e reinicia o aplicativo atualizado de forma totalmente transparente e automática.
 
+### Sincronização Upstream (GoLiveBypass 2.0.4)
+- **Perfil Efetivo do WireSock:** Ativação atualiza e valida a linha de comando do serviço mesmo quando previamente instalado por outros perfis/ferramentas. Propagação estrita de falhas na instalação ou inicialização. Standalone PowerShell atualizado com `#@ws:AllowedApps` alinhado ao SDK atual.
+- **Diagnóstico de Rota Não-Bloqueante (Windows/Linux):** Probes de IP, geolocalização, HTTP, handshake e tráfego deixam de impedir a ativação ou derrubar o cliente. Coleta em segundo plano sem rollback nem prompts interativos no Linux.
+- **Rota Proton Otimizada com Medição Real de Velocidade:** Novo botão e mecanismo de medição de velocidade (download, upload e latência HTTPS) em memória via WireGuard/netstack em até seis candidatos regionais de menor carga, gerando ranking de 70% velocidade (média harmônica) e 30% latência.
+- **CI & Build Multiplataforma:** Setup do Go nos runners do GitHub Actions com `setup-go@v6` via arquivo `go.mod` e script `build-proton.mjs` para compilação agnóstica entre shells. Suporte a drafts de release.
+- **Compatibilidade Fork PgLESv Preservada:** Mantidos 100% dos recursos do fork (planos pagos Proton Plus/Family/Unlimited, desbloqueio de mais de 140 países por continente, exclusão automática de rotas BR, normalização de sufixos de email Proton e auto-updater robusto).
+
 ## [2.1.2] - 2026-09-05
 
 ### Sincronização Upstream (GoLiveBypass 2.0.3)
@@ -47,6 +54,32 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   falha imediata com código 2028 ao tentar autenticar a conta Proton na GUI.
 - **Reutilização de sessão salva sem prompt no terminal:**
   - O backend do `proton-confgen` agora recupera o usuário e valida o token persistente salvo sem solicitar entrada interativa no terminal stdin.
+
+## [2.0.4] - 2026-09-05
+
+### Perfil efetivo do WireSock
+- A ativação atualiza e confere o comando do serviço, inclusive quando ele já foi instalado por outra ferramenta. Corrige a VM que continuava usando `wireproxy/discord-wiresock.conf` em vez da rota selecionada na GUI. Falhas reais de instalação/alteração/início do serviço são propagadas; não se aceita um serviço antigo como sucesso.
+- A mesma correção de configuração efetiva foi portada ao standalone PowerShell, com `#@ws:AllowedApps` compatível com o SDK atual. O legado SOCKS/PAC não gerencia esse serviço.
+- Autenticação e gerenciamento Proton permanecem na rede do host; somente os probes copiados para o diretório do Discord seguem seu túnel.
+
+### Diagnóstico de rota sem bloqueio (Windows/Linux)
+- Probes de IP, geolocalização, HTTP, handshake e tráfego deixam de impedir ativação/troca de rota ou derrubar o Discord. Os resultados, inclusive falhas repetidas, ficam somente nos logs; criação de túnel/serviço e abertura do processo continuam sendo verificadas.
+- Windows inicia o Discord após subir WireSock e coleta os probes de escopo em segundo plano. Preparação/limpeza do helper de diagnóstico não bloqueia o cliente. O monitor não faz rollback por reprovação do probe. DNS/HTTPS de recuperação são informativos; resíduos reais de serviço/filtro ainda falham.
+- Linux remove a espera obrigatória de readiness antes do lançamento/refresh; diagnóstico pontual vai a `logs/wireguard-diagnostics.log`, sem prompt de elevação. O monitor da GUI registra degradação sem reiniciar a sessão. O script Linux distribuído pela GUI compartilha esse comportamento; standalone Windows e plugin não tinham essa prova funcional.
+- A interface não declara saída comprovada nem mostra alertas de probe. Ativo descreve túnel e processo iniciados, sem garantir o país ou a qualidade da saída.
+
+### Rota Proton otimizada com medição real
+- A busca regional considera todas as localidades elegíveis (país, região e cidade), com até dois candidatos de baixa carga por localidade. País escolhido e filtros de plano continuam respeitados; a GUI exclui saídas brasileiras, incompatíveis com o objetivo do bypass. Probes de latência têm concorrência limitada, deduplicação de IP e orçamento de 18 segundos; listas muito grandes ou redes lentas podem encerrar antes de medir todos.
+- O botão **Otimizar rota** mede download, upload e latência HTTPS dentro de túneis WireGuard temporários de até seis finalistas, priorizando localidades distintas. Medições são sequenciais, evitando disputa de banda entre testes. Não é uma varredura de velocidade de todos os servidores nem garantia de máximo global.
+- Ranking final: 70% velocidade medida (média harmônica de download/upload, para penalizar upload ruim) e 30% latência. A interface mostra Mbps medidos e informa duração/consumo antes do resultado. Até 4 MiB de download e 1 MiB de upload por candidato, aproximadamente 30 MiB de payload por busca, além do overhead de rede; orçamento de 12 segundos por candidato, até 75 segundos na etapa de velocidade e timeout externo de 150 segundos.
+- O medidor usa WireGuard/netstack em memória: não cria interfaces ou rotas no host e nunca cai para HTTP direto quando o túnel falha. Na GUI, uma cópia temporária com outro nome fica fora das regras WireSock do helper normal; ela é removida ao terminar. VPNs externas que roteiem o sistema inteiro ainda podem influenciar a medição.
+- A abertura do aplicativo reaproveita o perfil medido correspondente às preferências, em vez de sobrescrevê-lo pela heurística de carga. Otimização explícita mede novamente. Sem perfil medido, login/arranque continuam usando seleção rápida. Se todos os testes de velocidade falharem, a configuração anterior é preservada.
+- Se o bypass estiver ativo, o Discord e o túnel anterior são encerrados antes da medição para evitar concorrência e interferência entre conexões. Em falha da medição, o Discord permanece fechado e a GUI orienta reativar o perfil anterior.
+- A medição de velocidade escolhe a rota; o diagnóstico do escopo real do Discord ocorre depois da abertura e fica apenas nos logs.
+
+### Fora do escopo
+- Medições curtas usam os endpoints públicos do Cloudflare Speedtest e refletem aquele caminho/momento, não a velocidade garantida de cada destino do Discord. O benchmark transfere IPv4; o diagnóstico de rota observa as famílias disponíveis depois da ativação.
+- GUI Windows/Linux compartilham o helper; sua CLI oferece `-speed-test`. Standalones sem seleção Proton e plugin SOCKS/PAC não usam esse seletor. Não foram alterados mecanismos de troca/reload do legado.
 
 ## [2.0.3] - 2026-09-05
 

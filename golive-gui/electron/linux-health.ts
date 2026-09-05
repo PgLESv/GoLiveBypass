@@ -17,7 +17,3 @@ export function classifyLinuxHealth(snapshot: LinuxHealthSnapshot): { healthy: b
   if (!snapshot.probeReady) return { healthy: false, reason: "gateway Discord inacessível pelo túnel" };
   return { healthy: true, reason: "túnel e tráfego confirmados" };
 }
-
-export function shouldRecoverLinuxTunnel(consecutiveFailures: number, nowMs: number, lastRecoveryMs: number, cooldownMs = 300_000): boolean {
-  return consecutiveFailures >= 2 && (lastRecoveryMs <= 0 || nowMs - lastRecoveryMs >= cooldownMs);
-}

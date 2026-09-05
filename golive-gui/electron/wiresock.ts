@@ -4,6 +4,7 @@ import { execFileSync, execSync, spawn } from "child_process";
 import dns from "dns/promises";
 import https from "https";
 import * as logger from "./logger";
+import { elevatedPowerShellArgs, wireSockServiceScript } from "./wiresock-service";
 
 const EMBEDDED_WG_CONF = `[Interface]
 PrivateKey = sLPBSsrhzoqZSOY/XxAzGAy5F+sQKQIIE3WoxG8buWM=
@@ -23,7 +24,7 @@ const WIRESOCK_DOWNLOAD_PAGE = "https://v3.wiresock.net/wiresock-sdk";
 const WIRESOCK_SERVICE_NAMES = ["wiresock-client-service", "wiresock-pro-client-service"] as const;
 // O SDK 3.4.x instala o filtro WireGuard como `ndiswg`; releases antigas do
 // mecanismo por aplicativo expunham `NDISRD`. Ambos são nomes oficiais vistos
-// em campo. A prova funcional de rota continua sendo a autoridade final.
+// em campo. A prova funcional é apenas diagnóstico, sem bloquear a ativação.
 const WIRESOCK_DRIVER_SERVICE_NAMES = ["ndiswg", "NDISRD"] as const;
 
 export type WireSockConnectionState = "connected" | "connecting" | "disconnected" | "unknown";
@@ -363,8 +364,7 @@ export async function ensureWireSockInstalled(): Promise<string> {
   if (found) {
     // Consultar o SCM a partir de um Electron não elevado pode ocultar drivers
     // que estão carregados (confirmado com `ndiswg` no SDK 3.4.x). Isso é
-    // telemetria, não autorização: a prova funcional após o start decide se a
-    // rota realmente mudou e falha fechado se o filtro não atuar.
+    // telemetria: a observação funcional após o start fica apenas nos logs.
     if (!isWireSockPacketFilterDriverInstalled()) {
       logger.warn("wiresock", "driver nao ficou visivel ao processo; seguindo para prova funcional", {});
     }
@@ -461,64 +461,15 @@ export async function startWireSockService(installDir: string, customConf?: stri
   fs.writeFileSync(targetConf, newLines.join("\r\n"), "utf8");
 
   try {
-    execSync("net.exe stop wiresock-client-service", { stdio: "ignore", windowsHide: true });
-  } catch {}
-
-  try {
-    execSync(`"${wsExe}" install -start-type 3 -config "${targetConf}" -log-level info -network-lock disabled`, {
-      stdio: "ignore",
-      windowsHide: true,
+    execFileSync("powershell.exe", elevatedPowerShellArgs(wireSockServiceScript(wsExe, targetConf)), {
+      windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000,
     });
-  } catch (err) {
-    logger.warn("wiresock", "install direto falhou (provavel falta de privilegio), tentando elevar via UAC", {
-      erro: String((err as Error)?.message ?? err),
-    });
-    try {
-      execSync(`powershell.exe -Command "Start-Process -FilePath '${wsExe}' -ArgumentList 'install -start-type 3 -config \\"${targetConf}\\" -log-level info -network-lock disabled' -Verb RunAs -WindowStyle Hidden -Wait"`, { stdio: "ignore", windowsHide: true });
-    } catch (err2) {
-      logger.warn("wiresock", "elevacao do install tambem falhou", { erro: String((err2 as Error)?.message ?? err2) });
-    }
+  } catch (error) {
+    logger.error("wiresock", "falha ao configurar ou iniciar servico", { erro: detalheErro(error) });
+    throw new Error("Não foi possível configurar/iniciar o serviço WireSock com a rota selecionada. Confira a permissão de administrador e os logs.");
   }
-
-  try {
-    execSync("net.exe start wiresock-client-service", { stdio: "ignore", windowsHide: true });
-  } catch (err) {
-    logger.warn("wiresock", "start do servico falhou, tentando elevar via UAC", {
-      erro: String((err as Error)?.message ?? err),
-    });
-    try {
-      execSync(`powershell.exe -Command "Start-Process net.exe -ArgumentList 'start wiresock-client-service' -Verb RunAs -WindowStyle Hidden -Wait"`, { stdio: "ignore", windowsHide: true });
-    } catch (err2) {
-      logger.warn("wiresock", "elevacao do start tambem falhou", { erro: String((err2 as Error)?.message ?? err2) });
-    }
-  }
-
-  if (tunelConfirmado()) {
-    limparDnsDoAdaptadorWireSock();
-    logger.info("wiresock", "servico ativo", {});
-    return;
-  }
-
-  // Servico nao confirmou: ultimo recurso, roda o cliente direto (sem servico do Windows).
-  // Continua exigindo o mesmo privilegio pra o driver WFP filtrar de verdade, entao isto
-  // raramente resolve sozinho quando o passo anterior falhou por falta de admin -- mas cobre
-  // o caso do servico instalado bloqueando outra porta/instancia.
-  logger.warn("wiresock", "servico nao confirmado, tentando modo direto (sem servico)", {});
-  spawn(wsExe, ["run", "-config", targetConf, "-log-level", "info", "-network-lock", "disabled"], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  }).unref();
-
-  const subiu = await esperarTunel(6, 500);
-  if (!subiu) {
-    logger.error("wiresock", "tunel nao confirmado depois de todas as tentativas", {});
-    throw new Error(
-      "Não consegui confirmar que o WireSock subiu. Isso geralmente significa que falta permissão de administrador para instalar/iniciar o serviço — feche o Discord, execute o GoLiveBypass como administrador e ative de novo.",
-    );
-  }
-  logger.info("wiresock", "tunel confirmado (modo direto)", {});
   limparDnsDoAdaptadorWireSock();
+  logger.info("wiresock", "servico ativo com perfil selecionado", { config: targetConf });
 }
 
 export interface WireSockCleanupResult {
@@ -758,13 +709,16 @@ export async function verifyWindowsNetworkStable(
   return last;
 }
 
-export interface WireSockRecoveryResult extends WireSockCleanupResult, WindowsNetworkCheck {}
+export interface WireSockRecoveryResult extends WireSockCleanupResult { ok: boolean; error?: string; }
 
 /** The sole recovery path used by deactivate, route changes and Restore internet. */
 export async function recoverWireSockNetwork(): Promise<WireSockRecoveryResult> {
   const cleanup = await stopWireSockService();
-  const network = await verifyWindowsNetworkStable();
-  const result = { ...cleanup, ...network, ok: cleanup.stopped && network.ok };
+  // Public endpoints are asynchronous diagnostics, never an OS cleanup gate.
+  void verifyWindowsNetworkStable().then((network) => {
+    logger.info("wiresock", "network.diagnostic", { ...network, mode: "log-only" });
+  }).catch((error) => logger.warn("wiresock", "network.diagnostic.error", { erro: String((error as Error)?.message ?? error) }));
+  const result = { ...cleanup, ok: cleanup.stopped };
   logger.info("wiresock", "recuperacao de rede concluida", result);
   return result;
 }

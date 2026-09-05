@@ -19,6 +19,7 @@ func Parse() (*Config, error) {
 	cfg := &Config{}
 
 	var countriesFlag string
+	var excludedCountriesFlag string
 	var dnsServersFlag string
 	var allowedIPsFlag string
 	var userAlias string
@@ -38,6 +39,7 @@ func Parse() (*Config, error) {
 	flag.StringVar(&passAlias, "pass", "", "Alias for -password")
 
 	// Server selection flags
+	flag.StringVar(&excludedCountriesFlag, "exclude-countries", "", "Exclude exit countries from automatic selection (comma-separated codes)")
 	flag.StringVar(&countriesFlag, "countries", "", "Comma-separated list of country codes (e.g., US,NL,CH)")
 	flag.StringVar(&cfg.ServerName, "server", "", "Select a specific server by name (e.g., UA#122)")
 	flag.BoolVar(&cfg.P2PServersOnly, "p2p-only", constants.DefaultP2POnly, "Use only P2P-enabled servers")
@@ -85,10 +87,11 @@ func Parse() (*Config, error) {
 	flag.StringVar(&cfg.RenewSerial, "renew-serial", "", "Renew a persistent configuration by SerialNumber (reuses existing key, no config file generated)")
 
 	// Automated GUI & Ping extensions
+	flag.BoolVar(&cfg.SpeedTest, "speed-test", false, "Measure real tunnel download/upload on up to six regional finalists (up to 30 MiB, about 90s)")
 	flag.StringVar(&cfg.TwoFactorCode, "2fa", "", "2FA TOTP code for non-interactive authentication")
 	flag.StringVar(&cfg.SessionFile, "session-file", "", "Custom path for session cache file")
 	flag.StringVar(&installDir, "install-dir", "", "Custom install directory containing proton-session.json")
-	flag.BoolVar(&cfg.AutoPing, "auto-ping", false, "Measure real-time server ping and select fastest server")
+	flag.BoolVar(&cfg.AutoPing, "auto-ping", false, "Compare all eligible regions, prioritizing lower load over measured ping (not a bandwidth test)")
 	flag.BoolVar(&cfg.JSONOutput, "json", false, "Output results in JSON format")
 	flag.BoolVar(&cfg.CheckSession, "check-session", false, "Check if cached session is valid and exit")
 	flag.BoolVar(&sessionCheckAlias, "session-check", false, "Alias for -check-session")
@@ -124,6 +127,7 @@ func Parse() (*Config, error) {
 	}
 
 	// Parse and validate country codes (needed by most modes)
+	cfg.ExcludedCountries = parseCountries(excludedCountriesFlag)
 	if countriesFlag != "" {
 		cfg.Countries = parseCountries(countriesFlag)
 		for _, country := range cfg.Countries {
@@ -164,8 +168,11 @@ func Parse() (*Config, error) {
 	}
 
 	// Validate required flags: countries are needed unless -server or -auto-ping is specified
+	if cfg.SpeedTest {
+		cfg.AutoPing = true
+	}
 	if countriesFlag == "" && cfg.ServerName == "" && !cfg.AutoPing {
-		return nil, fmt.Errorf("countries flag is required (or use -server to select a specific server, or -auto-ping for global fastest)")
+		return nil, fmt.Errorf("countries flag is required (or use -server to select a specific server, or -auto-ping for global regional selection)")
 	}
 
 	// Set defaults based on IPv6 setting

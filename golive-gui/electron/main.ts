@@ -29,10 +29,11 @@ import * as proton from "./proton";
 import { findWindowsDiscordInstall } from "./windows-discord-install";
 import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } from "./wait-condition";
 import { parseLinuxPreflight, linuxPreflightMessage, type LinuxPreflight } from "./linux-preflight";
-import { classifyLinuxHealth, shouldRecoverLinuxTunnel } from "./linux-health";
+import { classifyLinuxHealth } from "./linux-health";
 import { PROTON_CAPTCHA_CAPTURE_SCRIPT, isAllowedProtonCaptchaNavigation, parseProtonCaptchaChallenge, validateProtonCaptchaResponse } from "./proton-captcha";
+import { observeRouteDiagnostic } from "./route-diagnostics";
 import { decideRouteProof, maskedIP, type RouteProbeResult } from "./route-proof";
-import { prepareDiscordScopeProbes, type DiscordScopeProbe } from "./discord-scope-proof";
+import { prepareDiscordScopeProbes } from "./discord-scope-proof";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -46,14 +47,12 @@ const MAIN_WINDOW_WIDTH = 720;
 // global. Uma fila unica impede que clique, bandeja e troca Proton criem duas
 // instancias ou que uma validacao aprove a rede enquanto outra ainda a desmonta.
 let wireSockLifecycleQueue: Promise<void> = Promise.resolve();
-type WindowsRouteState = "inactive" | "preparing" | "probing" | "active" | "failed" | "recovery_required";
-let windowsRouteVerified = false;
+type WindowsRouteState = "inactive" | "preparing" | "active" | "failed" | "recovery_required";
+let windowsRouteStarted = false;
 let windowsRouteState: WindowsRouteState = "inactive";
 let windowsRouteGeneration = 0;
-let windowsRouteBaseline: RouteProbeResult | null = null;
 let windowsRouteWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 let windowsRouteWatchdogInFlight = false;
-let windowsRouteWatchdogFailures = 0;
 function withWireSockLifecycle<T>(operation: string, task: () => Promise<T>): Promise<T> {
   const run = wireSockLifecycleQueue.then(async () => {
     logger.info("wiresock", "inicio de operacao serializada", { operation });
@@ -69,7 +68,7 @@ function withWireSockLifecycle<T>(operation: string, task: () => Promise<T>): Pr
 
 function beginWindowsRouteOperation(state: WindowsRouteState = "preparing"): number {
   windowsRouteGeneration += 1;
-  windowsRouteVerified = false;
+  windowsRouteStarted = false;
   windowsRouteState = state;
   refreshWindowStatus();
   return windowsRouteGeneration;
@@ -437,8 +436,6 @@ let linuxStatusLastLogAt = 0;
 let linuxHealthTimer: ReturnType<typeof setInterval> | null = null;
 let linuxHealthInFlight = false;
 let linuxHealthFailures = 0;
-let linuxLastRecoveryAt = 0;
-let linuxRecoveryCount = 0;
 function linuxStatusLogAllowed(signature: string): boolean {
   const now = Date.now();
   if (signature === linuxStatusLastLog && now - linuxStatusLastLogAt < 30_000) return false;
@@ -1119,9 +1116,8 @@ function windowsAllowedAppPaths(installs: DiscordInstall[]): string[] {
     apps.add(path.join(path.dirname(path.dirname(install.exePath)), "Update.exe"));
     apps.add("Update.exe");
   }
-  const probeExe = path.resolve(proton.findProtonConfgenExe());
-  apps.add(probeExe);
-  apps.add(path.basename(probeExe));
+  // Controle da conta Proton usa a rede do host. Somente o probe copiado
+  // para o diretorio do Discord acompanha a regra de tunel desse aplicativo.
   return [...apps];
 }
 
@@ -1142,131 +1138,50 @@ function logRouteProbe(stage: "direct" | "tunnel", attempt: number, result: Rout
   });
 }
 
-async function directRouteBaseline(generation: number): Promise<RouteProbeResult | null> {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    assertWindowsRouteGeneration(generation);
-    try {
-      const result = await proton.runRouteProbe(12_000);
-      assertWindowsRouteGeneration(generation);
-      logRouteProbe("direct", attempt, result);
-      if (result.success && result.observations.length > 0) return result;
-    } catch (error) {
-      logger.warn("wiresock", "route.probe.direct.error", { attempt, erro: String((error as Error)?.message ?? error).slice(0, 300) });
+// Route observations are diagnostic only. Failure, geolocation disagreement,
+// unavailable helpers and cleanup errors must never control Discord lifecycle.
+async function diagnoseWindowsRoute(generation: number) {
+  let scope: ReturnType<typeof prepareDiscordScopeProbes> | undefined;
+  try {
+    scope = prepareDiscordScopeProbes(getDiscordInstalls(), proton.findProtonConfgenExe());
+    for (const probe of scope.probes) {
+      if (generation !== windowsRouteGeneration || !windowsRouteStarted || quitting) return;
+      await observeRouteDiagnostic(
+        () => proton.runRouteProbeFrom(probe.probePath, 12_000),
+        (result) => {
+          logRouteProbe("tunnel", 0, result, probe.flavours.join("+"));
+          logger.info("wiresock", "route.diagnostic", { ...decideRouteProof(null, result), mode: "log-only", target: probe.flavours.join("+") });
+        },
+        (error) => logger.warn("wiresock", "route.diagnostic.error", { mode: "log-only", erro: error }),
+        () => generation === windowsRouteGeneration && windowsRouteStarted && !quitting,
+      );
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  } catch (error) {
+    logger.warn("wiresock", "route.diagnostic.setup", { mode: "log-only", erro: String((error as Error)?.message ?? error).slice(0, 300) });
+  } finally {
+    await scope?.cleanup().catch((error) => logger.warn("wiresock", "route.diagnostic.cleanup", { erro: String((error as Error)?.message ?? error).slice(0, 300) }));
   }
-  return null;
-}
-
-async function requireFunctionalWindowsRoute(direct: RouteProbeResult | null, generation: number, probes: DiscordScopeProbe[]): Promise<void> {
-  if (probes.length === 0) throw new Error("Nenhum diretório do Discord foi preparado para a prova de escopo.");
-  let lastReason = "inconclusive";
-  let verifiedTargets = 0;
-  for (const probe of probes) {
-    const target = probe.flavours.join("+");
-    let verified = false;
-    for (let attempt = 1; attempt <= 4; attempt++) {
-      assertWindowsRouteGeneration(generation);
-      try {
-        const tunneled = await proton.runRouteProbeFrom(probe.probePath, 12_000);
-        assertWindowsRouteGeneration(generation);
-        logRouteProbe("tunnel", attempt, tunneled, target);
-        const decision = decideRouteProof(direct, tunneled);
-        lastReason = decision.reason;
-        logger.info("wiresock", "route.proof", {
-          attempt,
-          target,
-          verified: decision.verified,
-          reason: decision.reason,
-          source: decision.source || "?",
-          country: decision.country || "?",
-        });
-        if (decision.verified) {
-          verified = true;
-          verifiedTargets += 1;
-          break;
-        }
-      } catch (error) {
-        lastReason = "probe_failed";
-        logger.warn("wiresock", "route.probe.tunnel.error", { attempt, target, erro: String((error as Error)?.message ?? error).slice(0, 300) });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-    if (!verified) break;
-  }
-  if (verifiedTargets === probes.length) return;
-
-  const message = lastReason === "brazil"
-    ? "A saída do WireSock continuou no Brasil. O Discord não foi aberto para evitar o bloqueio regional."
-    : lastReason === "same_as_direct"
-      ? "O WireSock devolveu o mesmo IP da conexão direta. O Discord não foi aberto para evitar vazamento."
-      : lastReason === "discord_failed"
-        ? "A saída WireSock não conseguiu alcançar o Discord. O cliente permaneceu fechado."
-        : "Não foi possível comprovar funcionalmente a saída WireSock. O Discord permaneceu fechado para evitar vazamento.";
-  throw new Error(message);
 }
 
 function stopWindowsRouteWatchdog() {
   if (windowsRouteWatchdogTimer) clearInterval(windowsRouteWatchdogTimer);
   windowsRouteWatchdogTimer = null;
   windowsRouteWatchdogInFlight = false;
-  windowsRouteWatchdogFailures = 0;
 }
 
-function startWindowsRouteWatchdog(direct: RouteProbeResult | null) {
+function startWindowsRouteWatchdog() {
   if (!IS_WINDOWS) return;
   stopWindowsRouteWatchdog();
-  windowsRouteBaseline = direct;
   const generation = windowsRouteGeneration;
-  const recordFailure = async (reason: string) => {
-    if (generation !== windowsRouteGeneration || !windowsRouteVerified) return;
-    windowsRouteWatchdogFailures += 1;
-    logger.warn("wiresock", "route.watchdog.failed", { failures: windowsRouteWatchdogFailures, reason });
-    if (windowsRouteWatchdogFailures < 2) return;
-
-    windowsRouteVerified = false;
-    windowsRouteState = "failed";
-    stopWindowsRouteWatchdog();
-    await withWireSockLifecycle("route-watchdog-recovery", async () => {
-      if (generation !== windowsRouteGeneration) return;
-      // Confirma uma ultima vez dentro da fila, pois uma troca de rota pode
-      // ter terminado enquanto o probe anterior estava em voo.
-      const confirmation = await proton.runRouteProbe(12_000).catch(() => null);
-      if (confirmation && decideRouteProof(windowsRouteBaseline, confirmation).verified) {
-        windowsRouteVerified = true;
-        windowsRouteState = "active";
-        startWindowsRouteWatchdog(windowsRouteBaseline);
-        logger.info("wiresock", "route.watchdog.recovered", {});
-        return;
-      }
-      await killDiscord();
-      const recovery = await recoverWireSockNetwork();
-      clearSessionMarker();
-      windowsRouteState = recovery.ok ? "inactive" : "recovery_required";
-      logger.error("wiresock", "route.watchdog.rollback", { ok: recovery.ok, residual: recovery.residual.join(", ") });
-      refreshWindowStatus();
-      void refreshTray();
+  const observe = () => {
+    if (windowsRouteWatchdogInFlight || !windowsRouteStarted || quitting || generation !== windowsRouteGeneration) return;
+    windowsRouteWatchdogInFlight = true;
+    void diagnoseWindowsRoute(generation).finally(() => {
+      if (generation === windowsRouteGeneration) windowsRouteWatchdogInFlight = false;
     });
   };
-  windowsRouteWatchdogTimer = setInterval(() => {
-    if (windowsRouteWatchdogInFlight || !windowsRouteVerified || quitting) return;
-    windowsRouteWatchdogInFlight = true;
-    void proton.runRouteProbe(12_000).then(async (result) => {
-      if (generation !== windowsRouteGeneration) return;
-      logRouteProbe("tunnel", 0, result);
-      const decision = decideRouteProof(windowsRouteBaseline, result);
-      if (decision.verified) {
-        windowsRouteWatchdogFailures = 0;
-        return;
-      }
-      await recordFailure(decision.reason);
-    }).catch((error) => {
-      logger.warn("wiresock", "route.watchdog.error", { erro: String((error as Error)?.message ?? error).slice(0, 300) });
-      return recordFailure("probe_failed");
-    }).finally(() => {
-      windowsRouteWatchdogInFlight = false;
-    });
-  }, 60_000);
+  windowsRouteWatchdogTimer = setInterval(observe, 60_000);
+  observe();
 }
 
 // Nas transicoes que restauram a rede, nao basta pedir o spawn: sem esse ack a
@@ -1515,7 +1430,7 @@ async function executarAtivacao(event: any) {
     throw error;
   }
   stopWindowsRouteWatchdog();
-  windowsRouteVerified = false;
+  windowsRouteStarted = false;
 
   let windowsDiscordStarted = false;
   if (IS_WINDOWS) {
@@ -1528,27 +1443,16 @@ async function executarAtivacao(event: any) {
           if (!recovery.ok) throw new Error(`Não consegui limpar a sessão WireSock anterior (${recovery.residual.join(", ") || recovery.error || "rede não validada"}). Use "Restaurar internet".`);
         }
         assertWindowsRouteGeneration(windowsGeneration);
-        const direct = await directRouteBaseline(windowsGeneration);
-        const scope = prepareDiscordScopeProbes(installs, proton.findProtonConfgenExe());
-        try {
-          await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
-          windowsRouteState = "probing";
-          refreshWindowStatus();
-          // O probe temporario roda de dentro de cada app-* do Discord e so
-          // pode entrar no tunel pela mesma regra de diretorio do cliente real.
-          await requireFunctionalWindowsRoute(direct, windowsGeneration, scope.probes);
-        } finally {
-          await scope.cleanup();
-        }
+        await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
+        assertWindowsRouteGeneration(windowsGeneration);
         if (!(await startDiscordAndConfirm(installs, "ativacao"))) {
           throw new Error("O Discord não iniciou após preparar o túnel.");
         }
         windowsDiscordStarted = true;
-        windowsRouteVerified = true;
+        windowsRouteStarted = true;
         windowsRouteState = "active";
-        startWindowsRouteWatchdog(direct);
-        // Handshake/contadores permanecem telemetria auxiliar; a aprovacao ja
-        // veio da prova funcional acima.
+        startWindowsRouteWatchdog();
+        // Handshake, HTTP e geolocalizacao sao diagnosticos assincronos.
         void waitForWindowsWgReady().then((readiness) => {
           logger.info("wiresock", "prontidao.diagnostica", readiness);
         }).catch((error) => {
@@ -1556,7 +1460,7 @@ async function executarAtivacao(event: any) {
         });
       });
     } catch (cause) {
-      windowsRouteVerified = false;
+      windowsRouteStarted = false;
       windowsRouteState = "failed";
       stopWindowsRouteWatchdog();
       // startWireSockService pode parar o servico anterior antes de descobrir
@@ -1637,7 +1541,7 @@ async function executarAtivacao(event: any) {
 async function deactivateAll() {
   pararWgStatsWatchdog();
   stopWindowsRouteWatchdog();
-  windowsRouteVerified = false;
+  windowsRouteStarted = false;
   if (IS_WINDOWS) {
     windowsRouteGeneration += 1;
     windowsRouteState = "preparing";
@@ -1726,9 +1630,9 @@ function getStatus(): string {
   if (IS_WINDOWS) {
     const installs = getDiscordInstalls();
     if (installs.length === 0) return "NOT_FOUND";
-    if (windowsRouteState === "preparing" || windowsRouteState === "probing") return "CONNECTING";
+    if (windowsRouteState === "preparing") return "CONNECTING";
     if (windowsRouteState === "recovery_required") return "RECOVERY_REQUIRED";
-    return windowsRouteVerified && isWireSockActive() && discordIsRunning() ? "ACTIVE" : "INACTIVE";
+    return windowsRouteStarted && isWireSockActive() && discordIsRunning() ? "ACTIVE" : "INACTIVE";
   }
   const installs = getDiscordInstalls();
   if (installs.length === 0) return "NOT_FOUND";
@@ -1821,26 +1725,13 @@ function startLinuxHealthWatchdog() {
   linuxHealthTimer = setInterval(() => {
     if (linuxHealthInFlight || quitting) return;
     linuxHealthInFlight = true;
-    void checkLinuxTunnelHealth().then(async (result) => {
+    void checkLinuxTunnelHealth().then((result) => {
       if (result.healthy) {
         linuxHealthFailures = 0;
         return;
       }
-      // Falha de leitura sem privilégio é telemetria indisponível, não motivo
-      // para reiniciar o túnel a cada ciclo.
-      if (result.reason.includes("telemetria")) return;
       linuxHealthFailures += 1;
-      logger.warn("linux", "tunel.degradado", { falhas: linuxHealthFailures, motivo: result.reason });
-      if (!shouldRecoverLinuxTunnel(linuxHealthFailures, Date.now(), linuxLastRecoveryAt) || linuxRecoveryCount >= 2) return;
-      linuxLastRecoveryAt = Date.now();
-      linuxRecoveryCount += 1;
-      await withWireSockLifecycle("recuperar-linux", async () => {
-        logger.info("linux", "recuperacao.inicio", { tentativa: linuxRecoveryCount, motivo: result.reason });
-        await linuxDeactivate(() => {});
-        await linuxActivate(() => {});
-        logger.info("linux", "recuperacao.ok", { tentativa: linuxRecoveryCount });
-      }).catch((error) => logger.error("linux", "recuperacao.falhou", { erro: String((error as Error)?.message ?? error) }));
-      linuxHealthFailures = 0;
+      logger.warn("linux", "tunel.diagnostico", { mode: "log-only", falhas: linuxHealthFailures, motivo: result.reason });
     }).catch((error) => logger.warn("linux", "health.erro", { erro: String((error as Error)?.message ?? error) }))
       .finally(() => { linuxHealthInFlight = false; });
   }, 15_000);
@@ -2148,7 +2039,7 @@ ipcMain.handle("restore-internet", async () => {
   if (!IS_WINDOWS) return { ok: false, error: "Esta recuperação só está disponível no Windows." };
   return withWireSockLifecycle("restaurar-internet", async () => {
     windowsRouteGeneration += 1;
-    windowsRouteVerified = false;
+    windowsRouteStarted = false;
     windowsRouteState = "preparing";
     stopWindowsRouteWatchdog();
     // Releia dentro da fila: uma ativação concorrente pode ter subido o túnel
@@ -4217,7 +4108,7 @@ ipcMain.handle("logout-proton", async () => {
   return true;
 });
 
-ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: string; freeOnly?: boolean; autoPing?: boolean }) => {
+ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: string; freeOnly?: boolean; autoPing?: boolean; speedTest?: boolean }) => {
   // A geração também precisa ser serializada: ela grava o mesmo perfil
   // compartilhado que a instalação lê. Se duas requisições concorrentes
   // gerarem antes da fila, a primeira resposta pode acabar aplicando o perfil
@@ -4234,14 +4125,58 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
     const freeOnly = options?.freeOnly !== undefined ? options.freeOnly : (s.protonFreeOnly !== undefined ? Boolean(s.protonFreeOnly) : !isPaid);
     const autoPing = options?.autoPing !== undefined ? options.autoPing : (s.protonAutoPing !== false);
 
-    const gen = await proton.generateOptimalProtonConfig(settingsDir(), {
-      username,
-      countries: country || undefined,
-      freeOnly,
-      autoPing,
-    });
+    // Startup reuses the measured profile; explicit optimization always retests.
+    const previous = s.protonLastServer;
+    if (options?.speedTest === false && previous?.downloadMbps > 0 &&
+        (!country || country === previous.country) && freeOnly === (previous.tier === "Free") &&
+        proton.matchesMeasuredProfile(settingsDir(), previous.server, previous.endpoint)) {
+      return { ...previous, success: true };
+    }
 
-    if (!gen.success) return gen;
+    const status = IS_LINUX ? await linuxStatus() : getStatus();
+    const speedTest = options?.speedTest !== false;
+    // Do not benchmark beside the active Proton tunnel: limited accounts can
+    // evict the existing connection, and current traffic biases measurements.
+    if (speedTest) {
+      try {
+        if (IS_WINDOWS && (status === "ACTIVE" || isWireSockActive())) {
+          beginWindowsRouteOperation();
+          stopWindowsRouteWatchdog();
+          pararWgStatsWatchdog();
+          windowsRouteStarted = false;
+          await killDiscord();
+          const recovery = await recoverWireSockNetwork();
+          if (!recovery.ok) {
+            windowsRouteState = "recovery_required";
+            throw new Error("a rota anterior não encerrou com segurança. Use Restaurar internet.");
+          }
+          windowsRouteState = "inactive";
+          refreshWindowStatus();
+        } else if (IS_LINUX && status === "ACTIVE") {
+          await linuxDeactivate(() => {});
+        }
+      } catch (error) {
+        return { success: false, error: `Não foi possível preparar a medição: ${String((error as Error)?.message ?? error)}` };
+      }
+    }
+
+    let gen: Awaited<ReturnType<typeof proton.generateOptimalProtonConfig>>;
+    try {
+      gen = await proton.generateOptimalProtonConfig(settingsDir(), {
+        username,
+        countries: country || undefined,
+        freeOnly,
+        autoPing,
+        speedTest,
+      });
+    } catch (error) {
+      gen = { success: false, error: String((error as Error)?.message ?? error) };
+    }
+
+    if (!gen.success) {
+      const paused = speedTest && status === "ACTIVE";
+      return { ...gen, error: `${gen.error || "Falha ao medir servidores."}${paused ? " O Discord permanece fechado; ative o Bypass para retomar a configuração salva." : ""}` };
+    }
 
     updateSharedSettings({
       protonCountry: country,
@@ -4250,10 +4185,8 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
       protonLastServer: gen,
     });
 
-    const status = IS_LINUX ? await linuxStatus() : getStatus();
-    let readiness: WindowsRouteReadiness | undefined;
     if (status === "ACTIVE") {
-      logger.info("proton", "bypass ativo, validando nova rota antes de reabrir o Discord", { server: gen.server });
+      logger.info("proton", "bypass ativo, iniciando nova rota antes de reabrir o Discord", { server: gen.server });
       try {
         if (IS_WINDOWS) {
           const installs = getDiscordInstalls();
@@ -4265,23 +4198,15 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
             throw new Error(`a rota anterior não encerrou com segurança (${recovery.residual.join(", ") || recovery.error || "rede não validada"}). Use "Restaurar internet".`);
           }
           assertWindowsRouteGeneration(generation);
-          const direct = await directRouteBaseline(generation);
-          const scope = prepareDiscordScopeProbes(installs, proton.findProtonConfgenExe());
-          try {
-            await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
-            windowsRouteState = "probing";
-            refreshWindowStatus();
-            await requireFunctionalWindowsRoute(direct, generation, scope.probes);
-          } finally {
-            await scope.cleanup();
-          }
-          readiness = { verified: true, state: "connected", source: "functional", detail: "IP de saída e Discord comprovados pelo helper isolado" };
+          await startWireSockService(settingsDir(), undefined, windowsAllowedAppPaths(installs));
+          assertWindowsRouteGeneration(generation);
           if (!(await startDiscordAndConfirm(installs, "troca-rota-proton"))) {
             throw new Error("a nova rota foi comprovada, mas o Discord não iniciou");
           }
-          windowsRouteVerified = true;
+          windowsRouteStarted = true;
           windowsRouteState = "active";
-          startWindowsRouteWatchdog(direct);
+          startWindowsRouteWatchdog();
+          iniciarWgStatsWatchdog(wgStatsProvider);
           void waitForWindowsWgReady().then((result) => {
             logger.info("wiresock", "prontidao.diagnostica", result);
           }).catch((error) => {
@@ -4292,14 +4217,18 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
           if (!preflight.ok) {
             throw new Error(`${linuxPreflightMessage(preflight)}${preflight.installCommand ? ` Execute: ${preflight.installCommand}` : ""}`);
           }
-          const refreshed = await runScript(["--refresh-route"]);
-          if (refreshed.code !== 0) {
-            throw new Error(tailErroScript(refreshed.stderr, 4) || "falha ao atualizar a rota WireGuard");
+          if (speedTest) {
+            await linuxActivate(() => {});
+          } else {
+            const refreshed = await runScript(["--refresh-route"]);
+            if (refreshed.code !== 0) {
+              throw new Error(tailErroScript(refreshed.stderr, 4) || "falha ao atualizar a rota WireGuard");
+            }
           }
         }
       } catch (err) {
         if (IS_WINDOWS) {
-          windowsRouteVerified = false;
+          windowsRouteStarted = false;
           windowsRouteState = "failed";
           stopWindowsRouteWatchdog();
           try {
@@ -4318,10 +4247,10 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
         }
         const error = String((err as Error)?.message ?? err);
         logger.error("proton", "nova rota nao ficou pronta", { server: gen.server, erro: error });
-        return { ...gen, success: false, error: `A rota ${gen.server ?? "selecionada"} nao ficou pronta: ${error}`, readiness };
+        return { ...gen, success: false, error: `A rota ${gen.server ?? "selecionada"} nao ficou pronta: ${error}` };
       }
     }
-    return { ...gen, readiness };
+    return { ...gen };
   });
 });
 

@@ -16,6 +16,16 @@ on:
         type: string
         default: stable
 
+      rascunho:
+        description: 'Manter como draft para conferir todos os artefatos antes de publicar'
+        required: false
+        type: boolean
+        default: false
+
+# O publisher respeita draft existente; o override também protege sua criação.
+env:
+  EP_DRAFT: ${{ inputs.rascunho && 'true' || 'false' }}
+
 permissions:
   contents: write
 
@@ -29,9 +39,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version-file: tools/proton-confgen/go.mod
+          cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
       - name: Build Windows Executable
@@ -53,9 +64,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version-file: tools/proton-confgen/go.mod
+          cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
       - name: Build Linux AppImage
@@ -107,9 +119,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version-file: tools/proton-confgen/go.mod
+          cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
       - name: Build macOS GUI
@@ -162,7 +175,7 @@ jobs:
           tag_name: ${{ inputs.tag }}
           name: "GoLiveBypass ${{ inputs.tag }}"
           prerelease: true
-          draft: false
+          draft: ${{ inputs.rascunho || false }}
           body: "**Canal: beta** — versão de teste para quem optou em \"Participar dos testes\" nas configurações da GUI (Windows e Linux). Não é oferecida a quem usa o canal estável. Encontrou algo estranho? Use o botão Reportar bug do app — o relato vai com os logs completos."
           files: release-artifacts/*
         env:

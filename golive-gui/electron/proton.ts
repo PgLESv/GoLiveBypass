@@ -2,6 +2,7 @@ import path from 'path';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import os from 'os';
 import { app } from 'electron';
 import { spawn } from 'child_process';
 import * as logger from './logger';
@@ -384,6 +385,7 @@ export async function generateOptimalProtonConfig(
     countries?: string;
     freeOnly?: boolean;
     autoPing?: boolean;
+    speedTest?: boolean;
   }
 ): Promise<{
   success: boolean;
@@ -394,6 +396,10 @@ export async function generateOptimalProtonConfig(
   load?: number;
   score?: number;
   pingMs?: number;
+  downloadMbps?: number;
+  uploadMbps?: number;
+  speedTested?: number;
+  speedSucceeded?: number;
   endpoint?: string;
   confFile?: string;
   error?: string;
@@ -411,11 +417,14 @@ export async function generateOptimalProtonConfig(
     outputFile,
     '-json',
     '-ipv6',
+    '-exclude-countries',
+    'BR',
   ];
 
   if (options.autoPing !== false) {
     args.push('-auto-ping');
   }
+  if (options.speedTest) args.push('-speed-test');
 
   // Usuários com plano pago (Plus, Unlimited, Family) acessam todos os servidores de qualquer país
   if (options.freeOnly === true) {
@@ -432,13 +441,21 @@ export async function generateOptimalProtonConfig(
     autoPing: options.autoPing !== false,
   });
 
-  const res = await runConfgen({ args, timeoutMs: 35000 });
+  // Older WireSock filters may include the normal helper. A uniquely named
+  // copy outside Discord directories also avoids nesting with those profiles.
+  const res = options.speedTest
+    ? await runIsolatedSpeedSelection(args)
+    : await runConfgen({ args, timeoutMs: 60000 });
 
   if (res.json && res.json.success) {
     logger.info('proton', 'servidor ótimo selecionado com sucesso', {
       server: res.json.server,
       ping: res.json.pingMs,
       load: res.json.load,
+      downloadMbps: res.json.downloadMbps,
+      uploadMbps: res.json.uploadMbps,
+      speedTested: res.json.speedTested,
+      speedSucceeded: res.json.speedSucceeded,
     });
     return {
       success: true,
@@ -449,6 +466,10 @@ export async function generateOptimalProtonConfig(
       load: res.json.load,
       score: res.json.score,
       pingMs: res.json.pingMs,
+      downloadMbps: res.json.downloadMbps,
+      uploadMbps: res.json.uploadMbps,
+      speedTested: res.json.speedTested,
+      speedSucceeded: res.json.speedSucceeded,
       endpoint: res.json.endpoint,
       confFile: outputFile,
     };
@@ -457,4 +478,26 @@ export async function generateOptimalProtonConfig(
   const errMsg = res.json?.error || res.stderr || res.stdout || 'Falha ao selecionar e gerar configuração ProtonVPN.';
   logger.error('proton', 'erro ao gerar configuração ótima', { codigo_saida: res.code, resposta_json: Boolean(res.json) });
   return { success: false, error: errMsg };
+}
+
+async function runIsolatedSpeedSelection(args: string[]) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-speed-'));
+  const exePath = path.join(tempDir, process.platform === 'win32' ? 'golive-speed-probe.exe' : 'golive-speed-probe');
+  try {
+    fs.copyFileSync(findProtonConfgenExe(), exePath);
+    if (process.platform !== 'win32') fs.chmodSync(exePath, 0o700);
+    return await runConfgen({ args, exePath, timeoutMs: 150000 });
+  } finally {
+    // Windows may need a moment to release the executable after timeout/exit.
+    await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 12, retryDelay: 200 });
+  }
+}
+
+export function matchesMeasuredProfile(installDir: string, server: string, endpoint: string): boolean {
+  if (!server || !endpoint) return false;
+  try {
+    const content = fs.readFileSync(path.join(installDir, 'wireguard.conf'), 'utf8');
+    return content.split(/\r?\n/).includes(`# - Name: ${server}`) &&
+      content.split(/\r?\n/).some(line => line.trim() === `Endpoint = ${endpoint}`);
+  } catch { return false; }
 }

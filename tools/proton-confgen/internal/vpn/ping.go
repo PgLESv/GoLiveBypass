@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"math"
 	"net"
 	"os/exec"
 	"regexp"
@@ -21,22 +22,28 @@ var (
 
 // ProbePing measures round-trip time (RTT) to an IP address in milliseconds.
 func ProbePing(ip string, timeout time.Duration) int {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return probePingContext(ctx, ip)
+}
+
+func probePingContext(ctx context.Context, ip string) int {
 	if ip == "" {
 		return 999
 	}
 
 	// 1. Try system ICMP ping
-	if ms, err := systemPing(ip, timeout); err == nil && ms > 0 {
+	if ms, err := systemPingContext(ctx, ip); err == nil && ms > 0 {
 		return ms
 	}
 
 	// 2. Fallback: TCP probe to port 443 or 80
 	for _, port := range []string{"443", "80"} {
 		start := time.Now()
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 		if err == nil {
 			_ = conn.Close()
-			return int(time.Since(start).Milliseconds())
+			return max(1, int(time.Since(start).Milliseconds()))
 		}
 	}
 
@@ -46,13 +53,19 @@ func ProbePing(ip string, timeout time.Duration) int {
 func systemPing(ip string, timeout time.Duration) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return systemPingContext(ctx, ip)
+}
 
+func systemPingContext(ctx context.Context, ip string) (int, error) {
+	// Reserve time for TCP fallback when ICMP is filtered.
+	icmpCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
+	defer cancel()
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "ping", "-n", "1", "-w", strconv.Itoa(int(timeout.Milliseconds())), ip)
+		cmd = exec.CommandContext(icmpCtx, "ping", "-n", "1", "-w", "600", ip)
 	} else {
 		// Linux / macOS: 1 packet, 1s deadline
-		cmd = exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", ip)
+		cmd = exec.CommandContext(icmpCtx, "ping", "-c", "1", "-W", "1", ip)
 	}
 
 	out, err := cmd.CombinedOutput()
@@ -75,7 +88,7 @@ func systemPing(ip string, timeout time.Duration) (int, error) {
 		matches := pingLinuxRegex.FindStringSubmatch(text)
 		if len(matches) > 1 {
 			if val, err := strconv.ParseFloat(matches[1], 64); err == nil {
-				return int(val + 0.5), nil
+				return max(1, int(math.Round(val))), nil
 			}
 		}
 	}
@@ -83,39 +96,60 @@ func systemPing(ip string, timeout time.Duration) (int, error) {
 	return 0, nil
 }
 
-// ProbeCandidatesPing measures ping for up to maxCandidates servers concurrently.
+// ProbeCandidatesPing covers the regional candidates with bounded concurrency
+// and a shared deadline. Shared entry IPs are measured once, avoiding duplicate
+// probes to the same physical machine. Missing/failed probes are not winners.
 func ProbeCandidatesPing(servers []api.LogicalServer, maxCandidates int) map[string]int {
-	if maxCandidates > len(servers) {
-		maxCandidates = len(servers)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+	defer cancel()
+	return probeCandidates(ctx, servers[:max(0, min(maxCandidates, len(servers)))], probePingContext)
+}
 
-	results := make(map[string]int, maxCandidates)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	sem := make(chan struct{}, 6) // Max 6 parallel pings
-
-	for i := 0; i < maxCandidates; i++ {
-		server := servers[i]
-		phys := GetBestPhysicalServer(&server)
+func probeCandidates(ctx context.Context, servers []api.LogicalServer, probe func(context.Context, string) int) map[string]int {
+	byIP := make(map[string][]string)
+	var ips []string
+	for _, srv := range servers {
+		phys := GetBestPhysicalServer(&srv)
 		if phys == nil || phys.EntryIP == "" {
 			continue
 		}
-
-		wg.Add(1)
-		go func(srvName, ip string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			ms := ProbePing(ip, 1200*time.Millisecond)
-
-			mu.Lock()
-			results[srvName] = ms
-			mu.Unlock()
-		}(server.Name, phys.EntryIP)
+		if _, exists := byIP[phys.EntryIP]; !exists {
+			ips = append(ips, phys.EntryIP)
+		}
+		byIP[phys.EntryIP] = append(byIP[phys.EntryIP], srv.Name)
 	}
-
+	results := make(map[string]int)
+	jobs := make(chan string)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for range min(32, len(ips)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				probeCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+				ms := probe(probeCtx, ip)
+				cancel()
+				mu.Lock()
+				for _, name := range byIP[ip] {
+					results[name] = ms
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+send:
+	for _, ip := range ips {
+		select {
+		case jobs <- ip:
+		case <-ctx.Done():
+			break send
+		}
+	}
+	close(jobs)
 	wg.Wait()
 	return results
 }

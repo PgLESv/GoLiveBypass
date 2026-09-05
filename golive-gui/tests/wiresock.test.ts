@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { wireSockServiceScript } from "../electron/wiresock-service";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -25,7 +26,7 @@ describe("WireSock no Windows", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const fn = src.slice(src.indexOf("function windowsAllowedAppPaths"), src.indexOf("function logRouteProbe"));
     expect(fn).toContain("path.dirname(path.resolve(install.exePath))");
-    expect(fn).toContain("proton.findProtonConfgenExe()");
+    expect(fn).not.toContain("proton.findProtonConfgenExe()");
   });
 
   it("emite a extensao AllowedApps com o prefixo aceito pelo SDK 3.x", () => {
@@ -62,7 +63,7 @@ describe("WireSock no Windows", () => {
     expect(src).toContain("DNS\\s*=");
     expect(src).toContain("reset-network-lock");
     expect(src).toContain("ipconfig.exe /flushdns");
-    expect(src).toContain("-network-lock disabled");
+    expect(wireSockServiceScript("C:\\WireSock\\client.exe", "C:\\GoLive\\wg.conf")).toContain("-network-lock disabled");
   });
 
   it("encerra a arvore do cliente e aguarda o servico sair antes de confirmar a limpeza", () => {
@@ -85,8 +86,8 @@ describe("WireSock no Windows", () => {
     expect(src).toContain("servicesResidual: string[]");
     expect(src).toContain("processResidual: boolean");
     expect(src).toContain("export async function recoverWireSockNetwork");
-    expect(src).toContain("const network = await verifyWindowsNetworkStable();");
-    expect(src).toContain("ok: cleanup.stopped && network.ok");
+    expect(src).toContain("void verifyWindowsNetworkStable().then");
+    expect(src).toContain("ok: cleanup.stopped");
   });
 
   it("repete a sondagem para não liberar o Discord com DNS intermitente", () => {
@@ -97,7 +98,7 @@ describe("WireSock no Windows", () => {
     expect(src).toContain("const maxAttempts = Math.max(total, total * 3)");
     expect(src).toContain("if (consecutiveOk < total)");
     expect(src).toContain("ok: false");
-    expect(src).toContain("const network = await verifyWindowsNetworkStable();");
+    expect(src).toContain("void verifyWindowsNetworkStable().then");
   });
 
   it("falha fechado quando as amostras positivas não são consecutivas", async () => {
