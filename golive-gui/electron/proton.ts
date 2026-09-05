@@ -187,6 +187,9 @@ export async function runRouteProbe(timeoutMs = 10_000): Promise<RouteProbeResul
 
 export function classifyProtonError(error: unknown, stderr = '', stdout = ''): { code: ProtonLoginErrorCode; message: string; retryable: boolean } {
   const raw = `${error instanceof Error ? error.message : String(error)} ${stderr} ${stdout}`.toLowerCase();
+  if (/flag provided but not defined|unknown flag/.test(raw)) {
+    return { code: 'UNKNOWN', message: 'Erro nos parâmetros de inicialização do ProtonVPN. Atualize o aplicativo.', retryable: false };
+  }
   if (/captcha_invalid|captcha.*expired|human verification.*(invalid|expired)/.test(raw)) return { code: 'CAPTCHA_INVALID', message: 'A verificação de segurança expirou ou foi recusada. Abra um novo CAPTCHA e tente novamente.', retryable: true };
   if (/captcha_required|captcha verification required|human verification required|code 9001/.test(raw)) return { code: 'CAPTCHA_REQUIRED', message: 'O Proton solicitou uma verificação de segurança. Abra o CAPTCHA e tente novamente.', retryable: true };
   if (/2fa_required|two.?factor|required.*2fa/.test(raw)) return { code: 'TWO_FACTOR_REQUIRED', message: 'Esta conta exige autenticação em duas etapas.', retryable: false };
@@ -322,8 +325,8 @@ export async function loginProton(
   twoFactorCode?: string,
   humanVerificationToken?: string
 ): Promise<ProtonLoginResult> {
-  ensureInstallDir(installDir);
-  const args = ['-login', '-user', username, '-install-dir', installDir, '-json'];
+  const sessionFile = getProtonSessionFile(installDir);
+  const args = ['-login', '-user', username, '-install-dir', installDir, '-session-file', sessionFile, '-json'];
   if (password) args.push('-pass', password);
   if (twoFactorCode) args.push('-2fa', twoFactorCode);
   if (humanVerificationToken) args.push('-hv-token', humanVerificationToken);

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,6 +21,11 @@ func Parse() (*Config, error) {
 	var countriesFlag string
 	var dnsServersFlag string
 	var allowedIPsFlag string
+	var userAlias string
+	var passAlias string
+	var installDir string
+	var loginAlias bool
+	var sessionCheckAlias bool
 
 	// Set default DNS and allowed IPs based on IPv6 support
 	defaultDNS := constants.DefaultDNSIPv4
@@ -27,7 +33,9 @@ func Parse() (*Config, error) {
 
 	// Authentication flags
 	flag.StringVar(&cfg.Username, "username", "", "ProtonVPN username")
+	flag.StringVar(&userAlias, "user", "", "Alias for -username")
 	flag.StringVar(&cfg.Password, "password", "", "ProtonVPN password (will prompt if not provided)")
+	flag.StringVar(&passAlias, "pass", "", "Alias for -password")
 
 	// Server selection flags
 	flag.StringVar(&countriesFlag, "countries", "", "Comma-separated list of country codes (e.g., US,NL,CH)")
@@ -79,12 +87,31 @@ func Parse() (*Config, error) {
 	// Automated GUI & Ping extensions
 	flag.StringVar(&cfg.TwoFactorCode, "2fa", "", "2FA TOTP code for non-interactive authentication")
 	flag.StringVar(&cfg.SessionFile, "session-file", "", "Custom path for session cache file")
+	flag.StringVar(&installDir, "install-dir", "", "Custom install directory containing proton-session.json")
 	flag.BoolVar(&cfg.AutoPing, "auto-ping", false, "Measure real-time server ping and select fastest server")
 	flag.BoolVar(&cfg.JSONOutput, "json", false, "Output results in JSON format")
 	flag.BoolVar(&cfg.CheckSession, "check-session", false, "Check if cached session is valid and exit")
+	flag.BoolVar(&sessionCheckAlias, "session-check", false, "Alias for -check-session")
 	flag.BoolVar(&cfg.LoginOnly, "login-only", false, "Authenticate, save session, and exit")
+	flag.BoolVar(&loginAlias, "login", false, "Alias for -login-only")
 
 	flag.Parse()
+
+	if cfg.Username == "" && userAlias != "" {
+		cfg.Username = userAlias
+	}
+	if cfg.Password == "" && passAlias != "" {
+		cfg.Password = passAlias
+	}
+	if !cfg.LoginOnly && loginAlias {
+		cfg.LoginOnly = true
+	}
+	if !cfg.CheckSession && sessionCheckAlias {
+		cfg.CheckSession = true
+	}
+	if cfg.SessionFile == "" && installDir != "" {
+		cfg.SessionFile = filepath.Join(installDir, "proton-session.json")
+	}
 
 	// Session certificates max out at 7 days, so fall back to that instead of
 	// the 365d persistent default when -duration was not given explicitly.
