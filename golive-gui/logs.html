@@ -19,22 +19,13 @@
     <div class="logs-shell">
       <header class="logs-header">
         <h1>Diagnóstico</h1>
-        <p class="logs-sub">Logs ao vivo e relato de bug</p>
+        <p class="logs-sub">Logs ao vivo e diagnóstico</p>
       </header>
 
       <div class="dev-toolbar">
-        <button type="button" class="dev-btn" id="reportBugBtn">Reportar bug</button>
         <button type="button" class="dev-btn" id="copyDiagBtn">Copiar diagnóstico</button>
         <button type="button" class="dev-btn" id="openLogFolderBtn">Pasta de logs</button>
       </div>
-
-      <label class="dev-note-label" for="bugNoteInput">O que aconteceu? (vai na issue)</label>
-      <textarea
-        id="bugNoteInput"
-        class="dev-note"
-        rows="2"
-        placeholder="Ex.: câmera ok, Go Live carrega e dá 2012; região da call Brazil; modo Tor."
-      ></textarea>
 
       <div class="log-console" id="logConsole" aria-live="polite"></div>
       <small class="dev-hint" id="devHint">Logs ao vivo de golivebypass.log</small>

@@ -38,7 +38,7 @@ make_fake_checkout_with_plugin() {
   "version": "$version",
   "updater": {
     "type": "github",
-    "id": "bezumiya/GoLiveBypass",
+    "id": "PgLESv/GoLiveBypass",
     "assetName": "goLiveBypass-vencord.zip"
   }
 }
@@ -57,8 +57,8 @@ extract_update_functions() {
     ' "$REPO/installer/golivebypass-installer.sh"
     # backup_plugin() usa PLUGIN_DIR_NAME (constante global) que nao esta no harness.
     printf "PLUGIN_DIR_NAME=\"goLiveBypass\"\n"
-    printf "GITHUB_REPO=\"bezumiya/GoLiveBypass\"\n"
-    printf "GITHUB_API=\"https://api.github.com/repos/bezumiya/GoLiveBypass\"\n"
+    printf "GITHUB_REPO=\"PgLESv/GoLiveBypass\"\n"
+    printf "GITHUB_API=\"https://api.github.com/repos/PgLESv/GoLiveBypass\"\n"
     printf "GITHUB_UA=\"GoLiveBypass-Installer\"\n"
 }
 

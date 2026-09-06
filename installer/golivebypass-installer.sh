@@ -57,7 +57,7 @@ unset -f _local_probe 2>/dev/null || true
 
 
 
-REPO_RAW="https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main"
+REPO_RAW="https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main"
 PLUGIN_FILES="goLiveBypass/index.tsx goLiveBypass/native.ts goLiveBypass/stability.ts goLiveBypass/manifest.json"
 PLUGIN_DIR_NAME="goLiveBypass"
 EQUICORD_GIT="https://github.com/Equicord/Equicord"
@@ -88,72 +88,15 @@ fi
 step() { printf '  %s[*] %s%s\n' "$C_DIM" "$1" "$C_OFF" >&2; }
 ok()   { printf '  %s[OK] %s%s\n' "$C_GREEN" "$1" "$C_OFF" >&2; }
 warn() { printf '  %s[!] %s%s\n' "$C_YELLOW" "$1" "$C_OFF" >&2; }
-# should_report <mensagem>: 0 se a mensagem deve virar issue no GitHub, 1 se nao.
-# Tudo o que e "erro de uso" (dependencia faltando, CLI digitada errada, path
-# errado, ferramenta externa quebrada) cai aqui — NAO e bug do projeto. O resto
-# (bug real do instalador/bypass/patcher) continua abrindo issue como antes.
-should_report() {
-    case "$1" in
-        # --- cancelamento e instrucoes de uso ---
-        "Cancelado.") return 1 ;;
-        # Cancelamento via Ctrl+C: bash imprime "^C" mas o erro que captura o
-        # catch do sh vem do comando interrompido ("interrompido", "terminated"
-        # ou "canceled" dependendo do shell).
-        *"cancelada pelo usu"*) return 1 ;;
-        *"canceled by the user"*) return 1 ;;
-        *"interrompido"*) return 1 ;;
-        *"terminated"*) return 1 ;;
-        "O Discord nao fechou"*) return 1 ;;
-        # Argumento vazio/ilegal passado pro instalador (input ruim do usuario, nao bug):
-        # ver notas no installer.ps1.
-        *"cadeia de caracteres vazia"*) return 1 ;;
-        *"empty string"*) return 1 ;;
-        *"Illegal characters in path"*) return 1 ;;
-        *"associar"*"metro"*) return 1 ;;
-        *"porque ele "*" nulo"*) return 1 ;;
-        *"because it is null"*) return 1 ;;
-        *"Nao e possivel associar"*) return 1 ;;
-        *"Cannot bind argument"*) return 1 ;;
-        # --- input / uso do usuario ---
-        "Opcao desconhecida: "*) return 1 ;;
-        "Formato invalido. Use socks5://"*) return 1 ;;
-        "Endereco da proxy invalido"*) return 1 ;;
-        "Nao consegui baixar "*) return 1 ;;
-        # --- dependencia faltando (ambiente) ---
-        "Instale "*) return 1 ;;
-        "O npm nao conseguiu instalar o pnpm"*) return 1 ;;
-        "Nao consegui deixar o pnpm funcionando"*) return 1 ;;
-        # --- path / checkout errado ---
-        "Nao encontrei o checkout do Equicord/Vencord"*) return 1 ;;
-        "Nao achei "*) return 1 ;;
-        *"ja existe e nao parece um checkout"*) return 1 ;;
-        "Nao achei o patcher "*) return 1 ;;
-        "Nao achei nenhum Discord instalado"*) return 1 ;;
-        # --- ferramenta externa (ambiente) ---
-        "git clone falhou") return 1 ;;
-        "pnpm install falhou") return 1 ;;
-        "pnpm build falhou") return 1 ;;
-        "pnpm inject falhou") return 1 ;;
-        # --- desinstalacao / elevacao parcial ---
-        "Nao consegui desinstalar de todos"*) return 1 ;;
-        "NADA foi injetado"*) return 1 ;;
-        # default: e bug, reporta
-        *) return 0 ;;
-    esac
-}
-
 fail() {
     printf '\n  %s[X] %s%s\n\n' "$C_RED" "$1" "$C_OFF" >&2
-    if [ "${REPORT_NO_AUTO:-0}" -eq 0 ] && should_report "$1"; then
-        report_error "Falha no instalador GoLiveBypass: $1" 2>&1 || true
-    fi
     exit 1
 }
 
 banner() {
     printf '\n  %sGoLiveBypass%s\n' "$C_CYAN$C_BOLD" "$C_OFF"
     printf '  %sGo Live e camera de volta no Discord%s\n' "$C_DIM" "$C_OFF"
-    printf '  %shttps://github.com/bezumiya/GoLiveBypass%s\n\n' "$C_DIM" "$C_OFF"
+    printf '  %shttps://github.com/PgLESv/GoLiveBypass%s\n\n' "$C_DIM" "$C_OFF"
 }
 
 confirm() {
@@ -166,81 +109,6 @@ confirm() {
         *) return 1 ;;
     esac
 }
-
-# =========================================================================== Report de bugs
-# Quando o instalador falha, monta um diagnostico (versao, OS, log sanitizado) e chama
-# a mesma API de bugs da GUI. A issue abre automaticamente no bezumiya/GoLiveBypass.
-# O envio NUNCA bloqueia o fluxo.
-
-BUG_API_URL="https://api.skyplaceia.com/bugs/v1/reports"
-BUG_API_TOKEN="c3d0bff691ecc3ddc6f6ca10037b9ac967c62547e681d3749204e50800504511"
-
-report_sanitize() {
-    local texto="$1"
-    texto="$(printf '%s' "$texto" | sed -E 's#([a-z][a-z0-9+.-]*://)([^/ @:]+):([^/@]+)@#\1\2:***@#g')"
-    texto="$(printf '%s' "$texto" | sed -E 's/\b(mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,})\b/***/g')"
-    texto="$(printf '%s' "$texto" | sed -E 's#(https://gateway[^ ?]+)\?[^ ]*#\1?<params>#g')"
-    printf '%s' "$texto"
-}
-
-report_send() {
-    local titulo="$1" descricao="$2" corpo json
-
-    # Dedupe: o mesmo erro NAO reabre issue (os reports duplos da 1.1.11 vieram
-    # daqui — cada rodada do mesmo bug abria issue nova). Este script nao tem
-    # INSTALL_DIR (era da versao antiga da GUI), entao o estado mora no XDG cache;
-    # assinatura = titulo, com epoch, janela de 48h.
-    local sig state ultimo data
-    sig="$(printf '%s' "$titulo" | sha256sum 2>/dev/null | cut -c1-16)"
-    state="${XDG_CACHE_HOME:-$HOME/.cache}/golivebypass-last-report"
-    if [ -n "$sig" ] && [ -f "$state" ]; then
-        ultimo=""; data=0
-        read -r ultimo data < "$state" 2>/dev/null || true
-        case "$data" in ''|*[!0-9]*) data=0 ;; esac
-        if [ "$ultimo" = "$sig" ] && [ $(( $(date +%s) - data )) -lt 172800 ]; then
-            printf '  %s[i]%s Esse erro ja foi reportado a menos de 48h — nao vou reabrir a issue.\n' "$C_DIM" "$C_OFF" >&2
-            return 0
-        fi
-    fi
-    if [ -n "$sig" ]; then
-        mkdir -p "$(dirname "$state")" 2>/dev/null || true
-        printf '%s %s\n' "$sig" "$(date +%s)" > "$state" 2>/dev/null || true
-    fi
-
-    corpo="$(report_sanitize "$descricao")"
-    json="$(printf '{"title":"%s","description":"%s","includeLogs":true}' \
-        "$(printf '%s' "$titulo" | sed 's/"/\\"/g')" \
-        "$(printf '%s' "$corpo" | sed 's/"/\\"/g')")"
-    if have curl; then
-        curl -fsS -X POST "$BUG_API_URL" -H "Authorization: Bearer $BUG_API_TOKEN" -H "Content-Type: application/json" -d "$json" >/dev/null 2>&1 && return 0
-    elif have wget; then
-        echo "$json" | wget -qO- --post-data=- --header="Authorization: Bearer $BUG_API_TOKEN" --header="Content-Type: application/json" "$BUG_API_URL" >/dev/null 2>&1 && return 0
-    fi
-    return 1
-}
-
-report_error() {
-    local titulo="$1" desc=""
-    # INSTALL_DIR nao eh setado neste script (era de uma versao antiga da GUI). O log
-    # do bypass fica em ${XDG_DATA_HOME:-$HOME/.local/share}/GoLiveBypass/golivebypass.log,
-    # o mesmo que a GUI e o standalone usam. Fallback para o path do log se existir.
-    local logdir="${XDG_DATA_HOME:-$HOME/.local/share}/GoLiveBypass"
-    if [ -f "$logdir/golivebypass.log" ]; then
-        desc="$(tail -n 40 "$logdir/golivebypass.log" 2>/dev/null || true)"
-    fi
-    if [ -n "$desc" ]; then
-        printf '  %s[!]%s Ocorreu um erro. Enviando relatorio automatico (issue no GitHub)...%s\n' "$C_YELLOW" "$C_OFF" "$C_OFF" >&2
-        if report_send "$titulo" "$desc"; then
-            printf '  %s[OK]%s Relatorio enviado. Obrigado — os devs vao ver a issue no GitHub.%s\n' "$C_GREEN" "$C_OFF" "$C_OFF" >&2
-        else
-            printf '  %s[!]%s Nao consegui enviar o relatorio automatico. Mande esta saida.%s\n' "$C_YELLOW" "$C_OFF" "$C_OFF" >&2
-        fi
-    else
-        printf '  %s[!]%s Nao consegui montar o relatorio (sem logs). Mande o erro acima.%s\n' "$C_YELLOW" "$C_OFF" "$C_OFF" >&2
-    fi
-}
-
-# =========================================================================== /Report de bugs
 
 # =========================================================================== TUI
 # Interface no estilo OpenCode: dark, caixas, setas/Enter, mouse SGR onde o terminal
@@ -2104,7 +1972,7 @@ wait_discord_exit() {
 #   3. backup + rollback - restaura versao anterior se a nova quebrar
 # -----------------------------------------------------------------------------
 
-GITHUB_REPO="bezumiya/GoLiveBypass"
+GITHUB_REPO="PgLESv/GoLiveBypass"
 # API publica do GitHub: 60 req/h por IP, ok para uso interativo. User-Agent
 # obrigatorio pela RFC 7231; sem ele o GitHub responde 403.
 GITHUB_API="https://api.github.com/repos/$GITHUB_REPO"

@@ -130,7 +130,7 @@ CLEANUP_LEGACY=0
 ASSUME_YES=0
 JSON=0
 
-STANDALONE_REPO_API="https://api.github.com/repos/bezumiya/GoLiveBypass/releases/latest"
+STANDALONE_REPO_API="https://api.github.com/repos/PgLESv/GoLiveBypass/releases/latest"
 
 standalone_release() {
     local json tag_raw tag payload
@@ -203,7 +203,7 @@ standalone_update() {
     step "Baixando standalone v$latest"
     # Script e payload sempre vem da MESMA tag da release: buscar o script em
     # main misturaria uma versao do script com um payload de outra release.
-    local script_url="https://raw.githubusercontent.com/bezumiya/GoLiveBypass/$tag_ref/standalone/golivebypass-standalone.sh"
+    local script_url="https://raw.githubusercontent.com/PgLESv/GoLiveBypass/$tag_ref/standalone/golivebypass-standalone.sh"
     if have curl; then curl -fsSL "$script_url" -o "$tmp" || { rm -f "$tmp"; fail 'download do standalone falhou'; }
     else wget -qO "$tmp" "$script_url" || { rm -f "$tmp"; fail 'download do standalone falhou'; }
     fi
@@ -229,165 +229,10 @@ C_OFF=$(printf '\033[0m'); C_CYAN=$(printf '\033[36m'); C_GREEN=$(printf '\033[3
 step() { printf '  %s[*]%s %s\n' "$C_CYAN" "$C_OFF" "$1" >&2; }
 ok()   { printf '  %s[OK]%s %s\n' "$C_GREEN" "$C_OFF" "$1" >&2; }
 warn() { printf '  %s[!]%s %s\n' "$C_YELLOW" "$C_OFF" "$1" >&2; }
-# should_report <mensagem>: 0 se a mensagem deve virar issue no GitHub, 1 se nao.
-# Mesmo do instalador de plugin: erros de uso (dependencia, CLI typo, path
-# errado, ferramenta externa quebrada) nao viram issue. Bug real continua.
-should_report() {
-    case "$1" in
-        # --- cancelamento e instrucoes de uso ---
-        "Cancelado.") return 1 ;;
-        # Cancelamento via Ctrl+C: ver nota no installer.sh.
-        *"cancelada pelo usu"*) return 1 ;;
-        *"canceled by the user"*) return 1 ;;
-        *"interrompido"*) return 1 ;;
-        *"terminated"*) return 1 ;;
-        "O Discord nao fechou"*) return 1 ;;
-        # Argumento vazio/ilegal passado pro instalador (input ruim do usuario, nao bug):
-        # ver notas no installer.ps1.
-        *"cadeia de caracteres vazia"*) return 1 ;;
-        *"empty string"*) return 1 ;;
-        *"Illegal characters in path"*) return 1 ;;
-        *"associar"*"metro"*) return 1 ;;
-        *"porque ele "*" nulo"*) return 1 ;;
-        *"because it is null"*) return 1 ;;
-        *"Nao e possivel associar"*) return 1 ;;
-        *"Cannot bind argument"*) return 1 ;;
-        # --- input / uso do usuario ---
-        "Opcao desconhecida: "*) return 1 ;;
-        "Formato invalido. Use socks5://"*) return 1 ;;
-        "Endereco da proxy invalido"*) return 1 ;;
-        "Nao consegui baixar "*) return 1 ;;
-        # --- dependencia faltando (ambiente) ---
-        "Instale "*) return 1 ;;
-        "O npm nao conseguiu instalar o pnpm"*) return 1 ;;
-        "Nao consegui deixar o pnpm funcionando"*) return 1 ;;
-        # --- path / checkout errado ---
-        "Nao encontrei o checkout do Equicord/Vencord"*) return 1 ;;
-        "Nao achei "*) return 1 ;;
-        *"ja existe e nao parece um checkout"*) return 1 ;;
-        "Nao achei o patcher "*) return 1 ;;
-        "Nao achei nenhum Discord instalado"*) return 1 ;;
-        # --- ferramenta externa (ambiente) ---
-        "git clone falhou") return 1 ;;
-        "pnpm install falhou") return 1 ;;
-        "pnpm build falhou") return 1 ;;
-        "pnpm inject falhou") return 1 ;;
-        # --- desinstalacao / elevacao parcial ---
-        "Nao consegui desinstalar de todos"*) return 1 ;;
-        "NADA foi injetado"*) return 1 ;;
-        # default: e bug, reporta
-        *) return 0 ;;
-    esac
-}
-
 fail() {
     printf '  %s[X]%s %s\n' "$C_RED" "$C_OFF" "$1" >&2
-    # Report automatico: so quando esta de fato falhando (e nao em --yes de teste).
-    if [ "${REPORT_NO_AUTO:-0}" -eq 0 ] && should_report "$1"; then
-        report_error "Falha no instalador GoLiveBypass: $1" 2>&1 || true
-    fi
     exit 1
 }
-
-# =========================================================================== Report de bugs
-# Quando o instalador falha, monta um diagnostico (versao, OS, log sanitizado) e chama
-# a mesma API de bugs da GUI. A issue abre automaticamente no bezumiya/GoLiveBypass.
-# O envio NUNCA bloqueia o fluxo: falhou o report, avisa e segue.
-
-BUG_API_URL="https://api.skyplaceia.com/bugs/v1/reports"
-BUG_API_TOKEN="c3d0bff691ecc3ddc6f6ca10037b9ac967c62547e681d3749204e50800504511"
-
-# Sanitiza texto: credenciais em URL, tokens Discord, query de gateway, e a proxy salva.
-report_sanitize() {
-    local texto="$1"
-    # credenciais em URL: scheme://usuario:senha@host -> scheme://usuario:***@host
-    texto="$(printf '%s' "$texto" | sed -E 's#([a-z][a-z0-9+.-]*://)([^/ @:]+):([^/@]+)@#\1\2:***@#g')"
-    # tokens Discord (mfa.* / JWT)
-    texto="$(printf '%s' "$texto" | sed -E 's/\b(mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,})\b/***/g')"
-    # query de gateway: so o host interessa
-    texto="$(printf '%s' "$texto" | sed -E 's#(https://gateway[^ ?]+)\?[^ ]*#\1?<params>#g')"
-    # Identidade local: e-mails e a pasta pessoal podem aparecer em erros de sistema/logs.
-    texto="$(printf '%s' "$texto" | sed -E 's/[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}/<email>/g')"
-    texto="$(printf '%s' "$texto" | sed -E 's#/(home|var/home|Users)/[^/[:space:]]+#/\1/<usuario>#g')"
-    texto="$(printf '%s' "$texto" | sed -E 's/(nome|name|usuario|username|user)[[:space:]]*([:=])[[:space:]]*[^[:space:],;]+/\1\2<usuario>/g')"
-    # proxy personalizada salva (host/porta e URL inteira)
-    if [ -f "$INSTALL_DIR/settings.json" ]; then
-        local segredo
-        segredo="$(sed -n 's/.*"proxy"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$INSTALL_DIR/settings.json" | head -1)"
-        if [ -n "$segredo" ]; then
-            texto="$(printf '%s' "$texto" | sed "s#$(printf '%s' "$segredo" | sed 's/[&/\]/\\&/g')#<proxy-pessoal>#g")"
-        fi
-    fi
-    printf '%s' "$texto"
-}
-
-# Envia o report para a API. Devolve 0 em caso de sucesso (issue aberta).
-report_send() {
-    local titulo="$1" descricao="$2"
-
-    # Dedupe: o mesmo erro NAO reabre issue (os reports duplos da 1.1.11 vieram
-    # daqui — cada rodada do mesmo bug abria issue nova). Assinatura = titulo,
-    # guardada com epoch em INSTALL_DIR/.last-report; janela de 48h.
-    local sig state ultimo data
-    sig="$(printf '%s' "$titulo" | sha256sum 2>/dev/null | cut -c1-16)"
-    state="$INSTALL_DIR/.last-report"
-    if [ -n "$sig" ] && [ -f "$state" ]; then
-        ultimo=""; data=0
-        read -r ultimo data < "$state" 2>/dev/null || true
-        case "$data" in ''|*[!0-9]*) data=0 ;; esac
-        if [ "$ultimo" = "$sig" ] && [ $(( $(date +%s) - data )) -lt 172800 ]; then
-            printf '  %s[i]%s Esse erro ja foi reportado a menos de 48h — nao vou reabrir a issue.\n' "$C_DIM" "$C_OFF" >&2
-            return 0
-        fi
-    fi
-    if [ -n "$sig" ]; then
-        mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-        printf '%s %s\n' "$sig" "$(date +%s)" > "$state" 2>/dev/null || true
-    fi
-
-    local corpo
-    corpo="$(report_sanitize "$descricao")"
-    # JSON minimo: title, description, includeLogs
-    local json
-    json="$(printf '{"title":"%s","description":"%s","includeLogs":true}' \
-        "$(printf '%s' "$titulo" | sed 's/"/\\"/g')" \
-        "$(printf '%s' "$corpo" | sed 's/"/\\"/g')")"
-    if have curl; then
-        curl -fsS -X POST "$BUG_API_URL" \
-            -H "Authorization: Bearer $BUG_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$json" >/dev/null 2>&1 && return 0
-    elif have wget; then
-        echo "$json" | wget -qO- --post-data=- --header="Authorization: Bearer $BUG_API_TOKEN" --header="Content-Type: application/json" "$BUG_API_URL" >/dev/null 2>&1 && return 0
-    fi
-    return 1
-}
-
-# Chamada unica de report: mostra aviso e tenta enviar (sem bloquear).
-report_error() {
-    local titulo="$1"
-    local desc="$(cat 2>/dev/null || true)"
-    if [ -s /tmp/glb-report-context.txt ]; then
-        desc="$(cat /tmp/glb-report-context.txt 2>/dev/null || true) $desc"
-    fi
-    # Aqui entra a cauda do log se existir
-    if [ -f "$INSTALL_DIR/golivebypass.log" ]; then
-        desc="$desc
-$(tail -n 40 "$INSTALL_DIR/golivebypass.log" 2>/dev/null || true)"
-    fi
-    if [ -n "$desc" ]; then
-        printf '  %s[!]%s Ocorreu um erro. Enviando relatorio automatico (issue no GitHub)...%s\n' "$C_YELLOW" "$C_OFF" "$C_OFF" >&2
-        if report_send "$titulo" "$desc"; then
-            printf '  %s[OK]%s Relatorio enviado. Obrigado — os devs vao ver a issue no GitHub.%s\n' "$C_GREEN" "$C_OFF" "$C_OFF" >&2
-        else
-            printf '  %s[!]%s Nao consegui enviar o relatorio automatico. Rode com --json e mande a saida.%s\n' "$C_YELLOW" "$C_OFF" "$C_OFF" >&2
-        fi
-    else
-        printf '  %s[!]%s Nao consegui montar o relatorio (sem logs). Mande o erro acima.%s\n' "$C_YELLOW" "$C_OFF" "$C_OFF" >&2
-    fi
-}
-
-# =========================================================================== /Report de bugs
 
 # =========================================================================== TUI (standalone)
 # Interface no estilo OpenCode (dark, caixas, setas/Enter), ANSI puro, POSIX.

@@ -3,6 +3,9 @@
   "description": "Devolve o Go Live e a câmera para contas brasileiras",
   "authors": [
     {
+      "name": "PgLESv"
+    },
+    {
       "name": "bezumiya",
       "id": "1366453661970071633"
     }
@@ -10,7 +13,7 @@
   "version": "1.1.12-beta.13",
   "updater": {
     "type": "github",
-    "id": "pdl-clay/GoLiveBypass",
+    "id": "PgLESv/GoLiveBypass",
     "assetName": "goLiveBypass-vencord.zip"
   }
 }

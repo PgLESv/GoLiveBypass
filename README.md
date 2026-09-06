@@ -5,6 +5,10 @@
   <a href="https://discord.gg/7cWbtr82rG"><img src="https://img.shields.io/badge/💬_Discord-Entrar_na_comunidade-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Entrar no Discord"></a>
 </p>
 
+> [!NOTE]
+> **Este repositório é um fork mantido por [PgLESv](https://github.com/PgLESv/GoLiveBypass)**, baseado no projeto original de [bezumiya/GoLiveBypass](https://github.com/bezumiya/GoLiveBypass).
+> O fork possui releases e melhorias independentes, acompanhando o upstream.
+
 Feito por um desenvolvedor brasileiro, o GoLiveBypass **devolve o Go Live e a câmera para usuários brasileiros** no Discord para computador. Na versão 2.0.0, a GUI cria um túnel WireGuard exclusivo para os processos do Discord, sem transformar a conexão inteira do computador em VPN.
 
 No Windows, o WireSock aplica o túnel via WFP somente a `Discord.exe` e `Update.exe`. No Linux, o Discord é iniciado dentro de um namespace de rede dedicado. Navegadores, jogos e os demais aplicativos continuam usando a rede normal. Os detalhes técnicos ficam [mais abaixo](#como-funciona-na-versão-200).
@@ -57,7 +61,7 @@ Criamos um aplicativo completo que faz todo o trabalho de forma **100% automáti
 O túnel cobre o processo do Discord inteiro — gateway, login, voz, vídeo e anexos — evitando a divergência de IP que motivou a migração. A mídia não é roteada por um proxy SOCKS separado.
 
 ### Como Baixar e Instalar
-1. Vá na **[última release](https://github.com/bezumiya/GoLiveBypass/releases/latest)** aqui no GitHub.
+1. Vá na **[última release](https://github.com/PgLESv/GoLiveBypass/releases/latest)** aqui no GitHub.
 2. Baixe o arquivo da sua plataforma, na lista no fim da página:
    - **Windows:** `GoLiveBypass-*.exe` (portátil, roda direto sem instalar)
    - **Linux:** `GoLiveBypass-*.AppImage`
@@ -89,7 +93,7 @@ A mesma interface gráfica do Windows, **agora para Linux**, empacotada como **A
 Assim como a versão Windows, ela é **portátil** e usa o namespace WireGuard diretamente. O standalone CLI continua separado e indisponível na 2.0.0.
 
 ### Como Baixar e Instalar
-1. Vá na **[última release](https://github.com/bezumiya/GoLiveBypass/releases/latest)**.
+1. Vá na **[última release](https://github.com/PgLESv/GoLiveBypass/releases/latest)**.
 2. Baixe o **`GoLiveBypass-*.AppImage`**.
 3. Dê permissão de execução e abra:
 
@@ -184,13 +188,13 @@ por **setas** (ou `j`/`k`), **Enter** para escolher, **Esc** para sair, e mouse.
 integrado do VS Code — todos suportam ANSI):
 
 ```powershell
-irm https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main/installer/GoLiveBypass-Installer.ps1 -OutFile $env:TEMP\glb.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\glb.ps1"
+irm https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/GoLiveBypass-Installer.ps1 -OutFile $env:TEMP\glb.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\glb.ps1"
 ```
 
 **Linux**, em qualquer shell (bash, zsh, fish, sh, dash, ksh):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main/installer/golivebypass-installer.sh -o /tmp/glb.sh && chmod +x /tmp/glb.sh && /tmp/glb.sh
+curl -fsSL https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/golivebypass-installer.sh -o /tmp/glb.sh && chmod +x /tmp/glb.sh && /tmp/glb.sh
 ```
 
 Os dois abrem a TUI completa. Se você já tem Equicord ou Vencord clonado em algum
@@ -205,13 +209,13 @@ diretamente. O instalador faz tudo sem perguntar nada:
 **Windows:**
 
 ```powershell
-irm https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main/installer/GoLiveBypass-Installer.ps1 -OutFile $env:TEMP\glb.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\glb.ps1" -Mode Install -Mod Vencord -Yes
+irm https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/GoLiveBypass-Installer.ps1 -OutFile $env:TEMP\glb.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\glb.ps1" -Mode Install -Mod Vencord -Yes
 ```
 
 **Linux:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main/installer/golivebypass-installer.sh -o /tmp/glb.sh && chmod +x /tmp/glb.sh && /tmp/glb.sh --install --mod vencord --yes
+curl -fsSL https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/golivebypass-installer.sh -o /tmp/glb.sh && chmod +x /tmp/glb.sh && /tmp/glb.sh --install --mod vencord --yes
 ```
 
 Para apontar para um checkout que você já tem clonado (em vez de baixar tudo):
@@ -248,7 +252,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\glb.ps1" -Source 
 **Linux:**
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main/installer/golivebypass-installer.sh
+curl -fsSLO https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/golivebypass-installer.sh
 chmod +x golivebypass-installer.sh
 ./golivebypass-installer.sh
 ```
@@ -275,7 +279,7 @@ Escolhendo instalar, ele pergunta três coisas: **onde** (usar o mod que já est
 **Pelo PowerShell:**
 
 ```powershell
-irm https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main/installer/GoLiveBypass-Installer.ps1 -OutFile GoLiveBypass-Installer.ps1
+irm https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/GoLiveBypass-Installer.ps1 -OutFile GoLiveBypass-Installer.ps1
 powershell -ExecutionPolicy Bypass -File .\GoLiveBypass-Installer.ps1
 ```
 
@@ -545,29 +549,12 @@ o servidor liberou video nesta sessao, gateway por socks5://...
 
 A linha que importa é `atribuicao do video guard: null`. **`null` significa que o servidor nem tentou te bloquear** — foi o que a proxy comprou. Se aparecer `variantId: 2`, o gateway subiu pelo seu IP real, e o plugin vai recarregar para tentar de novo.
 
-## Reportar um bug (GUI)
+## Suporte e Issues
 
-O app gráfico tem um botão **Reportar bug** no rodapé. Ele abre um diálogo onde você descreve o problema e envia um pacote de diagnóstico que vira uma issue no GitHub — sem precisar copiar logs na mão.
+Se você encontrar algum problema ou tiver sugestões, abra uma issue diretamente no repositório deste fork:
+👉 **[Issues no GitHub](https://github.com/PgLESv/GoLiveBypass/issues)**
 
-**O que é enviado:**
-- **Resumo e descrição** que você digita (até 200 e 8 KB).
-- **Logs da sessão** — cauda do `gui.log`, do `golivebypass.log` (do Discord injetado) e o ring buffer em memória — cortados para 256 KB, mantendo o fim (o mais recente importa mais).
-- **Metadados técnicos** — versão do app, plataforma, modo de roteamento (Tor/gratuitas/personalizado), status do bypass, se o Tor embutido está ativo e em qual porta, uptime.
-
-Depois do envio o app mostra o link da **issue criada** (ex.: `https://github.com/bezumiya/GoLiveBypass/issues/123`). Se preferir, abra direto em `https://github.com/bezumiya/GoLiveBypass/issues`.
-
-**Privacidade — o que NUNCA sai da sua máquina:**
-Sua proxy personalizada (`socks5://usuario:senha@host:porta`) é tratada como segredo. Antes de enviar, o app passa o pacote por três camadas:
-
-- **L1 — padrões conhecidos:** credenciais embutidas em URL (`usuario:***@host`), cabeçalhos `authorization`, tokens do Discord (`mfa.*`) e query string do gateway.
-- **L2 — segredos literais:** qualquer ocorrência exata de usuário, senha, `host:porta` e da URL inteira configurada em `settings.json` vira `<proxy-pessoal>` — mesmo fora de um padrão.
-- **L3 — varredura final:** se algum segredo sobreviveu, **nada é enviado** e o app avisa “proxy apareceu nos logs”. O token da API (`api.skyplaceia.com`) também sai por L2 e trava em L3 se ficar.
-
-Hosts do Discord (`gateway.discord.gg`) e do país de saída podem aparecer — são necessários para diagnosticar rota e latência. Senha e `host:porta` da sua proxy nunca.
-
-**Operação:** o botão chama `POST https://api.skyplaceia.com/bugs/v1/reports` com `Authorization: Bearer <token>` embutido no app (escopo: só criar issue, com rate limit). Rate limit: **1 issue/min por IP** — o 2º envio no mesmo minuto recebe `429` e bloqueia o IP por **300s** (`Retry-After` + `GET /v1/block-status` informam o tempo restante; a GUI mostra a mensagem de bloqueio com contagem regressiva). O corpo é limitado a 512 KB; o campo `log` é cortado em 256 KB. Logs locais nunca excedem 2 MB por arquivo nem 128 KB em memória.
-
-Sem GUI, compartilhe o arquivo de [O registro](#o-registro-o-que-o-plugin-anotou) manualmente numa issue.
+Para relatar um problema com precisão, copie o diagnóstico do app (clicando em **Ver logs → Copiar diagnóstico**) e anexe à sua issue. Suas credenciais e senhas privadas nunca são incluídas no diagnóstico.
 
 ---
 
@@ -739,8 +726,8 @@ Isso baixa tudo que o Equicord precisa para compilar (demora um pouco na primeir
 
 Duas formas de baixar este repositório:
 
-- **Pelo terminal** (estando fora da pasta Equicord): `git clone https://github.com/bezumiya/GoLiveBypass`
-- **Pelo navegador**: abra [github.com/bezumiya/GoLiveBypass](https://github.com/bezumiya/GoLiveBypass), clique no botão verde **Code → Download ZIP** e extraia o arquivo
+- **Pelo terminal** (estando fora da pasta Equicord): `git clone https://github.com/PgLESv/GoLiveBypass`
+- **Pelo navegador**: abra [github.com/PgLESv/GoLiveBypass](https://github.com/PgLESv/GoLiveBypass), clique no botão verde **Code → Download ZIP** e extraia o arquivo
 
 Depois copie a pasta **`goLiveBypass`** (a que contém `index.tsx`, `native.ts` e `stability.ts`) para dentro de:
 
@@ -804,7 +791,7 @@ pnpm install
 
 ### Passo 3 — Baixe o plugin e coloque na pasta certa
 
-1. Clone este repositório: `git clone https://github.com/bezumiya/GoLiveBypass`
+1. Clone este repositório: `git clone https://github.com/PgLESv/GoLiveBypass`
 2. Copie a pasta **`goLiveBypass`** (a que contém `index.tsx`, `native.ts` e `stability.ts`) para dentro de:
 
 ```
@@ -888,7 +875,13 @@ assets/
 
 GPL-3.0-or-later, mesma licença do Vencord/Equicord. Veja [LICENSE](LICENSE).
 
-## Autor
+## Mantenedor do Fork
+
+**PgLESv**
+
+- GitHub: [PgLESv/GoLiveBypass](https://github.com/PgLESv/GoLiveBypass)
+
+### Autor Original
 
 **bezumiya**
 
@@ -966,7 +959,8 @@ It was written after Brazil's data protection authority (ANPD) [ordered Discord 
 - Free proxies are ranked by the `alive` / `uptime` / `timeout` metadata the list already returns, port 4145 is dropped (measured 14/14 TLS interception), candidates race in batches of 12 and the first good one wins, and the test is a real TLS handshake through the tunnel against Cloudflare's trace (proving tunnel, valid certificate, real exit country and exit IP in one connection) followed by a reachability check against `gateway.discord.gg`. Up to 5 verified exits are kept for 24h in a pool. Measured: random pick with a handshake-only test works 12% of the time, ranked with a real TLS test works 60%.
 - It cannot leave you unable to open Discord: the fallback decision lives inside the local router, not in the PAC (no `PROXY;DIRECT` for Chromium to silently prefer), a per-connection 12s stall budget fails open to direct, reserve exits take over mid-session, and a system proxy policy that varies per host (corporate PAC) makes the plugin refuse to enable rather than trample it.
 - Install: copy the `goLiveBypass` folder into `src/userplugins/` of your Equicord or Vencord clone, then `pnpm install && pnpm build && pnpm inject`, fully restart Discord, and enable **GoLiveBypass** in plugin settings. On **Vesktop**, skip `pnpm inject` and point Vesktop's *Vencord Location* at your build's `dist` folder instead (see [Instalação no Vesktop](#instalação-no-vesktop)).
-- Made by **bezumiya** — [GitHub](https://github.com/bezumiya/GoLiveBypass), [Twitter](https://twitter.com/obezumiya), Discord `1366453661970071633`.
+- Fork maintained by **PgLESv** — [GitHub](https://github.com/PgLESv/GoLiveBypass).
+- Originally created by **bezumiya** — [GitHub](https://github.com/bezumiya/GoLiveBypass), [Twitter](https://twitter.com/obezumiya), Discord `1366453661970071633`.
 - Thanks to **[mazxxy](https://github.com/mazxxy)** for the idea that became the project's backbone: a local SOCKS5 with an embedded PAC routing only the gateway through the proxy ([#3](https://github.com/bezumiya/GoLiveBypass/pull/3), merged for authorship — the lines were later rewritten, but the design is his).
 - Thanks to **[mazxxy](https://github.com/mazxxy)** for the idea this project is built on: he was the first to notice that `session.setProxy` applies to the whole session, and proposed the design still in use — a local SOCKS5 with an embedded PAC routing **only the gateway** through the proxy. Thanks to **[Vithor](https://github.com/Vith0r)** for the installer: he wrote the first GoLiveBypass installer on his own and showed that the whole setup could be automated in a single script. Thanks to **[cleo-dev](https://github.com/cleo-dev)** for the graphical app, built from scratch. Thanks to **[Eduardo Vasconcelos](https://github.com/EduardoVasconceloss)** for the [StreamFix](https://github.com/EduardoVasconceloss/StreamFix) fork: his adversarial reviews found real bugs (verdict read too early, retry ceiling raced, system proxy policy trampled) and he ported the local SOCKS router into the plugin — fixes and improvements adopted here. Thanks to **[gabrigode](https://github.com/gabrigode)** for the Linux installer improvements: Flatpak support for system and user installs, including the sandbox filesystem override. Thanks to **[StellaThimoty](https://github.com/StellaThimoty)** for finding and testing the manual Vesktop path, and to **[pdl-clay](https://github.com/pdl-clay)** for turning it into the step-by-step guide in this README. Thanks to **[Victor Mello](https://github.com/victorsvart)** for the [GUI-MacOS](https://github.com/victorsvart/GoLiveBypass-GUI-MacOS) fork: He ported the GUI app to MacOS. Thanks to **[Claude](https://claude.com/claude-code)** for the hand on the code: much of this was written and debugged alongside it, mostly the bugs that only show up when you measure instead of read.
 - License: GPL-3.0-or-later.

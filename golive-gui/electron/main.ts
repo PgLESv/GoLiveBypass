@@ -21,7 +21,6 @@ import { setupUpdater, isQuittingForUpdate } from "./updater";
 import * as logger from "./logger";
 import * as discordscan from "./discordscan";
 import * as logsDir from "./logsDir";
-import { submitBugReport } from "./bugreport";
 import { getWireSockConnectionStatus, getWireSockAdapterTraffic, hasWireSockAdapterTrafficIncrease, isWireSockActive, startWireSockService, recoverWireSockNetwork, type WireSockConnectionStatus } from "./wiresock";
 import { classifyWgReadiness, getWgStats, iniciarWgStatsWatchdog, pararWgStatsWatchdog, type WgTunnelStats } from "./wgstats";
 import { validateWgConfContent } from "./wg-validator";
@@ -3510,184 +3509,9 @@ ipcMain.handle("get-diagnostic", async (_event, payload: unknown) => {
   return {
     text: await buildDiagnostic(status, note),
     logPath: logFilePath(),
-    apiConfigured: Boolean(readBugReportConfig()),
   };
 });
 
-function readBugReportConfig(): { baseUrl: string; token: string } | null {
-  // Prioridade: settings.json da pasta compartilhada, depois env do processo.
-  // Sem os dois, o botao cai no form do GitHub (sem segredo embutido no binario).
-  let url = (process.env.GOLIVE_BUG_API_URL || "").trim().replace(/\/$/, "");
-  let token = (process.env.GOLIVE_BUG_API_TOKEN || "").trim();
-  try {
-    const file = path.join(settingsDir(), "settings.json");
-    if (fs.existsSync(file)) {
-      const data = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (typeof data.bugReportApiUrl === "string" && data.bugReportApiUrl.trim()) {
-        url = data.bugReportApiUrl.trim().replace(/\/$/, "");
-      }
-      if (typeof data.bugReportToken === "string" && data.bugReportToken.trim()) {
-        token = data.bugReportToken.trim();
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-  if (!url || !token) return null;
-  return { baseUrl: url, token };
-}
-
-async function postBugReportToApi(
-  cfg: { baseUrl: string; token: string },
-  title: string,
-  description: string,
-  status: string,
-): Promise<{ ok: true; issueUrl: string; issueNumber?: number } | { ok: false; error: string }> {
-  const endpoint = `${cfg.baseUrl}/v1/reports`;
-  const wgTunel = !isMac && status === "ACTIVE" ? await wgStatsProvider() : undefined;
-  const body = {
-    title,
-    description,
-    log: maskSecrets(readLogTail(200_000)),
-    meta: {
-      app: "golive-gui",
-      version: app.getVersion(),
-      os: `${process.platform} ${process.arch}`,
-      electron: process.versions.electron ?? "",
-      status,
-      routeMode: readNetMode(),
-      // Mesmo raciocinio do submitBugReport: handshake velho/trafego parado com bypass ativo
-      // e o sinal mais direto de tunel morto ou saturado (ver electron/wgstats.ts).
-      wg_handshake_ha_s: wgTunel?.ok ? String(wgTunel.handshakeAgoS ?? "nunca") : "indisponivel",
-      wg_rx_kb: wgTunel?.ok && wgTunel.rxBytes !== null ? String(Math.round(wgTunel.rxBytes / 1024)) : "indisponivel",
-      wg_tx_kb: wgTunel?.ok && wgTunel.txBytes !== null ? String(Math.round(wgTunel.txBytes / 1024)) : "indisponivel",
-      wg_erro: !wgTunel?.ok ? (wgTunel?.error ?? "?") : "",
-    },
-  };
-
-  try {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${cfg.token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    let data: Record<string, unknown> = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      /* corpo nao-json */
-    }
-
-    if (!res.ok) {
-      const err =
-        typeof data.error === "string"
-          ? data.error
-          : `API respondeu ${res.status}`;
-      return { ok: false, error: err };
-    }
-
-    const issueUrl =
-      typeof data.issue_url === "string"
-        ? data.issue_url
-        : typeof data.html_url === "string"
-          ? data.html_url
-          : "";
-    if (!issueUrl) return { ok: false, error: "API nao devolveu issue_url" };
-    return {
-      ok: true,
-      issueUrl,
-      issueNumber: typeof data.issue_number === "number" ? data.issue_number : undefined,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-ipcMain.handle("open-bug-report", async (_event, payload: unknown) => {
-  const p = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
-  const status = typeof p.status === "string" ? p.status : "UNKNOWN";
-  const note =
-    typeof p.note === "string" && p.note.trim()
-      ? p.note.trim()
-      : "(descreva o que aconteceu, o que esperava, e se câmera / Go Live / região da call)";
-  const titleRaw =
-    typeof p.title === "string" && p.title.trim()
-      ? p.title.trim()
-      : `[GUI] problema com bypass (${status})`;
-  const title = titleRaw.slice(0, 180);
-
-  const fullBody = await buildDiagnostic(status, note);
-  clipboard.writeText(fullBody);
-
-  // 1) API (log completo, labels no servidor) — se configurada.
-  const apiCfg = readBugReportConfig();
-  if (apiCfg) {
-    const posted = await postBugReportToApi(apiCfg, title, note, status);
-    if (posted.ok) {
-      await shell.openExternal(posted.issueUrl);
-      return {
-        ok: true,
-        via: "api" as const,
-        url: posted.issueUrl,
-        issueNumber: posted.issueNumber,
-        copied: true,
-        truncated: false,
-      };
-    }
-    // Cai no form do GitHub, mas avisa o motivo no retorno.
-    const maxBody = 5500;
-    const bodyForUrl =
-      fullBody.length > maxBody
-        ? `${fullBody.slice(0, maxBody)}\n\n…(truncado — cole o diagnóstico do clipboard)\n\n_API falhou: ${posted.error}_`
-        : `${fullBody}\n\n_API falhou: ${posted.error}_`;
-    const params = new URLSearchParams({
-      title,
-      body: bodyForUrl,
-      labels: ISSUE_LABELS.join(","),
-    });
-    const url = `https://github.com/${ISSUE_REPO}/issues/new?${params.toString()}`;
-    await shell.openExternal(url);
-    return {
-      ok: true,
-      via: "github" as const,
-      url,
-      copied: true,
-      truncated: fullBody.length > maxBody,
-      apiError: posted.error,
-    };
-  }
-
-  // 2) Fallback: form do GitHub (sem token no app).
-  const maxBody = 5500;
-  const bodyForUrl =
-    fullBody.length > maxBody
-      ? `${fullBody.slice(0, maxBody)}\n\n…(truncado — cole o diagnóstico completo do clipboard)`
-      : fullBody;
-
-  const params = new URLSearchParams({
-    title,
-    body: bodyForUrl,
-    labels: ISSUE_LABELS.join(","),
-  });
-  const url = `https://github.com/${ISSUE_REPO}/issues/new?${params.toString()}`;
-  await shell.openExternal(url);
-
-  return {
-    ok: true,
-    via: "github" as const,
-    url,
-    copied: true,
-    truncated: fullBody.length > maxBody,
-  };
-});
 
 ipcMain.handle("open-log-folder", async () => {
   const dir = settingsDir();
@@ -4254,19 +4078,6 @@ ipcMain.handle("optimize-proton-route", async (_event, options?: { country?: str
   });
 });
 
-ipcMain.handle("report-bug", async (_event, payload: unknown) => {
-  const p = (payload ?? {}) as { title?: string; description?: string; includeLogs?: boolean };
-  let statusBypass = "INACTIVE";
-  try {
-    statusBypass = IS_LINUX ? await linuxStatus() : getStatus();
-  } catch {}
-  // Snapshot do tunel WireGuard no momento do report.
-  const wgTunel = !isMac && statusBypass === "ACTIVE" ? await wgStatsProvider() : undefined;
-  return submitBugReport(
-    { title: String(p.title ?? ""), description: String(p.description ?? ""), includeLogs: !!p.includeLogs },
-    { statusBypass, installsFlavours: ultimosFlavoursLinux, graphics: ultimosGraficosLinux, wgTunel },
-  );
-});
 
 // A pagina reporta a ALTURA DO CONTEUDO. Com titleBarOverlay, setSize (janela externa)
 // nao casa com essa medida: a janela crescia no Personalizado e nao encolhia ao voltar.

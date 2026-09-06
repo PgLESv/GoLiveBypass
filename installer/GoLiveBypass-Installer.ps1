@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # recusado, e nesse caso nao ha o que fazer aqui: o proprio .bat ja abre com -ExecutionPolicy Bypass.
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }
 
-$RepoRaw = 'https://raw.githubusercontent.com/bezumiya/GoLiveBypass/main'
+$RepoRaw = 'https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main'
 $PluginFiles = @('goLiveBypass/index.tsx', 'goLiveBypass/native.ts', 'goLiveBypass/stability.ts', 'goLiveBypass/manifest.json')
 $PluginDirName = 'goLiveBypass'
 $DiscordNames = @('Discord', 'DiscordCanary', 'DiscordPTB')
@@ -110,7 +110,7 @@ function Show-Banner {
     Write-Host ''
     Write-Host '  GoLiveBypass' -ForegroundColor Cyan
     Write-Host '  Go Live e camera de volta no Discord' -ForegroundColor DarkGray
-    Write-Host '  https://github.com/bezumiya/GoLiveBypass' -ForegroundColor DarkGray
+    Write-Host '  https://github.com/PgLESv/GoLiveBypass' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -156,174 +156,7 @@ function Confirm-Action($question) {
     return (Read-Escolha "  $question [s/N]") -match '^[sSyY]'
 }
 
-# =========================================================================== Report de bugs
-# Igual a GUI: ao falhar, monta diagnostico sanitizado e POST na API de bugs
-# (abre issue no bezumiya/GoLiveBypass). Nunca bloqueia o fluxo.
 
-$script:BugApiUrl = 'https://api.skyplaceia.com/bugs/v1/reports'
-$script:BugApiToken = 'c3d0bff691ecc3ddc6f6ca10037b9ac967c62547e681d3749204e50800504511'
-
-function Invoke-BugReport([string]$title, [string]$description, [string]$log = '', [hashtable]$meta = @{}) {
-    if ($Yes) { return }  # automacao: nao spammar a API
-    # Dedupe: o mesmo erro NAO reabre issue. Os 3 reports duplos da 1.1.11
-    # (issues 124-126) vieram daqui: cada rodada do mesmo bug abria issue nova.
-    # Assinatura = titulo + primeira linha da descricao, com data; janela de 48h.
-    try {
-        $primeiraLinha = ($description -split "`n" | Select-Object -First 1)
-        if ($primeiraLinha.Length -gt 300) { $primeiraLinha = $primeiraLinha.Substring(0, 300) }
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        $hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes("$title|$primeiraLinha"))) -replace '-', '').Substring(0, 16)
-        $sha.Dispose()
-        $stateFile = Join-Path (Get-EffectiveLocalApp) 'GoLiveBypass\.last-report'
-        if (Test-Path -LiteralPath $stateFile) {
-            $campos = @((Get-Content -LiteralPath $stateFile -First 1) -split ' ')
-            if ($campos.Count -ge 2 -and $campos[0] -eq $hash) {
-                try {
-                    $ultimo = [datetime]::ParseExact($campos[1], 'yyyyMMddHHmm', [Globalization.CultureInfo]::InvariantCulture)
-                    if (((Get-Date) - $ultimo).TotalHours -lt 48) {
-                        Write-Host '  [i] Esse erro ja foi reportado a menos de 48h — nao vou reabrir a issue.' -ForegroundColor DarkGray
-                        return
-                    }
-                } catch { }
-            }
-        }
-        New-Item -ItemType Directory -Path (Split-Path -Parent $stateFile) -Force -ErrorAction SilentlyContinue | Out-Null
-        Set-Content -LiteralPath $stateFile -Value "$hash $(Get-Date -Format 'yyyyMMddHHmm')" -ErrorAction SilentlyContinue
-    } catch { }
-    $desc = Invoke-SanitizeBug $description
-    # Mesma forma do payload da GUI (golive-gui/electron/bugreport.ts): {title,
-    # description, log, meta}. O formato antigo (includeLogs) nunca foi lido pela
-    # API -- os reports do instalador/standalone chegavam no GitHub com log e
-    # metadata vazios (ex.: issue #94).
-    $body = @{ title = $title; description = $desc; log = $log; meta = $meta } | ConvertTo-Json
-    try {
-        Invoke-RestMethod -Method Post -Uri $script:BugApiUrl -Body $body -ContentType 'application/json' -Headers @{ Authorization = "Bearer $($script:BugApiToken)" } -TimeoutSec 15 -ErrorAction Stop | Out-Null
-        Write-Host ''
-        Write-Host '  [OK] Relatorio enviado. Obrigado — os devs vao ver a issue no GitHub.' -ForegroundColor Green
-    } catch {
-        Write-Host ''
-        Write-Host '  [!] Nao consegui enviar o relatorio automatico. Rode de novo e mande a saida.' -ForegroundColor Yellow
-    }
-}
-
-function Invoke-SanitizeBug([string]$text) {
-    $text = [regex]::Replace($text, '([a-z][a-z0-9+.-]*://)([^/ @:]+):([^/@]+)@', '$1$2:***@')
-    $text = [regex]::Replace($text, '\b(mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,})\b', '***')
-    $text = [regex]::Replace($text, '(https://gateway[^ ?]+)\?[^ ]*', '$1?<params>')
-    # proxy personalizada digitada na instalacao (nunca sai)
-    if ($script:UltimaProxy) { $text = $text.Replace($script:UltimaProxy, '<proxy-pessoal>') }
-    return $text
-}
-
-# Metadata do report, mesmo espirito da GUI (bugreport.ts montarMeta): so flags de
-# diagnostico, sem caminhos completos do usuario. caminho_8_3 marca variaveis de
-# ambiente gravadas na forma curta (ex. C:\Users\CSAR~1) -- o cenario da issue #94.
-function Get-ReportMeta($ErrorRecord) {
-    $short = $false
-    foreach ($v in @($env:LOCALAPPDATA, $env:USERPROFILE, $env:TEMP)) {
-        if ($v -and $v -match '~\d($|\\)') { $short = $true; break }
-    }
-    $meta = @{
-        versao                = 'instalador'
-        plataforma            = "win32-$env:PROCESSOR_ARCHITECTURE"
-        locale                = "$(if ($PSUICulture -and $PSUICulture.Name) { $PSUICulture.Name } else { '?' })"
-        localappdata_presente = "$(if ($env:LOCALAPPDATA) { 'sim' } else { 'nao' })"
-        caminho_8_3           = "$(if ($short) { 'sim' } else { 'nao' })"
-    }
-    if ($ErrorRecord -and $ErrorRecord.Exception) {
-        $meta['excecao'] = $ErrorRecord.Exception.GetType().FullName
-    }
-    return $meta
-}
-
-function Invoke-SendAutoReport([string]$summary, [string]$extra = '', $ErrorRecord = $null) {
-    if ($Yes) { return }
-    $desc = "$extra`n`n--- logs ---`n"
-    $tail = ''
-    try {
-        $logDir = Join-Path (Get-EffectiveLocalApp) 'GoLiveBypass'
-        foreach ($log in @('golivebypass.log', 'gui.log')) {
-            $lp = Join-Path $logDir $log
-            if (Test-Path -LiteralPath $lp) {
-                $tail += (Get-Content -LiteralPath $lp -Tail 40 -ErrorAction SilentlyContinue | Out-String)
-            }
-        }
-    } catch { }
-    if ($ErrorRecord -and $ErrorRecord.Exception) {
-        $frame = ''
-        try {
-            $st = $ErrorRecord.Exception.StackTrace
-            if ($st) { $frame = (($st -split "`n") | Select-Object -First 1).Trim() }
-        } catch { }
-        $desc += "`n`nexcecao: " + $ErrorRecord.Exception.GetType().FullName
-        if ($frame) { $desc += "`nframe: " + $frame }
-        # A LINHA do script: sem ela um "Invalid handle" de FileStream nao diz nada
-        # (issue #127). O catch do instalador mostra no console; o report so via aqui.
-        $info = $ErrorRecord.InvocationInfo
-        if ($info -and $info.ScriptLineNumber) {
-            $desc += "`nlinha do script: $($info.ScriptLineNumber): $($info.Line.Trim())"
-        } elseif ($ErrorRecord.ScriptStackTrace) {
-            # Excecao .NET surfada pelo pipeline as vezes chega sem InvocationInfo
-            # util (#136: DriveNotFoundException sem linha nenhuma no relato). O
-            # ScriptStackTrace e preenchido sempre que existe frame de script.
-            $pilha = ($ErrorRecord.ScriptStackTrace -split "`n" | Select-Object -First 2) -join ' | '
-            $desc += "`npilha: " + $pilha
-        }
-    }
-    Invoke-BugReport $summary $desc $tail (Get-ReportMeta $ErrorRecord)
-}
-
-# Test-ShouldReport <mensagem>: $false se a mensagem NAO deve abrir issue.
-# Mesmo espelho do should_report() do .sh: erros de uso (dependencia faltando,
-# CLI digitada errada, path errado, ferramenta externa quebrada) nao viram
-# issue. O resto (bug real) continua reportando.
-function Test-ShouldReport([string]$msg) {
-    # cancelamento e instrucoes de uso
-    if ($msg -eq 'Cancelado.') { return $false }
-    # console sem teclado (issue #146): ambiente de uso, o aviso ja diz o que fazer
-    if ($msg -like '*Este console nao aceita entrada de teclado*') { return $false }
-    # Cancelamento via Ctrl+C no Read-Host: PowerShell lanca a mensagem nativa
-    # "Esse comando nao pode ser executado devido ao erro: A operacao foi cancelada
-    # pelo usuario." (PT-BR) / "This command cannot be executed ... The operation
-    # was canceled by the user." (EN). E cancelamento do usuario, nao bug.
-    if ($msg -like '*cancelada pelo usu*rio*') { return $false }
-    if ($msg -like '*canceled by the user*') { return $false }
-    if ($msg -like '*cadeia de caracteres vazia*') { return $false }
-    if ($msg -like '*empty string*') { return $false }
-    if ($msg -like 'Illegal characters in path*') { return $false }
-    if ($msg -like '*associar*par*metro*') { return $false }
-    if ($msg -like '*Cannot bind argument*') { return $false }
-    if ($msg -like '*porque ele ? nulo*' -or $msg -like '*because it is null*') { return $false }
-    if ($msg -like 'Nao e possivel associar*') { return $false }
-    if ($msg -like 'O Discord nao fechou*') { return $false }
-    # input / uso do usuario
-    if ($msg -like 'Opcao desconhecida: *') { return $false }
-    if ($msg -like 'Formato invalido. Use socks5://*') { return $false }
-    if ($msg -like 'Endereco da proxy invalido*') { return $false }
-    if ($msg -like 'Nao consegui baixar *') { return $false }
-    # dependencia faltando (ambiente)
-    if ($msg -like 'Instale *') { return $false }
-    if ($msg -like 'O npm nao conseguiu instalar o pnpm*') { return $false }
-    if ($msg -like 'Nao consegui deixar o pnpm funcionando*') { return $false }
-    # path / checkout errado
-    if ($msg -like 'Nao encontrei o checkout do Equicord/Vencord*') { return $false }
-    if ($msg -like 'Nao achei *') { return $false }
-    if ($msg -like '*ja existe e nao parece um checkout*') { return $false }
-    if ($msg -like 'Nao achei o patcher *') { return $false }
-    if ($msg -like 'Nao achei nenhum Discord instalado*') { return $false }
-    # ferramenta externa (ambiente)
-    if ($msg -eq 'git clone falhou') { return $false }
-    if ($msg -eq 'pnpm install falhou') { return $false }
-    if ($msg -eq 'pnpm build falhou') { return $false }
-    if ($msg -eq 'pnpm inject falhou') { return $false }
-    # desinstalacao / elevacao parcial
-    if ($msg -like 'Nao consegui desinstalar de todos*') { return $false }
-    if ($msg -like 'NADA foi injetado*') { return $false }
-    # default: e bug, reporta
-    return $true
-}
-
-# =========================================================================== /Report de bugs
 
 # =========================================================================== TUI (PowerShell)
 # Interface no estilo OpenCode: dark, caixas, setas/Enter. Mouse: o console do Windows
@@ -1795,7 +1628,7 @@ function Show-MainMenu {
 # SHA-256 contra o asset companion .sha256).
 # -----------------------------------------------------------------------------
 
-$GitHubRepo = 'bezumiya/GoLiveBypass'
+$GitHubRepo = 'PgLESv/GoLiveBypass'
 $GitHubApi  = "https://api.github.com/repos/$GitHubRepo"
 
 # Consulta a release mais recente. Devolve um objeto com .Tag e .AssetUrl
@@ -2069,12 +1902,6 @@ try {
         Write-Host "      linha $($info.ScriptLineNumber): $($info.Line.Trim())" -ForegroundColor DarkGray
     }
     Write-Host '      Se for relatar, mande esta linha junto.' -ForegroundColor DarkGray
-
-    # Report automatico (se nao for automacao): a issue abre no GitHub.
-    # Erros de uso (dependencia, CLI typo, path errado, ferramenta externa) nao viram issue.
-    if (Test-ShouldReport $_.Exception.Message) {
-        Invoke-SendAutoReport "Falha no instalador GoLiveBypass: $($_.Exception.Message)" $_.Exception.Message $_
-    }
     Wait-AntesDeFechar
     exit 1
 }

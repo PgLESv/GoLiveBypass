@@ -176,7 +176,7 @@ jobs:
           name: "GoLiveBypass ${{ inputs.tag }}"
           prerelease: true
           draft: ${{ inputs.rascunho || false }}
-          body: "**Canal: beta** — versão de teste para quem optou em \"Participar dos testes\" nas configurações da GUI (Windows e Linux). Não é oferecida a quem usa o canal estável. Encontrou algo estranho? Use o botão Reportar bug do app — o relato vai com os logs completos."
+          body: "**Canal: beta** — versão de teste para quem optou em \"Participar dos testes\" nas configurações da GUI (Windows e Linux). Não é oferecida a quem usa o canal estável. Encontrou algo estranho? Abra uma issue no GitHub com o diagnóstico copiado."
           files: release-artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

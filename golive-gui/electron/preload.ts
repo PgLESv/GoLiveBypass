@@ -23,8 +23,6 @@ import { ipcRenderer } from 'electron';
   stopLogWatch: () => ipcRenderer.invoke('stop-log-watch'),
   getDiagnostic: (payload: { status: string; note?: string }) =>
     ipcRenderer.invoke('get-diagnostic', payload),
-  openBugReport: (payload: { status: string; note?: string; title?: string }) =>
-    ipcRenderer.invoke('open-bug-report', payload),
   openLogFolder: () => ipcRenderer.invoke('open-log-folder'),
   setDevLogWindow: (open: boolean) => ipcRenderer.invoke('set-dev-log-window', open),
   onLogChunk: (callback: (chunk: string) => void) => {
@@ -38,7 +36,6 @@ import { ipcRenderer } from 'electron';
   onRefreshStatus: (callback: () => void) => ipcRenderer.on('refresh-status', callback),
   resizeWindow: (height: number) => ipcRenderer.send('resize-window', height),
   setTheme: (theme: string) => ipcRenderer.send('set-theme', theme),
-  reportBug: (payload: { title: string; description: string; includeLogs: boolean }) => ipcRenderer.invoke('report-bug', payload),
   getVpnMode: () => ipcRenderer.invoke('get-vpn-mode'),
   setVpnMode: (mode: 'proton' | 'custom') => ipcRenderer.invoke('set-vpn-mode', mode),
   checkProtonSession: (username: string) => ipcRenderer.invoke('check-proton-session', username),

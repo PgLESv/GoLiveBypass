@@ -145,7 +145,7 @@ function AboutPlugin() {
         <>
             <PluginUpdateSettings />
             <Paragraph>
-                Made by bezumiya. Source and issues on <MaskedLink href="https://github.com/bezumiya/GoLiveBypass">GitHub</MaskedLink>, and I post about it on <MaskedLink href="https://twitter.com/obezumiya">Twitter</MaskedLink>.
+                Fork mantido por PgLESv (original por bezumiya). Código e issues no <MaskedLink href="https://github.com/PgLESv/GoLiveBypass">GitHub</MaskedLink>.
             </Paragraph>
         </>
     );
@@ -559,7 +559,7 @@ async function buildReport() {
 export default definePlugin({
     name: "GoLiveBypass",
     description: "Turns Go Live and camera back on for Brazilian accounts by neutralising Discord's video guard, and keeps your calls on the region you pick.",
-    authors: [{ name: "bezumiya", id: 1366453661970071633n }],
+    authors: [{ name: "PgLESv" }, { name: "bezumiya", id: 1366453661970071633n }],
     tags: ["Voice", "Privacy"],
     settings,
     settingsAboutComponent: AboutPlugin,

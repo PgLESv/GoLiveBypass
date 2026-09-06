@@ -8,27 +8,12 @@ const api = (window as any).api as {
     text: string;
     logPath: string;
   }>;
-  openBugReport: (payload: {
-    status: string;
-    note?: string;
-    title?: string;
-  }) => Promise<{
-    ok: boolean;
-    via?: 'api' | 'github';
-    url: string;
-    issueNumber?: number;
-    copied: boolean;
-    truncated: boolean;
-    apiError?: string;
-  }>;
   openLogFolder: () => Promise<string>;
   onLogChunk: (callback: (chunk: string) => void) => void;
   onRefreshStatus: (callback: () => void) => void;
 };
 
 const logConsole = document.getElementById('logConsole')!;
-const bugNoteInput = document.getElementById('bugNoteInput') as HTMLTextAreaElement;
-const reportBugBtn = document.getElementById('reportBugBtn') as HTMLButtonElement;
 const copyDiagBtn = document.getElementById('copyDiagBtn') as HTMLButtonElement;
 const openLogFolderBtn = document.getElementById('openLogFolderBtn') as HTMLButtonElement;
 const devHint = document.getElementById('devHint')!;
@@ -73,7 +58,6 @@ copyDiagBtn.addEventListener('click', async () => {
   try {
     const { text } = await api.getDiagnostic({
       status: currentStatus,
-      note: bugNoteInput.value,
     });
     await navigator.clipboard.writeText(text);
     devHint.textContent = 'Diagnóstico copiado para a área de transferência.';
@@ -81,35 +65,6 @@ copyDiagBtn.addEventListener('click', async () => {
     devHint.textContent = err instanceof Error ? err.message : String(err);
   } finally {
     copyDiagBtn.disabled = false;
-  }
-});
-
-reportBugBtn.addEventListener('click', async () => {
-  reportBugBtn.disabled = true;
-  devHint.textContent = 'Enviando relato...';
-  try {
-    const r = await api.openBugReport({
-      status: currentStatus,
-      note: bugNoteInput.value,
-      title: `[GUI] ${currentStatus} — relato`,
-    });
-    if (r.via === 'api') {
-      devHint.textContent = r.issueNumber
-        ? `Issue #${r.issueNumber} criada pela API.`
-        : 'Issue criada pela API.';
-    } else if (r.apiError) {
-      devHint.textContent = `API falhou (${r.apiError}). Abri o formulário do GitHub; diagnóstico no clipboard.`;
-    } else if (r.truncated) {
-      devHint.textContent =
-        'Issue aberta (corpo truncado). Diagnóstico completo no clipboard.';
-    } else {
-      devHint.textContent =
-        'Formulário do GitHub aberto (labels bug,gui). Diagnóstico no clipboard.';
-    }
-  } catch (err) {
-    devHint.textContent = err instanceof Error ? err.message : String(err);
-  } finally {
-    reportBugBtn.disabled = false;
   }
 });
 

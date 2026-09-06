@@ -82,7 +82,7 @@ cat > "$EXTRA/manifest.json" <<EOF
   "version": "1.1.8",
   "updater": {
     "type": "github",
-    "id": "bezumiya/GoLiveBypass",
+    "id": "PgLESv/GoLiveBypass",
     "assetName": "goLiveBypass-vencord.zip"
   },
   "author": "extra",

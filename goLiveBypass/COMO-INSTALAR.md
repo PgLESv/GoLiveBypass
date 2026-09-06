@@ -23,7 +23,7 @@ Este zip traz os arquivos fonte do plugin (`index.tsx`, `native.ts`,
 
 O README do projeto tem o passo a passo detalhado (com prints de erro
 comuns) na seção **"Instalação: passo a passo completo"**:
-https://github.com/bezumiya/GoLiveBypass#instala%C3%A7%C3%A3o-passo-a-passo-completo
+https://github.com/PgLESv/GoLiveBypass#instala%C3%A7%C3%A3o-passo-a-passo-completo
 
 ## Já tenho o Vencord instalado pelo instalador oficial — e agora?
 

@@ -113,7 +113,7 @@ const MAX_LOG_LINES = 400;
 const MAX_LOG_BYTES = 256 * 1024;
 const MAX_RETRIES = 2;
 
-const GITHUB_RELEASES_URL = "https://api.github.com/repos/pdl-clay/GoLiveBypass/releases/latest";
+const GITHUB_RELEASES_URL = "https://api.github.com/repos/PgLESv/GoLiveBypass/releases/latest";
 const PLUGIN_ASSET = "goLiveBypass-vencord.zip";
 const PLUGIN_UPDATE_TIMEOUT_MS = 30_000;
 const PLUGIN_VERSION = "1.1.12-beta.13";

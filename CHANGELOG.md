@@ -4,6 +4,25 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.4] - 2026-09-05
+
+### Modificado
+- **Oficialização de Fork e Atualização Geral (PgLESv):**
+  - Repositório oficialmente configurado como fork independente mantido por **PgLESv**, com releases e builds próprios acompanhando o upstream **bezumiya/GoLiveBypass**.
+  - Documentação ([README.md](README.md)), plugin Vencord/Equicord ([manifest.json](goLiveBypass/manifest.json)), scripts instaladores e standalone atualizados para referenciar o repositório oficial do fork (`https://github.com/PgLESv/GoLiveBypass`).
+  - Distinção explícita entre a autoria original (`bezumiya`) e a manutenção do fork (`PgLESv`).
+
+### Removido
+- **Sistema Legado de Reporte de Bugs (`api.skyplaceia.com`):**
+  - Removidos o botão de envio de bugs (`#bugBtn` no rodapé e `#reportBugBtn` na visualização de logs) e o modal de formulário na GUI.
+  - Excluído o helper `golive-gui/electron/bugreport.ts` e removidos os handlers IPC correspondentes.
+  - Removidas rotinas de envio automático de erros nos instaladores e scripts standalone (`standalone/golivebypass-standalone.sh`, `standalone/GoLiveBypass-Standalone.ps1`, `installer/golivebypass-installer.sh`, `installer/GoLiveBypass-Installer.ps1`).
+  - Função local de diagnóstico preservada ("Copiar diagnóstico") para encaminhamento manual de ocorrências na aba de [Issues no GitHub](https://github.com/PgLESv/GoLiveBypass/issues).
+
+### Corrigido
+- **Codificação PowerShell (UTF-8 com BOM):**
+  - Preservado o Byte Order Mark (BOM) UTF-8 em `GoLiveBypass-Standalone.ps1` e `GoLiveBypass-Installer.ps1`, prevenindo falhas de interpretação de sintaxe e caracteres Unicode (caixas TUI, setas) no Windows PowerShell 5.1.
+
 ## [2.1.3] - 2026-09-05
 
 ### Corrigido
