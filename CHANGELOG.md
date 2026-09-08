@@ -4,7 +4,7 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [Unreleased]
+## [2.1.5] - 2026-09-08
 
 ### Sincronização Upstream (GoLiveBypass 2.0.5 Estável)
 - **Atualização Automática & Segurança no Windows:**
