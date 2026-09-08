@@ -8,10 +8,11 @@ import {
   buildWindowsUpdateScript,
   cleanupOldExe,
   OLD_SUFFIX,
+  versionedPortableExePath,
 } from "../electron/updater-replace";
 
-// O cenario do Windows (exe em uso nao apaga, mas renomeia) nao existe no Linux —
-// aqui o que se testa e a coreografia: rename-aside, troca, rollback e limpeza.
+// O cenario do Windows (exe em uso bloqueado ate o processo sair) nao existe no Linux —
+// aqui o que se testa e a coreografia pos-saida: rename-aside, troca, rollback e limpeza.
 // Os builders do helper (.bat/.vbs) sao testados como conteudo: disparar o helper
 // de verdade (spawnWindowsUpdateHelper) exigiria wscript/cmd e sujaria o %TEMP%
 // real da maquina, entao ele nao roda em teste.
@@ -68,38 +69,66 @@ describe("updater-replace", () => {
     const script = buildWindowsUpdateScript();
     // cmd le .bat no codepage OEM: qualquer nao-ASCII no conteudo e lido errado.
     expect(script).toMatch(/^[\x20-\x7E\r\n]+$/);
-    // Os caminhos NUNCA sao embutidos: chegam como %1 (exe alvo), %2 (update baixado)
-    // e %3 (.vbs a limpar).
-    expect(script).toContain('start "" "%~1"');
-    expect(script).toContain('move /y "%~2" "%~1" >NUL 2>&1');
-    expect(script).toContain('del "%~3" >NUL 2>&1');
+    // Os caminhos NUNCA sao embutidos: chegam como %1 (exe atual), %2 (download),
+    // %3 (exe novo versionado) e %4 (vbs a limpar).
+    expect(script).toContain('move /Y "%~1" "%~1.old" >NUL 2>&1');
+    expect(script).toContain('move /Y "%~2" "%~3" >NUL 2>&1');
+    expect(script).toContain("Start-Process -FilePath $env:GOLIVE_NEW_EXE -PassThru");
+    expect(script).toContain('del "%~1.old" >NUL 2>&1');
+    expect(script).toContain('del "%~2" >NUL 2>&1');
+    expect(script).toContain('del "%~4" >NUL 2>&1');
     // Depois de lancar, o bat apaga a si mesmo.
     expect(script).toContain('del "%~f0"');
     // Linhas CRLF: e um arquivo para o cmd do Windows (todo \n precedido de \r).
     expect(script).not.toMatch(/(^|[^\r])\n/);
     expect(script.split("\r\n").length).toBeGreaterThan(10);
-    // Loop com verificacao de errorlevel e fallback
-    expect(script).toContain("if not errorlevel 1 goto launch");
-    expect(script).toContain("goto fallback");
-    expect(script).toContain("copy /y");
+    // Esgotou as tentativas e restaura/lanca a versao antiga.
+    expect(script).toContain("goto fail");
+    expect(script).toContain(":installed");
   });
 
-  it("vbs do helper comeca com BOM UTF-16LE e cita os quatro caminhos", () => {
+  it("so apaga o exe antigo depois de confirmar que a nova versao continua aberta", () => {
+    const script = buildWindowsUpdateScript();
+    const installed = script.indexOf(":installed");
+    const launched = script.indexOf("Start-Process -FilePath $env:GOLIVE_NEW_EXE -PassThru", installed);
+    const verified = script.indexOf("Start-Sleep -Seconds 5", launched);
+    const failed = script.indexOf("if errorlevel 1 goto fail", verified);
+    const cleaned = script.indexOf('del "%~1.old" >NUL 2>&1', failed);
+
+    expect(launched).toBeGreaterThan(installed);
+    expect(verified).toBeGreaterThan(installed);
+    expect(failed).toBeGreaterThan(verified);
+    expect(cleaned).toBeGreaterThan(failed);
+    expect(script).toContain("$ErrorActionPreference='Stop'");
+    expect(script).toContain("if ($null -eq $p -or $p.HasExited) { exit 1 }");
+  });
+
+  it("vbs do helper comeca com BOM UTF-16LE e cita os cinco caminhos", () => {
     const bat = "C:\\Users\\João\\AppData\\Local\\Temp\\g-1.bat";
     const exe = "C:\\Users\\João\\Desktop\\GoLiveBypass-1.1.12.exe";
-    const update = "C:\\Users\\João\\AppData\\Local\\Temp\\GoLiveBypass-update.exe";
+    const downloaded = "C:\\Users\\João\\AppData\\Local\\Temp\\GoLiveBypass-update.exe";
+    const newExe = "C:\\Users\\João\\Desktop\\GoLiveBypass-1.1.13.exe";
     const vbs = "C:\\Users\\João\\AppData\\Local\\Temp\\g-1.vbs";
-    const launcher = buildWindowsUpdateLauncher(bat, exe, update, vbs);
+    const launcher = buildWindowsUpdateLauncher(bat, exe, downloaded, newExe, vbs);
     // Sem o BOM o wscript le o arquivo como ANSI e o acento corrompe o script.
     expect(launcher.charCodeAt(0)).toBe(0xfeff);
     // Conteudo do arquivo sera gravado em utf16le (o teste cobre o texto logico).
     expect(launcher).toContain(bat);
     expect(launcher).toContain(exe);
-    expect(launcher).toContain(update);
+    expect(launcher).toContain(downloaded);
+    expect(launcher).toContain(newExe);
     expect(launcher).toContain(vbs);
     // Cada caminho entre Chr(34): espaco e acento nao quebram a linha de comando.
     expect(launcher).toContain(`Chr(34) & "${exe}" & Chr(34)`);
-    expect(launcher).toContain(`Chr(34) & "${update}" & Chr(34)`);
     expect(launcher).toContain(", 0, False");
+  });
+
+  it("calcula o novo exe ao lado do atual usando a versao da release", () => {
+    expect(versionedPortableExePath("C:\\Users\\João\\Desktop\\GoLiveBypass-2.0.5-beta.6.exe", "2.0.5-beta.7"))
+      .toBe("C:\\Users\\João\\Desktop\\GoLiveBypass-2.0.5-beta.7.exe");
+  });
+
+  it("recusa versao que poderia escapar do nome versionado", () => {
+    expect(() => versionedPortableExePath("/tmp/GoLiveBypass.exe", "../outro.exe")).toThrow();
   });
 });

@@ -1,14 +1,22 @@
 import path from 'path';
-import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
 import { app } from 'electron';
 import { spawn } from 'child_process';
 import * as logger from './logger';
+import { randomUUID } from 'crypto';
+import { StringDecoder } from 'string_decoder';
 import type { RouteProbeResult } from './route-proof';
+import type { ProtonRouteMetadata } from './route-failover';
+import {
+  ensureProtonConfgen as ensureProtonConfgenRuntime,
+  findProtonConfgenPath,
+  protonConfgenCandidates,
+  type ProtonRuntimeContext,
+} from './proton-runtime';
 
-const moduleDir = dirname(fileURLToPath(import.meta.url));
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 export type ProtonLoginErrorCode =
   | 'INVALID_CREDENTIALS'
@@ -38,6 +46,20 @@ export interface ProtonLoginResult {
   isPaid?: boolean;
 }
 
+export type ProtonPlanStatus = 'free' | 'premium' | 'unknown';
+
+export interface ProtonPlanResult {
+  success: boolean;
+  status: ProtonPlanStatus;
+  maxTier?: number;
+  planName?: string;
+  planTitle?: string;
+  checkedAt?: string;
+  error?: string;
+}
+
+const GENERIC_PLAN_ERROR = 'Não foi possível confirmar o plano Proton.';
+
 export interface ProtonSettings {
   vpnMode: 'proton' | 'custom';
   username: string;
@@ -58,48 +80,81 @@ export interface ProtonSettings {
 }
 
 export function findProtonConfgenExe(): string {
+  const context = protonRuntimeContext();
+  const found = findProtonConfgenPath(context);
+  if (found) return found;
   const exeName = process.platform === 'win32' ? 'proton-confgen.exe' : 'proton-confgen';
+  throw new Error(`Executável ${exeName} não foi encontrado. Caminhos verificados: ${protonConfgenCandidates(context).slice(0, 4).join(', ')}`);
+}
 
-  // 1. AppImage / packaged: extraResources
-  if (process.resourcesPath) {
-    const bundled = path.join(process.resourcesPath, 'extra', 'proton-confgen', exeName);
-    if (fs.existsSync(bundled)) return bundled;
-  }
+function protonRuntimeContext(): ProtonRuntimeContext {
+  let appPath = '';
+  try { appPath = app.getAppPath(); } catch {}
+  return {
+    resourcesPath: process.resourcesPath,
+    appPath,
+    execPath: process.execPath,
+    cwd: process.cwd(),
+    moduleDir,
+    platform: process.platform,
+    arch: process.arch,
+  };
+}
 
-  // 2. Dev mode: tools/proton-confgen/build
+export function ensureProtonConfgen(installDir: string): Promise<string> {
+  let version = process.env.npm_package_version || '0.0.0-dev';
   try {
-    if (app && typeof app.getAppPath === 'function') {
-      const dev = path.join(app.getAppPath(), '..', 'tools', 'proton-confgen', 'build', exeName);
-      if (fs.existsSync(dev)) return dev;
-    }
+    if (app && typeof app.getVersion === 'function') version = app.getVersion();
   } catch {}
-
-  // 3. Fallback dev mode relative to process.cwd() or the ESM module directory
-  const cwdDev = path.resolve(process.cwd(), '..', 'tools', 'proton-confgen', 'build', exeName);
-  if (fs.existsSync(cwdDev)) return cwdDev;
-
-  const localDev = path.resolve(moduleDir, '..', '..', 'tools', 'proton-confgen', 'build', exeName);
-  if (fs.existsSync(localDev)) return localDev;
-
-  const directDev = path.resolve(process.cwd(), 'tools', 'proton-confgen', 'build', exeName);
-  if (fs.existsSync(directDev)) return directDev;
-
-  // 4. Beside executable
-  if (process.execPath) {
-    const beside = path.join(path.dirname(process.execPath), 'extra', 'proton-confgen', exeName);
-    if (fs.existsSync(beside)) return beside;
-
-    const directBeside = path.join(path.dirname(process.execPath), exeName);
-    if (fs.existsSync(directBeside)) return directBeside;
-  }
-
-  throw new Error(`Executável ${exeName} não foi encontrado.`);
+  return ensureProtonConfgenRuntime({ context: protonRuntimeContext(), installDir, version });
 }
 
 export interface RunConfgenOptions {
   args: string[];
   timeoutMs?: number;
   exePath?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: ProtonOptimizationProgress) => void;
+}
+
+// Increment when the route triage changes so a profile measured by an older
+// pipeline is not reused as if it had gone through the complete twelve-route
+// tunnel preflight.
+export const MEASUREMENT_CRITERION_VERSION = 5;
+
+export interface ProtonOptimizationProgress {
+  phase: 'ping' | 'preparing' | 'testing' | 'finalizing' | 'completed' | 'failed' | 'cancelled';
+  total: number;
+  tested: number;
+  succeeded: number;
+  server?: string;
+  downloadMbps?: number;
+  uploadMbps?: number;
+  pingMs?: number;
+  status?: 'testing' | 'success' | 'failed';
+}
+
+function abortError(): Error {
+  const error = new Error('Operação Proton cancelada.');
+  error.name = 'AbortError';
+  return error;
+}
+
+function validProgress(value: any): ProtonOptimizationProgress | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const phases = ['ping', 'preparing', 'testing', 'finalizing', 'completed', 'failed', 'cancelled'];
+  if (!phases.includes(value.phase)) return undefined;
+  const total = Number.isFinite(value.total) ? Math.max(0, Math.floor(value.total)) : 0;
+  const tested = Number.isFinite(value.tested) ? Math.max(0, Math.min(total, Math.floor(value.tested))) : 0;
+  const succeeded = Number.isFinite(value.succeeded) ? Math.max(0, Math.min(tested, Math.floor(value.succeeded))) : 0;
+  const result: ProtonOptimizationProgress = { phase: value.phase, total, tested, succeeded };
+  for (const key of ['server', 'downloadMbps', 'uploadMbps', 'pingMs'] as const) {
+    if (key === 'server') {
+      if (typeof value[key] === 'string' && value[key].length <= 200) result[key] = value[key];
+    } else if (Number.isFinite(value[key]) && value[key] > 0) result[key] = value[key];
+  }
+  if (value.status === 'testing' || value.status === 'success' || value.status === 'failed') result.status = value.status;
+  return result;
 }
 
 export function parseConfgenJson(stdout: string): any | undefined {
@@ -117,6 +172,7 @@ export function parseConfgenJson(stdout: string): any | undefined {
 
 export function runConfgen(options: RunConfgenOptions): Promise<{ code: number | null; stdout: string; stderr: string; json?: any }> {
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) { reject(abortError()); return; }
     let exe: string;
     try {
       exe = options.exePath ? path.resolve(options.exePath) : findProtonConfgenExe();
@@ -133,32 +189,69 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
 
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    let aborted = Boolean(options.signal?.aborted);
+    let terminationError: Error | undefined;
+    let stderrBuffer = '';
+    const stderrDecoder = new StringDecoder('utf8');
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const emitProgress = (chunk: string) => {
+      stderrBuffer += chunk;
+      if (stderrBuffer.length > 128 * 1024) stderrBuffer = stderrBuffer.slice(-128 * 1024);
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop() || '';
+      for (const line of lines) {
+        const match = line.match(/^\s*GOLIVE_PROGRESS\s+(\{.*\})\s*$/);
+        if (!match) continue;
+        try { const progress = validProgress(JSON.parse(match[1])); if (progress && !terminationError) options.onProgress?.(progress); } catch {}
+      }
+    };
+    const finishReject = (error: Error) => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } };
+    const killAndWait = (error: Error) => {
+      if (settled || terminationError) return;
+      terminationError = error;
+      try { child.kill(); } catch { /* Close remains the cleanup boundary. */ }
+      killTimer = setTimeout(() => {
+        if (!settled) { try { child.kill('SIGKILL'); } catch {} }
+      }, 1000);
+      killTimer.unref?.();
+    };
 
     const timer = setTimeout(() => {
-      try {
-        child.kill();
-      } catch {}
-      reject(new Error(`Tempo limite excedido (${timeout / 1000}s) ao executar proton-confgen.`));
+      killAndWait(new Error(`Tempo limite excedido (${timeout / 1000}s) ao executar proton-confgen.`));
     }, timeout);
+
+    const abort = () => { aborted = true; killAndWait(abortError()); };
+    options.signal?.addEventListener('abort', abort, { once: true });
 
     child.stdout.on('data', (d: Buffer) => {
       stdout += d.toString();
     });
 
     child.stderr.on('data', (d: Buffer) => {
-      stderr += d.toString();
+      const text = stderrDecoder.write(d); stderr += text; emitProgress(text);
     });
 
     child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
+      // Node emits close after spawn errors too. Never remove an executable
+      // or staged profile while its process may still be using it.
+      terminationError ??= err;
     });
 
     child.on('close', (code) => {
+      if (settled) return;
+      const tail = stderrDecoder.end();
+      stderr += tail;
+      if (stderrBuffer || tail) emitProgress(tail + '\n');
       clearTimeout(timer);
+      clearTimeout(killTimer);
+      options.signal?.removeEventListener('abort', abort);
+      if (terminationError || aborted) { finishReject(terminationError || abortError()); return; }
       const parsedJson = parseConfgenJson(stdout);
+      settled = true;
       resolve({ code, stdout, stderr, json: parsedJson });
     });
+    if (aborted) abort();
   });
 }
 
@@ -197,7 +290,7 @@ export function classifyProtonError(error: unknown, stderr = '', stdout = ''): {
   if (/2fa|two.?factor|totp|verification code/.test(raw)) return { code: 'TWO_FACTOR_INVALID', message: 'O código 2FA está incorreto ou expirou.', retryable: false };
   if (/invalid credential|invalid password|wrong password|authentication failed|incorrect/.test(raw)) return { code: 'INVALID_CREDENTIALS', message: 'Usuário ou senha incorretos.', retryable: false };
   if (/timeout|tempo limite|timed out/.test(raw)) return { code: 'TIMEOUT', message: 'O ProtonVPN demorou demais para responder. Tente novamente em alguns instantes.', retryable: true };
-  if (/encontrado|not found|enoent|spawn/.test(raw)) return { code: 'MISSING_EXECUTABLE', message: 'O componente de conexão ProtonVPN não foi encontrado nesta instalação. Reinstale o GoLiveBypass ou atualize para a versão mais recente.', retryable: false };
+  if (/encontrado|not found|enoent|spawn|runtime proton|componente proton/.test(raw)) return { code: 'MISSING_EXECUTABLE', message: 'O componente Proton não pôde ser preparado automaticamente. Verifique sua conexão e tente novamente.', retryable: true };
   if (/network|connection|dns|tls|temporary|unreachable|reset/.test(raw)) return { code: 'NETWORK_ERROR', message: 'Não foi possível conectar aos servidores ProtonVPN. Verifique sua internet e tente novamente.', retryable: true };
   return { code: 'UNKNOWN', message: 'Não foi possível concluir o login ProtonVPN. Tente novamente ou envie um relatório de diagnóstico.', retryable: true };
 }
@@ -292,11 +385,25 @@ export async function checkProtonSession(
     return { valid: false, error: 'Usuário não especificado.' };
   }
   ensureInstallDir(installDir);
-  const args = ['-session-check', '-install-dir', installDir, '-json'];
-  if (username && username.trim()) args.push('-user', username.trim());
+  const sessionFile = getProtonSessionFile(installDir);
+  let exePath: string;
+  try {
+    exePath = await ensureProtonConfgen(installDir);
+  } catch (error) {
+    return { valid: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  const args = [
+    '-check-session',
+    '-session-file',
+    sessionFile,
+    '-json',
+  ];
+  if (username && username.trim()) {
+    args.push('-username', username.trim());
+  }
 
   try {
-    const res = await runConfgen({ args, timeoutMs: 15000 });
+    const res = await runConfgen({ args, timeoutMs: 15000, exePath });
     if (res.json && res.json.valid) {
       return {
         valid: true,
@@ -319,6 +426,83 @@ export async function checkProtonSession(
   }
 }
 
+/**
+ * Accept only the small, non-secret contract emitted by -check-plan. In
+ * particular, a missing/invalid MaxTier is never interpreted as Free.
+ */
+export function normalizeProtonPlanResult(value: any): ProtonPlanResult {
+  if (!value || typeof value !== 'object' || value.success !== true) {
+    return { success: false, status: 'unknown', error: GENERIC_PLAN_ERROR };
+  }
+
+  const maxTier = value.maxTier;
+  if (!Number.isInteger(maxTier) || maxTier < 0) {
+    return { success: false, status: 'unknown', error: GENERIC_PLAN_ERROR };
+  }
+
+  const result: ProtonPlanResult = {
+    success: true,
+    status: maxTier === 0 ? 'free' : 'premium',
+    maxTier,
+  };
+  for (const key of ['planName', 'planTitle'] as const) {
+    if (typeof value[key] === 'string' && value[key].trim() && value[key].length <= 120) {
+      result[key] = value[key].trim();
+    }
+  }
+  if (typeof value.checkedAt === 'string' && value.checkedAt.length <= 40) {
+    result.checkedAt = value.checkedAt;
+  }
+  return result;
+}
+
+/**
+ * Queries the account plan through the saved Proton session only. This does
+ * not request a certificate, select a server, or create a WireGuard tunnel.
+ */
+export async function getProtonPlan(installDir: string, username: string): Promise<ProtonPlanResult> {
+  if (!username || !username.trim()) {
+    return { success: false, status: 'unknown', error: 'Sessão Proton não encontrada.' };
+  }
+
+  ensureInstallDir(installDir);
+  const sessionFile = getProtonSessionFile(installDir);
+  let exePath: string;
+  try {
+    exePath = await ensureProtonConfgen(installDir);
+  } catch {
+    return { success: false, status: 'unknown', error: GENERIC_PLAN_ERROR };
+  }
+  let res;
+  try {
+    res = await runConfgen({
+      args: [
+        '-username',
+        username.trim(),
+        '-session-file',
+        sessionFile,
+        '-check-plan',
+        '-json',
+      ],
+      timeoutMs: 10000,
+      exePath,
+    });
+  } catch {
+    return { success: false, status: 'unknown', error: GENERIC_PLAN_ERROR };
+  }
+
+  if (res.code !== 0 || !res.json) {
+    logger.warn('proton', 'falha ao consultar plano ProtonVPN', {
+      codigo_saida: res.code,
+      resposta_json: Boolean(res.json),
+    });
+    return { success: false, status: 'unknown', error: GENERIC_PLAN_ERROR };
+  }
+
+  const normalized = normalizeProtonPlanResult(res.json);
+  return { ...normalized, checkedAt: new Date().toISOString() };
+}
+
 export async function loginProton(
   installDir: string,
   username: string,
@@ -326,6 +510,19 @@ export async function loginProton(
   twoFactorCode?: string,
   humanVerificationToken?: string
 ): Promise<ProtonLoginResult> {
+  try {
+    ensureInstallDir(installDir);
+  } catch (error) {
+    const classified = classifyProtonError(error);
+    return { success: false, ...classified, code: 'SESSION_PERSISTENCE', message: 'Não foi possível preparar a pasta de dados para salvar a sessão ProtonVPN.', retryable: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  let exePath: string;
+  try {
+    exePath = await ensureProtonConfgen(installDir);
+  } catch (error) {
+    const classified = classifyProtonError(error);
+    return { success: false, ...classified, error: error instanceof Error ? error.message : String(error) };
+  }
   const sessionFile = getProtonSessionFile(installDir);
   const args = ['-login', '-user', username, '-install-dir', installDir, '-session-file', sessionFile, '-json'];
   if (password) args.push('-pass', password);
@@ -335,7 +532,7 @@ export async function loginProton(
   logger.info('proton', 'iniciando login via proton-confgen', { usuario: username });
   let res: { code: number | null; stdout: string; stderr: string; json?: any };
   try {
-    res = await runConfgen({ args, timeoutMs: 25000 });
+    res = await runConfgen({ args, timeoutMs: 25000, exePath });
   } catch (error) {
     const classified = classifyProtonError(error);
     logger.error('proton', 'falha ao iniciar proton-confgen', { codigo: classified.code, erro: error instanceof Error ? error.message : String(error) });
@@ -386,6 +583,8 @@ export async function generateOptimalProtonConfig(
     freeOnly?: boolean;
     autoPing?: boolean;
     speedTest?: boolean;
+    signal?: AbortSignal;
+    onProgress?: (progress: ProtonOptimizationProgress) => void;
   }
 ): Promise<{
   success: boolean;
@@ -407,6 +606,13 @@ export async function generateOptimalProtonConfig(
   const sessionFile = getProtonSessionFile(installDir);
   const outputFile = path.join(installDir, 'wireguard.conf');
   ensureInstallDir(installDir);
+  const stagingFile = path.join(installDir, `.wireguard.conf.${randomUUID()}.tmp`);
+  let exePath: string;
+  try {
+    exePath = await ensureProtonConfgen(installDir);
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
 
   const args = [
     '-username',
@@ -414,7 +620,7 @@ export async function generateOptimalProtonConfig(
     '-session-file',
     sessionFile,
     '-output',
-    outputFile,
+    stagingFile,
     '-json',
     '-ipv6',
     '-exclude-countries',
@@ -443,11 +649,28 @@ export async function generateOptimalProtonConfig(
 
   // Older WireSock filters may include the normal helper. A uniquely named
   // copy outside Discord directories also avoids nesting with those profiles.
-  const res = options.speedTest
-    ? await runIsolatedSpeedSelection(args)
-    : await runConfgen({ args, timeoutMs: 60000 });
+  let res;
+  try {
+    res = options.speedTest
+      ? await runIsolatedSpeedSelection(args, options.signal, options.onProgress, exePath)
+      : await runConfgen({ args, timeoutMs: 60000, signal: options.signal, onProgress: options.onProgress, exePath });
+  } catch (error) {
+    try { fs.rmSync(stagingFile, { force: true }); } catch {}
+    throw error;
+  }
 
-  if (res.json && res.json.success) {
+  const measuredResultValid = !options.speedTest ||
+    (finitePositive(res.json?.downloadMbps) && finitePositive(res.json?.uploadMbps));
+  if (res.code === 0 && res.json && res.json.success && measuredResultValid && fs.existsSync(stagingFile)) {
+    if (options.signal?.aborted) {
+      try { fs.rmSync(stagingFile, { force: true }); } catch {}
+      throw abortError();
+    }
+    try { fs.renameSync(stagingFile, outputFile); }
+    catch (error) {
+      try { fs.rmSync(stagingFile, { force: true }); } catch {}
+      throw error;
+    }
     logger.info('proton', 'servidor ótimo selecionado com sucesso', {
       server: res.json.server,
       ping: res.json.pingMs,
@@ -475,22 +698,143 @@ export async function generateOptimalProtonConfig(
     };
   }
 
-  const errMsg = res.json?.error || res.stderr || res.stdout || 'Falha ao selecionar e gerar configuração ProtonVPN.';
+  try { fs.rmSync(stagingFile, { force: true }); } catch {}
+  const errMsg = res.json?.error || (options.speedTest && res.json?.success
+    ? 'A medição não retornou velocidades válidas de download e upload.'
+    : undefined) || res.stderr || res.stdout || 'Falha ao selecionar e gerar configuração ProtonVPN.';
   logger.error('proton', 'erro ao gerar configuração ótima', { codigo_saida: res.code, resposta_json: Boolean(res.json) });
   return { success: false, error: errMsg };
 }
 
-async function runIsolatedSpeedSelection(args: string[]) {
+export interface ProtonRoutePoolResult {
+  success: boolean;
+  stagingDir?: string;
+  routes?: ProtonRouteMetadata[];
+  expiresAt?: number;
+  error?: string;
+}
+
+/**
+ * Generates ping-ranked reserve profiles in an isolated directory. The Go
+ * helper does not create temporary tunnels; the active Discord route therefore
+ * remains the only WireGuard session while this background work runs.
+ */
+export async function generateProtonRoutePool(
+  installDir: string,
+  options: {
+    username: string;
+    countries?: string;
+    freeOnly?: boolean;
+    autoPing?: boolean;
+    size: number;
+    excludeServers?: string[];
+    signal?: AbortSignal;
+  },
+): Promise<ProtonRoutePoolResult> {
+  ensureInstallDir(installDir);
+  let exePath: string;
+  try {
+    exePath = await ensureProtonConfgen(installDir);
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  const size = Math.max(1, Math.min(3, Math.floor(options.size)));
+  const stagingDir = fs.mkdtempSync(path.join(installDir, '.proton-route-pool-'));
+  const sessionFile = getProtonSessionFile(installDir);
+  const args = [
+    '-username', options.username,
+    '-session-file', sessionFile,
+    '-route-pool',
+    '-route-pool-size', String(size),
+    '-route-pool-output-dir', stagingDir,
+    '-no-save',
+    '-json',
+    '-ipv6',
+    '-exclude-countries', 'BR',
+    '-auto-ping',
+    '-free-only',
+  ];
+  if (options.countries && options.countries.trim()) args.push('-countries', options.countries.trim());
+  const excluded = (options.excludeServers ?? []).map((item) => item.trim()).filter(Boolean);
+  if (excluded.length > 0) args.push('-exclude-servers', excluded.join(','));
+
+  try {
+    const res = await runConfgen({ args, timeoutMs: 120_000, signal: options.signal, exePath });
+    const rawRoutes = Array.isArray(res.json?.routes) ? res.json.routes : [];
+    const routes: ProtonRouteMetadata[] = [];
+    for (const raw of rawRoutes) {
+      if (!raw || typeof raw !== 'object') continue;
+      const confFile = typeof raw.confFile === 'string' ? path.resolve(raw.confFile) : '';
+      const relative = confFile ? path.relative(path.resolve(stagingDir), confFile) : '';
+      const pingMs = Number(raw.pingMs);
+      const endpoint = typeof raw.endpoint === 'string' ? raw.endpoint.trim() : '';
+      if (!confFile || !relative || relative.startsWith('..') || path.isAbsolute(relative) ||
+        !fs.existsSync(confFile) || typeof raw.server !== 'string' || !raw.server.trim() ||
+        !endpoint || !Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999) continue;
+      routes.push({
+        success: raw.success === true,
+        server: raw.server.trim(),
+        country: typeof raw.country === 'string' ? raw.country.trim() : '',
+        city: typeof raw.city === 'string' ? raw.city.trim() : '',
+        tier: typeof raw.tier === 'string' ? raw.tier.trim() : 'Free',
+        load: Number.isFinite(Number(raw.load)) ? Number(raw.load) : 0,
+        score: Number.isFinite(Number(raw.score)) ? Number(raw.score) : 0,
+        pingMs,
+        endpoint,
+        confFile,
+        expiresAt: Number.isFinite(Number(raw.expiresAt)) ? Number(raw.expiresAt) : undefined,
+        generatedAt: new Date().toISOString(),
+      });
+    }
+    if (res.code !== 0 || res.json?.success !== true || routes.length < size) {
+      const error = res.json?.error || res.stderr || res.stdout || 'Não foi possível preparar reservas Proton Free.';
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+      return { success: false, error: String(error).trim().slice(0, 500) };
+    }
+    return {
+      success: true,
+      stagingDir,
+      routes,
+      expiresAt: Number.isFinite(Number(res.json?.expiresAt)) ? Number(res.json.expiresAt) : undefined,
+    };
+  } catch (error) {
+    try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+    throw error;
+  }
+}
+
+export async function runIsolatedSpeedSelection(args: string[], signal?: AbortSignal, onProgress?: (progress: ProtonOptimizationProgress) => void, sourceExePath?: string) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-speed-'));
   const exePath = path.join(tempDir, process.platform === 'win32' ? 'golive-speed-probe.exe' : 'golive-speed-probe');
   try {
-    fs.copyFileSync(findProtonConfgenExe(), exePath);
+    fs.copyFileSync(sourceExePath || findProtonConfgenExe(), exePath);
     if (process.platform !== 'win32') fs.chmodSync(exePath, 0o700);
-    return await runConfgen({ args, exePath, timeoutMs: 150000 });
+    return await runConfgen({ args: [...args, '-progress-json'], exePath, timeoutMs: 210000, signal, onProgress });
   } finally {
     // Windows may need a moment to release the executable after timeout/exit.
     await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 12, retryDelay: 200 });
   }
+}
+
+function finitePositive(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+export function canReuseMeasuredProfile(
+  installDir: string,
+  previous: any,
+  filter: { username: string; country?: string; freeOnly?: boolean; autoPing?: boolean },
+): boolean {
+  if (!previous || previous.measurementVersion !== MEASUREMENT_CRITERION_VERSION) return false;
+  if (!protonIdentityMatches(String(previous.measurementUsername || ''), filter.username)) return false;
+  if (String(previous.measurementCountry || '') !== String(filter.country || '')) return false;
+  if (previous.measurementFreeOnly !== (filter.freeOnly !== false) || previous.measurementAutoPing !== (filter.autoPing !== false)) return false;
+  const server = previous.lastServer || previous;
+  const name = typeof previous.server === 'string' ? previous.server : server.name;
+  const endpoint = typeof previous.endpoint === 'string' ? previous.endpoint : server.endpoint;
+  if (typeof name !== 'string' || typeof endpoint !== 'string' || !name || !endpoint) return false;
+  if (!finitePositive(previous.downloadMbps ?? server.downloadMbps) || !finitePositive(previous.uploadMbps ?? server.uploadMbps) || !finitePositive(previous.pingMs ?? server.pingMs)) return false;
+  return matchesMeasuredProfile(installDir, name, endpoint);
 }
 
 export function matchesMeasuredProfile(installDir: string, server: string, endpoint: string): boolean {

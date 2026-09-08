@@ -27,6 +27,7 @@ func Parse() (*Config, error) {
 	var installDir string
 	var loginAlias bool
 	var sessionCheckAlias bool
+	var excludedServersFlag string
 
 	// Set default DNS and allowed IPs based on IPv6 support
 	defaultDNS := constants.DefaultDNSIPv4
@@ -87,7 +88,9 @@ func Parse() (*Config, error) {
 	flag.StringVar(&cfg.RenewSerial, "renew-serial", "", "Renew a persistent configuration by SerialNumber (reuses existing key, no config file generated)")
 
 	// Automated GUI & Ping extensions
-	flag.BoolVar(&cfg.SpeedTest, "speed-test", false, "Measure real tunnel download/upload on up to six regional finalists (up to 30 MiB, about 90s)")
+	flag.BoolVar(&cfg.SpeedTest, "speed-test", false, "Ping all regional routes, validate twelve, then measure download/upload on up to six healthy finalists (up to 30 MiB, about 3m)")
+	flag.BoolVar(&cfg.ProgressJSON, "progress-json", false, "Emit speed-test progress events as JSON on stderr")
+	flag.BoolVar(&cfg.SpeedTestTrace, "speed-test-trace", false, "Print the four speed-test stages in the terminal (ping, shortlist, tunnel, speed)")
 	flag.StringVar(&cfg.TwoFactorCode, "2fa", "", "2FA TOTP code for non-interactive authentication")
 	flag.StringVar(&cfg.SessionFile, "session-file", "", "Custom path for session cache file")
 	flag.StringVar(&installDir, "install-dir", "", "Custom install directory containing proton-session.json")
@@ -95,8 +98,13 @@ func Parse() (*Config, error) {
 	flag.BoolVar(&cfg.JSONOutput, "json", false, "Output results in JSON format")
 	flag.BoolVar(&cfg.CheckSession, "check-session", false, "Check if cached session is valid and exit")
 	flag.BoolVar(&sessionCheckAlias, "session-check", false, "Alias for -check-session")
+	flag.BoolVar(&cfg.CheckPlan, "check-plan", false, "Check the cached account plan and exit (does not prompt for a password)")
 	flag.BoolVar(&cfg.LoginOnly, "login-only", false, "Authenticate, save session, and exit")
 	flag.BoolVar(&loginAlias, "login", false, "Alias for -login-only")
+	flag.BoolVar(&cfg.RoutePool, "route-pool", false, "Generate a local pool of ping-validated routes")
+	flag.IntVar(&cfg.RoutePoolSize, "route-pool-size", 2, "Number of profiles to generate in route-pool mode")
+	flag.StringVar(&cfg.RoutePoolOutputDir, "route-pool-output-dir", "", "Directory for route-pool profiles")
+	flag.StringVar(&excludedServersFlag, "exclude-servers", "", "Exclude server names from automatic selection (comma-separated)")
 
 	flag.Parse()
 
@@ -118,6 +126,11 @@ func Parse() (*Config, error) {
 
 	// Session certificates max out at 7 days, so fall back to that instead of
 	// the 365d persistent default when -duration was not given explicitly.
+	// Route-pool profiles are disposable reserves and must never create a new
+	// persistent device in the Proton dashboard, even for direct CLI callers.
+	if cfg.RoutePool {
+		cfg.NoSave = true
+	}
 	if cfg.NoSave && !isFlagSet("duration") {
 		cfg.Duration = constants.DefaultSessionCertDuration
 	}
@@ -125,9 +138,16 @@ func Parse() (*Config, error) {
 	if err := validateFeatureFlags(cfg); err != nil {
 		return nil, err
 	}
+	if cfg.RoutePool && (cfg.RoutePoolSize < 1 || cfg.RoutePoolSize > 3) {
+		return nil, fmt.Errorf("route-pool-size must be between 1 and 3")
+	}
+	if cfg.RoutePool && strings.TrimSpace(cfg.RoutePoolOutputDir) == "" {
+		return nil, fmt.Errorf("route-pool-output-dir is required in route-pool mode")
+	}
 
 	// Parse and validate country codes (needed by most modes)
 	cfg.ExcludedCountries = parseCountries(excludedCountriesFlag)
+	cfg.ExcludedServers = parseCommaSeparatedList(excludedServersFlag)
 	if countriesFlag != "" {
 		cfg.Countries = parseCountries(countriesFlag)
 		for _, country := range cfg.Countries {
@@ -157,6 +177,13 @@ func Parse() (*Config, error) {
 
 	// -check-session does not need country filter or server.
 	if cfg.CheckSession {
+		cfg.Username = validation.CleanUsername(cfg.Username)
+		return cfg, nil
+	}
+
+	// -check-plan uses only the cached session and does not need a country
+	// filter, server, certificate or password prompt.
+	if cfg.CheckPlan {
 		cfg.Username = validation.CleanUsername(cfg.Username)
 		return cfg, nil
 	}

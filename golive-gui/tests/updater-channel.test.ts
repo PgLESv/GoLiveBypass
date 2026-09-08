@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import fs from "fs";
 import path from "path";
-import { compararVersoes, escolherRelease, type ReleaseCandidata } from "../electron/updater-channel";
+import {
+  compararVersoes,
+  escolherAssetWindows,
+  escolherRelease,
+  type ReleaseCandidata,
+} from "../electron/updater-channel";
 
 // O canal beta e o opt-in dos testadores (regra §9): prereleases nunca viram
 // "latest", o canal estavel nunca as ve, e NENHUM canal faz downgrade — pelo
@@ -36,6 +41,11 @@ describe("compararVersoes (semver minimo do projeto)", () => {
   it("prereleases do mesmo triplo crescem com o numero", () => {
     expect(compararVersoes("1.1.12-beta.7", "1.1.12-beta.6")).toBeGreaterThan(0);
     expect(compararVersoes("1.1.12-beta.10", "1.1.12-beta.9")).toBeGreaterThan(0); // numerico, nao lexicografico
+  });
+
+  it("ordena o novo formato beta-10 acima de beta-9 e mantém compatibilidade", () => {
+    expect(compararVersoes("1.1.12-beta-10", "1.1.12-beta-9")).toBeGreaterThan(0);
+    expect(compararVersoes("1.1.12-beta-8", "1.1.12-beta.7")).toBeGreaterThan(0);
   });
 
   it("prerelease de triplo maior ganha de stable de triplo menor", () => {
@@ -84,11 +94,55 @@ describe("escolherRelease (candidata de update por canal)", () => {
   });
 });
 
+describe("escolherAssetWindows (portable da release)", () => {
+  it("escolhe o portable exato beta-12 mesmo quando o helper Proton vem primeiro", () => {
+    const assets = [
+      { name: "GoLiveBypass-2.0.5-beta-12-proton-confgen-win-x64.exe" },
+      { name: "GoLiveBypass-2.0.5-beta-12.exe" },
+    ];
+    expect(escolherAssetWindows("v2.0.5-beta-12", assets)?.name).toBe(
+      "GoLiveBypass-2.0.5-beta-12.exe",
+    );
+  });
+
+  it("não trata o helper Proton como executável atualizável", () => {
+    expect(
+      escolherAssetWindows("v2.0.5-beta-12", [
+        { name: "GoLiveBypass-2.0.5-beta-12-proton-confgen-win-x64.exe" },
+      ]),
+    ).toBeNull();
+  });
+
+  it("recusa metadado que aponta o nome portable para outro arquivo", () => {
+    expect(
+      escolherAssetWindows("v2.0.5-beta-12", [
+        {
+          name: "GoLiveBypass-2.0.5-beta-12.exe",
+          browser_download_url:
+            "https://github.com/bezumiya/GoLiveBypass/releases/download/v2.0.5-beta-12/GoLiveBypass-2.0.5-beta-12-proton-confgen-win-x64.exe",
+        },
+      ]),
+    ).toBeNull();
+  });
+});
+
 describe("wiring do canal no updater e no workflow", () => {
   it("o updater liga allowPrerelease no Linux e usa escolherRelease no Windows", () => {
     const updater = fs.readFileSync(path.resolve(process.cwd(), "electron/updater.ts"), "utf8");
+    expect(updater).toContain('const REPO = "PgLESv/GoLiveBypass"');
     expect(updater).toContain('autoUpdater.allowPrerelease = canalAtual() === "beta"');
-    expect(updater).toContain("escolherRelease(releases, app.getVersion(), canalAtual())");
+    expect(updater).toContain("autoUpdater.autoInstallOnAppQuit = false");
+    expect(updater).toContain("escolherRelease(releases, app.getVersion(), canal)");
+    expect(updater).toContain("escolherAssetWindows(String(item.tag_name), assets)");
+    expect(updater).not.toContain("a.name.startsWith(EXE_PREFIX)");
+    expect(updater).toContain("CHECK_INTERVAL_MS = 60 * 60 * 1000");
+    expect(updater).toContain("createUpdatePulseClient");
+    expect(updater).toContain("UPDATE_STREAM_URL");
+    expect(updater).toContain("pending-windows-update.json");
+    expect(updater).toContain('const reason = canal === "beta" ? "beta-ativada"');
+    expect(updater).toContain("await checkWindowsUpdate");
+    expect(updater).toContain("await checkLinuxUpdate");
+    expect(updater).not.toContain("attemptReplace(current, downloaded)");
     // a comparacao por string que faria downgrade foi embora
     expect(updater).not.toContain("const isNewer = latest !== current;");
   });
@@ -103,23 +157,19 @@ describe("wiring do canal no updater e no workflow", () => {
     expect(workflow).toContain("inputs.canal == 'beta'");
   });
 
-  it("o updater nunca usa showMessageBoxSync (bloqueia o watchdog do Tor enquanto o dialogo espera resposta)", () => {
-    // showMessageBoxSync bloqueia a thread JS do processo principal ate a pessoa clicar um
-    // botao -- inclusive o setInterval do watchdog do Tor (main.ts, ver
-    // docs/handoff-2026-09-02-tor-watchdog-gap.md), que fica sem checar o daemon por todo o
-    // tempo que o aviso de atualizacao ficar aberto sem resposta. showMessageBox (assincrono)
-    // nao tem esse problema; main.ts ja usa a versao async em outro lugar (linha ~1162).
+  it("o updater não abre popup nativo para atualizações", () => {
+    // O aviso e a ação de aplicação ficam exclusivamente no card persistente da GUI.
+    // Isso evita interromper a sessão com janelas nativas no Windows ou no Linux.
     const updater = fs.readFileSync(path.resolve(process.cwd(), "electron/updater.ts"), "utf8");
-    expect(updater).not.toContain("dialog.showMessageBoxSync(");
-    // Confirma que os 4 usos anteriores viraram await showMessageBox(...) de verdade,
-    // nao so que a string sumiu por outro motivo.
-    const usos = updater.match(/await dialog\.showMessageBox\(/g) ?? [];
-    expect(usos.length).toBeGreaterThanOrEqual(4);
+    expect(updater).not.toContain("dialog.showMessageBox");
+    expect(updater).not.toContain("checkForUpdatesAndNotify");
+    expect(updater).not.toContain("askToInstallWindowsUpdate");
+    expect(updater).not.toContain("showUpdateFailure");
   });
 
   it("nao consulta releases durante npm run dev", () => {
     const updater = fs.readFileSync(path.resolve(process.cwd(), "electron/updater.ts"), "utf8");
-    expect(updater).toMatch(/const isDev = !app\.isPackaged;[\s\S]{0,300}if \(isDev\) \{[\s\S]{0,300}return;/);
+    expect(updater).toMatch(/const isDev = !app\.isPackaged;[\s\S]{0,300}if \(isDev\) \{[\s\S]{0,300}return(?: null)?;/);
     expect(updater).not.toContain("autoUpdater.forceDevUpdateConfig = true");
   });
 });

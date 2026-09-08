@@ -1,15 +1,17 @@
 # Auto-update do GoLiveBypass — guia do mantenedor
 
-O app se atualiza sozinho consultando as **releases do GitHub** (`api.github.com`),
-sem servidor intermediário. Este documento explica como configurar, publicar e
-testar — inclui o que é obrigatório para o auto-update funcionar em cada SO.
+O app recebe um **pulso SSE** da API Go quando uma release é publicada e então
+consulta as **releases do GitHub** (`api.github.com`) diretamente. A API não
+entrega executáveis nem digests: ela só acorda o updater. Este documento explica
+como configurar, publicar e testar — inclui o que é obrigatório para o
+auto-update funcionar em cada SO.
 
 ## Como funciona
 
 | SO | Mecanismo | Requisito |
 |----|-----------|-----------|
-| Windows | Updater **portable** próprio (`electron/updater.ts`): consulta a release, baixa o `.exe` novo, substitui via `PORTABLE_EXECUTABLE_FILE` e reabre | Nenhum (não precisa assinar) |
-| Linux | `electron-updater` nativo (AppImageUpdater) com **download diferencial** (blockMap) | Nenhum |
+| Windows | Updater **portable** próprio (`electron/updater.ts`): recebe o pulso, consulta a release, baixa e confere o `.exe`, deixa o update pendente e agenda a troca via `PORTABLE_EXECUTABLE_FILE` somente após o pedido de reinício | Nenhum (não precisa assinar) |
+| Linux | `electron-updater` nativo (AppImageUpdater) com **download diferencial** (blockMap), acordado pelo pulso | Nenhum |
 | macOS | **desligado por enquanto** — ver abaixo | **Obrigatório: app assinado** (sem assinatura o download falha) |
 
 O `publish` está configurado em `golive-gui/package.json`:
@@ -23,6 +25,32 @@ O `publish` está configurado em `golive-gui/package.json`:
 }
 ```
 
+## API do pulso
+
+A GUI conecta em:
+
+```text
+https://api.skyplaceia.com/bugs/v1/updates/stream
+```
+
+O servidor mantém o SSE público com limite de 100 conexões, no máximo 2 por IP
+e heartbeat de 20 segundos. A conexão reconecta com backoff quando a API cai.
+O fallback continua existindo: a GUI consulta o updater no boot e uma vez por
+hora. Se o GitHub ainda não tiver propagado o asset na hora do webhook, há duas
+retentativas em 30 s e 120 s.
+
+No deploy da API, configure `GITHUB_WEBHOOK_SECRET` e o webhook do repositório:
+
+```text
+POST https://api.skyplaceia.com/bugs/v1/updates/github/webhook
+X-GitHub-Event: release
+```
+
+O webhook deve usar `application/json`, o mesmo segredo HMAC e somente o evento
+**Release**. A API aceita apenas `action=published`, `draft=false` e o
+`GITHUB_REPO` configurado. Consulte [api/deploy/README.md](../api/deploy/README.md)
+para o checklist do servidor.
+
 ## Publicar uma release (fluxo do CI)
 
 1. Crie a tag no formato `vX.Y.Z` (ex.: `v1.1.5`) no commit desejado
@@ -33,8 +61,9 @@ O `publish` está configurado em `golive-gui/package.json`:
    - `GoLiveBypass.AppImage` + `latest-linux.yml` (Linux)
    - `GoLiveBypass.dmg` + `GoLiveBypass.zip` + `latest-mac.yml` (macOS)
 
-> O `latest*.yml` é o metadata com checksum SHA-512 e o blockMap. **Sem ele na
-> release, o app detecta a versão nova mas não consegue baixar** (erro 404).
+> O caminho Windows desta aplicação consulta a API do GitHub e confere o digest
+> SHA-256 do anexo; ele não depende de `latest.yml`. Linux e macOS continuam
+> dependendo do metadata gerado pelo `electron-updater`.
 
 ## macOS: por que está desligado
 
@@ -80,10 +109,13 @@ desabilitado (o app funciona, mas não atualiza sozinho).
 
 O fluxo de atualização avisa antes de instalar:
 
-- **Mac/Linux**: o download corre em background; ao terminar, aparece um diálogo
+- **Linux**: o download corre em background; ao terminar, aparece um diálogo
   *"GoLiveBypass X.Y.Z foi baixada — Reiniciar agora?"* — só instala com o OK
-- **Windows portable**: ao detectar a versão nova, pergunta *"Atualizar agora?"*
-  antes de baixar/substituir
+- **Windows portable**: ao receber o pulso, baixa e valida em background; ao
+  terminar, pergunta *"Reiniciar agora?"*. Se o usuário escolher **Depois** ou
+  o app estiver apenas na bandeja, o arquivo fica guardado com seu digest e o
+  item **Reiniciar para atualizar** aparece na bandeja. A preferência de
+  atualizações desliga o pulso e as consultas automáticas.
 
 ## Teste E2E (procedimento validado)
 
@@ -129,17 +161,20 @@ npm run build:win          # ou publish:win com GH_TOKEN
 gh release create v1.1.5-test --repo SEU_FORK/GoLiveBypass \
   dist-app/GoLiveBypass.exe dist-app/latest.yml
 
-# 3. Roda o exe antigo (1.0.0); ele detecta a 1.1.5, pergunta "Atualizar agora?",
-#    baixa, substitui o exe em uso (com retry) e reabre a versão nova
+# 3. Roda o exe antigo (1.0.0); o webhook acorda a consulta, ele baixa/confere,
+#    pergunta "Reiniciar agora?", encerra o processo, troca o exe pelo helper
+#    externo e reabre. Escolha "Depois" e confira o item da bandeja.
+#    a versão nova
 ```
 
 **Pontos de atenção no Windows**:
 - O updater usa `PORTABLE_EXECUTABLE_FILE` (variável do electron-builder
   portable) para achar o exe em uso — sem ela o update é pulado
-- A substituição tem retry (até 10 tentativas, 1s entre elas) porque o Windows
-  segura o exe em uso por um instante após o fechamento
-- Teste também o fluxo "Depois": o app continua rodando e a checagem periódica
-  (a cada 4h) oferece de novo
+- O helper externo espera até 90 tentativas, com aproximadamente 1s entre elas,
+  e só move o exe atual depois que o processo antigo liberou a imagem
+- Teste também o fluxo "Depois": o app continua rodando, o update permanece
+  pendente após reiniciar a GUI e o item da bandeja permite aplicar sem novo
+  download
 
 ### macOS — procedimento
 
@@ -205,5 +240,6 @@ use o AppImage inteiro (grupo A/B).
 | `Update for version X is not available` | A release tem a **mesma versão** do app rodando — suba a versão no package.json |
 | macOS: download falha/instalação falha | App sem assinatura — configure `CSC_LINK`/`CSC_KEY_PASSWORD`/`APPLE_*` |
 | `downgrade is disallowed` | A release é mais antiga que a versão local — publique uma versão maior |
-| App fecha mas não abre após atualizar | App antigo segurando o lock de instância única — o `before-quit` não deve adiar o quit durante o update (o `markQuittingForUpdate` cuida disso; confira se o build tem esse fix) |
+| Windows: `EBUSY` ao renomear o exe | Build antigo tentou trocar o próprio arquivo ainda em execução; o helper pós-saída do build atual deve fazer a troca |
+| App fecha mas não abre após atualizar | Confira o log `[updater]`, a existência do helper no `%TEMP%` e se o `before-quit` não adia o quit durante o update (`markQuittingForUpdate`) |
 | AppImageLauncher renomeia o arquivo com hash | Esperado: o nome versionado (`GoLiveBypass-1.1.5_<hash>`) evita sobrescrever o antigo; o app novo abre integrado |

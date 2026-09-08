@@ -4,6 +4,27 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Unreleased]
+
+### Sincronização Upstream (GoLiveBypass 2.0.5 Estável)
+- **Atualização Automática & Segurança no Windows:**
+  - O updater seleciona estritamente o executável portable da release correspondente, valida o SHA-256 e agenda a substituição via helper PowerShell em segundo plano. O script aguarda o término do processo antigo e confirma que a nova versão permaneceu aberta por pelo menos 5 segundos antes de remover o `.old`; em caso de falha, realiza rollback automático.
+  - O aviso de atualização foi transformado em um card persistente e não-bloqueante no topo da interface gráfica, eliminando popups nativos do sistema operacional.
+  - Adicionado suporte a pulso de atualização via SSE (Server-Sent Events) integrado à API Go, com ordenação SemVer estrita, reconexão com backoff e proteção contra downgrades ou webhooks atrasados.
+- **Instalação Automática de Runtimes & Preflight:**
+  - A GUI agora detecta e instala dependências necessárias automaticamente no Windows (WireSock SDK 3.4.8.1 com hash fixado) e no Linux (instalação granular de ferramentas ausentes por gerenciador de pacotes: apt, dnf, zypper, pacman).
+  - Paridade determinística de hash na compilação do `proton-confgen` (`-buildvcs=false`) com verificação rigorosa contra o manifesto de release.
+- **Estabilidade no Linux & Suporte Bazzite/Flatpak:**
+  - Abertura do Discord oficial em sandbox agora utiliza `setsid` diretamente no namespace de rede WireGuard, preservando sessões Wayland e barramento do usuário sem depender de unidades transitórias systemd.
+  - Matriz de testes automatizada para distribuições Ubuntu, Debian, Fedora e Arch Linux.
+- **Melhorias no Proton Sidecar & CAPTCHA:**
+  - Preload sandbox CommonJS e captura robusta da janela de CAPTCHA oficial, prevenindo erros de `Object has been destroyed` ao cancelar ou fechar o desafio.
+  - Medição de rota com seleção de velocidade, métrica harmônica ponderada e fallback seguro sem interromper sessões ativas do Discord.
+- **Paridade e Recursos Exclusivos do Fork PgLESv Preservados:**
+  - 100% de suporte mantido a contas Proton pagas (Plus, Unlimited, Family) e detecção automática de `MaxTier >= 2`.
+  - Acesso desbloqueado a mais de 140 países organizados por continente, com otimização regional de latência para a América do Sul.
+  - Remoção de telemetria/reportes externos legados e direcionamento de suporte/issues diretamente para o repositório oficial do fork.
+
 ## [2.1.4] - 2026-09-05
 
 ### Modificado
@@ -73,6 +94,194 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   falha imediata com código 2028 ao tentar autenticar a conta Proton na GUI.
 - **Reutilização de sessão salva sem prompt no terminal:**
   - O backend do `proton-confgen` agora recupera o usuário e valida o token persistente salvo sem solicitar entrada interativa no terminal stdin.
+
+## [2.0.5] - 2026-09-08
+
+### Devlog da release estável
+
+- O updater Windows agora baixa somente o portable da versão correta, valida o SHA-256 e só remove a versão anterior depois que a nova inicializa com sucesso.
+- O card persistente de atualização concentra o aviso e o botão de reinício; os popups nativos foram removidos do fluxo de atualização.
+- O SSE da API acorda o updater rapidamente, com polling de segurança, ordenação SemVer e proteção contra eventos atrasados ou downgrades.
+- A GUI instala automaticamente os componentes de runtime necessários no Windows e no Linux, sem exigir Go, WireSock ou ProtonVPN instalados manualmente.
+- A seleção e a medição de rotas Proton receberam preflight, fallback e melhorias de diagnóstico sem bloquear a ativação do Discord.
+
+### Plugin Vencord/Equicord
+
+- O plugin já está funcional na linha de testes e continua em validação de compatibilidade antes de ser promovido como parte estável.
+
+### Agradecimentos
+
+- Obrigado a @bezu, criador do projeto: sem ele, nada do que está sendo construído aqui existiria.
+- Obrigado a todos os beta testers e, em especial, ao usuário 505133988369661955, que passou mais de oito horas em call corrigindo bugs e testando as betas.
+
+## [2.0.5-beta-15] - 2026-09-08
+
+### Teste adicional do update beta
+
+- Nova prerelease para validar a entrega do SSE e a atualização pelo card da interface.
+
+## [2.0.5-beta-14] - 2026-09-08
+
+### Teste de entrega do update beta
+
+- Publicação de validação do fluxo SSE e do card de atualização para instalações na beta-13.
+
+## [2.0.5-beta-13] - 2026-09-08
+
+### Proteção contra downgrade no SSE e no updater Windows
+
+- O broker SSE agora rejeita releases antigas ou iguais, evitando que um
+  webhook atrasado de beta-9 substitua o replay de beta-12.
+- O polling escolhe a maior tag SemVer válida, sem depender da ordem ou apenas
+  da data de publicação retornada pelo GitHub.
+- O updater Windows valida o nome completo do portable e o nome do arquivo na
+  URL; o helper Proton de aproximadamente 14,6 MB nunca é candidato ao update.
+- O incidente foi confirmado nos artefatos: o portable publicado mede cerca de
+  101 MB e o helper separado cerca de 14,6 MB; o digest SHA-256 continua sendo
+  conferido antes da aplicação.
+
+## [2.0.5-beta-12] - 2026-09-07
+
+### Correção do asset Windows no updater
+
+- O updater agora seleciona somente o portable `GoLiveBypass-<versão>.exe` da release.
+- O `proton-confgen` não pode mais ser baixado como se fosse o executável principal.
+- Adicionados testes para a ordem real dos assets e para a ausência do helper como candidato.
+
+## [2.0.5-beta-11] - 2026-09-07
+
+### Paridade dos helpers Proton no empacotamento
+
+- A compilação dos helpers agora desativa o carimbo VCS do Go (`-buildvcs=false`) e o job de assets de reparo reutiliza exatamente as saídas que geram o manifesto.
+- O pipeline compara a versão e o SHA-256 de cada helper com `proton-confgen-manifest.json` antes do upload; qualquer divergência interrompe a release.
+- O incidente de paridade encontrado na `v2.0.5-beta-10` está documentado em [`docs/releases/2026-09-08-proton-helper-hash-parity.md`](docs/releases/2026-09-08-proton-helper-hash-parity.md).
+- O helper do updater Windows só remove o executável antigo depois de iniciar a nova versão e confirmar que ela permanece aberta por cinco segundos; em falha, restaura a versão anterior.
+
+## [2.0.5-beta-10] - 2026-09-07
+
+### Fluxo de atualização na GUI
+
+- Removidos os popups nativos de atualização do Windows e Linux; o card persistente da interface agora concentra o aviso e a ação de reinício.
+- Falhas de preparação ou aplicação continuam preservando a versão atual e ficam registradas no log, sem interromper a sessão com uma janela do sistema.
+- O `npm run dev` exibe uma prévia visual do card para validação antes da publicação.
+
+### Ajuste visual
+
+- O card de atualização fica centralizado horizontalmente no topo da janela.
+
+## [2.0.5-beta-9] - 2026-09-07
+
+### Card persistente de atualização
+
+- O aviso de atualização passou a ser um card fixo no canto superior direito, exibido somente quando há uma versão pronta.
+- O card oferece **Reiniciar e aplicar** e permanece visível até a aplicação ser iniciada com sucesso.
+
+## [2.0.5-beta-8] - 2026-09-07
+
+### Preparação automática da GUI
+
+- A GUI agora procura o `proton-confgen` em todos os layouts de desenvolvimento e empacotados, valida o hash e repara a cópia ausente ou corrompida usando o asset da mesma release.
+- O Windows continua instalando o WireSock automaticamente via UAC quando necessário; o Linux instala apenas `wireguard-tools`, `iproute2`/`iproute` e `curl` ausentes via `pkexec`/`sudo`, sem upgrade global.
+- A versão não exige Go, WireSock ou o aplicativo ProtonVPN instalados manualmente pelo usuário.
+
+### Ativação imediata do canal beta
+
+- Ao ativar o canal beta nas configurações, a GUI consulta imediatamente a última beta compatível, baixa o instalador e abre o pedido para reiniciar e aplicar a atualização.
+- A checagem aguarda uma consulta inicial em andamento para não perder a troca de canal; desativar o canal continua respeitando a preferência de atualizações automáticas.
+
+## [2.0.5-beta.7] - 2026-09-07
+
+### Atualização da GUI
+
+- Corrige a troca do executável portable no Windows para relançar com o nome da nova versão, em vez de manter o nome anterior.
+- Adiciona um toast interno na GUI quando uma atualização é baixada e fica pronta para reiniciar.
+- Reativa o cliente SSE na beta publicada e mantém a consulta de releases como fallback.
+
+## [2.0.6-beta.2] - 2026-09-07
+
+### Correção do pipeline beta
+
+- A publicação dos assets Windows/Linux ocorre primeiro em draft; a release só é marcada como prerelease depois que os dois jobs terminam.
+
+### Failover automático de rotas Proton Free
+
+- A GUI Windows/Linux mantém um pool local de até duas reservas ping-validadas além da rota ativa. A preparação ocorre depois da abertura do Discord e não cria túneis concorrentes.
+- Após falha sustentada do peer WireGuard, a GUI troca a rota sem fechar o processo do Discord: Linux reaplica o peer com `wg setconf` e Windows reinicia somente o serviço WireSock. Cada candidata precisa confirmar handshake antes de ser promovida.
+- O recurso fica ativo por padrão e pode ser desligado em Preferências. É exclusivo do Proton Free; há uma única renovação do pool por sessão. Se todas as candidatas falharem, o Discord permanece aberto e a GUI exibe um aviso discreto.
+- Perfis Proton gerenciados passaram a usar `PersistentKeepalive = 10` para fornecer um sinal de liveness compatível com a janela de 10–15 segundos. Probes HTTP, IP e geolocalização continuam somente diagnósticos.
+
+### Migração da VPN para o plugin
+
+- O plugin Vencord/Equicord ganhou um controlador WireGuard/WireSock autônomo para Windows x64, com ProtonVPN e `.conf` personalizado, lock de ownership, reinício completo do Discord e restauração verificável da rede.
+- O filtro `AllowedApps` fica restrito ao `Discord.exe`, ao `Update.exe` da instalação atual e, quando disponível, ao helper temporário de diagnóstico. Probes de IP, DNS, HTTPS e rota são log-only.
+- Sessão Proton, perfil, lock e logs ficam no namespace privado `GoLiveBypass/plugin-vpn`. Uma única migração compatível importa apenas `wireguard.conf` e `proton-session.json` da GUI; settings e estado legado não são compartilhados.
+- O `proton-confgen.exe` x64 passa a ser incluído no zip do plugin pelo workflow de release. O standalone, o `app.asar` e a cópia gerada `golive-gui/electron/bypass.ts` não foram alterados por esta migração.
+
+### Inicialização do túnel WireGuard
+
+- Windows e Linux aguardam dois segundos para o túnel se acomodar antes de abrir o Discord, evitando que o updater seja iniciado durante a conexão inicial. A espera é local e limitada; probes de IP, HTTP e handshake continuam apenas diagnósticos.
+
+### Atualização automática do Windows
+
+- O updater portable baixa o executável, confere o SHA-256 e agenda a troca em um helper externo. A substituição agora ocorre somente depois que o processo antigo encerra, evitando `EBUSY` ao renomear o próprio `.exe`; falhas mantêm a versão atual aberta e ficam registradas no log.
+
+### Pulso de atualização
+
+- A API Go recebe o webhook de `release.published` do GitHub, valida o HMAC e distribui um evento SSE para as GUIs conectadas. O cliente reconecta com backoff, faz duas tentativas após o pulso e mantém a consulta direta ao GitHub como fonte de verdade.
+- A checagem de segurança passou para uma vez por hora. No Windows, o executável validado por SHA-256 fica pendente até o usuário escolher **Reiniciar para atualizar**; a preferência de updates pode desligar o SSE e as consultas automáticas sem interromper o app.
+
+### Detecção do plano Proton
+
+- A GUI consulta o endpoint autenticado de configurações da Proton (`/vpn/v2`) usando somente a sessão salva e classifica `VPN.MaxTier` como Free, Premium ou desconhecido. A consulta não tenta conectar a um servidor pago, não cria túnel e não interrompe uma rota ativa.
+- O plano fica em cache por 15 minutos por conta, com coalescência de chamadas simultâneas e atualização manual. Free e respostas desconhecidas mantêm a seleção segura em tier 0; somente Premium confirmado permite tiers pagos. A sessão, o token, o IP e o endpoint não são exibidos.
+- O indicador do painel informa Free, o título do plano Premium ou “não confirmado”. Falhas de sessão/rede não viram falso Free e não impedem o login; o helper oferece `-check-plan -json` sem pedir senha. Standalone e plugin legado não usam essa integração.
+
+### Seleção inicial Proton por velocidade
+
+- O primeiro login e a abertura sem medição compatível passam a medir download e upload em até seis finalistas saudáveis. A triagem mede o ping de todas as rotas da amostra regional, ordena as doze menores latências, valida o túnel e o endpoint HTTPS das doze e começa a medição pelos seis primeiros saudáveis; uma falha de transferência avança para a próxima rota já aprovada. O ranking final escolhe a maior média harmônica de download/upload, usando ping apenas como desempate. A busca continua sendo uma amostra regional, não uma varredura de todos os servidores.
+- O painel Proton mostra skeleton, progresso por tentativa, servidores testados/restantes e Mbps medidos, com cancelamento e opções de tentar novamente ou continuar sem uma nova medição. Os resultados permanecem visíveis após reabrir o aplicativo.
+- Quando a otimização automática é iniciada na abertura do programa, o diálogo de progresso também fica visível durante toda a triagem e medição; ao terminar, ele é fechado sem deslocar o foco do usuário.
+- Em contas Premium no modo automático, rotas da América do Sul recebem preferência quando o ping medido fica até 12 ms acima de uma rota distante; uma diferença maior continua favorecendo o menor ping. A versão do critério foi incrementada para medir novamente perfis anteriores.
+- O loop real com uma sessão Premium percorreu três ciclos sul-americanos e nove ciclos globais (370 rotas regionais pingadas por ciclo no escopo global): preflight de 12 rotas e seis medições válidas foram preservados, e o melhor resultado ficou em 94 ms de RTT aquecido com `SV#36` e 54,4 Mbps de download. Depois desse ganho, cinco ciclos consecutivos não reduziram o RTT; a rodada foi encerrada sem alterar a qualidade mínima.
+- A lista de medição e o cartão da rota selecionada exibem os servidores no formato compacto `PAÍS#servidor` (por exemplo, `US#189`), mantendo o nome original internamente para seleção e cache.
+- Cada rota visível ganhou uma bandeira SVG correspondente ao país, com fallback compacto para novos códigos que a Proton venha a disponibilizar.
+- O diálogo de otimização acompanha a paleta da aplicação nos temas claro e escuro, usando superfícies, bordas e estados semânticos existentes no lugar do destaque roxo.
+- Medições são reutilizadas quando conta, filtros, versão do critério e perfil salvo correspondem em fluxos que pedem reaproveitamento. A versão do critério foi incrementada para exigir o novo preflight completo de doze rotas; resultados anteriores são medidos novamente uma vez. Não há expiração diária. A abertura/login repetem a otimização quando o bypass está inativo; se ele já estiver ativo, a medição é adiada para não interromper uma chamada. A otimização manual mede novamente.
+- Geração temporária e cancelamento aguardando o encerramento do helper preservam o perfil anterior em falhas. O login permanece válido se a medição falhar. A medição continua isolada por WireGuard/netstack, sem alterar a rota do host; diagnósticos de IP/HTTP do Discord continuam somente nos logs.
+- Mantidos até 4 MiB de download e 1 MiB de upload por candidato, 12 segundos por candidato, verificação rápida de até 6 segundos por rota (handshake e HTTPS zero-byte, até quatro túneis em paralelo, com retentativa serial das falhas transitórias), 180 segundos para a triagem e os testes e limite externo de 210 segundos. A velocidade começa pelos seis menores pings aprovados e usa as demais rotas já aprovadas como reserva até completar seis medições válidas. O resultado descreve o caminho até o endpoint de medição naquele momento, sem garantir a qualidade de cada transmissão.
+- Windows/Linux compartilham a seleção e a interface. O helper CLI oferece `-progress-json` em stderr e `-speed-test-trace` para acompanhar no terminal, sem mudar seu JSON final. Standalones e plugin legado não usam esse seletor Proton; não receberam uma tela nem mudanças de recuperação de rede.
+
+### Correções investigadas na fila de issues
+
+### Loop de estabilidade Linux
+
+- **Bazzite/Flatpak:** a abertura do Discord oficial agora entra diretamente no namespace
+  WireGuard com `setsid`, preservando o barramento da sessão Wayland e o portal do usuário;
+  o launcher não passa mais por uma unidade `systemd` do sistema, que podia encerrar o
+  `bwrap` antes de o cliente aparecer. A confirmação consulta `flatpak ps` e usa o PID do
+  sandbox para o status, com espera de até 20 segundos para cold starts. Se a abertura falhar,
+  o processo é fechado antes da remoção do namespace para não deixar um cliente órfão. A GUI
+  também remove sequências ANSI corrompidas (como `�[36m`) das mensagens de erro. A triagem
+  do detector foi validada em CachyOS com Flatpak simulado; a aceitação em uma sessão Bazzite
+  real ainda depende do log do usuário, especialmente se o `bwrap` estiver sendo bloqueado por
+  política de namespaces do sistema.
+- Adicionada a matriz descartável `tests/test-linux-matrix.sh` para Ubuntu 24.04/22.04, Debian 13/12, Fedora 43/42 e Arch atual, com caso histórico fixado em 2025-09-01. O runner valida o preflight JSON, detecta binários presentes mas inutilizáveis, audita bibliotecas antigas/AppImage e executa a prova de namespace sem alterar a rede do host.
+- O preflight agora sugere o comando correto por família: `apt-get update`/instalação mínima, `dnf makecache --refresh`, `zypper --non-interactive refresh` ou `pacman -S --needed`. A GUI continua instalando apenas dependências ausentes; não há upgrade global nem `pacman -Sy` parcial. DNF e Zypper atualizam somente os metadados antes da instalação.
+- Adicionado `tests/test-linux-vm.sh` para VMs libvirt preparadas, com preflight/reparo por SSH, conferência da rota default do host e hook opt-in para uma sessão Premium sem registrar credenciais. Distrobox fica como reprodução auxiliar, não como prova de isolamento.
+- O workflow `.github/workflows/linux-stability.yml` executa a matriz rápida e a auditoria do AppImage sem publicar artefatos. O procedimento, a execução contínua até sinal explícito e as limitações estão em [loop de estabilidade Linux](docs/testing/linux-stability-loop.md).
+- A auditoria de bibliotecas do AppImage separa imagens mínimas de instalações desktop: bibliotecas ausentes ficam explícitas como `SKIP`, e `APPIMAGE_STRICT_LIBS=1` permite torná-las falhas em uma imagem com runtime gráfico instalado.
+- O controlador `tests/run-linux-stability-loop.sh` mantém as rodadas Linux contínuas, alternando preflight, reparo e auditoria AppImage, comparando assinaturas de falha e encerrando somente por sinal explícito do operador.
+- Evidência local desta rodada: os sete containers sem snapshot e a prova de namespace passaram no modo rápido; Debian 12 e Fedora 42 passaram instalação completa com segunda chamada idempotente. A imagem Arch atual foi marcada como infraestrutura bloqueada porque `archlinux:base` não traz bancos Pacman e a política impede upgrade parcial. O AppImage `2.0.5-beta.2` foi extraído em quatro bases e registrou bibliotecas ausentes nas imagens mínimas; isso não equivale a falha em uma instalação desktop completa. O snapshot Arch continua sem cobertura quando o espelho histórico não está disponível.
+
+- CAPTCHA Proton (#239): duas perdas de resposta e uma corrida de fechamento antecipado foram reproduzidas no Electron real. O preload sandbox CommonJS, a captura persistente e o tratamento imediato de preload ausente/erro e `close` corrigem esses caminhos. Linux e Windows passaram as suítes sintéticas, incluindo Full-Repeat e captura/lifecycle 13/13; o relato original com desafio oficial não foi provado. A #230 (`__dirname`, caso histórico distinto do `_dirname` relatado pelo usuário na 2.0.4) permanece separada.
+- Preflight de dependências Windows/Linux: a GUI distingue a SDK WireSock legada 1.4.7.1 da compatível 3.4.8.1, exige o par EXE/DLL e prepara `wg`/`ip`/`curl` Linux somente quando o preflight identifica um caso reparável. Linux teve validação de produto real em Debian rootless; Windows usa instalador oficial direto de hash fixado. Na VM, o runtime 1.4.7.1 interferiu no HTTPS fora do Discord em 3/3 ciclos com o formato atual; mudar somente a diretiva para o formato antigo preservou a rede nativa em 9/9 requisições. A GUI corrigida instalou a SDK 3.4.8.1 e passou três ciclos de ativação/desativação com isolamento por processo. A mudança para IP estrangeiro e os cenários de RTC/reboot ainda não foram comprovados. Detalhes: [relatório de preflight](docs/testing/2026-09-06-dependency-preflight.md).
+- Elevação Linux no standalone: preserva sudo cacheado, usa pkexec quando a GUI não tem zenity/kdialog para apresentar um prompt sudo e não faz fallback após cancelamento, recusa ou senha incorreta. Probes readonly continuam sem prompt. A suíte completa executada após o ajuste teve 243 testes aprovados em 29 arquivos, incluindo 6 novos casos; o reviewer independente marcou PASS. Build Linux local com `--publish never` regenerado e SHA do shell empacotado conferido contra a fonte. O build Windows terminou com exit 0 sem publicação e SHA `f57f629f0d145a880e206692b0bc269ce85550d48714ee3169190e320e93caf3`; a VM confirmou a instalação automática e os ciclos de isolamento descritos no relatório.
+- Linux: reconhece namespaces listados pelo `ip` tanto pelo nome puro quanto com NSID. A checagem anterior exigia um espaço após o nome, podendo tentar criar novamente `discord-vpn` e falhar com `File exists` (#228), além de omitir status e limpeza. GUI e standalone Linux compartilham a fonte corrigida. O outro sintoma da #228, `fopen: Permission denied`, ainda não tem causa confirmada.
+- CAPTCHA Proton: o cancelamento usa uma referência à sessão capturada antes da destruição da janela. Evita `Object has been destroyed` no cleanup e operação de login pendente. O defeito foi reproduzido ao fechar a janela; a relação com o relato de erro após CAPTCHA da #239 ainda requer confirmação do cenário específico.
+- Standalone Windows: a saída do `winget` vai ao console e não contamina o caminho retornado por `Ensure-WireSock` (#240). O entrypoint continua temporariamente desabilitado; esta correção da função não reativa nem publica o standalone.
+- Os caminhos de proxy/PAC, plugin e standalone Windows não usam a detecção de namespace Linux nem a janela CAPTCHA da GUI. Nenhuma alteração de recuperação/rede foi portada mecanicamente ao legado.
+
+Investigação, validação e limites por issue: [relatório da rodada](docs/testing/2026-09-05-global-issue-triage.md).
 
 ## [2.0.4] - 2026-09-05
 
@@ -191,7 +400,6 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
   standalone PowerShell não distribui esse sidecar e o plugin Vencord/Equicord
   não controla WireSock; portar o comportamento exigirá um helper autenticado
   próprio em cada pacote, sem ampliar `AllowedApps` para todo `powershell.exe`.
->>>>>>> upstream/main
 
 ## [2.0.2] - 2026-09-05
 

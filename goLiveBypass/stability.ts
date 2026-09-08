@@ -18,6 +18,43 @@ export interface StreamClaimState {
     warned: boolean;
 }
 
+export interface StreamObservation {
+    now: number;
+    senderClaimed: boolean | null;
+    visibleStreamCount: number | null;
+    nativeStreamCount: number | null;
+    voiceState: string | null;
+    voiceHostname: string | null;
+    selectedRegion: string | null;
+}
+
+export type StreamObservationStatus = "unknown" | "claimed-without-native" | "native-connected" | "idle";
+
+export interface StreamObservationDecision {
+    status: StreamObservationStatus;
+    key: string;
+}
+
+/**
+ * Classifica apenas sinais já coletados pelo renderer. A chave não inclui o
+ * timestamp, pois o watcher deve registrar mudanças de estado, não cada tick.
+ */
+export function evaluateStreamObservation(sample: StreamObservation): StreamObservationDecision {
+    const key = [
+        sample.senderClaimed,
+        sample.visibleStreamCount,
+        sample.nativeStreamCount,
+        sample.voiceState,
+        sample.voiceHostname,
+        sample.selectedRegion,
+    ].map(value => String(value ?? "null")).join("|");
+
+    if (sample.senderClaimed === false) return { status: "idle", key };
+    if (sample.senderClaimed === null || sample.nativeStreamCount === null) return { status: "unknown", key };
+    if (sample.nativeStreamCount > 0) return { status: "native-connected", key };
+    return { status: "claimed-without-native", key };
+}
+
 export interface StreamClaimSample {
     now: number;
     senderClaimed: boolean | null;
@@ -77,29 +114,4 @@ export function evaluateStreamClaim(
         status: "failed",
         warn: true
     };
-}
-
-// Proxy local explicitamente configurado numa porta Tor significa escolha
-// consciente de Tor. Nesse caso o plugin deve preservar a mesma promessa do
-// routeMode=tor da GUI/standalone: sem Tor, gateway fechado; nunca gratuita ou
-// DIRECT. O modo automatico (campo vazio) continua livre para usar reservas.
-export function isStrictManualTor(
-    manual: { proxy: string; } | "auto" | "invalid",
-    isTor: (proxy: string) => boolean
-): manual is { proxy: string; } {
-    return typeof manual === "object" && isTor(manual.proxy);
-}
-
-// Nenhuma saida ativa e trocada por um unico probe ruidoso. Isso vale especialmente
-// para a gratuita: durante a reentrada numa Live, uma troca desnecessaria reconecta
-// o gateway e pode deixar o motor de video preso em so-audio (issues #170/#171).
-// A ativa so e substituida quando o mesmo teto que remove entradas mortas do pote
-// confirma a morte.
-export function shouldReplaceActiveExit(input: {
-    failed: boolean;
-    missedBeats: number;
-    maxMissedBeats: number;
-}) {
-    if (!input.failed) return false;
-    return input.missedBeats >= input.maxMissedBeats;
 }
