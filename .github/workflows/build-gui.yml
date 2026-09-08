@@ -45,15 +45,20 @@ jobs:
           cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
-      - name: Build Windows Executable
-        run: npm run build:win
+      # --publish always: gera o GoLiveBypass.exe + latest.yml e faz upload na release
+      # (o GH_TOKEN do workflow vira o GH_TOKEN que o electron-builder usa).
+      # No canal beta a release nasce como draft; beta-marcar aplica a classificação
+      # PRERELEASE depois que Windows e Linux terminarem — nunca vira "latest".
+      - run: npm run publish:win
+        if: ${{ inputs.canal != 'beta' }}
         working-directory: golive-gui
-      - name: Upload Windows Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-windows
-          path: golive-gui/dist-app/GoLiveBypass-*.exe
-          if-no-files-found: error
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: npm run publish:win -- --config.publish.channel=beta --config.publish.releaseType=prerelease
+        if: ${{ inputs.canal == 'beta' }}
+        working-directory: golive-gui
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   linux:
     runs-on: ubuntu-latest
@@ -70,43 +75,19 @@ jobs:
           cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
-      - name: Build Linux AppImage
-        run: npm run build:linux
+      # No canal beta publica AppImage + beta.yml (electron-updater com
+      # allowPrerelease consome o canal beta.yml que o electron-builder gera
+      # sozinho para versao com sufixo de prerelease).
+      - run: npm run publish:linux
+        if: ${{ inputs.canal != 'beta' }}
         working-directory: golive-gui
-      - name: Ensure Linux Update Metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: npm run publish:linux -- --config.publish.channel=beta --config.publish.releaseType=prerelease
+        if: ${{ inputs.canal == 'beta' }}
         working-directory: golive-gui
-        run: |
-          if [ ! -f "dist-app/latest-linux.yml" ]; then
-            node -e '
-              const fs = require("fs");
-              const crypto = require("crypto");
-              const path = require("path");
-              const file = fs.readdirSync("dist-app").find(f => f.endsWith(".AppImage"));
-              if (!file) {
-                console.error("AppImage not found in dist-app");
-                process.exit(1);
-              }
-              const fullPath = path.join("dist-app", file);
-              const stat = fs.statSync(fullPath);
-              const buf = fs.readFileSync(fullPath);
-              const hash = crypto.createHash("sha512").update(buf).digest("base64");
-              const version = "${{ inputs.tag }}".replace(/^v/, "");
-              const yml = `version: ${version}\nfiles:\n  - url: ${file}\n    sha512: ${hash}\n    size: ${stat.size}\npath: ${file}\nsha512: ${hash}\nreleaseDate: "${new Date().toISOString()}"\n`;
-              fs.writeFileSync("dist-app/latest-linux.yml", yml);
-              console.log("Generated dist-app/latest-linux.yml successfully");
-            '
-          fi
-          if [ "${{ inputs.canal }}" = "beta" ]; then
-            cp dist-app/latest-linux.yml dist-app/beta-linux.yml
-          fi
-      - name: Upload Linux Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-linux
-          path: |
-            golive-gui/dist-app/GoLiveBypass-*.AppImage
-            golive-gui/dist-app/*-linux.yml
-          if-no-files-found: error
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   proton-runtime-assets:
     # Os helpers sao um reparo de contingencia para instalacoes que perderam
