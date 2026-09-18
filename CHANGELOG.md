@@ -5,11 +5,15 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
+
+## [2.0.7-beta-2] - 2026-09-18
+
 ### Plugin Linux: módulo WireGuard verificado e poll sem travar a main thread
 
 - Causa: a ativação empurrava `modprobe wireguard` para a sequência elevada e seguia direto para `ip link add … type wireguard`. Quando o módulo não carregava, o usuário recebia `Falha ao executar ip: Error: Unknown device type.` (log de 17/09 na linha beta), que não diz o que fazer. E o painel consultava o estado do módulo a cada poucos segundos com `modprobe -n -v` **síncrono** — até 2 s de travamento da main thread do Electron por consulta, dentro do cliente.
 - Correção: a mesma sequência elevada agora confirma `/sys/module/wireguard` logo depois do `modprobe` e falha com a mensagem do módulo (o rollback do namespace já existente continua rodando, sem fechar o Discord); se a sequência falhar por esse motivo, o erro críptico do `ip` é trocado pela mesma mensagem. O estado do módulo passa a ter cache curto, invalidado quando uma ativação roda `modprobe`, o que remove o spawn repetido do poll.
 - Cobertura: `golive-gui/tests/plugin-vpn-linux.test.ts` cobre a checagem (falha no passo certo, com a mensagem certa) e o cache (duas consultas, uma chamada de `modprobe`). Limitação: a carga real do módulo depende do kernel — neste host o `wireguard` não existe no kernel em execução (`7.2.5-1-cachyos`), então a ativação completa do plugin não pôde ser exercitada aqui.
+- Achado do teste de ponta a ponta (pós-reboot, kernel 7.2.6 com o módulo carregado): a sequência elevada **expira em 15 s** (`Comando expirou após 15000ms: /usr/bin/pkexec`) e a ativação faz rollback. Em sessão **sem agente polkit** o `pkexec` responde `Request dismissed`; com prompt, o usuário precisa de mais de 15 s para digitar a senha. O timeout do caminho de ativação Linux ainda é o `DEFAULT_COMMAND_TIMEOUT_MS` e não foi alterado nesta beta — quem tiver o polkit sem agente continua vendo a falha com rollback (a GUI já tem o fallback por `sudo askpass`; o plugin, não).
 
 ### Instaladores: restaurar um cliente que não abre (Windows e Linux)
 
