@@ -6,6 +6,8 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+## [2.0.7-beta-3] - 2026-09-18
+
 ### Plugin Linux: o cliente só fecha depois que o novo processo entra no namespace (#313)
 
 - Causa confirmada: ao ativar, o plugin criava o namespace/WireGuard e relançava o Discord com `pkexec netns-launcher …`, mas **saía do processo atual depois de 200 ms**, contando com o tempo. Com o polkit esperando resposta (ou sem agente de autenticação, que responde "Request dismissed"), o launcher nunca rodava: o Discord fechava assim que o diálogo aparecia e **não voltava** — o sintoma relatado na #313.
