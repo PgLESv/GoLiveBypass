@@ -9,7 +9,9 @@ import {
   buildLinuxPrivilegedScript,
   formatLinuxWireGuardModuleIssue,
   linuxDependencyStatus,
+  linuxWireGuardModuleCheckCommand,
   linuxWireGuardModuleState,
+  resetLinuxWireGuardModuleCache,
 } from "../../goLiveBypass/vpn-linux";
 
 describe("transporte Linux do plugin", () => {
@@ -43,6 +45,57 @@ describe("transporte Linux do plugin", () => {
       expect(status.missing).toContain("wireguard-kernel-module");
       expect(fs.existsSync(marker)).toBe(false);
     } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("confirma a carga do módulo antes de criar a interface", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-module-check-"));
+    try {
+      const ausente = path.join(root, "wireguard-nao-existe");
+      const presente = path.join(root, "wireguard-presente");
+      fs.writeFileSync(presente, "x");
+
+      const comFalha = buildLinuxPrivilegedScript([
+        ["/usr/bin/true", []],
+        linuxWireGuardModuleCheckCommand("/bin/sh", ausente),
+      ]);
+      const falha = spawnSync("/bin/sh", ["-c", comFalha], { encoding: "utf8" });
+      expect(falha.status).toBe(1);
+      // O passo que falha tem que ser a checagem (1), não o comando anterior.
+      expect(falha.stderr).toContain("__GOLIVE_STEP__1");
+      expect(falha.stderr).toContain("não carregou");
+
+      const semFalha = linuxWireGuardModuleCheckCommand("/bin/sh", presente);
+      const ok = spawnSync(semFalha[0], semFalha[1] as string[], { encoding: "utf8" });
+      expect(ok.status).toBe(0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("não repete o modprobe a cada consulta de dependências (cache curto)", () => {
+    if (process.platform !== "linux" || fs.existsSync("/sys/module/wireguard")) return;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-module-cache-"));
+    const bin = path.join(root, "bin");
+    const chamadas = path.join(root, "chamadas");
+    fs.mkdirSync(bin);
+    const modprobe = path.join(bin, "modprobe");
+    fs.writeFileSync(modprobe, `#!/bin/sh\nprintf 'x\\n' >> ${chamadas}\nexit 1\n`);
+    fs.chmodSync(modprobe, 0o755);
+    const env = { ...process.env, PATH: bin };
+    const total = () => (fs.existsSync(chamadas) ? fs.readFileSync(chamadas, "utf8").trim().split("\n").length : 0);
+    try {
+      resetLinuxWireGuardModuleCache();
+      expect(linuxWireGuardModuleState(env)).toBe("missing");
+      expect(linuxWireGuardModuleState(env)).toBe("missing");
+      expect(total()).toBe(1);
+      // Invalidação (usada depois de uma ativação) força nova checagem.
+      resetLinuxWireGuardModuleCache();
+      expect(linuxWireGuardModuleState(env)).toBe("missing");
+      expect(total()).toBe(2);
+    } finally {
+      resetLinuxWireGuardModuleCache();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

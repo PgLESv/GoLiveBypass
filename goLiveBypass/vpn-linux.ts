@@ -185,9 +185,39 @@ export function formatLinuxWireGuardModuleIssue(
     return `O módulo WireGuard não está disponível no kernel Linux em execução (${release}). Instale ou ative o módulo WireGuard antes de ativar.`;
 }
 
-export function linuxWireGuardModuleState(env: NodeJS.ProcessEnv = process.env): LinuxWireGuardModuleState {
-    if (!isLinux()) return "missing";
-    if (fs.existsSync("/sys/module/wireguard")) return "loaded";
+// O modulo WireGuard so muda de estado quando alguem roda modprobe, mas o painel consulta as
+// dependencias a cada poucos segundos e cada consulta spawna `modprobe -n -v` DE FORMA SINCRONA
+// na main thread do Electron (ate 2s de travamento por consulta, dentro do cliente). Por isso o
+// resultado fica em cache curto e e invalidado quando uma ativacao roda modprobe de verdade.
+const WIREGUARD_MODULE_CACHE_MS = 30_000;
+const WIREGUARD_MODULE_PATH = "/sys/module/wireguard";
+
+let wireGuardModuleCache: { key: string; state: LinuxWireGuardModuleState; at: number } | null = null;
+
+export function resetLinuxWireGuardModuleCache(): void {
+    wireGuardModuleCache = null;
+}
+
+export function wireGuardModuleLoadFailureMessage(): string {
+    const release = os.release().trim() || "atual";
+    return `O módulo WireGuard não carregou no kernel em execução (${release}). Ative ou instale o módulo (ex.: wireguard-dkms, ou o pacote de módulos do seu kernel) e tente de novo.`;
+}
+
+// Checagem que entra na MESMA sequencia elevada do modprobe: `modprobe` pode sair com 0 sem
+// carregar nada (modulo de outro kernel, assinatura recusada, embutido sem suporte) e o erro
+// que sobra e o `ip: Unknown device type`, que nao diz o que fazer (relato do beta-22 no Linux).
+export function linuxWireGuardModuleCheckCommand(
+    shellPath: string,
+    modulePath: string = WIREGUARD_MODULE_PATH,
+): LinuxPrivilegedCommand {
+    return [
+        shellPath,
+        ["-c", `test -e ${shellQuote(modulePath)} || { printf '%s\\n' ${shellQuote(wireGuardModuleLoadFailureMessage())} >&2; exit 1; }`],
+    ];
+}
+
+function detectLinuxWireGuardModuleState(env: NodeJS.ProcessEnv): LinuxWireGuardModuleState {
+    if (fs.existsSync(WIREGUARD_MODULE_PATH)) return "loaded";
 
     const modprobe = findSystemBinary("modprobe", env);
     if (!modprobe) return "missing";
@@ -209,6 +239,21 @@ export function linuxWireGuardModuleState(env: NodeJS.ProcessEnv = process.env):
     } catch {
         return "missing";
     }
+}
+
+export function linuxWireGuardModuleState(env: NodeJS.ProcessEnv = process.env): LinuxWireGuardModuleState {
+    if (!isLinux()) return "missing";
+
+    const key = `${isFlatpak(env) ? "flatpak" : "host"}|${findSystemBinary("modprobe", env) ?? ""}`;
+    const now = Date.now();
+    const cached = wireGuardModuleCache;
+    if (cached && cached.key === key && now - cached.at < WIREGUARD_MODULE_CACHE_MS) {
+        return cached.state;
+    }
+
+    const state = detectLinuxWireGuardModuleState(env);
+    wireGuardModuleCache = { key, state, at: now };
+    return state;
 }
 
 export function linuxWireGuardModuleIssue(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -1181,6 +1226,9 @@ export async function startLinuxNetwork(
         if (moduleState === "available") {
             if (!modprobePath) throw new Error("Utilitário 'modprobe' não encontrado para carregar o módulo WireGuard.");
             commands.push([modprobePath, ["wireguard"]]);
+            // Confirma a carga na MESMA sequência elevada: sem isto, o módulo não subir termina
+            // no erro críptico do `ip` ("Unknown device type") em vez de dizer o que fazer.
+            commands.push(linuxWireGuardModuleCheckCommand(findSystemBinary("sh") || "/bin/sh"));
         }
 
         // A sequência inteira roda sob uma única autorização; o rollback permanece dentro do
@@ -1231,7 +1279,18 @@ export async function startLinuxNetwork(
         if (tempResolvFile && rmPath) {
             rollback.unshift([rmPath, ["-rf", `/etc/netns/${namespace}`]]);
         }
-        await execPrivilegedSequence(commands, { timeoutMs, signal, rollback });
+        try {
+            await execPrivilegedSequence(commands, { timeoutMs, signal, rollback });
+        } catch (error) {
+            // Depois de rodar modprobe, o "available" em cache ficou velho: a proxima consulta
+            // (painel/watchdog) precisa ver o estado real.
+            resetLinuxWireGuardModuleCache();
+            if (moduleState === "available" && linuxWireGuardModuleState() !== "loaded") {
+                throw new Error(wireGuardModuleLoadFailureMessage());
+            }
+            throw error;
+        }
+        resetLinuxWireGuardModuleCache();
         options?.log?.("info", "linux.network.phase", { phase: "namespace" });
         options?.log?.("info", "linux.network.phase", { phase: "interface" });
         options?.log?.("info", "linux.network.phase", { phase: "routes" });

@@ -5,6 +5,12 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
+### Plugin Linux: módulo WireGuard verificado e poll sem travar a main thread
+
+- Causa: a ativação empurrava `modprobe wireguard` para a sequência elevada e seguia direto para `ip link add … type wireguard`. Quando o módulo não carregava, o usuário recebia `Falha ao executar ip: Error: Unknown device type.` (log de 17/09 na linha beta), que não diz o que fazer. E o painel consultava o estado do módulo a cada poucos segundos com `modprobe -n -v` **síncrono** — até 2 s de travamento da main thread do Electron por consulta, dentro do cliente.
+- Correção: a mesma sequência elevada agora confirma `/sys/module/wireguard` logo depois do `modprobe` e falha com a mensagem do módulo (o rollback do namespace já existente continua rodando, sem fechar o Discord); se a sequência falhar por esse motivo, o erro críptico do `ip` é trocado pela mesma mensagem. O estado do módulo passa a ter cache curto, invalidado quando uma ativação roda `modprobe`, o que remove o spawn repetido do poll.
+- Cobertura: `golive-gui/tests/plugin-vpn-linux.test.ts` cobre a checagem (falha no passo certo, com a mensagem certa) e o cache (duas consultas, uma chamada de `modprobe`). Limitação: a carga real do módulo depende do kernel — neste host o `wireguard` não existe no kernel em execução (`7.2.5-1-cachyos`), então a ativação completa do plugin não pôde ser exercitada aqui.
+
 ### Instaladores: restaurar um cliente que não abre (Windows e Linux)
 
 - Causa: o patch em cliente paralelo troca o `app.asar` pelo `dist/<cliente>.asar` do checkout e guarda o original em `_app.asar`, mas **nada devolvia esse backup**. Se o checkout, o build ou a versão do mod mudassem depois, o cliente ficava sem abrir e nem `--uninstall`/`-Mode Uninstall` nem `--restore`/`-Mode Restore` resolviam: os dois só removiam o userplugin e recompilavam, deixando o `app.asar` patchado no lugar. É o mecanismo por trás dos relatos de Equibop/Vesktop que deixaram de abrir (#268, #258).
