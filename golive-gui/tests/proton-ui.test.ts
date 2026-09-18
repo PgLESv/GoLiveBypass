@@ -21,6 +21,25 @@ describe("controles Proton", () => {
     expect(fnBody).toContain("Rota ${selectedServerName} aplicada!");
   });
 
+  it("libera o botão de ativar quando a otimização da rota termina", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    const fnStart = source.indexOf("async function optimizeProtonRoute");
+    const fnEnd = source.indexOf("protonOptimizeBtn?.addEventListener", fnStart);
+    const finallyBody = source.slice(
+      source.indexOf("} finally {", fnStart),
+      fnEnd > fnStart ? fnEnd : undefined,
+    );
+    const libera = finallyBody.indexOf("protonOptimizationInFlight = false;");
+    const atualizaStatus = finallyBody.indexOf("await updateStatus();");
+    // updateStatus() desativa o botão enquanto o flag estiver ligado, e os
+    // gatilhos (ativar, trocar de rota, sair da conta) o consultam antes de
+    // agir. O reset precisa vir antes do updateStatus, senão o "Ativar Bypass"
+    // fica indisponível após qualquer medição, inclusive a automática da
+    // abertura, até reiniciar o programa.
+    expect(libera).toBeGreaterThanOrEqual(0);
+    expect(atualizaStatus).toBeGreaterThan(libera);
+  });
+
   it("refaz a otimização automática na abertura em vez de reutilizar o cache", () => {
     const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(source).toContain("refreshOnStartup: onStartup");

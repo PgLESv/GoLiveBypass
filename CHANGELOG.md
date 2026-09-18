@@ -6,6 +6,16 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+## [2.0.7-beta-1] - 2026-09-18
+
+### GUI: botão "Ativar Bypass" volta a funcionar (#312, #316)
+
+- Causa confirmada: o `finally` de `optimizeProtonRoute` no renderer deixou de limpar `protonOptimizationInFlight` (a linha foi trocada por `stopProtonOptimizeAnimation()` em `2.0.6-beta-21`, e a regressão chegou ao estável `2.0.6`). O flag nunca voltava a `false`; como a rota é otimizada automaticamente na abertura para quem já tem a conta Proton conectada, o botão terminava desativado — cursor de proibido, clique sem efeito e nenhum evento de ativação nos logs.
+- O mesmo flag ignorava trocar de aba/rota, **Otimizar rota**, **Atualizar plano** e **Sair**, e bloqueava o catálogo de rotas seguinte, que deixava o seletor vazio.
+- Correção: o reset voltou ao `finally`, antes do `updateStatus()` que reabilita o botão. Teste de regressão em `tests/proton-ui.test.ts` fixa a ordem.
+- Afetadas: GUI Windows e Linux de `2.0.6-beta-21` em diante, incluindo o estável `2.0.6`. Quem está em `2.0.6-beta-20` ou anterior não tem a regressão.
+- Limitação: validação por teste de renderer e compilação; a confirmação em Windows real depende deste beta.
+
 ## [2.0.6] - 2026-09-18
 
 ### Devlog da release estável

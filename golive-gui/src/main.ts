@@ -1703,6 +1703,11 @@ async function optimizeProtonRoute(onStartup = false, speedTest = true) {
     await updateStatus();
   } finally {
     stopProtonOptimizeAnimation();
+    // O flag libera o botao de ativar em updateStatus() e os gatilhos que o
+    // ignoram enquanto a medicao roda (ativar, trocar aba/rota, sair da conta).
+    // Sem este reset, qualquer otimizacao - inclusive a automatica da abertura -
+    // deixava o botao "Ativar Bypass" desativado ate reiniciar o programa.
+    protonOptimizationInFlight = false;
     protonOptimizationRequestId = '';
     if (tabProton) tabProton.disabled = false;
     if (tabCustom) tabCustom.disabled = false;
