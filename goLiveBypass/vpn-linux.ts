@@ -22,6 +22,34 @@ export const MAX_LINUX_INTERFACE_LEN = 15;
 export const MAX_LINUX_NAMESPACE_LEN = 31;
 export const PROTECTED_LINUX_NAMES = Object.freeze(["discord-vpn", "wg-discord"] as const);
 export const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
+
+// Explica falhas de elevação que o usuário pode resolver, em vez de devolver o texto cru do
+// pkexec ("Error executing command as another user: Request dismissed", que não diz nada).
+export function linuxAuthorizationGuidance(detail: string, filePath = ""): string | null {
+    if (/Request dismissed|No authentication agent|no agent|not authorized|dismissed|authentication agent/i.test(detail)) {
+        return "O polkit não conseguiu pedir autorização (diálogo recusado ou sem agente de autenticação). Instale ou inicie um agente do polkit (polkit-gnome, lxqt-policykit, kde-polkit ou o do seu ambiente) e tente de novo.";
+    }
+    if (/pkexec/i.test(filePath) && /expirou após \d+ms/i.test(detail)) {
+        return "O pedido de autorização não foi respondido a tempo. Responda o diálogo do polkit (ou configure um agente de autenticação) e tente de novo.";
+    }
+    return null;
+}
+
+// Espera um arquivo aparecer (usado pela confirmação do relaunch). Devolve false no timeout.
+export async function waitForFile(filePath: string, timeoutMs: number, pollMs = 100): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        try {
+            if (fs.existsSync(filePath)) return true;
+        } catch {
+            // segue tentando: um erro de leitura agora não é motivo para desistir da confirmação
+        }
+        if (Date.now() >= deadline) return false;
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, pollMs);
+        await promise;
+    }
+}
 export const DEFAULT_AUTH_PROMPT_TIMEOUT_MS = 60_000;
 export const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 
@@ -520,6 +548,23 @@ export function buildLinuxPrivilegedScript(
     return `${lines.join("\n")}\n`;
 }
 
+// O timeout do pkexec não pode virar só "Comando expirou após 15000ms: /usr/bin/pkexec": quando
+// o polkit está esperando o usuário (ou não tem agente), a mensagem precisa dizer o que fazer.
+// Era esse texto cru que aparecia no relato #313 e no log local do E2E.
+async function runPrivilegedCommand(
+    spec: CommandSpec,
+    options?: { timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv },
+): Promise<CommandResult> {
+    try {
+        return await runCommandAsync(spec, options);
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const guidance = linuxAuthorizationGuidance(detail, spec.file);
+        if (!guidance) throw error;
+        throw new Error(`${detail} ${guidance}`);
+    }
+}
+
 async function execPrivilegedSequence(
     commands: readonly LinuxPrivilegedCommand[],
     options?: {
@@ -539,7 +584,7 @@ async function execPrivilegedSequence(
         isFlatpakEnv: isFlatpak(env),
         env,
     });
-    let result = await runCommandAsync(spec, options);
+    let result = await runPrivilegedCommand(spec, options);
     const initialFailure = result.exitCode === null || result.exitCode === 0
         ? null
         : new LinuxAuthorizationError(
@@ -551,7 +596,7 @@ async function execPrivilegedSequence(
         const terminalSpec = pkexec
             ? resolveTerminalAuthorizationSpec(pkexec, shellPath, env, ["-c", script])
             : null;
-        if (terminalSpec) result = await runCommandAsync(terminalSpec, options);
+        if (terminalSpec) result = await runPrivilegedCommand(terminalSpec, options);
     }
     if (result.exitCode !== 0) {
         const match = /__GOLIVE_STEP__(\d+)/.exec(result.stderr);
@@ -564,10 +609,11 @@ async function execPrivilegedSequence(
                 || result.stdout
                 || `Exit code ${result.exitCode}`,
         );
+        const guidance = linuxAuthorizationGuidance(detail, spec.file);
         if (result.exitCode === 126) {
-            throw new LinuxAuthorizationError("A autorização administrativa foi cancelada.", result.exitCode);
+            throw new LinuxAuthorizationError(`A autorização administrativa foi cancelada.${guidance ? ` ${guidance}` : ""}`, result.exitCode);
         }
-        throw new Error(`Falha ao executar ${failedCommand ? path.basename(failedCommand[0]) : "comando privilegiado"}: ${detail}`);
+        throw new Error(`Falha ao executar ${failedCommand ? path.basename(failedCommand[0]) : "comando privilegiado"}: ${detail}${guidance ? ` ${guidance}` : ""}`);
     }
     return result;
 }
@@ -1217,7 +1263,7 @@ export async function startLinuxNetwork(
     fs.writeFileSync(tempConfigFile, setconfContent, { mode: 0o600 });
 
     let tempResolvFile: string | null = null;
-    const timeoutMs = options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_AUTH_PROMPT_TIMEOUT_MS;
     const signal = options?.signal;
 
     options?.log?.("info", "linux.network.started", { phase: "preparing" });

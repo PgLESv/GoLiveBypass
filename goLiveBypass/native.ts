@@ -64,11 +64,14 @@ import { resolveWindowsPnpmBuildCommand } from "./plugin-build";
 import { defaultPluginVpnDataDir, PluginVpnController, type ProtonLoginPayload, type ProtonOptimizationOptions } from "./vpn-controller";
 import { disposeWireSockSnapshotWorker } from "./vpn-snapshot-worker";
 import {
+    DEFAULT_AUTH_PROMPT_TIMEOUT_MS,
     findSystemBinary,
     GOLIVE_PLUGIN_LINUX_NAMESPACE,
     isFlatpak as isLinuxFlatpak,
     isProcessInNamespace,
     isValidLinuxName,
+    linuxAuthorizationGuidance,
+    waitForFile,
 } from "./vpn-linux";
 import * as proton from "./vpn-proton";
 import { safeDiagnosticDetail } from "./vpn-types";
@@ -636,6 +639,9 @@ async function requestRelaunch(namespace: string | null): Promise<boolean> {
         const directNativeLaunch = currentlyInNamespace && !inFlatpak;
         let temporaryHostLauncher: string | undefined;
         let temporaryHostLauncherAccepted = false;
+        // Marcador combinado com o launcher (--confirm=): só existe depois que o novo processo
+        // entrou no namespace. Fica fora do try para ser limpo em qualquer saída.
+        const confirmMarker = join(VPN_DATA_DIR, `.relaunch-confirm-${randomUUID()}`);
         try {
             const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
             const gid = typeof process.getgid === "function" ? process.getgid() : undefined;
@@ -667,6 +673,10 @@ async function requestRelaunch(namespace: string | null): Promise<boolean> {
                     String(uid),
                     String(gid),
                     ...(inFlatpak ? ["--self-delete"] : []),
+                    // O launcher escreve este arquivo depois de entrar no namespace: é o sinal
+                    // para encerrar o cliente atual. Sem ele, sair do processo era uma aposta de
+                    // 200 ms e um polkit sem resposta deixava o usuário sem Discord (#313).
+                    `--confirm=${confirmMarker}`,
                     ...launcherEnvArgs,
                     "--",
                     target,
@@ -684,38 +694,49 @@ async function requestRelaunch(namespace: string | null): Promise<boolean> {
                 }
             }
 
-            const { promise, resolve, reject } = Promise.withResolvers<void>();
             const child = spawn(command, spawnArgs, {
                 detached: true,
                 stdio: ["ignore", "ignore", "pipe"],
                 env: childEnv,
             });
-            let settled = false;
             let stderrData = "";
-            const finish = (error?: Error) => {
-                if (settled) return;
-                settled = true;
-                if (error) reject(error);
-                else resolve();
+            const { promise: falhaDoRelaunch, resolve: relatarFalha } = Promise.withResolvers<Error>();
+            let falhaSettled = false;
+            const relatarUmaVez = (error: Error) => {
+                if (falhaSettled) return;
+                falhaSettled = true;
+                relatarFalha(error);
             };
             child.stderr?.on("data", chunk => { stderrData = (stderrData + chunk.toString("utf8")).slice(-1000); });
-            child.once("error", error => finish(error));
+            child.once("error", error => relatarUmaVez(error));
             child.once("close", (code, signal) => {
                 if (code === 0 || code === null) {
-                    finish();
+                    // Saiu cedo mas sem erro: só conta como falha se a confirmação ainda não veio
+                    // (o waitForFile decide pelo timeout).
+                    relatarUmaVez(new Error("O relançamento terminou antes de entrar no namespace."));
                     return;
                 }
                 const detail = `${stderrData.trim()} (código ${code}, sinal ${signal})`.trim();
                 if (/AccessDenied|Portal call failed|Permission denied/i.test(detail)) {
-                    finish(new Error(`O cliente Flatpak não possui permissão para executar o relaunch no host. Conceda: flatpak override --user --talk-name=org.freedesktop.Flatpak ${flatpakId || "<app-id>"}`));
+                    relatarUmaVez(new Error(`O cliente Flatpak não possui permissão para executar o relaunch no host. Conceda: flatpak override --user --talk-name=org.freedesktop.Flatpak ${flatpakId || "<app-id>"}`));
                     return;
                 }
-                finish(new Error(`Relaunch Linux encerrou prematuramente: ${detail}`));
+                relatarUmaVez(new Error(`Relaunch Linux encerrou prematuramente: ${detail}`));
             });
-            const timer = setTimeout(() => finish(), 200);
-            timer.unref?.();
             child.unref();
-            await promise;
+
+            const resultado = await Promise.race([
+                waitForFile(confirmMarker, DEFAULT_AUTH_PROMPT_TIMEOUT_MS).then(ok => (ok ? "confirmado" as const : "timeout" as const)),
+                falhaDoRelaunch,
+            ]);
+            try { rmSync(confirmMarker, { force: true }); } catch {}
+            if (resultado !== "confirmado") {
+                if (typeof resultado === "string") {
+                    const guidance = linuxAuthorizationGuidance("pkexec", "pkexec");
+                    throw new Error(`O relançamento não confirmou a entrada no namespace em ${Math.round(DEFAULT_AUTH_PROMPT_TIMEOUT_MS / 1000)}s.${guidance ? ` ${guidance}` : ""}`);
+                }
+                throw resultado;
+            }
             temporaryHostLauncherAccepted = true;
         } finally {
             if (temporaryHostLauncher && !temporaryHostLauncherAccepted) {

@@ -6,6 +6,15 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### Plugin Linux: o cliente só fecha depois que o novo processo entra no namespace (#313)
+
+- Causa confirmada: ao ativar, o plugin criava o namespace/WireGuard e relançava o Discord com `pkexec netns-launcher …`, mas **saía do processo atual depois de 200 ms**, contando com o tempo. Com o polkit esperando resposta (ou sem agente de autenticação, que responde "Request dismissed"), o launcher nunca rodava: o Discord fechava assim que o diálogo aparecia e **não voltava** — o sintoma relatado na #313.
+- Correção: o launcher (`netns-launcher.c`) escreve um marcador combinado por `--confirm=<arquivo>` **depois de entrar no namespace e abandonar privilégios**, e o plugin espera por esse marcador (até 60 s) antes de encerrar o cliente. Se o pkexec for recusado, cancelado ou o launcher falhar, o Discord **continua aberto** e o erro é reportado.
+- O timeout da sequência elevada de ativação deixou de ser o padrão de 15 s e passou a usar `DEFAULT_AUTH_PROMPT_TIMEOUT_MS` (60 s): com prompt de senha ninguém responde em 15 s, e o plugin matava o pedido no meio (log do E2E local: `Comando expirou após 15000ms: /usr/bin/pkexec`).
+- Falhas de autorização agora vêm com orientação acionável em vez do texto cru do pkexec ("instale ou inicie um agente do polkit (polkit-gnome, lxqt-policykit, kde-polkit)…" / "o pedido não foi respondido a tempo").
+- Cobertura: `tests/test-netns-launcher.sh` (build limpo com `-Wall -Wextra -Werror`, confirmação escrita só depois de largar privilégios, falha de namespace sem marcador, parsing de `--confirm=`/`--env=`) e novos casos em `golive-gui/tests/plugin-vpn-linux.test.ts` (orientação de polkit, espera pelo marcador, launcher confirmando antes de qualquer saída). O binário embutido em `vpn-proton.ts` foi regerado a partir do C, com o hash conferido.
+- Limitação: o caminho de **sucesso** do launcher (entrar num namespace real) não pôde ser executado neste host — `/run/netns` é do root e o `pkexec` local está sem agente que responda; o que está provado é o build, a escrita da confirmação e o caminho de falha. A confirmação em cliente real depende de uma máquina com polkit funcional.
+
 ## [2.0.7-beta-2] - 2026-09-18
 
 ### Plugin Linux: módulo WireGuard verificado e poll sem travar a main thread

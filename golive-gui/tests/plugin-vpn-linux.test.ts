@@ -3,15 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   buildLinuxPrivilegedScript,
   formatLinuxWireGuardModuleIssue,
+  linuxAuthorizationGuidance,
   linuxDependencyStatus,
   linuxWireGuardModuleCheckCommand,
   linuxWireGuardModuleState,
   resetLinuxWireGuardModuleCache,
+  waitForFile,
 } from "../../goLiveBypass/vpn-linux";
 
 describe("transporte Linux do plugin", () => {
@@ -98,6 +100,54 @@ describe("transporte Linux do plugin", () => {
       resetLinuxWireGuardModuleCache();
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("explica falha de autorização do polkit em vez de devolver o erro cru", () => {
+    const dismissed = linuxAuthorizationGuidance("Error executing command as another user: Request dismissed", "/usr/bin/pkexec");
+    expect(dismissed).toContain("polkit");
+    expect(dismissed).toContain("agente");
+    const expirou = linuxAuthorizationGuidance("Comando expirou após 15000ms: /usr/bin/pkexec", "/usr/bin/pkexec");
+    expect(expirou).toContain("não foi respondido a tempo");
+    // Um timeout que não é de elevação não vira conselho de polkit.
+    expect(linuxAuthorizationGuidance("Comando expirou após 15000ms: /usr/bin/ip", "/usr/bin/ip")).toBeNull();
+    expect(linuxAuthorizationGuidance("Unknown device type.", "/usr/bin/ip")).toBeNull();
+  });
+
+  it("espera o arquivo de confirmação do relaunch (e desiste no timeout)", async () => {
+    vi.useFakeTimers();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-confirm-"));
+    try {
+      const pronto = path.join(root, "pronto");
+      fs.writeFileSync(pronto, "ok");
+      expect(await waitForFile(pronto, 1000, 20)).toBe(true);
+
+      const atrasado = path.join(root, "atrasado");
+      const pendente = waitForFile(atrasado, 2000, 20);
+      fs.writeFileSync(atrasado, "ok");
+      await vi.advanceTimersByTimeAsync(40);
+      expect(await pendente).toBe(true);
+
+      const nunca = path.join(root, "nunca");
+      const desiste = waitForFile(nunca, 200, 20);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(await desiste).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("só encerra o cliente depois da confirmação do launcher", () => {
+    const native = fs.readFileSync(path.resolve(process.cwd(), "../goLiveBypass/native.ts"), "utf8");
+    const launcher = fs.readFileSync(path.resolve(process.cwd(), "../goLiveBypass/tools/netns-launcher.c"), "utf8");
+    // O plugin combina o marcador e espera por ele antes de sair (relato #313: saía ~200 ms
+    // depois do pkexec e o Discord ficava fechado quando o polkit não respondia).
+    expect(native).toContain("`--confirm=${confirmMarker}`");
+    expect(native).toContain("waitForFile(confirmMarker, DEFAULT_AUTH_PROMPT_TIMEOUT_MS)");
+    // E o launcher escreve a confirmação depois de entrar no namespace e largar privilégios.
+    expect(launcher).toContain("--confirm=");
+    expect(launcher).toContain("write_confirmation(confirm_path, argv[1])");
+    expect(launcher.indexOf("setuid(uid)")).toBeLessThan(launcher.indexOf("write_confirmation(confirm_path, argv[1])"));
   });
 
   it("agrupa comandos privilegiados e executa rollback no mesmo processo", () => {
