@@ -16,6 +16,9 @@
 #   ./golivebypass-installer.sh --mod vencord --yes
 #   ./golivebypass-installer.sh --uninstall
 #   ./golivebypass-installer.sh --check-update   # consulta a API e pode persistir o canal, sem baixar ZIP
+#   ./golivebypass-installer.sh --client-status  # estado da injecao em cada cliente (nao altera nada)
+#   ./golivebypass-installer.sh --restore-client # devolve o app.asar original (cliente que nao abre)
+#   ./golivebypass-installer.sh --restore-client Equibop --force
 #
 # Obrigado ao Vithor (https://github.com/Vith0r), que escreveu o primeiro instalador do
 # GoLiveBypass e abriu o caminho para este aqui.
@@ -79,6 +82,10 @@ SOURCE=""
 PLUGIN_SOURCE=""
 CHANNEL="stable"
 CHANNEL_EXPLICIT=0
+# Alvo de --restore-client (nome do cliente ou vazio = todos os que tem patch/backup) e o
+# escape para desfazer tambem um mod que esta funcionando (--force).
+RESTORE_CLIENT_TARGET=""
+FORCE_RESTORE=0
 ASSUME_YES=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
@@ -681,6 +688,15 @@ while [ $# -gt 0 ]; do
         --mod) MOD="${2:-}"; shift ;;
         --source) SOURCE="${2:-}"; shift ;;
         --plugin-source) PLUGIN_SOURCE="${2:-}"; shift ;;
+        --restore-client)
+            MODE="restore-client"
+            case "${2:-}" in
+                ""|-*) ;;
+                *) RESTORE_CLIENT_TARGET="${2:-}"; shift ;;
+            esac
+            ;;
+        --client-status) MODE="client-status" ;;
+        --force) FORCE_RESTORE=1 ;;
         --yes|-y) ASSUME_YES=1 ;;
         --help|-h) usage ;;
         *) fail "Opcao desconhecida: $1" ;;
@@ -1589,6 +1605,247 @@ patch_parallel_one() {
         sudo chown "$(id -u):$(id -g)" "$app_path" 2>/dev/null || true
     fi
     ok "$client_name patchado: $app_path"
+    return 0
+}
+
+# ---------------------------------------------------------------- restauracao de cliente
+#
+# O patch em cliente paralelo troca app.asar pelo dist/<cliente>.asar do checkout e guarda o
+# original em _app.asar (patch_parallel_one). Se o checkout, o build ou a versao do mod
+# mudarem depois, o cliente fica sem abrir -- e nao havia caminho de volta: do_uninstall e
+# do_restore_everything so removiam o userplugin e recompilavam, deixando o app.asar patchado
+# no lugar. Estas funcoes devolvem o original.
+
+# Rotulo do cliente a partir do resources. Paralelos tem nome proprio; o resto e "Discord".
+nome_cliente() {
+    local nome
+    if nome="$(nome_cliente_paralelo "$1")"; then
+        printf '%s\n' "$nome"
+        return 0
+    fi
+    printf 'Discord\n'
+}
+
+# O app.asar atual carrega o userplugin? O build do mod feito com o GoLiveBypass dentro tem o
+# nome do plugin; o stub do Vencord/Equicord (so um require) nao tem.
+asar_tem_marca_golive() {
+    [ -f "$1" ] || return 1
+    have grep || return 1
+    grep -aq "GoLiveBypass" "$1" 2>/dev/null
+}
+
+# Stub do mod apontando para um alvo que nao existe mais == cliente que nao sobe.
+stub_do_mod_quebrado() {
+    local resources="$1" alvo
+    alvo="$(injected_path "$resources" || true)"
+    [ -n "$alvo" ] || return 1
+    [ -e "$alvo" ] && return 1
+    [ -e "$alvo/index.js" ] && return 1
+    [ -e "$alvo/package.json" ] && return 1
+    return 0
+}
+
+# Estado do app.asar de um cliente. Rotulos estaveis (menu, log e suporte):
+#   golive       patch do GoLiveBypass (copia do dist do checkout)
+#   mod-quebrado stub do Vencord/Equicord com alvo ausente -> o cliente nao abre
+#   mod          stub do Vencord/Equicord funcionando (nao e nosso; so com --force)
+#   outro        tem _app.asar mas o app.asar atual nao e reconhecido (outro programa/versao)
+#   vanilla      sem _app.asar: nunca foi injetado
+#   ausente      sem app.asar nesse resources
+client_asar_state() {
+    local resources="$1" app="$1/app.asar" backup="$1/_app.asar"
+    if [ ! -f "$app" ]; then
+        if [ -f "$backup" ]; then printf 'outro\n'; else printf 'ausente\n'; fi
+        return 0
+    fi
+    if asar_tem_marca_golive "$app"; then printf 'golive\n'; return 0; fi
+    if injected_path "$resources" >/dev/null 2>&1; then
+        if stub_do_mod_quebrado "$resources"; then printf 'mod-quebrado\n'; else printf 'mod\n'; fi
+        return 0
+    fi
+    if [ -f "$backup" ]; then printf 'outro\n'; return 0; fi
+    printf 'vanilla\n'
+}
+
+client_estado_legivel() {
+    case "$1" in
+        golive)       printf 'patch do GoLiveBypass (revertivel)' ;;
+        mod-quebrado) printf 'injecao QUEBRADA: o alvo do require nao existe, o cliente nao abre' ;;
+        mod)          printf 'mod Vencord/Equicord funcionando' ;;
+        outro)        printf 'patch de outro programa (nao mexemos sem --force)' ;;
+        vanilla)      printf 'original, sem injecao' ;;
+        *)            printf 'sem app.asar nesse diretorio' ;;
+    esac
+}
+
+# cp/mv com sudo quando o diretorio do cliente nao e gravavel (mesma regra do backup).
+_cp_cliente() { # $1 = destino, $2 = origem
+    if [ -w "$(dirname "$1")" ]; then
+        cp -p "$2" "$1"
+    else
+        sudo cp -p "$2" "$1" || return 1
+        sudo chown "$(id -u):$(id -g)" "$1" 2>/dev/null || true
+    fi
+}
+
+_mv_cliente() { # $1 = origem, $2 = destino
+    if [ -w "$(dirname "$2")" ]; then
+        mv -f "$1" "$2"
+    else
+        sudo mv -f "$1" "$2"
+    fi
+}
+
+# Devolve o app.asar original (o _app.asar) para o cliente.
+# $1 = resources, $2 = rotulo, $3 = 1 para --force (desfaz mod funcionando/patch desconhecido).
+restore_client_asar() {
+    local resources="$1" label="${2:-cliente}" force="${3:-0}"
+    local app="$1/app.asar" backup="$1/_app.asar" state
+    state="$(client_asar_state "$resources")"
+    case "$state" in
+        golive) : ;;
+        mod-quebrado)
+            printf '  %s[!] %s: a injecao do mod aponta para um alvo que nao existe mais; devolvendo o original.%s\n' \
+                "$C_YELLOW" "$label" "$C_OFF" >&2 ;;
+        mod)
+            if [ "$force" -ne 1 ]; then
+                warn "$label: o mod Vencord/Equicord esta funcionando; restaurar tiraria o mod deste cliente. Use --force se e isso mesmo."
+                installer_log warn installer.client_restore refused reason_code MOD_FUNCIONANDO target_count 1
+                return 1
+            fi ;;
+        outro)
+            if [ "$force" -ne 1 ]; then
+                warn "$label: o app.asar atual nao e um patch reconhecido do GoLiveBypass. Use --force para devolver o backup mesmo assim."
+                installer_log warn installer.client_restore refused reason_code PATCH_DESCONHECIDO target_count 1
+                return 1
+            fi ;;
+        vanilla)
+            warn "$label: o app.asar ja e o original; nada para restaurar."
+            return 1 ;;
+        *)
+            warn "$label: nao encontrei app.asar em $resources."
+            return 1 ;;
+    esac
+    if [ ! -f "$backup" ]; then
+        warn "$label: nao ha backup _app.asar; sem ele nao da para devolver o original automaticamente."
+        installer_log warn installer.client_restore refused reason_code BACKUP_AUSENTE target_count 1
+        return 1
+    fi
+
+    installer_log info installer.client_restore start reason_code "$state" target_count 1
+    # Preserva o patch atual: se o cliente voltar a precisar do mod, o arquivo fica ali.
+    _cp_cliente "$app.golive-patched.bak" "$app" >/dev/null 2>&1 || true
+    # Copia para um temporario no MESMO diretorio e so entao substitui: um erro no meio nao
+    # deixa o cliente sem app.asar nenhum.
+    if ! _cp_cliente "$app.restore.tmp" "$backup"; then
+        warn "$label: nao consegui preparar a copia de restauracao (permissao?)."
+        return 1
+    fi
+    if have cmp && ! cmp -s "$app.restore.tmp" "$backup"; then
+        rm -f "$app.restore.tmp" 2>/dev/null || sudo rm -f "$app.restore.tmp" 2>/dev/null || true
+        warn "$label: a copia de restauracao saiu diferente do backup; nao toquei no app.asar."
+        return 1
+    fi
+    if ! _mv_cliente "$app.restore.tmp" "$app"; then
+        warn "$label: nao consegui substituir o app.asar."
+        return 1
+    fi
+    if have cmp && ! cmp -s "$app" "$backup"; then
+        warn "$label: o app.asar restaurado nao confere com o backup; o _app.asar foi preservado."
+        return 1
+    fi
+    # O backup cumpriu o papel; sai do caminho para o proximo install criar um limpo. Fica com
+    # sufixo para o usuario conferir depois.
+    _mv_cliente "$backup" "$resources/_app.asar.restaurado.bak" 2>/dev/null || true
+
+    ok "$label: app.asar original restaurado (patch anterior em app.asar.golive-patched.bak)"
+    installer_log info installer.client_restore done reason_code "$state" target_count 1
+    return 0
+}
+
+# Tabela de estado por cliente. Usada por --client-status e pelo menu.
+show_client_states() {
+    local resources label state vistos=0
+    while IFS= read -r resources; do
+        [ -n "$resources" ] || continue
+        label="$(nome_cliente "$resources")"
+        state="$(client_asar_state "$resources")"
+        printf '  %s  %-9s %s%s\n' "$C_DIM" "$label" "$(client_estado_legivel "$state")" "$C_OFF" >&2
+        printf '  %s    %s%s\n' "$C_DIM" "$resources" "$C_OFF" >&2
+        vistos=$((vistos + 1))
+    done <<EOF
+$(discord_resources)
+EOF
+    if [ "$vistos" -eq 0 ]; then
+        printf '  %s  nenhum cliente encontrado%s\n' "$C_DIM" "$C_OFF" >&2
+    fi
+    return 0
+}
+
+# Restaura todos os clientes com patch/backup, ou so o que casar com $1 (Equibop, Vesktop,
+# Legcord, Discord). Fecha o Discord antes e reabre depois: o app.asar restaurado so vale no
+# proximo inicio, e deixar o cliente aberto rodando o patch antigo confunde o diagnostico.
+do_restore_client() {
+    local filtro="${1:-}" resources label state normalizado encontrados=0 rc=0
+    filtro="$(printf '%s' "$filtro" | tr '[:upper:]' '[:lower:]')"
+    stop_discord
+    while IFS= read -r resources; do
+        [ -n "$resources" ] || continue
+        label="$(nome_cliente "$resources")"
+        state="$(client_asar_state "$resources")"
+        case "$state" in
+            vanilla|ausente) continue ;;
+        esac
+        if [ -n "$filtro" ]; then
+            normalizado="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')"
+            case "$normalizado" in
+                "$filtro"*) ;;
+                *) continue ;;
+            esac
+        fi
+        encontrados=$((encontrados + 1))
+        restore_client_asar "$resources" "$label" "$FORCE_RESTORE" || rc=1
+    done <<EOF
+$(discord_resources)
+EOF
+    if [ "$encontrados" -eq 0 ]; then
+        warn "Nenhum cliente com injecao ou backup para restaurar."
+        start_discord "$(find_checkout || true)" >/dev/null 2>&1 || true
+        return 1
+    fi
+    start_discord "$(find_checkout || true)" >/dev/null 2>&1 || true
+    return "$rc"
+}
+
+# Depois de remover o userplugin, um cliente paralelo continuaria rodando o build antigo (que
+# ainda tem o GoLiveBypass dentro): recopia o asar recem-buildado, quando ele existir.
+refresh_parallel_patches() {
+    local root="$1" resources label mod rel asar
+    [ -n "$root" ] || return 0
+    while IFS= read -r resources; do
+        [ -n "$resources" ] || continue
+        is_parallel_install "$resources" || continue
+        asar_tem_marca_golive "$resources/app.asar" || continue
+        label="$(nome_cliente "$resources")"
+        mod="$(checkout_mod "$root")"
+        rel="$(asar_do_paralelo "$label" "$mod" 2>/dev/null || true)"
+        if [ -z "$rel" ]; then
+            warn "$label: patch antigo preservado (o checkout $mod nao gera build para ele)."
+            continue
+        fi
+        asar="$root/$rel"
+        if [ ! -f "$asar" ]; then
+            warn "$label: rode 'pnpm build' em $root e reinstale para tirar o plugin do cliente."
+            continue
+        fi
+        if _cp_cliente "$resources/app.asar" "$asar" >/dev/null 2>&1; then
+            ok "$label: patch atualizado com o build sem o plugin."
+        else
+            warn "$label: nao consegui atualizar o patch; o cliente segue com o build antigo."
+        fi
+    done <<EOF
+$(discord_resources)
+EOF
     return 0
 }
 
@@ -2631,6 +2888,9 @@ do_uninstall() {
 
     build_mod "$root"
     stop_discord
+    # Cliente paralelo patchado continuaria rodando o build antigo, que ainda tem o plugin
+    # dentro: atualiza o patch com o build recem-saido (sem o plugin).
+    refresh_parallel_patches "$root"
     remove_tor
     start_discord "$root"
 
@@ -2719,6 +2979,8 @@ main_menu() {
                 "Mudar canal de atualizacoes" \
                 "Remover so o plugin (o mod continua)" \
                 "Restaurar tudo (remove o plugin; preserva o mod)" \
+                "Ver estado dos clientes (injecao/backup)" \
+                "Restaurar cliente que nao abre (devolve o app.asar)" \
                 "Sair")"
             case "$tui_choice" in
                 1) do_install "$root"; return ;;
@@ -2727,6 +2989,8 @@ main_menu() {
                 4) change_channel_menu "$root"; continue ;;
                 5) do_uninstall; return ;;
                 6) do_restore_everything; return ;;
+                7) show_client_states; continue ;;
+                8) do_restore_client "$RESTORE_CLIENT_TARGET"; continue ;;
                 *) printf '  %sAte mais.%s\n' "$C_DIM" "$C_OFF" >&2; return ;;
             esac
         fi
@@ -2738,6 +3002,8 @@ main_menu() {
         printf '    %s[4] Mudar canal de atualizacoes%s\n' "$C_CYAN" "$C_OFF" >&2
         printf '    %s[5] Remover so o plugin (o mod continua)%s\n' "$C_YELLOW" "$C_OFF" >&2
         printf '    %s[6] Restaurar tudo (remove o plugin; preserva o mod)%s\n' "$C_RED" "$C_OFF" >&2
+        printf '    %s[7] Ver estado dos clientes (injecao/backup)%s\n' "$C_CYAN" "$C_OFF" >&2
+        printf '    %s[8] Restaurar cliente que nao abre (devolve o app.asar)%s\n' "$C_YELLOW" "$C_OFF" >&2
         printf '%s' "  Escolha: " >&2
         local choice
         IFS= read -r choice || return 0
@@ -2748,6 +3014,8 @@ main_menu() {
             4) change_channel_menu "$root"; continue ;;
             5) do_uninstall; return ;;
             6) do_restore_everything; return ;;
+            7) show_client_states; continue ;;
+            8) do_restore_client "$RESTORE_CLIENT_TARGET"; continue ;;
             *) printf '  %sAte mais.%s\n' "$C_DIM" "$C_OFF" >&2; return ;;
         esac
     done
@@ -2759,6 +3027,8 @@ case "$MODE" in
     install) do_install "$(find_checkout || true)" ;;
     uninstall) do_uninstall ;;
     restore) do_restore_everything ;;
+    restore-client) do_restore_client "$RESTORE_CLIENT_TARGET" ;;
+    client-status) show_client_states ;;
     check-update) do_check_update ;;
     update) do_update ;;
     *) main_menu ;;

@@ -127,6 +127,40 @@ Para um perfil próprio, escolha **Arquivo WireGuard personalizado** e informe o
 `.conf`; o plugin copia o perfil para sua pasta privada, remove DNS do perfil e isola somente
 o executável do Discord e o `Update.exe` da instalação atual (ou o cliente dentro da namespace Linux).
 
+## Cliente que não abre depois de instalar (Windows ou Linux)
+
+O instalador troca o `app.asar` do cliente para carregar o mod e guarda o original em
+`_app.asar`. Se o checkout, o build ou a versão do mod mudarem depois, o cliente pode ficar
+sem abrir — e até agora não havia caminho de volta pelo instalador. Agora há:
+
+```sh
+# Linux — mostra o estado da injeção em cada cliente (não altera nada)
+./golivebypass-installer.sh --client-status
+
+# devolve o app.asar original de todos os clientes com patch/backup
+./golivebypass-installer.sh --restore-client
+
+# só um cliente, e desfazendo também um mod que está funcionando
+./golivebypass-installer.sh --restore-client Equibop --force
+```
+
+```powershell
+# Windows — equivalente
+.\GoLiveBypass-Installer.ps1 -Mode ClientStatus
+.\GoLiveBypass-Installer.ps1 -Mode RestoreClient
+.\GoLiveBypass-Installer.ps1 -Mode RestoreClient -Client Equibop -Force
+```
+
+O comando fecha o Discord, copia `_app.asar` de volta para `app.asar` (guardando o patch
+anterior em `app.asar.golive-patched.bak`), reabre o cliente e continua funcionando sem rede.
+Ele restaura sozinho quando o patch é nosso ou quando a injeção do mod aponta para um alvo que
+não existe mais; **recusa** desfazer um mod Vencord/Equicord que está funcionando (ou um patch
+de outro programa) sem `--force`/`-Force`, porque nesse caso o cliente perderia o mod.
+
+Se o cliente ainda não abrir, o caminho manual é o mesmo passo: com o cliente fechado,
+`cp _app.asar app.asar` na pasta `resources` dele (no Windows, em
+`%LOCALAPPDATA%\<cliente>\app-<versão>\resources`).
+
 ## Tutorial completo
 
 O README do projeto tem o passo a passo detalhado (com prints de erro

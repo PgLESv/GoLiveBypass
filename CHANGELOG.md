@@ -5,6 +5,13 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
+### Instaladores: restaurar um cliente que não abre (Windows e Linux)
+
+- Causa: o patch em cliente paralelo troca o `app.asar` pelo `dist/<cliente>.asar` do checkout e guarda o original em `_app.asar`, mas **nada devolvia esse backup**. Se o checkout, o build ou a versão do mod mudassem depois, o cliente ficava sem abrir e nem `--uninstall`/`-Mode Uninstall` nem `--restore`/`-Mode Restore` resolviam: os dois só removiam o userplugin e recompilavam, deixando o `app.asar` patchado no lugar. É o mecanismo por trás dos relatos de Equibop/Vesktop que deixaram de abrir (#268, #258).
+- Correção: `--restore-client`/`-Mode RestoreClient` fecha o cliente, devolve `_app.asar` para `app.asar` (guardando o patch em `app.asar.golive-patched.bak` e o backup em `_app.asar.restaurado.bak`), reabre e **recusa** desfazer um mod Vencord/Equicord que está funcionando ou um patch de outro programa sem `--force`/`-Force`. A restauração só acontece quando o patch é nosso (`golive`) ou quando a injeção aponta para um alvo que não existe mais (`mod-quebrado`).
+- `--client-status`/`-Mode ClientStatus` mostra, por cliente, quem é o dono da injeção hoje (`golive`, `mod`, `mod-quebrado`, `outro`, `vanilla`), sem alterar nada — é o que o suporte precisa antes de pedir qualquer coisa ao usuário.
+- `--uninstall`/`-Mode Uninstall` deixaram de deixar o plugin rodando em cliente paralelo: o patch é atualizado com o build recém-saído (sem o userplugin), ou o usuário recebe a instrução de rodar `pnpm build` e reinstalar.
+- Cobertura: `tests/test-client-restore.sh` roda 29 asserções em `dash` sobre clientes falsos (patch nosso, stub quebrado, mod funcionando, sem backup, refresh no uninstall). Limitação: o PowerShell foi alterado em espelho e ainda não foi executado neste host — a validação dele depende da VM Windows.
 
 ## [2.0.7-beta-1] - 2026-09-18
 
