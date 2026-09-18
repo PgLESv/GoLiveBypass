@@ -3727,6 +3727,9 @@ ipcMain.handle("get-proton-settings", async () => {
   return {
     vpnMode: (s.vpnMode as string) || "proton",
     username: recoveredUsername,
+    // O perfil Proton no disco e o que a ativacao consome; a verificacao de sessao
+    // (rede) nao pode segurar o botao de ativar por uma falha passageira (#312/#316/#317).
+    profileReady: Boolean(recoveredUsername) && fs.existsSync(path.join(settingsDir(), "wireguard.conf")),
     country: (s.protonCountry as string) || "",
     freeOnly: s.protonFreeOnly !== false,
     autoPing: s.protonAutoPing !== false,

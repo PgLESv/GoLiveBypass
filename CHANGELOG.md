@@ -6,6 +6,16 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### GUI: falha passageira na verificação Proton não bloqueia mais o "Ativar Bypass" (#312, #316, #317)
+
+- Causa confirmada: `checkProtonSession` devolvia `valid: false` tanto para "sessão inválida" quanto para "não consegui verificar agora" (rede/API/helper). O painel tratava tudo como logout — escondia a conta conectada, zerava a rota medida — e, como em modo Proton `hasSelectedConf` era `isProtonAuthenticated`, deixava o botão **Ativar Bypass desabilitado** mesmo com a rota recém-otimizada. É o padrão dos três relatos de 18/09: otimização concluída no log, **nenhuma tentativa de ativação** e `installs: 0` no relatório.
+- O helper de `-check-session` agora emite `code` (`INVALID_SESSION` | `NETWORK_ERROR`) e `retryable`. O decodificador do lado Electron usa esses campos e reconhece a mensagem "Não foi possível verificar a sessão Proton temporariamente" dos helpers já instalados (presente desde antes da 2.0.6), então a correção não depende de baixar o helper novo.
+- O painel passa a decidir por veredito (`decideProtonSession`): `authenticated` | `unverified` | `logged-out`. Em `unverified` mantém conta, rota e painel como estavam, avisa que a ativação segue disponível com a rota preparada e reconsulta em 20 s; a falha do próprio IPC também deixou de deslogar.
+- Em modo Proton, `hasSelectedConf` considera o **perfil local** (`username` + `wireguard.conf`, novo campo `profileReady` de `get-proton-settings`), que é o que a ativação realmente consome. A verificação de sessão continua gateando login e otimização — não a aplicação de um perfil já gerado.
+- O botão desabilitado agora explica o motivo via `title` (otimização em andamento, aplicando rota, conectar conta, importar .conf), para o próximo relato já trazer a causa.
+- Cobertura: `tools/proton-confgen/cmd/protonvpn-wg/main_session_test.go` (contrato de códigos), `golive-gui/tests/proton-session.test.ts` (veredito e guarda contra voltar a deslogar com `valid: false`) e novos casos em `golive-gui/tests/proton.test.ts` (helper novo, helper antigo e resposta inesperada).
+- Lacuna: o plugin Vencord/Equicord já separava `NETWORK_ERROR`/`TIMEOUT` na UI e não foi alterado.
+
 ## [2.0.7-beta-3] - 2026-09-18
 
 ### Plugin Linux: o cliente só fecha depois que o novo processo entra no namespace (#313)

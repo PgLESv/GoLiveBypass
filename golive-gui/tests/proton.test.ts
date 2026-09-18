@@ -15,6 +15,7 @@ import {
   protonIdentityMatches,
   classifyProtonError,
   normalizeProtonPlanResult,
+  normalizeProtonSessionResult,
 } from "../electron/proton";
 
 describe("ProtonVPN Integration & Sidecar", () => {
@@ -134,6 +135,31 @@ describe("ProtonVPN Integration & Sidecar", () => {
     expect(normalizeProtonPlanResult({ success: true })).toMatchObject({ success: false, status: "unknown" });
     expect(normalizeProtonPlanResult({ success: true, maxTier: -1 })).toMatchObject({ success: false, status: "unknown" });
     expect(normalizeProtonPlanResult({ success: false, status: "free", maxTier: 0 })).toMatchObject({ success: false, status: "unknown" });
+  });
+
+  it("separa sessao invalida de falha temporaria de verificacao", () => {
+    expect(normalizeProtonSessionResult({ success: true, valid: true, username: "conta_teste", expiresIn: "3h0m0s" }))
+      .toMatchObject({ valid: true, username: "conta_teste", expiresIn: "3h0m0s" });
+
+    // Helper novo: codigo explicito no JSON.
+    expect(normalizeProtonSessionResult({ success: false, valid: false, code: "NETWORK_ERROR", retryable: true, error: "sem rede" }))
+      .toMatchObject({ valid: false, code: "NETWORK_ERROR", retryable: true });
+    expect(normalizeProtonSessionResult({ success: false, valid: false, code: "INVALID_SESSION", retryable: false, error: "Sessão expirada ou não encontrada" }))
+      .toMatchObject({ valid: false, code: "INVALID_SESSION", retryable: false });
+
+    // Helper antigo (2.0.6): so a mensagem distingue, e ela nao pode virar logout.
+    expect(normalizeProtonSessionResult({ success: false, valid: false, error: "Não foi possível verificar a sessão Proton temporariamente" }))
+      .toMatchObject({ valid: false, code: "NETWORK_ERROR", retryable: true });
+    expect(normalizeProtonSessionResult({ success: false, valid: false, error: "Sessão expirada ou não encontrada" }))
+      .toMatchObject({ valid: false, code: "INVALID_SESSION", retryable: false });
+
+    // Resposta ausente/estranha nunca vira "autenticado" nem "retryable".
+    expect(normalizeProtonSessionResult(null)).toMatchObject({ valid: false, retryable: false });
+    // Codigo desconhecido sem pista temporaria: invalido (o helper futuro marca retryable).
+    expect(normalizeProtonSessionResult({ success: true, valid: false, code: "ALGO_NOVO" }))
+      .toMatchObject({ valid: false, code: "INVALID_SESSION", retryable: false });
+    expect(normalizeProtonSessionResult({ success: false, valid: false, code: "ALGO_NOVO", retryable: true }))
+      .toMatchObject({ valid: false, retryable: true });
   });
 
   it("cria a pasta de dados antes de executar o login", async () => {
