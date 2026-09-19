@@ -6,6 +6,8 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+## [2.0.7-beta-4] - 2026-09-18
+
 ### GUI Windows: status, bandeja e watchdog param de travar a janela
 
 - Causa medida na VM `win11` (2.0.7-beta-3, túnel ativo, janela visível, 150 s): a janela do GoLiveBypass ficou **"Não respondendo" 9 vezes** — 3 pausas de ~3–4 s, uma a cada 60 s — somando 14,98 s de sobrecarga, enquanto Discord e Equibop não registraram nenhuma pausa ≥300 ms. Ao desativar, o build antigo mostrava o título "GoLiveBypass (Not Responding)" durante a limpeza.
