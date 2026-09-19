@@ -40,7 +40,7 @@ import {
     type StreamObservation,
     type StreamObservationStatus,
 } from "./stability";
-import { protonUsernamesMatch, safeDiagnosticDetail, type VpnPlatform, type VpnState } from "./vpn-types";
+import { formatVpnRouteSummary, protonUsernamesMatch, safeDiagnosticDetail, vpnRouteStateLabel, type VpnPlatform, type VpnRouteInfo, type VpnState } from "./vpn-types";
 
 type PluginUpdateChannel = "stable" | "beta";
 
@@ -557,6 +557,10 @@ interface ProtonRouteSelectionProps {
     /** Sessão inválida: a lista não consulta o catálogo e orienta a recuperação. */
     lockedReason?: string | null;
     emptyMessage: string;
+    /** Rota do perfil ativo (sobrevive ao catálogo): o túnel já pode estar valendo sem lista carregada. */
+    activeRoute?: VpnRouteInfo | null;
+    /** `true` quando o túnel está ativo agora; `false` mostra a rota como preparada. */
+    routeActive?: boolean;
     onOptimize(): void;
     onDiscover(): void;
     onSelect(server: string): void;
@@ -814,6 +818,8 @@ function ProtonRouteSelection({
     selectionError,
     lockedReason,
     emptyMessage,
+    activeRoute,
+    routeActive,
     onOptimize,
     onDiscover,
     onSelect,
@@ -827,6 +833,7 @@ function ProtonRouteSelection({
         ? Math.min(100, Math.round((progress.tested / progress.total) * 100))
         : null;
     const progressIsIndeterminate = optimization.active && progressPercent === null;
+    const activeRouteSummary = formatVpnRouteSummary(activeRoute ?? null);
     const heading = ordered.length > 0
         ? `Escolha uma rota Proton — ${measuredCount} de ${ordered.length} rotas com ping`
         : "Escolha uma rota Proton";
@@ -855,6 +862,12 @@ function ProtonRouteSelection({
                 {progress && progress.total > 0 && <Paragraph>{progress.tested} de {progress.total} servidores testados · {progress.succeeded} aprovados</Paragraph>}
                 {progress?.server && <Paragraph>Servidor selecionado: {progress.server}</Paragraph>}
                 {typeof progress?.pingMs === "number" && <Paragraph>Latência medida: {progress.pingMs} ms</Paragraph>}
+                {activeRouteSummary && (
+                    <div style={protonRouteRowTopStyle}>
+                        <span>{routeActive ? "Rota em uso agora" : "Rota preparada no perfil"}</span>
+                        <strong>{activeRouteSummary}</strong>
+                    </div>
+                )}
             </div>
             {optimization.error && (
                 <Paragraph role="alert" aria-live="assertive">
@@ -878,7 +891,11 @@ function ProtonRouteSelection({
                         </Paragraph>
                     )}
                     {ordered.length === 0 ? (
-                        <Paragraph role="status" aria-live="polite">{emptyMessage}</Paragraph>
+                        <Paragraph role="status" aria-live="polite">
+                            {routeActive && activeRouteSummary
+                                ? <>O túnel está ativo com <strong>{activeRouteSummary}</strong>. A lista desta sessão ainda não foi carregada — use "Buscar rotas novamente" ou "Otimizar automaticamente" para medir outras rotas.</>
+                                : emptyMessage}
+                        </Paragraph>
                     ) : (
                         <ul aria-label="Rotas Proton disponíveis" tabIndex={0} style={protonRouteListStyle}>
                             {ordered.map(candidate => {
@@ -1573,13 +1590,15 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
                             routes={routeSelection.routes}
                             recommendedServer={routeSelection.recommendedServer}
                             discovery={routeSelection.discovery}
-                            optimization={{ active: busy, label: phaseLabel, error: routeFailure, progress }}
+                            optimization={{ active: busy, label: vpnRouteStateLabel({ status: vpnStatus, optimizing: busy, optimizationNotice: phaseLabel }), error: routeFailure, progress }}
                             applyingServer={routeSelection.applyingServer}
                             selectionError={routeSelection.selectionError}
                             lockedReason={routeSelectionActive ? null : "Entre com uma conta Proton válida para listar as rotas."}
                             emptyMessage={routeSelection.discovery.active
                                 ? "Buscando rotas Proton e medindo ping…"
                                 : "Nenhuma rota Proton foi catalogada. Otimize automaticamente ou use \"Buscar rotas novamente\"."}
+                            activeRoute={vpnStatus?.route ?? null}
+                            routeActive={Boolean(vpnStatus?.active)}
                             onOptimize={() => void optimizeRoute()}
                             onDiscover={routeSelection.restart}
                             onSelect={routeSelection.select}
@@ -1997,6 +2016,8 @@ interface PluginVpnStatus {
     lastDiagnostic: { detail: string; ok?: boolean; kind?: string } | null;
     message: string;
     sessionStorage?: "safe-storage" | "file" | "memory-only";
+    /** Rota do perfil ativo (o plugin novo envia; uma versão antiga do plugin deixa ausente). */
+    route?: VpnRouteInfo | null;
 }
 
 function VpnPanel() {
@@ -2367,7 +2388,7 @@ function VpnPanel() {
                             discovery={routeSelection.discovery}
                             optimization={{
                                 active: optimizing,
-                                label: optimizing ? "otimizando a rota automaticamente" : optimizationNotice,
+                                label: vpnRouteStateLabel({ status, optimizing, optimizationNotice }),
                                 error: optimizationError,
                             }}
                             applyingServer={routeSelection.applyingServer}
@@ -2380,6 +2401,8 @@ function VpnPanel() {
                             emptyMessage={routeSelection.discovery.active
                                 ? "Buscando rotas Proton e medindo ping…"
                                 : "Nenhuma rota Proton foi catalogada. Otimize automaticamente ou use \"Buscar rotas novamente\"."}
+                            activeRoute={status?.route ?? null}
+                            routeActive={Boolean(status?.active)}
                             onOptimize={() => void optimize()}
                             onDiscover={routeSelection.restart}
                             onSelect={routeSelection.select}

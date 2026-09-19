@@ -18,13 +18,17 @@ import {
     normalizeProtonUsername,
     normalizeVpnSettings,
     protonUsernamesMatch,
+    readWireGuardEndpoint,
     safeDiagnosticDetail,
     validateWireGuardConfig,
     VPN_OWNER_KIND,
     VPN_SCHEMA_VERSION,
     type VpnDiagnostic,
+    type VpnMode,
     type VpnOperationResult,
     type VpnOwnerRecord,
+    type VpnRouteInfo,
+    type VpnRouteSource,
     type VpnSettings,
     type VpnState,
     type VpnStatus,
@@ -134,6 +138,12 @@ const MIGRATION_FILE = "migration-v1.json";
 const PROFILE_FILE = "wireguard.conf";
 const PROFILE_ACCOUNT_FILE = "wireguard-profile-account.json";
 const SERVICE_CONFIG_FILE = "wiresock-discord.conf";
+/**
+ * Registro da rota que o perfil ativo usa. Fica fora do wireguard.conf de propósito:
+ * o perfil é gerado pelo helper e não carrega o nome do servidor; sem este registro o
+ * painel só saberia da rota enquanto o catálogo da sessão existisse.
+ */
+const ACTIVE_ROUTE_FILE = "active-route.json";
 const WATCHDOG_MS = 15_000;
 const OWNER_MUTEX_SUFFIX = ".mutex";
 const OWNER_MUTEX_HOLDER_FILE = "holder.json";
@@ -313,6 +323,29 @@ interface ProtonRouteMeasurement {
 interface ProtonProfileBackup {
     profile: string;
     account: string | null;
+    /** Registro da rota ativa; entra no backup para o rollback não deixar um rótulo antigo no painel. */
+    route: string | null;
+}
+
+interface ActiveRouteRecord {
+    schema: number;
+    mode: VpnMode;
+    server: string | null;
+    endpoint: string | null;
+    appliedAt: number;
+    source: VpnRouteSource;
+}
+
+/** Aceita só um nome de servidor no formato do catálogo — o resto vira null em vez de ir para a UI. */
+function validRouteServer(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const server = value.trim();
+    if (!server || server.length > MAX_PROTON_ROUTE_SERVER_LENGTH || !CATALOG_SERVER_RE.test(server)) return null;
+    return server;
+}
+
+function isVpnRouteSource(value: unknown): value is VpnRouteSource {
+    return value === "auto" || value === "manual" || value === "custom" || value === "imported";
 }
 
 export class PluginVpnController {
@@ -320,6 +353,7 @@ export class PluginVpnController {
     private readonly dataDir: string;
     private readonly profilePath: string;
     private readonly profileAccountPath: string;
+    private readonly activeRoutePath: string;
     private readonly serviceConfigPath: string;
     private readonly guiConfigPath: string;
     private readonly ownerPath: string;
@@ -349,6 +383,7 @@ export class PluginVpnController {
         this.dataDir = path.resolve(options.dataDir);
         this.profilePath = path.join(this.dataDir, PROFILE_FILE);
         this.profileAccountPath = path.join(this.dataDir, PROFILE_ACCOUNT_FILE);
+        this.activeRoutePath = path.join(this.dataDir, ACTIVE_ROUTE_FILE);
         this.serviceConfigPath = path.join(this.dataDir, SERVICE_CONFIG_FILE);
         this.guiConfigPath = path.join(this.options.guiDataDir, SERVICE_CONFIG_FILE);
         this.ownerPath = path.join(this.dataDir, OWNER_FILE);
@@ -589,6 +624,7 @@ export class PluginVpnController {
                 externalReason: "O transporte Linux do plugin exige Linux x64.",
                 lastDiagnostic: this.lastDiagnostic,
                 message: "Linux x64 necessário",
+                route: this.readActiveRoute(),
             };
         }
 
@@ -643,6 +679,7 @@ export class PluginVpnController {
             externalReason,
             lastDiagnostic: this.lastDiagnostic,
             message,
+            route: this.readActiveRoute(),
         };
     }
 
@@ -662,6 +699,7 @@ export class PluginVpnController {
                 externalReason: "A VPN do plugin nesta versão está disponível somente no Windows x64.",
                 lastDiagnostic: this.lastDiagnostic,
                 message: "Windows x64 necessário",
+                route: this.readActiveRoute(),
             };
         }
         const inspection = providedInspection ?? this.inspectWindows();
@@ -682,6 +720,7 @@ export class PluginVpnController {
                 externalReason: null,
                 lastDiagnostic: this.lastDiagnostic,
                 message,
+                route: this.readActiveRoute(),
             };
         }
         // Durante uma operação em andamento (ativação explícita com retomada, parada,
@@ -712,6 +751,7 @@ export class PluginVpnController {
             externalReason: this.externalReason,
             lastDiagnostic: this.lastDiagnostic,
             message: reportedState === "inactive" ? "VPN inativa" : this.statusMessage(),
+            route: this.readActiveRoute(),
         };
     }
     public async getStatusAsync(): Promise<VpnStatus> {
@@ -803,6 +843,7 @@ export class PluginVpnController {
                 if (!validation.valid) throw new Error(validation.error);
                 this.clearProtonProfileAccount();
                 this.writeProfileAtomically(raw);
+                this.writeActiveRoute({ mode: "custom", server: null, source: "imported" });
                 return { success: true, path: this.profilePath };
             } catch (error) {
                 return { success: false, error: errorMessage(error) };
@@ -996,7 +1037,10 @@ export class PluginVpnController {
                         onProgress: progress => options.onProgress?.({ ...progress, requestId: id }),
                         log: this.options.log,
                     });
-                    if (result.success) this.writeProtonProfileAccount(username, selection);
+                    if (result.success) {
+                        this.writeProtonProfileAccount(username, selection);
+                        this.writeActiveRoute({ mode: "proton", server: typeof result.server === "string" ? result.server : null, source: "auto" });
+                    }
                 } catch (error) {
                     if (wasActive && !isLinux()) {
                         const restoreError = await restorePreviousRoute();
@@ -1285,6 +1329,7 @@ export class PluginVpnController {
                     freeOnly: measurement.freeOnly,
                     autoPing: measurement.autoPing,
                 });
+                this.writeActiveRoute({ mode: "proton", server, source: "manual" });
                 const applied = this.publicRouteSelection(generated, server);
                 if (!wasActive) {
                     return { ...applied, state: this.state, message: "Rota Proton preparada; ela será usada na próxima ativação." };
@@ -1460,11 +1505,15 @@ export class PluginVpnController {
         const account = fs.existsSync(this.profileAccountPath)
             ? fs.readFileSync(this.profileAccountPath, "utf8")
             : null;
-        return { profile, account };
+        const route = fs.existsSync(this.activeRoutePath)
+            ? fs.readFileSync(this.activeRoutePath, "utf8")
+            : null;
+        return { profile, account, route };
     }
 
     private restoreProtonProfileBackup(backup: ProtonProfileBackup): void {
         this.writeProfileAtomically(backup.profile);
+        this.restoreActiveRoute(backup.route);
         if (backup.account === null) {
             this.clearProtonProfileAccount();
             return;
@@ -1473,6 +1522,78 @@ export class PluginVpnController {
         const temporary = `${this.profileAccountPath}.${process.pid}.${Date.now()}.tmp`;
         fs.writeFileSync(temporary, backup.account, { encoding: "utf8", mode: 0o600 });
         fs.renameSync(temporary, this.profileAccountPath);
+    }
+
+    /**
+     * Registra a rota que passou a valer. O `wireguard.conf` não carrega o nome do
+     * servidor (só o endpoint), então sem este registro o painel perde a identidade da
+     * rota assim que a sessão/catálogo Proton termina — e passa a dizer "pronta para
+     * otimizar" com o túnel já ativo.
+     */
+    private writeActiveRoute(entry: { mode: VpnMode; server: string | null; source: VpnRouteSource }): void {
+        try {
+            fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
+            const profileRaw = this.activeProfileRaw();
+            const record: ActiveRouteRecord = {
+                schema: VPN_SCHEMA_VERSION,
+                mode: entry.mode,
+                server: validRouteServer(entry.server),
+                endpoint: readWireGuardEndpoint(profileRaw),
+                appliedAt: Date.now(),
+                source: entry.source,
+            };
+            const temporary = `${this.activeRoutePath}.${process.pid}.${Date.now()}.tmp`;
+            fs.writeFileSync(temporary, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
+            fs.renameSync(temporary, this.activeRoutePath);
+        } catch (error) {
+            // Rótulo sem registro é menos grave que derrubar a ativação.
+            this.options.log("warn", "não consegui registrar a rota ativa", { erro: errorMessage(error) });
+        }
+    }
+
+    private restoreActiveRoute(raw: string | null): void {
+        try {
+            if (raw === null) {
+                fs.rmSync(this.activeRoutePath, { force: true });
+                return;
+            }
+            fs.writeFileSync(this.activeRoutePath, raw, { encoding: "utf8", mode: 0o600 });
+        } catch { }
+    }
+
+    private clearActiveRoute(): void {
+        try { fs.rmSync(this.activeRoutePath, { force: true }); } catch { }
+    }
+
+    private activeProfileRaw(): string {
+        for (const candidate of [this.serviceConfigPath, this.profilePath]) {
+            try {
+                if (fs.existsSync(candidate)) return fs.readFileSync(candidate, "utf8");
+            } catch { }
+        }
+        return "";
+    }
+
+    /** Lê o registro e relê o endpoint do perfil ativo — o registro nunca inventa o que está em uso. */
+    private readActiveRoute(): VpnRouteInfo | null {
+        const raw = this.activeProfileRaw();
+        if (!raw) return null;
+        let record: Partial<ActiveRouteRecord> | null = null;
+        try {
+            const parsed = JSON.parse(fs.readFileSync(this.activeRoutePath, "utf8")) as unknown;
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) record = parsed as Partial<ActiveRouteRecord>;
+        } catch {
+            record = null;
+        }
+        const accountKnown = fs.existsSync(this.profileAccountPath);
+        const mode: VpnMode = record?.mode === "custom" || (!record && !accountKnown) ? "custom" : "proton";
+        return {
+            mode,
+            server: mode === "proton" ? validRouteServer(record?.server) : null,
+            endpoint: readWireGuardEndpoint(raw),
+            appliedAt: typeof record?.appliedAt === "number" && Number.isFinite(record.appliedAt) ? record.appliedAt : null,
+            source: isVpnRouteSource(record?.source) ? record.source : null,
+        };
     }
 
     /** Devolve o erro de rollback, se houver; nunca lança por cima da falha original. */
@@ -1638,6 +1759,7 @@ export class PluginVpnController {
                     });
                     if (!generated.success) throw new Error(generated.error || "Não foi possível gerar a configuração Proton.");
                     this.writeProtonProfileAccount(settings.protonUsername, selection);
+                    this.writeActiveRoute({ mode: "proton", server: typeof generated.server === "string" ? generated.server : null, source: "auto" });
                 }
             } else {
                 if (!settings.customConfigPath) throw new Error("Configure um arquivo WireGuard personalizado antes de ativar.");
@@ -1828,6 +1950,7 @@ export class PluginVpnController {
                     });
                     if (!generated.success) throw new Error(generated.error || "Não foi possível gerar a configuração Proton.");
                     this.writeProtonProfileAccount(settings.protonUsername, selection);
+                    this.writeActiveRoute({ mode: "proton", server: typeof generated.server === "string" ? generated.server : null, source: "auto" });
                 }
             } else {
                 if (!settings.customConfigPath) throw new Error("Configure um arquivo WireGuard personalizado antes de ativar.");
@@ -2768,6 +2891,7 @@ export class PluginVpnController {
     private clearProtonArtifacts(): void {
         for (const target of [this.profilePath, this.serviceConfigPath, this.profileAccountPath])
             fs.rmSync(target, { force: true });
+        this.clearActiveRoute();
         this.probePath = undefined;
     }
 

@@ -6,6 +6,14 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### Plugin: a configuração mostra a rota que está ativa
+
+- Sintoma (relato beta): com o túnel ativo e funcionando, o painel dizia "Estado da rota: pronta para otimizar" e "Nenhuma rota Proton foi catalogada" — o rótulo vinha só do fluxo de otimização e a identidade da rota existia apenas enquanto o catálogo Proton da sessão estava carregado.
+- Correção: o controlador registra a rota do perfil que ficou ativo (`active-route.json` no estado do plugin: modo, servidor, endpoint, quando e como foi escolhida) e o `VpnStatus` passa a carregar esse `route`, relendo o endpoint do próprio perfil em uso. O painel usa o estado real do túnel no rótulo (`vpnRouteStateLabel`) e mostra "Rota em uso agora: NL#2 · 198.51.100.9:51820" mesmo com a lista vazia; quando ainda não ativou, mostra "Rota preparada no perfil".
+- O registro entra no backup de rollback da seleção manual (uma seleção que falha não deixa o servidor antigo no rótulo), desaparece junto com os artefatos Proton e descarta texto fora do formato do catálogo (servidor inválido vira ausência, não vai para a tela).
+- Cobertura: `golive-gui/tests/plugin-route-status.test.ts` — leitura do endpoint do perfil, resumo da rota, rótulo por estado do túnel, rota exposta no status e guarda da ligação no painel.
+- Limite: contrato verificado por testes; a conferência visual dentro do Discord depende de build do Equicord/Vencord + injeção e não foi executada nesta sessão.
+
 ## [2.0.7-beta-4] - 2026-09-18
 
 ### GUI Windows: status, bandeja e watchdog param de travar a janela

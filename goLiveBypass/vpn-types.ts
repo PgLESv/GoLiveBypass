@@ -73,6 +73,25 @@ export interface VpnDiagnostic {
     detail: string;
 }
 
+/** Como o perfil ativo foi escolhido — o painel usa isto para não chamar de "manual" o que veio do botão. */
+export type VpnRouteSource = "auto" | "manual" | "custom" | "imported";
+
+/**
+ * Identidade da rota que o perfil ativo usa. Existe para o painel conseguir mostrar
+ * "ativa em X" mesmo quando o catálogo Proton não está carregado nesta sessão (o
+ * catálogo depende da sessão/medição; o perfil ativo, não).
+ */
+export interface VpnRouteInfo {
+    mode: VpnMode;
+    /** Servidor Proton quando conhecido (ex.: "NL#2"); null em modo custom ou perfil anterior a este registro. */
+    server: string | null;
+    /** Endpoint WireGuard lido do próprio perfil ativo (host:porta). */
+    endpoint: string | null;
+    /** Quando este perfil foi aplicado (epoch ms); null quando só o registro antigo existe. */
+    appliedAt: number | null;
+    source: VpnRouteSource | null;
+}
+
 export interface VpnStatus {
     state: VpnState;
     platform: VpnPlatform;
@@ -93,6 +112,8 @@ export interface VpnStatus {
     lastDiagnostic: VpnDiagnostic | null;
     message: string;
     sessionStorage?: ProtonSessionStorage;
+    /** Rota do perfil ativo; null quando não há perfil gravado. */
+    route?: VpnRouteInfo | null;
 }
 
 export type VpnOperationCode =
@@ -234,4 +255,51 @@ export function safeDiagnosticDetail(value: unknown, max = 300): string {
         .replace(/(PrivateKey\s*=\s*)\S+/gi, "$1<redacted>")
         .replace(/(password|token|secret|authorization)\s*[:=]\s*\S+/gi, "$1=<redacted>")
         .slice(0, max);
+}
+
+/** Lê `Endpoint = host:porta` do perfil WireGuard, sem interpretar o resto do arquivo. */
+export function readWireGuardEndpoint(raw: string): string | null {
+    const endpoint = configValue(raw, "peer", "Endpoint");
+    if (!endpoint) return null;
+    const cleaned = endpoint.replace(/[^\x20-\x7E]/g, "").trim().slice(0, 120);
+    return cleaned || null;
+}
+
+/**
+ * Texto curto da rota para a UI. Não promete localização geográfica: mostra o servidor
+ * quando ele foi registrado e sempre o endpoint que está no perfil ativo.
+ */
+export function formatVpnRouteSummary(route: VpnRouteInfo | null | undefined): string | null {
+    if (!route) return null;
+    const parts: string[] = [];
+    if (route.server) parts.push(route.server);
+    else parts.push(route.mode === "custom" ? "arquivo .conf personalizado" : "perfil Proton");
+    if (route.endpoint) parts.push(route.endpoint);
+    return parts.join(" · ");
+}
+
+/**
+ * Rótulo de "Estado da rota" a partir do estado real do túnel — antes ele vinha só do
+ * fluxo de otimização e dizia "pronta para otimizar" com o túnel já ativo.
+ */
+export function vpnRouteStateLabel(input: {
+    status: { state?: VpnState | string | null; active?: boolean } | null | undefined;
+    optimizing: boolean;
+    optimizationNotice: string;
+}): string {
+    if (input.optimizing) return "otimizando a rota automaticamente";
+    const status = input.status;
+    if (!status) return input.optimizationNotice;
+    if (status.active || status.state === "active") return "ativa";
+    switch (status.state) {
+        case "authorizing": return "aguardando autorização";
+        case "preparing": return "preparando o túnel";
+        case "starting": return "iniciando o túnel";
+        case "restart_pending": return "reinicie o Discord para concluir";
+        case "stopping": return "desativando";
+        case "blocked_external": return "bloqueada por outro WireSock ativo";
+        case "dependency_missing": return "dependências do sistema ausentes";
+        case "recovery_required": return "recuperação necessária";
+        default: return input.optimizationNotice;
+    }
 }
