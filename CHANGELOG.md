@@ -6,6 +6,8 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+## [2.0.9-beta-1] - 2026-09-19
+
 ### GUI Windows: a ativação elevada deixa de ser reportada como problema de perfil
 
 - Sintoma (relato da API, 2.0.8, Windows x64): ao ativar, o Discord era fechado, a GUI carregava por ~85 s e terminava em "O perfil WireGuard selecionado não pôde ser aplicado. Selecione ou gere o perfil novamente e tente ativar." — sem abrir o cliente e sem causa nenhuma no log.
