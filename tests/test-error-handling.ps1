@@ -309,9 +309,15 @@ try {
     $originalResolvePnpmInvocation = ${function:Resolve-PnpmInvocation}
     function Resolve-PnpmInvocation([string[]]$Arguments) {
         $hostExe = (Get-Process -Id $PID).Path
+        # -Command com aspas cai no quoting do Windows PowerShell 5.1: o argumento com
+        # espacos chega fatiado ao processo nativo, o stub nem compila e o teste mede
+        # outra coisa. -EncodedCommand e um argumento base64 unico — o caso real fica
+        # isolado: stderr do filho nativo e codigo de saida 7.
+        $payload = '[Console]::Error.WriteLine("banner-de-teste"); exit 7'
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
         return [pscustomobject]@{
             Command = $hostExe
-            Arguments = @('-NoProfile', '-NonInteractive', '-Command', '[Console]::Error.WriteLine("banner-de-teste"); exit 7')
+            Arguments = @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
         }
     }
     try {
