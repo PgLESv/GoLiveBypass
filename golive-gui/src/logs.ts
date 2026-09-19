@@ -36,12 +36,30 @@ const devHint = document.getElementById('devHint')!;
 const MAX_LOG_CHARS = 120_000;
 let currentStatus = 'UNKNOWN';
 
-function appendLog(chunk: string) {
+// O watcher entrega um chunk por linha; escrever e rolar a cada chunk forca um
+// reflow por linha. Acumula e aplica uma vez por frame, mantendo a posicao de
+// leitura de quem rolou para tras.
+let pendingLogChunk = '';
+let logFlushScheduled = false;
+
+function flushLog(): void {
+  logFlushScheduled = false;
+  const chunk = pendingLogChunk;
+  if (!chunk) return;
+  pendingLogChunk = '';
+  const atBottom = logConsole.scrollTop + logConsole.clientHeight >= logConsole.scrollHeight - 24;
   logConsole.textContent += chunk;
   if (logConsole.textContent.length > MAX_LOG_CHARS) {
     logConsole.textContent = logConsole.textContent.slice(-MAX_LOG_CHARS);
   }
-  logConsole.scrollTop = logConsole.scrollHeight;
+  if (atBottom) logConsole.scrollTop = logConsole.scrollHeight;
+}
+
+function appendLog(chunk: string) {
+  pendingLogChunk += chunk;
+  if (logFlushScheduled) return;
+  logFlushScheduled = true;
+  requestAnimationFrame(flushLog);
 }
 
 async function refreshStatus() {

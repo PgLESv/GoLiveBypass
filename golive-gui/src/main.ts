@@ -319,11 +319,18 @@ document.querySelectorAll<HTMLButtonElement>('.theme-opt[data-theme-opt]').forEa
 
 // O warning do bypass ativo faz o conteudo crescer; a janela e fixa, entao reportamos a altura
 // necessaria para o main process redimensionar e nada ficar cortado.
+let fitWindowScheduled = false;
 function fitWindowToContent() {
+  // Rajadas de chamadas (fim de progresso, troca de estado, abertura de dialogo)
+  // nao podem empilhar varios rAF duplos: um agendamento pendente ja mede a
+  // altura final depois do layout.
+  if (fitWindowScheduled) return;
+  fitWindowScheduled = true;
   // Espera o layout apos hidden/details: sem rAF a medicao ainda ve a altura antiga
   // (Personalizado expandia e a janela nunca encolhia ao voltar para Tor/Gratuitas).
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
+      fitWindowScheduled = false;
       const container = document.querySelector('.container') as HTMLElement | null;
       if (!container) return;
       const height = Math.ceil(container.getBoundingClientRect().height + 1);

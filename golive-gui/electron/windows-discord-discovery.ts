@@ -1,4 +1,4 @@
-import { execFileSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
 import path from "path";
 import type { WindowsDiscordInstall } from "./windows-discord-install";
 
@@ -95,6 +95,10 @@ export interface WindowsDiscoveryCollectors {
   readShortcut: (file: string) => { target: string; args: string };
 }
 export type WindowsDiscoveryPowerShellRunner = (file: string, args: readonly string[]) => string;
+export type WindowsDiscoveryPowerShellRunnerAsync = (
+  file: string,
+  args: readonly string[],
+) => Promise<string>;
 
 export interface WindowsDiscoveryRegistryHandlerDeps extends WindowsDiscoveryFileSystem {
   listDirectory: (root: string) => string[];
@@ -121,10 +125,17 @@ export interface WindowsDiscoveryCacheDeps {
     env: WindowsDiscoveryEnvironment,
     roots: string[],
   ) => WindowsDiscoverySnapshot;
+  // Variante sem bloqueio do thread principal. Quando ausente (testes), o
+  // cache cai na coleta sincrona para manter o contrato antigo.
+  collectFreshAsync?: (
+    env: WindowsDiscoveryEnvironment,
+    roots: string[],
+  ) => Promise<WindowsDiscoverySnapshot>;
 }
 
 export interface WindowsDiscoveryCache {
   read(options?: { forceRefresh?: boolean; allowStale?: boolean }): WindowsDiscoverySnapshot;
+  readAsync(options?: { forceRefresh?: boolean; allowStale?: boolean }): Promise<WindowsDiscoverySnapshot>;
   invalidate(): void;
 }
 
@@ -330,6 +341,42 @@ function defaultWindowsDiscoveryPowerShellRunner(file: string, args: readonly st
   }));
 }
 
+// Mesma consulta, sem bloquear a thread principal: o caminho de status (IPC
+// get-status, bandeja e watchdog de rota) roda a cada poucos segundos e o
+// powershell.exe pode levar segundos numa maquina carregada.
+function defaultWindowsDiscoveryPowerShellRunnerAsync(
+  file: string,
+  args: readonly string[],
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, [...args], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 3_000,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(String(stdout ?? ""));
+    });
+  });
+}
+
+function windowsDiscoveryPowerShellArgs(): string[] {
+  return [
+    "-NoProfile",
+    "-NonInteractive",
+    "-EncodedCommand",
+    Buffer.from(WINDOWS_DISCOVERY_POWERSHELL_SCRIPT, "utf16le").toString("base64"),
+  ];
+}
+
+function parseWindowsDiscoveryStdout(stdout: string): WindowsDiscoveryRaw {
+  try {
+    return parseWindowsDiscoveryJson(stdout);
+  } catch {
+    throw new WindowsDiscoveryCollectionError("JSON_INVALID");
+  }
+}
+
 export function buildWindowsDiscoveryPowerShell(): string {
   return WINDOWS_DISCOVERY_POWERSHELL_SCRIPT;
 }
@@ -339,20 +386,23 @@ export function collectWindowsDiscoveryPowerShell(
 ): WindowsDiscoveryRaw {
   let stdout: string;
   try {
-    stdout = runner("powershell.exe", [
-      "-NoProfile",
-      "-NonInteractive",
-      "-EncodedCommand",
-      Buffer.from(WINDOWS_DISCOVERY_POWERSHELL_SCRIPT, "utf16le").toString("base64"),
-    ]);
+    stdout = runner("powershell.exe", windowsDiscoveryPowerShellArgs());
   } catch {
     throw new WindowsDiscoveryCollectionError("POWERSHELL_EXIT");
   }
+  return parseWindowsDiscoveryStdout(stdout);
+}
+
+export async function collectWindowsDiscoveryPowerShellAsync(
+  runner: WindowsDiscoveryPowerShellRunnerAsync = defaultWindowsDiscoveryPowerShellRunnerAsync,
+): Promise<WindowsDiscoveryRaw> {
+  let stdout: string;
   try {
-    return parseWindowsDiscoveryJson(stdout);
+    stdout = await runner("powershell.exe", windowsDiscoveryPowerShellArgs());
   } catch {
-    throw new WindowsDiscoveryCollectionError("JSON_INVALID");
+    throw new WindowsDiscoveryCollectionError("POWERSHELL_EXIT");
   }
+  return parseWindowsDiscoveryStdout(stdout);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -941,18 +991,13 @@ function discoveryErrorCode(error: unknown): string {
   return error instanceof WindowsDiscoveryCollectionError ? error.errorCode : "POWERSHELL_EXIT";
 }
 
-export function collectWindowsDiscoverySnapshot(
+function assembleWindowsDiscoverySnapshot(
+  raw: WindowsDiscoveryRaw,
   env: WindowsDiscoveryEnvironment,
   deps: WindowsDiscoverySnapshotCollectors,
   capturedAtMs: number,
-  roots = rootsForEnvironment(env),
+  roots: readonly string[],
 ): WindowsDiscoverySnapshot {
-  let raw: WindowsDiscoveryRaw;
-  try {
-    raw = deps.collectPowerShell();
-  } catch (error) {
-    raw = failedWindowsDiscoveryRaw(discoveryErrorCode(error));
-  }
   const candidates = [
     ...handleRootPaths(roots, deps),
     ...handleProcessRows(raw.process.rows, deps),
@@ -966,6 +1011,37 @@ export function collectWindowsDiscoverySnapshot(
     collectionFailed: health.collectionFailed,
     sourceFailure: health.sourceFailure,
   };
+}
+
+// Exposto para o chamador assincrono: a consulta do PowerShell acontece fora do
+// `noAsar`, e a montagem (fs/atalhos) roda sincrona dentro dele.
+export function assembleWindowsDiscoverySnapshotFromRaw(
+  raw: WindowsDiscoveryRaw,
+  env: WindowsDiscoveryEnvironment,
+  deps: WindowsDiscoverySnapshotCollectors,
+  capturedAtMs: number,
+  roots = rootsForEnvironment(env),
+): WindowsDiscoverySnapshot {
+  return assembleWindowsDiscoverySnapshot(raw, env, deps, capturedAtMs, roots);
+}
+
+export function failedWindowsDiscoveryRawFor(error: unknown): WindowsDiscoveryRaw {
+  return failedWindowsDiscoveryRaw(discoveryErrorCode(error));
+}
+
+export function collectWindowsDiscoverySnapshot(
+  env: WindowsDiscoveryEnvironment,
+  deps: WindowsDiscoverySnapshotCollectors,
+  capturedAtMs: number,
+  roots = rootsForEnvironment(env),
+): WindowsDiscoverySnapshot {
+  let raw: WindowsDiscoveryRaw;
+  try {
+    raw = deps.collectPowerShell();
+  } catch (error) {
+    raw = failedWindowsDiscoveryRaw(discoveryErrorCode(error));
+  }
+  return assembleWindowsDiscoverySnapshot(raw, env, deps, capturedAtMs, roots);
 }
 
 export type PublicWindowsDiscoveryInstall = Pick<WindowsDiscoveryCandidate, "flavour" | "resources" | "exePath">;
@@ -1009,6 +1085,7 @@ function copySnapshot(snapshot: WindowsDiscoverySnapshot, stale: boolean): Windo
 
 export function createWindowsDiscoveryCache(deps: WindowsDiscoveryCacheDeps): WindowsDiscoveryCache {
   let cached: { key: string; snapshot: WindowsDiscoverySnapshot } | null = null;
+  let inFlight: { key: string; promise: Promise<WindowsDiscoverySnapshot> } | null = null;
 
   const read = (options: { forceRefresh?: boolean; allowStale?: boolean } = {}): WindowsDiscoverySnapshot => {
     const now = deps.nowMs();
@@ -1043,8 +1120,57 @@ export function createWindowsDiscoveryCache(deps: WindowsDiscoveryCacheDeps): Wi
     }
   };
 
+  // Mesmo contrato de `read`, mas a coleta roda fora do thread principal. Uma
+  // consulta por chave fica em voo: chamadas concorrentes (janela, bandeja e
+  // watchdog) compartilham a mesma execucao do powershell.exe.
+  const readAsync = (options: { forceRefresh?: boolean; allowStale?: boolean } = {}): Promise<WindowsDiscoverySnapshot> => {
+    const now = deps.nowMs();
+    const env = deps.readEnv();
+    const roots = deps.rootsForEnv(env);
+    const key = cacheKey(deps.platform(), env, roots);
+    const forceRefresh = options.forceRefresh === true;
+    const allowStale = options.allowStale === true && !forceRefresh;
+
+    const previous = !forceRefresh && cached?.key === key ? cached : null;
+    const age = previous ? now - previous.snapshot.capturedAtMs : Number.POSITIVE_INFINITY;
+    if (previous && age >= 0 && age < WINDOWS_DISCOVERY_TTL_MS) {
+      return Promise.resolve(copySnapshot(previous.snapshot, false));
+    }
+    if (inFlight && inFlight.key === key) return inFlight.promise;
+
+    const state: { key: string; promise: Promise<WindowsDiscoverySnapshot> } = {
+      key,
+      promise: Promise.resolve<WindowsDiscoverySnapshot>(undefined as never),
+    };
+    const collect = deps.collectFreshAsync
+      ? () => deps.collectFreshAsync!(env, roots)
+      : () => Promise.resolve().then(() => deps.collectFresh(env, roots));
+    const promise = collect()
+      .then((fresh) => {
+        const degraded = fresh.collectionFailed;
+        if (previous && allowStale && age >= 0 && age < WINDOWS_DISCOVERY_STALE_MS && degraded) {
+          return copySnapshot(previous.snapshot, true);
+        }
+        cached = { key, snapshot: { ...fresh, capturedAtMs: now, stale: false } };
+        return copySnapshot(cached.snapshot, false);
+      })
+      .catch((error) => {
+        if (previous && allowStale && age >= 0 && age < WINDOWS_DISCOVERY_STALE_MS) {
+          return copySnapshot(previous.snapshot, true);
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (inFlight === state) inFlight = null;
+      });
+    state.promise = promise;
+    inFlight = state;
+    return promise;
+  };
+
   return {
     read,
+    readAsync,
     invalidate: () => { cached = null; },
   };
 }

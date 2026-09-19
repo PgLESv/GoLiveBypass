@@ -230,17 +230,17 @@ describe("WireSock no Windows", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("DNS\\s*=");
     expect(src).toContain("reset-network-lock");
-    expect(src).toContain("ipconfig.exe /flushdns");
+    expect(src).toContain('"/flushdns"');
     expect(wireSockServiceScript("C:\\WireSock\\client.exe", "C:\\GoLive\\wg.conf")).toContain("-network-lock disabled");
   });
 
   it("encerra a arvore do cliente e aguarda o servico sair antes de confirmar a limpeza", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
-    expect(src).toContain("taskkill.exe /F /T /IM wiresock-client.exe");
+    expect(src).toContain('"/F", "/T", "/IM", "wiresock-client.exe"');
     expect(src).toContain("for (let pass = 0; pass < 2; pass++)");
     expect(src).toContain("residuo encontrado; repetindo limpeza elevada");
     expect(src).toContain("await esperar(250)");
-    expect(src).toContain("sc.exe stop ${name}");
+    expect(src).toContain('"sc.exe", ["stop", name]');
     expect(src).toContain("stopWireSockServiceElevated");
     expect(src).toContain("-Verb RunAs");
     expect(src).toContain("-PassThru");

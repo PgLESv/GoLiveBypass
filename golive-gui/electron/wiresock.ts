@@ -757,8 +757,8 @@ async function applyWireSockProfile(installDir: string, rawConf: string, allowed
     const directStartedAt = Date.now();
     let directError: unknown = null;
     try {
-      execFileSync("powershell.exe", elevatedPowerShellFileArgs(directScriptPath, directResultPath), {
-        windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000,
+      await execFileWithWindow("powershell.exe", elevatedPowerShellFileArgs(directScriptPath, directResultPath), {
+        windowsHide: true, timeout: 120_000,
       });
     } catch (error) {
       directError = error;
@@ -836,8 +836,8 @@ async function applyWireSockProfile(installDir: string, rawConf: string, allowed
       const serviceStartedAt = Date.now();
       let serviceError: unknown = null;
       try {
-        execFileSync("powershell.exe", elevatedPowerShellFileArgs(serviceScriptPath), {
-          windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000,
+        await execFileWithWindow("powershell.exe", elevatedPowerShellFileArgs(serviceScriptPath), {
+          windowsHide: true, timeout: 120_000,
         });
       } catch (error) {
         serviceError = error;
@@ -907,7 +907,7 @@ async function applyWireSockProfile(installDir: string, rawConf: string, allowed
       logger.warn("wiresock", "nao consegui remover script temporario de ativacao", { erro: detalheErro(error) });
     }
   }
-  limparDnsDoAdaptadorWireSock();
+  await limparDnsDoAdaptadorWireSock();
   logger.logEvent("info", "wiresock", "activation.completed", {
     operation_id: operationId,
     phase: "active",
@@ -956,14 +956,36 @@ export interface WindowsNetworkCheck {
   error?: string;
 }
 
-function resetWireSockNetworkLock(wsExe: string): boolean {
+// Chamadas que podem abrir UAC ficam assincronas: enquanto o prompt esta na tela
+// a janela precisa continuar respondendo (execSync segurava a main thread por
+// tempo indeterminado ate o usuario responder).
+const UAC_TIMEOUT_MS = 5 * 60_000;
+
+function execFileWithWindow(
+  file: string,
+  args: string[],
+  options: { windowsHide: boolean; timeout: number },
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: "utf8", windowsHide: options.windowsHide, timeout: options.timeout }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(String(stdout ?? ""));
+    });
+  });
+}
+
+async function resetWireSockNetworkLock(wsExe: string): Promise<boolean> {
   try {
-    execSync(`"${wsExe}" reset-network-lock`, { stdio: "ignore", windowsHide: true });
+    await execFileWithWindow(wsExe, ["reset-network-lock"], { windowsHide: true, timeout: 30_000 });
     return true;
   } catch {
     try {
       const escaped = wsExe.replace(/'/g, "''");
-      execSync(`powershell.exe -NoProfile -Command "Start-Process -FilePath '${escaped}' -ArgumentList 'reset-network-lock' -Verb RunAs -WindowStyle Hidden -Wait"`, { stdio: "ignore", windowsHide: true });
+      await execFileWithWindow(
+        "powershell.exe",
+        ["-NoProfile", "-Command", `Start-Process -FilePath '${escaped}' -ArgumentList 'reset-network-lock' -Verb RunAs -WindowStyle Hidden -Wait`],
+        { windowsHide: false, timeout: UAC_TIMEOUT_MS },
+      );
       return true;
     } catch (err) {
       logger.warn("wiresock", "nao consegui resetar network lock residual", { erro: detalheErro(err) });
@@ -972,15 +994,16 @@ function resetWireSockNetworkLock(wsExe: string): boolean {
   }
 }
 
-function stopWireSockServiceElevated(name: string): boolean {
+async function stopWireSockServiceElevated(name: string): Promise<boolean> {
   try {
     const escaped = name.replace(/'/g, "''");
-    execSync(`powershell.exe -NoProfile -Command "$p = Start-Process -FilePath 'sc.exe' -ArgumentList 'stop ${escaped}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) { exit $p.ExitCode }"`, {
-      stdio: "ignore",
+    await execFileWithWindow(
+      "powershell.exe",
+      ["-NoProfile", "-Command", `$p = Start-Process -FilePath 'sc.exe' -ArgumentList 'stop ${escaped}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) { exit $p.ExitCode }`],
       // A parada pode exigir consentimento UAC. Esconder o PowerShell fazia a
       // solicitacao ficar invisivel e o servico permanecia em execucao.
-      windowsHide: false,
-    });
+      { windowsHide: false, timeout: UAC_TIMEOUT_MS },
+    );
     return true;
   } catch (err) {
     logger.warn("wiresock", "parada elevada do servico falhou", { servico: name, erro: detalheErro(err) });
@@ -988,12 +1011,13 @@ function stopWireSockServiceElevated(name: string): boolean {
   }
 }
 
-function killWireSockProcessElevated(): boolean {
+async function killWireSockProcessElevated(): Promise<boolean> {
   try {
-    execSync("powershell.exe -NoProfile -Command \"$p = Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F /T /IM wiresock-client.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) { exit $p.ExitCode }\"", {
-      stdio: "ignore",
-      windowsHide: false,
-    });
+    await execFileWithWindow(
+      "powershell.exe",
+      ["-NoProfile", "-Command", "$p = Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F /T /IM wiresock-client.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) { exit $p.ExitCode }"],
+      { windowsHide: false, timeout: UAC_TIMEOUT_MS },
+    );
     return true;
   } catch (err) {
     logger.warn("wiresock", "encerramento elevado do processo falhou", { erro: detalheErro(err) });
@@ -1001,12 +1025,13 @@ function killWireSockProcessElevated(): boolean {
   }
 }
 
-function limparDnsDoAdaptadorWireSock(): boolean {
+async function limparDnsDoAdaptadorWireSock(): Promise<boolean> {
   try {
-    execSync("powershell.exe -NoProfile -Command \"Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match 'ProTUN|WireSock' -or $_.InterfaceDescription -match 'WireSock|WireGuard' } | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue }\"", {
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    await execFileWithWindow(
+      "powershell.exe",
+      ["-NoProfile", "-Command", "Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match 'ProTUN|WireSock' -or $_.InterfaceDescription -match 'WireSock|WireGuard' } | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue }"],
+      { windowsHide: true, timeout: 10_000 },
+    );
     return true;
   } catch (err) {
     logger.warn("wiresock", "nao consegui limpar DNS do adaptador virtual", { erro: detalheErro(err) });
@@ -1045,26 +1070,26 @@ export async function stopWireSockService(): Promise<WireSockCleanupResult> {
       if (!isServiceRunning(name)) continue;
       let stopSolicitado = false;
       try {
-        execSync(`sc.exe stop ${name}`, { stdio: "ignore", windowsHide: true });
+        await execFileWithWindow("sc.exe", ["stop", name], { windowsHide: true, timeout: 30_000 });
         stopSolicitado = true;
       } catch (err) {
         try {
           const escaped = name.replace(/'/g, "''");
-          execSync(`powershell.exe -NoProfile -Command "Stop-Service -Name '${escaped}' -Force -ErrorAction Stop"`, { stdio: "ignore", windowsHide: true });
+          await execFileWithWindow("powershell.exe", ["-NoProfile", "-Command", `Stop-Service -Name '${escaped}' -Force -ErrorAction Stop`], { windowsHide: true, timeout: 30_000 });
           stopSolicitado = true;
         } catch (fallbackErr) {
-          stopSolicitado = stopWireSockServiceElevated(name);
+          stopSolicitado = await stopWireSockServiceElevated(name);
           if (!stopSolicitado) logger.warn("wiresock", "parada do servico recusada", { servico: name, erro: detalheErro(fallbackErr) || detalheErro(err), pass: pass + 1 });
         }
       }
-      if (pass === 1 && isServiceRunning(name)) stopWireSockServiceElevated(name);
+      if (pass === 1 && isServiceRunning(name)) await stopWireSockServiceElevated(name);
     }
     try {
       // /T e necessario: o servico pode deixar um cliente filho fora do PID que
       // o gerenciador de servicos reporta.
-      execSync("taskkill.exe /F /T /IM wiresock-client.exe", { stdio: "ignore", windowsHide: true });
+      await execFileWithWindow("taskkill.exe", ["/F", "/T", "/IM", "wiresock-client.exe"], { windowsHide: true, timeout: 30_000 });
     } catch {
-      killWireSockProcessElevated();
+      await killWireSockProcessElevated();
     }
     for (let i = 0; i < 10 && isWireSockActive(); i++) await esperar(250);
     servicesResidual = WIRESOCK_SERVICE_NAMES.filter(isServiceRunning);
@@ -1072,7 +1097,7 @@ export async function stopWireSockService(): Promise<WireSockCleanupResult> {
     if (servicesResidual.length === 0 && !processResidual) break;
     logger.warn("wiresock", "residuo encontrado; repetindo limpeza elevada", { pass: pass + 1, servicesResidual, processResidual });
     const wsExe = findWireSockCleanupExe();
-    if (wsExe) resetNetworkLock = resetWireSockNetworkLock(wsExe) || resetNetworkLock;
+    if (wsExe) resetNetworkLock = (await resetWireSockNetworkLock(wsExe)) || resetNetworkLock;
   }
   servicesResidual = WIRESOCK_SERVICE_NAMES.filter(isServiceRunning);
   processResidual = isWireSockProcessAlive();
@@ -1081,12 +1106,12 @@ export async function stopWireSockService(): Promise<WireSockCleanupResult> {
 
   if (estavaAtivo || residual.length > 0) {
     const wsExe = findWireSockCleanupExe();
-    if (wsExe) resetNetworkLock = resetWireSockNetworkLock(wsExe) || resetNetworkLock;
+    if (wsExe) resetNetworkLock = (await resetWireSockNetworkLock(wsExe)) || resetNetworkLock;
   }
   let dnsFlushed = false;
-  const dnsCleared = limparDnsDoAdaptadorWireSock();
+  const dnsCleared = await limparDnsDoAdaptadorWireSock();
   try {
-    execSync("ipconfig.exe /flushdns", { stdio: "ignore", windowsHide: true });
+    await execFileWithWindow("ipconfig.exe", ["/flushdns"], { windowsHide: true, timeout: 10_000 });
     dnsFlushed = true;
   } catch (err) {
     logger.warn("wiresock", "flushdns falhou", { erro: detalheErro(err) });

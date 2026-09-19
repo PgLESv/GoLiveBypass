@@ -28,6 +28,9 @@ interface Entrada {
 
 let arquivo = "";
 const ring: Entrada[] = [];
+// Tamanho conhecido do arquivo atual: evita existsSync+statSync a cada linha
+// (eram tres syscalls sincronos por evento de log na thread principal).
+let tamanhoArquivo = 0;
 
 export function stamp(): string {
   return new Date().toTimeString().slice(0, 8);
@@ -51,10 +54,14 @@ export function formatLine(
 function gravar(linha: string) {
   if (!arquivo) return;
   try {
-    if (fs.existsSync(arquivo) && fs.statSync(arquivo).size > MAX_FILE_BYTES) {
-      fs.writeFileSync(arquivo, fs.readFileSync(arquivo, "utf8").slice(-MAX_FILE_BYTES / 2));
+    const bytes = Buffer.byteLength(linha, "utf8") + 1;
+    if (tamanhoArquivo + bytes > MAX_FILE_BYTES) {
+      const conteudo = fs.readFileSync(arquivo, "utf8").slice(-MAX_FILE_BYTES / 2);
+      fs.writeFileSync(arquivo, conteudo);
+      tamanhoArquivo = Buffer.byteLength(conteudo, "utf8");
     }
     fs.appendFileSync(arquivo, linha + "\n");
+    tamanhoArquivo += bytes;
   } catch {
     // Ficar sem registro e ruim; derrubar o app por causa do registro e pior.
   }
@@ -131,8 +138,14 @@ export function initLogger(dir: string) {
     if (/^\/(proc|sys)(\/|$)/.test(dir)) throw new Error("caminho virtual nao gravavel");
     fs.mkdirSync(dir, { recursive: true });
     arquivo = path.join(dir, "gui.log");
+    try {
+      tamanhoArquivo = fs.statSync(arquivo).size;
+    } catch {
+      tamanhoArquivo = 0; // primeira gravacao cria o arquivo
+    }
   } catch {
     arquivo = ""; // sem pasta de dados, segue so o ring em memoria
+    tamanhoArquivo = 0;
   }
 }
 
@@ -159,6 +172,7 @@ export function getRecent(): string {
 export function _resetForTests() {
   ring.length = 0;
   arquivo = "";
+  tamanhoArquivo = 0;
 }
 
 // ---------------------------------------------------------------------------

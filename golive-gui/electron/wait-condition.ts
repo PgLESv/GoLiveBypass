@@ -1,5 +1,5 @@
 export async function waitForCondition(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   options: {
     attempts?: number;
     delayMs?: number;
@@ -11,26 +11,27 @@ export async function waitForCondition(
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   for (let attempt = 0; attempt < attempts; attempt++) {
-    if (condition()) return true;
+    if (await condition()) return true;
     await sleep(delayMs);
   }
-  return condition();
+  return await condition();
 }
 
 export type ProcessProbeState = "running" | "stopped" | "unknown";
+export type ProcessProbe = () => ProcessProbeState | Promise<ProcessProbeState>;
 
 // Falha de observacao nao e prova de encerramento. Em particular, tasklist/pgrep pode
 // falhar transitoriamente enquanto o processo continua segurando a rota anterior.
 export async function waitForProcessStopped(
-  probe: () => ProcessProbeState,
+  probe: ProcessProbe,
   options: Parameters<typeof waitForCondition>[1] = {},
 ): Promise<boolean> {
-  return waitForCondition(() => probe() === "stopped", options);
+  return waitForCondition(async () => (await probe()) === "stopped", options);
 }
 
 export async function waitForProcessRunning(
-  probe: () => ProcessProbeState,
+  probe: ProcessProbe,
   options: Parameters<typeof waitForCondition>[1] = {},
 ): Promise<boolean> {
-  return waitForCondition(() => probe() === "running", options);
+  return waitForCondition(async () => (await probe()) === "running", options);
 }

@@ -739,7 +739,7 @@ html[data-theme='dark'] .switch-row input:checked + .switch-track .switch-thumb 
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 150ms ease;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
   box-sizing: border-box;
 }
 
@@ -917,7 +917,7 @@ html[data-theme='dark'] .switch-row input:checked + .switch-track .switch-thumb 
   font-weight: 600;
   cursor: pointer;
   border: 1px solid transparent;
-  transition: all 150ms var(--ease);
+  transition: background-color 150ms var(--ease), border-color 150ms var(--ease), color 150ms var(--ease), transform 150ms var(--ease);
   white-space: nowrap;
   box-sizing: border-box;
 }
@@ -1092,7 +1092,7 @@ html[data-theme='dark'] .switch-row input:checked + .switch-track .switch-thumb 
   cursor: pointer;
   padding: 2px 8px;
   border-radius: 6px;
-  transition: all 150ms ease;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
   flex-shrink: 0;
 }
 
