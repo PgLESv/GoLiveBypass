@@ -111,7 +111,7 @@ test("voos nativos não misturam canais e recusam instalações concorrentes", (
 });
 
 test("checagem automática limpa erro antigo quando o canal se recupera", () => {
-  const automaticBlock = nativeSource.slice(nativeSource.indexOf("async function automaticPluginUpdate"), nativeSource.indexOf("export function configurePluginUpdates"));
+  const automaticBlock = nativeSource.slice(nativeSource.indexOf("async function automaticPluginUpdate"), nativeSource.indexOf("export async function configurePluginUpdates"));
   assert.match(nativeSource, /let pluginUpdatePolicyRevision = 0/);
   assert.match(nativeSource, /function setPluginUpdateLastError\(/);
   assert.match(nativeSource, /revision !== pluginUpdatePolicyRevision/);
@@ -119,8 +119,8 @@ test("checagem automática limpa erro antigo quando o canal se recupera", () => 
   assert.match(automaticBlock, /setPluginUpdateLastError\(policy, revision, update\.ok \? null : update\.error\)/);
 });
 test("canal stable remove beta pendente mesmo sem troca de política", () => {
-  const configureBlock = nativeSource.slice(nativeSource.indexOf("export function configurePluginUpdates"), nativeSource.indexOf("export function getPluginUpdateStatus"));
-  const statusBlock = nativeSource.slice(nativeSource.indexOf("export function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
+  const configureBlock = nativeSource.slice(nativeSource.indexOf("export async function configurePluginUpdates"), nativeSource.indexOf("export async function getPluginUpdateStatus"));
+  const statusBlock = nativeSource.slice(nativeSource.indexOf("export async function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
   assert.match(configureBlock, /if \(next\.channel === "stable"\)[\s\S]*?discardPendingBetaForStable\(\)/);
   assert.doesNotMatch(configureBlock, /if \(changed && next\.channel === "stable"\)/);
   assert.match(statusBlock, /if \(pluginUpdatePolicy\.channel === "stable"\) discardPendingBetaForStable\(\)/);
@@ -175,7 +175,11 @@ test("falha manual não duplica o overlay automático", () => {
 test("commit do update revalida a política antes de tocar no plugin", () => {
   assert.match(nativeSource, /function assertCurrentPluginUpdatePolicy\(policy: PluginUpdatePolicy, revision: number\)/);
   assert.match(nativeSource, /assertCurrentPluginUpdatePolicy\(policy, revision\);\n\s+const \{ projectRoot, target \} = userpluginSource\(\)/);
-  assert.match(nativeSource, /assertCurrentPluginUpdatePolicy\(policy, revision\);\n\s+renameSync\(extracted\.source, target\)/);
+  // A sessão não toca mais na árvore: a troca e o build ficam para o boot, e ali só
+  // uma árvore de staging que prova o digest esperado é promovida.
+  assert.match(nativeSource, /function stagedPluginSourcePath\(/);
+  assert.match(nativeSource, /hashPluginSourceTree\(resolved\) !== pending\.sourceDigest\) return null/);
+  assert.match(nativeSource, /if \(!staged\) \{[\s\S]*rmSync\(pendingUpdatePath\(\), \{ force: true \}\)/);
   assert.match(nativeSource, /revision: number;/);
   assert.match(nativeSource, /pluginUpdateFlight\.revision === revision/);
 });
@@ -185,7 +189,7 @@ test("o status reporta a versão em execução enquanto o checkout aguarda reloa
   assert.match(nativeSource, /let pluginRuntimeVersion = UNKNOWN_PLUGIN_VERSION/);
   assert.match(nativeSource, /const installedVersion = currentPluginVersion\(\);/);
   assert.match(nativeSource, /pending = reconcileReachedPendingUpdate\(installedVersion, pendingInspection\)/);
-  const statusBlock = nativeSource.slice(nativeSource.indexOf("export function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
+  const statusBlock = nativeSource.slice(nativeSource.indexOf("export async function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
   assert.match(statusBlock, /current: pluginRuntimeVersion/);
 });
 

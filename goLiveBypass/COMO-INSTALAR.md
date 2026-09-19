@@ -47,8 +47,11 @@ as releases do repositório do projeto e instala somente o asset
 - **Atualização automática** vem ligada por padrão. Quando ligada, o plugin verifica em
   segundo plano e prepara a atualização; quando desligada, as verificações automáticas são
   interrompidas, mas **Verificar agora** e **Atualizar** continuam disponíveis no painel.
-- Antes de substituir os arquivos, o updater confere HTTPS, o manifesto do plugin, o
-  tamanho do arquivo e o **SHA-256** publicado. Se a validação ou a recompilação falhar,
+- Antes de aplicar, o updater confere HTTPS, o manifesto do plugin, o tamanho do arquivo e
+  o **SHA-256** publicado; o download validado fica em staging dentro do checkout e o
+  journal registra o estado `staged`. A troca dos arquivos e a recompilação acontecem
+  **na próxima abertura do cliente**, quando você ainda não está usando a janela: a
+  compilação nunca roda com o Discord em uso. Se a validação ou a recompilação falhar,
   o backup anterior é restaurado e a VPN, a chamada e o Discord permanecem intactos.
 - A atualização nunca reinicia o Discord silenciosamente. Depois de uma atualização
   preparada, o painel informa que é necessário fazer um **reload/recarregar manualmente o
@@ -69,16 +72,24 @@ Trocar o usuário inicia uma nova sessão e o botão para sair remove a sessão 
 
 Na etapa da rota, o progresso exibido vem dos eventos reais do controlador: fase atual,
 servidores testados/aprovados, servidor escolhido e latência/velocidades quando medidas.
-Cancelar interrompe a otimização sem ativar ou reiniciar o Discord. A conclusão apenas
-salva a preparação; a ativação do túnel continua sendo uma ação separada no painel. O
-assistente pode ser adiado e reaberto pelo botão **Abrir guia de configuração** ou pela
-ação do Toolbox do Vencord/Equicord.
+Cancelar interrompe a otimização sem ativar ou reiniciar o Discord. Se a otimização
+automática falhar sem nenhuma rota utilizável — o critério exige download e upload
+completos pelo túnel —, o próprio assistente mede o catálogo Proton de novo e mostra a
+lista manual ordenada por ping (com a rota recomendada em destaque) para a escolha seguir
+dali; nenhuma rota já medida é remedida. A conclusão apenas salva a preparação; a ativação
+do túnel continua sendo uma ação separada no painel. O assistente pode ser adiado e
+reaberto pelo botão **Abrir guia de configuração** ou pela ação do Toolbox do
+Vencord/Equicord.
 
 ## Instalação resumida
 
 1. Tenha o **Git**, **Node.js 22+** e **pnpm** instalados. No Linux, instale também
-   `iproute2`, `wireguard-tools` e `polkit`; o cliente precisa de uma sessão `systemd --user`
-   quando o relaunch sair da namespace.
+   `iproute2`, `wireguard-tools` e o polkit — `policykit-1` no Debian/Ubuntu (`sudo apt
+   install policykit-1`), `polkit` no Fedora (`sudo dnf install polkit`) e no Arch (`sudo
+   pacman -S polkit`); o cliente precisa de uma sessão `systemd --user`
+   quando o relaunch sair da namespace. Se o kernel em execução estiver sem os módulos,
+   reinicie no kernel instalado ou instale o pacote de módulos correspondente (no
+   Debian/Ubuntu: `sudo apt install linux-modules-$(uname -r)`).
 2. Baixe o código do Equicord (ou Vencord):
    `git clone https://github.com/Equicord/Equicord` (ou Vencord/Vencord)
 3. Copie **esta pasta** (`goLiveBypass`) para dentro de `src/userplugins/`

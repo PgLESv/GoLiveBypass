@@ -3,7 +3,7 @@ import { elevatedPowerShellFileArgs, wireSockDirectScript, wireSockServiceScript
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { classifyWireSockActivationFailure, classifyWireSockDirectResult, findWireSockInKnownRoots, formatAllowedApps, hasWireSockAdapterTrafficIncrease, mayUseServiceCompatibility, parseWireSockCliExternalAddress, parseWireSockCliStatus, verifyWindowsNetworkStable, wireSockDriverQueryShowsInstalled, wireSockInstallerExitKind, wireSockSearchRoots } from "../electron/wiresock";
+import { classifyWireSockActivationFailure, classifyWireSockDirectResult, findWireSockInKnownRoots, formatAllowedApps, hasWireSockAdapterTrafficIncrease, mayUseServiceCompatibility, parseWireSockCliExternalAddress, parseWireSockCliStatus, readWireSockResult, unwrapPowerShellErrorStream, verifyWindowsNetworkStable, wireSockDriverQueryShowsInstalled, wireSockExecError, wireSockInstallerExitKind, wireSockSearchRoots } from "../electron/wiresock";
 
 describe("WireSock no Windows", () => {
   it("preserva caminhos Unicode nos arquivos usados pelo Windows PowerShell 5.1", () => {
@@ -71,6 +71,73 @@ describe("WireSock no Windows", () => {
       kind: "unknown",
       code: "WIRESOCK_UNKNOWN",
     });
+  });
+
+  it("não lê o -NoProfile do wrapper elevado como evidência de perfil", () => {
+    // Caso de campo (2.0.8): o wrapper elevado falhou e o único texto era a
+    // própria linha de comando; o `-NoProfile` virou diagnóstico de perfil.
+    const wrapper = {
+      message: "Command failed: powershell.exe -NoProfile -NonInteractive -EncodedCommand JABFAHIAcgBvAHIAQQBj",
+    };
+    const failure = classifyWireSockActivationFailure(wrapper);
+    expect(failure).toMatchObject({ kind: "unknown", code: "WIRESOCK_UNKNOWN" });
+    expect(failure.message).not.toMatch(/perfil/i);
+  });
+
+  it("leva o stderr do wrapper elevado para a classificação da falha", () => {
+    const wrapper = { message: "Command failed: powershell.exe -NoProfile -EncodedCommand JABFAHIAcgBvAHIAQQBj", code: 1 };
+    const cancelado = wireSockExecError(wrapper, "powershell.exe", "", "Start-Process : A operação foi cancelada pelo usuário.");
+    // A linha de comando sozinha não identifica o cancelamento; é o stderr que decide.
+    expect(classifyWireSockActivationFailure(wrapper).code).not.toBe("WIRESOCK_PERMISSION");
+    expect(classifyWireSockActivationFailure(cancelado)).toMatchObject({
+      kind: "permission",
+      code: "WIRESOCK_PERMISSION",
+    });
+    expect(classifyWireSockActivationFailure(cancelado).message).toMatch(/administrador/);
+  });
+
+  it("explica a elevação que termina sem resultado", () => {
+    expect(classifyWireSockActivationFailure({ stderr: "GOLIVE_WIRESOCK_DIRECT_ERROR: DIRECT_WORKER_TIMEOUT: sem resultado de ativacao" }))
+      .toMatchObject({ kind: "timeout", code: "WIRESOCK_ELEVATION_TIMEOUT" });
+    expect(classifyWireSockActivationFailure({ stderr: "DIRECT_WORKER_EXITED: worker encerrou sem resultado" }))
+      .toMatchObject({ kind: "process", code: "WIRESOCK_WORKER_SEM_RESULTADO" });
+  });
+
+  it("decodifica o CLIXML que o PowerShell manda no stderr do wrapper elevado", () => {
+    // Captura real (VM win11, wrapper elevado com script inexistente): o
+    // marcador só aparece depois de ~600 caracteres de XML de progresso, fora do
+    // corte de 500 do diagnóstico — sem decodificar, a falha fica sem causa.
+    const clixml = `#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><TN RefId="0"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N="SourceId">1</I64><PR N="Record"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><S S="Error">DIRECT_WORKER_EXITED: worker encerrou sem resultado_x000D__x000A_</S><S S="Error">At line:14 char:28_x000D__x000A_</S><S S="Error">+ ... asExited) { throw 'DIRECT_WORKER_EXITED: worker encerrou sem resultad ..._x000D__x000A_</S><S S="Error">    + FullyQualifiedErrorId : DIRECT_WORKER_EXITED: worker encerrou sem resultado_x000D__x000A_</S></Objs>`;
+    const decodificado = unwrapPowerShellErrorStream(clixml);
+    expect(decodificado).toContain("DIRECT_WORKER_EXITED: worker encerrou sem resultado");
+    expect(decodificado).not.toContain("<Objs");
+    const erro = wireSockExecError(
+      Object.assign(new Error("Command failed: powershell.exe -NoProfile -NonInteractive -EncodedCommand JABF"), { code: 1 }),
+      "powershell.exe",
+      "",
+      clixml,
+    );
+    expect(classifyWireSockActivationFailure(erro)).toMatchObject({
+      kind: "process",
+      code: "WIRESOCK_WORKER_SEM_RESULTADO",
+    });
+  });
+
+  it("usa a saída capturada do WireSock quando o worker não escreve o resultado", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "golive-wiresock-result-"));
+    const resultPath = path.join(dir, "direct-result.txt");
+    try {
+      fs.writeFileSync(resultPath, "1\nGOLIVE_WIRESOCK_DIRECT_ERROR: DIRECT_EXITED: codigo=1 stderr=unknown command run");
+      expect(readWireSockResult(resultPath)).toContain("DIRECT_EXITED: codigo=1");
+      fs.rmSync(resultPath);
+      fs.writeFileSync(`${resultPath}.stderr`, "  wireguard: profile rejected  ");
+      expect(readWireSockResult(resultPath)).toBe("wireguard: profile rejected");
+      fs.rmSync(`${resultPath}.stderr`);
+      expect(readWireSockResult(resultPath)).toBe("");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("reconhece drivers WireSock atual e legado sem confundir servico comum", () => {

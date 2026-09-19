@@ -145,4 +145,22 @@ test("o status exposto à UI informa onde a sessão Proton é guardada", () => {
   assert.match(native, /import \* as proton from "\.\/vpn-proton";/);
 });
 
-console.log("plugin onboarding source tests: 12/12");
+test("falha da otimização automática mede o catálogo para a escolha manual por ping", () => {
+    // Sem rota utilizável a lista manual fica vazia e o usuário não tem saída
+    // ("seleção manual continua disponível" precisa ser verdade): os dois
+    // caminhos de falha do assistente e do painel remedem o catálogo.
+    const onboarding = source.slice(source.indexOf("const optimizeRoute"), source.indexOf("const cancelOptimization"));
+    assert.match(onboarding, /setError\(detail\);[\s\S]{0,200}?routeSelection\.measureCatalogIfEmpty\(\);/);
+    const panel = source.slice(source.indexOf("const optimize = async"), source.indexOf("const statusLabel"));
+    const panelCalls = panel.match(/setOptimizationNotice\("otimização falhou; escolha uma rota na lista"\);\n\s*routeSelection\.measureCatalogIfEmpty\(\);/g) || [];
+    assert.equal(panelCalls.length, 2, "painel: retorno de falha e exceção precisam remedir o catálogo");
+    // Remedir só quando não sobrou rota selecionável: com rota medida na lista,
+    // outra rodada de ping não muda a decisão do usuário.
+    assert.match(source, /const measureCatalogIfEmpty = React\.useCallback\(\(\) => \{[\s\S]*?shouldMeasureRouteCatalogOnFailure\(routes\)[\s\S]*?restart\(\);[\s\S]*?\}, \[active, routes, restart\]\)/);
+    assert.match(source, /A seleção manual continua disponível na lista abaixo, ordenada por ping\./);
+    // Enquanto o catálogo é remedido, "nenhuma rota catalogada" seria falso.
+    const emptyState = source.slice(source.indexOf("ordered.length === 0 ?"), source.indexOf(": emptyMessage}"));
+    assert.match(emptyState, /discovery\.active \? null : \(/);
+});
+
+console.log("plugin onboarding source tests: 15/15");

@@ -1061,35 +1061,39 @@ function discordDidNotStop(): never {
  * O updater do Discord usa o nome genérico Update.exe e não aparece como
  * Discord*.exe. Se ele sobrevive ao encerramento, pode reabrir uma sessão velha
  * e ficar preso em “Checking for updates...”, disputando a sessão recém-criada.
- * Filtramos pelo command line para não matar atualizadores de outros produtos.
+ * Update.exe e' compartilhado por apps Squirrel: a identificacao usa a command line,
+ * nunca somente o nome do executavel, para nao matar atualizadores de outros produtos.
  */
-function killDiscordUpdater() {
+const DISCORD_UPDATER_PROBE_SCRIPT = "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction Stop | Where-Object { $_.CommandLine -match 'Discord' }); if ($procs.Count -gt 0) { exit 0 }; exit 1";
+const DISCORD_UPDATER_KILL_SCRIPT = "$procs = Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'Discord' }; $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+
+/**
+ * Encerra o updater fora do thread principal. Cada execucao e' um powershell.exe que
+ * pode levar segundos numa maquina carregada, e a troca de rota chama isto varias
+ * vezes seguidas: sincrono, a janela ficava "Nao respondendo" justamente enquanto o
+ * usuario clicava para ativar/desativar.
+ */
+async function killDiscordUpdater(): Promise<void> {
   if (!IS_WINDOWS) return;
   try {
-    const script = "$procs = Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'Discord' }; $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
-    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: "ignore", windowsHide: true, timeout: 5000 });
+    await execFileTextAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", DISCORD_UPDATER_KILL_SCRIPT]);
   } catch (err) {
     logger.warn("discord", "nao consegui encerrar o updater do Discord", { erro: String((err as Error)?.message ?? err) });
   }
 }
 
-// Update.exe e' compartilhado por apps Squirrel. Por isso a identificacao usa a
-// command line, nunca somente o nome do executavel. Uma falha na consulta nao e'
-// tratada como ausencia: alterar a rota com um updater desconhecido ainda vivo
-// pode relancar o Discord fora da janela controlada.
-function discordUpdaterProcessState(): ProcessProbeState {
+// Uma falha na consulta nao e' tratada como ausencia: alterar a rota com um updater
+// desconhecido ainda vivo pode relancar o Discord fora da janela controlada.
+async function discordUpdaterProcessState(): Promise<ProcessProbeState> {
   if (!IS_WINDOWS) return "stopped";
   try {
-    const script = "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction Stop | Where-Object { $_.CommandLine -match 'Discord' }); if ($procs.Count -gt 0) { exit 0 }; exit 1";
-    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      stdio: "ignore",
-      windowsHide: true,
-      timeout: 5000,
-    });
+    await execFileTextAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", DISCORD_UPDATER_PROBE_SCRIPT]);
     return "running";
   } catch (err) {
     // O exit 1 e' a resposta esperada do script para nenhuma instancia Discord.
-    if ((err as NodeJS.ErrnoException)?.status === 1) return "stopped";
+    // `execFileSync` expunha o codigo em `.status`; o assincrono usa `.code`.
+    const failure = err as NodeJS.ErrnoException & { status?: number };
+    if (failure.status === 1 || failure.code === 1) return "stopped";
     logger.warn("discord", "updater.estado_desconhecido", {
       erro: String((err as Error)?.message ?? err),
     });
@@ -1106,12 +1110,10 @@ function discordUpdaterDidNotStop(): never {
   throw new Error("Não foi possível encerrar o atualizador do Discord. Feche o cliente e tente novamente antes de alterar a rota.");
 }
 
-function killMacProcesses(names: readonly string[], signal?: "-9") {
+async function killMacProcesses(names: readonly string[], signal?: "-9") {
   for (const name of names) {
     try {
-      execFileSync("killall", signal ? [signal, name] : [name], {
-        stdio: "ignore",
-      });
+      await execFileTextAsync("killall", signal ? [signal, name] : [name]);
     } catch {}
   }
 }
@@ -1119,11 +1121,11 @@ function killMacProcesses(names: readonly string[], signal?: "-9") {
 async function killDiscord() {
   if (isMac) {
     const mains = MAC_APPS.map((macApp) => macApp.processName);
-    killMacProcesses(mains);
-    killMacProcesses(MAC_HELPER_PROCESSES);
+    await killMacProcesses(mains);
+    await killMacProcesses(MAC_HELPER_PROCESSES);
     if (!(await waitUntilDiscordGone())) {
-      killMacProcesses(mains, "-9");
-      killMacProcesses(MAC_HELPER_PROCESSES, "-9");
+      await killMacProcesses(mains, "-9");
+      await killMacProcesses(MAC_HELPER_PROCESSES, "-9");
       if (!(await waitUntilDiscordGone(20, 250))) discordDidNotStop();
     }
     return;
@@ -1131,21 +1133,21 @@ async function killDiscord() {
 
   for (const flavour of ALL_APPS) {
     try {
-      execSync(`taskkill /F /T /IM ${flavour}.exe`, { stdio: "ignore" });
+      await execFileTextAsync("taskkill", ["/F", "/T", "/IM", `${flavour}.exe`]);
     } catch {}
   }
-  killDiscordUpdater();
+  await killDiscordUpdater();
   if (!(await waitUntilDiscordGone())) {
     // Um Update.exe pode recriar o processo principal depois do primeiro taskkill.
     // Mata-o mais uma vez e falha de forma segura se a sessao antiga persistir.
-    killDiscordUpdater();
+    await killDiscordUpdater();
     if (!(await waitUntilDiscordGone(20, 250))) discordDidNotStop();
   }
   // O updater pode ter sido recriado no intervalo em que o processo principal
   // saiu; repete a verificação antes de qualquer nova instalação/rota.
-  killDiscordUpdater();
+  await killDiscordUpdater();
   if (!(await waitUntilDiscordUpdaterGone())) {
-    killDiscordUpdater();
+    await killDiscordUpdater();
     if (!(await waitUntilDiscordUpdaterGone(20, 250))) discordUpdaterDidNotStop();
   }
 }
@@ -2334,12 +2336,20 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
   }, { timeout_ms: timeoutMs });
   const deadline = Date.now() + timeoutMs;
   let last: WgTunnelStats | undefined;
-  let lastWireSock: WireSockConnectionStatus = getWireSockConnectionStatus();
+  let lastWireSock: WireSockConnectionStatus = await getWireSockConnectionStatusAsync();
   let cliFlowSamples = 0;
   let adapterFlowSamples = 0;
   let previousAdapterTraffic: ReturnType<typeof getWireSockAdapterTraffic> = null;
   while (Date.now() < deadline) {
-    lastWireSock = getWireSockConnectionStatus();
+    // Três spawns por tique (wiresock-cli, wg.exe e powershell). Síncronos, eles
+    // seguravam a janela uma vez por segundo enquanto a rota subia; em paralelo e
+    // assíncronos o mesmo dado chega sem "Não respondendo" durante a ativação.
+    const [wireSockStatus, stats, traffic] = await Promise.all([
+      getWireSockConnectionStatusAsync(),
+      getWgStatsAsync(),
+      getWireSockAdapterTrafficAsync(),
+    ]);
+    lastWireSock = wireSockStatus;
     if (lastWireSock.source === "cli" && lastWireSock.state === "disconnected") {
       return finish({
         verified: false,
@@ -2348,7 +2358,7 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
         detail: "WireSock informou que a rota está desconectada",
       });
     }
-    last = getWgStats();
+    last = stats;
     const readiness = classifyWgReadiness(last, true);
     if (readiness.ready) {
       return finish({ verified: true, state: "connected", source: "wg", detail: "handshake recente e tráfego WireGuard bidirecional confirmados" });
@@ -2367,7 +2377,6 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
     // Algumas instalações oficiais expõem apenas wiresock-client.exe + ProTUN.
     // Depois de abrir o Discord (que está em AllowedApps), duas amostras RX/TX
     // provam o fluxo real pelo túnel sem depender do tráfego da própria GUI.
-    const traffic = getWireSockAdapterTraffic();
     const adapterTrafficIncreasing = hasWireSockAdapterTrafficIncrease(previousAdapterTraffic, traffic);
     previousAdapterTraffic = traffic;
     if (lastWireSock.source === "service" && lastWireSock.state === "unknown" && traffic && adapterTrafficIncreasing) {
@@ -3285,9 +3294,11 @@ async function formatWgTunelDiagnostico(status: string): Promise<string> {
   return `handshake ${handshake} · ${trafego}`;
 }
 
-function formatWireSockDiagnostico(): string {
+async function formatWireSockDiagnostico(): Promise<string> {
   if (!IS_WINDOWS) return "n/a";
-  const s = getWireSockConnectionStatus();
+  // Assíncrono: a sonda é um wiresock-cli/powershell que pode levar segundos, e o
+  // relatório de diagnóstico é copiado a partir de um clique na janela.
+  const s = await getWireSockConnectionStatusAsync();
   return `${s.state} · fonte=${s.source}${s.detail ? ` · ${s.detail}` : ""}`;
 }
 
@@ -3302,7 +3313,7 @@ async function buildDiagnostic(status: string, extraNote = ""): Promise<string> 
     `| electron | ${process.versions.electron} |`,
     `| status | ${status} |`,
     `| routeMode | wireguard |`,
-    `| wireSock | ${formatWireSockDiagnostico()} |`,
+    `| wireSock | ${await formatWireSockDiagnostico()} |`,
     // "Carregando infinito" pos-WireGuard costuma ser tunel morto/saturado, nao mais gateway
     // zumbi de proxy: handshake velho ou trafego zerado com bypass ativo aponta pra isso direto.
     `| tunelWg | ${await formatWgTunelDiagnostico(status)} |`,
@@ -3689,7 +3700,7 @@ ipcMain.handle("test-wg-conf", async () => {
     let readiness: Record<string, unknown> | undefined;
 
     if (status === "ACTIVE" && IS_WINDOWS) {
-      const ws = getWireSockConnectionStatus();
+      const ws = await getWireSockConnectionStatusAsync();
       readiness = {
         ready: ws.verified,
         state: ws.state,

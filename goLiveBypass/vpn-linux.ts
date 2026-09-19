@@ -200,15 +200,93 @@ export function isFlatpak(env: NodeJS.ProcessEnv = process.env): boolean {
     return Boolean(env.FLATPAK_ID || env.FLATPAK_SANDBOX_DIR || fs.existsSync("/.flatpak-info"));
 }
 
+// O nome do pacote muda de distribuição para distribuição: "polkit" existe no Fedora e no
+// Arch, mas no Debian/Ubuntu o pacote se chama policykit-1 (que hoje entrega polkitd e pkexec
+// separados). A mensagem genérica ("instale o pacote polkit") mandava o usuário do Ubuntu
+// procurar um pacote que não existe e deixava o painel sem ação possível (relato com kernel
+// 6.8.0-139-generic). Mesma ideia do linux_dependency_plan() do standalone, sem executar
+// nada: lê /etc/os-release e escreve o comando que a pessoa consegue copiar.
+export type LinuxDistroFamily = "debian" | "fedora" | "arch" | "unknown";
+
+const LINUX_DISTRO_FAMILY_BY_ID: Record<string, LinuxDistroFamily> = {
+    debian: "debian", ubuntu: "debian", linuxmint: "debian", pop: "debian", raspbian: "debian", kali: "debian",
+    fedora: "fedora", rhel: "fedora", centos: "fedora", rocky: "fedora", almalinux: "fedora",
+    arch: "arch", manjaro: "arch", endeavouros: "arch", cachyos: "arch", garuda: "arch",
+};
+
+export function identifyLinuxDistroFamily(osRelease?: string | null): LinuxDistroFamily {
+    if (!osRelease) return "unknown";
+    const fields = new Map<string, string>();
+    for (const line of osRelease.split("\n")) {
+        const match = /^([A-Z_]+)=(.*)$/.exec(line.trim());
+        if (match) fields.set(match[1], match[2].replace(/^"|"$/g, "").trim());
+    }
+    for (const token of [fields.get("ID") ?? "", ...(fields.get("ID_LIKE") ?? "").split(/\s+/)]) {
+        const family = LINUX_DISTRO_FAMILY_BY_ID[token.toLowerCase()];
+        if (family) return family;
+    }
+    return "unknown";
+}
+
+// /etc/os-release não muda durante a sessão; a leitura entra no cache como a do módulo
+// WireGuard, porque o painel consulta as dependências a cada poucos segundos.
+let linuxDistroFamilyCache: LinuxDistroFamily | null = null;
+
+export function resetLinuxDistroFamilyCache(): void {
+    linuxDistroFamilyCache = null;
+}
+
+export function linuxDistroFamily(): LinuxDistroFamily {
+    if (linuxDistroFamilyCache) return linuxDistroFamilyCache;
+    let raw: string | null = null;
+    try {
+        raw = fs.readFileSync("/etc/os-release", "utf8");
+    } catch {
+        // Container/sandbox sem os-release: fica a mensagem genérica.
+        raw = null;
+    }
+    linuxDistroFamilyCache = identifyLinuxDistroFamily(raw);
+    return linuxDistroFamilyCache;
+}
+
+// Comando copiavel para instalar o pkexec. Vazio quando a familia nao e conhecida: melhor nao
+// mandar o usuario de uma distribuicao desconhecida rodar o gerenciador de pacotes errado.
+export function polkitInstallCommand(family: LinuxDistroFamily): string {
+    switch (family) {
+        case "debian": return "sudo apt install policykit-1";
+        case "fedora": return "sudo dnf install polkit";
+        case "arch": return "sudo pacman -S polkit";
+        default: return "";
+    }
+}
+
+export function kernelModulesInstallCommand(family: LinuxDistroFamily, kernelRelease: string): string {
+    // Só o Debian/Ubuntu empacota módulos por versão de kernel (linux-modules-<release>); nas
+    // outras famílias eles vêm junto do kernel e a ação útil continua sendo reiniciar.
+    if (family !== "debian") return "";
+    const release = kernelRelease.trim();
+    return `sudo apt install linux-modules-${release || "$(uname -r)"}`;
+}
+
+export function pkexecMissingIssue(family: LinuxDistroFamily = linuxDistroFamily()): string {
+    const command = polkitInstallCommand(family);
+    return command
+        ? `Utilitário 'pkexec' (polkit) não encontrado. Instale o polkit (${command}) para autorização administrativa.`
+        : "Utilitário 'pkexec' (polkit) não encontrado. Instale o pacote polkit da sua distribuição para autorização administrativa.";
+}
+
 export function formatLinuxWireGuardModuleIssue(
     state: LinuxWireGuardModuleState,
     kernelRelease: string,
     modulesDirectoryAvailable: boolean,
+    family: LinuxDistroFamily = linuxDistroFamily(),
 ): string | null {
     if (state !== "missing") return null;
     const release = kernelRelease.trim() || "atual";
     if (!modulesDirectoryAvailable) {
-        return `O kernel Linux em execução (${release}) não possui os módulos instalados. Reinicie no kernel instalado ou instale os módulos correspondentes antes de ativar.`;
+        const base = `O kernel Linux em execução (${release}) não possui os módulos instalados. Reinicie no kernel instalado ou instale os módulos correspondentes antes de ativar.`;
+        const command = kernelModulesInstallCommand(family, release);
+        return command ? `${base} No Debian/Ubuntu: ${command} e reinicie.` : base;
     }
     return `O módulo WireGuard não está disponível no kernel Linux em execução (${release}). Instale ou ative o módulo WireGuard antes de ativar.`;
 }
@@ -345,10 +423,7 @@ function resolveCommandInvocation(
     if (options.elevated) {
         const pkexec = findSystemBinary("pkexec", env);
         if (!pkexec) {
-            throw new Error(
-                "Utilitário de elevação 'pkexec' (polkit) não encontrado no sistema. " +
-                "Instale o pacote polkit para permitir operações de rede privilegiadas."
-            );
+            throw new Error(pkexecMissingIssue());
         }
         cmdArgs = [cmdFile, ...cmdArgs];
         cmdFile = pkexec;
@@ -764,7 +839,7 @@ export function linuxDependencyIssues(env: NodeJS.ProcessEnv = process.env): str
         issues.push("Utilitário 'wg' (wireguard-tools) não encontrado. Instale o pacote wireguard-tools no sistema.");
     }
     if (!hasPkexec) {
-        issues.push("Utilitário 'pkexec' (polkit) não encontrado. Instale o pacote polkit para autorização administrativa.");
+        issues.push(pkexecMissingIssue());
     }
     const moduleIssue = linuxWireGuardModuleIssue(env);
     if (moduleIssue) {

@@ -26,6 +26,7 @@ import {
     protonRouteStateLabel,
     protonRouteTierLabel,
     recommendProtonRoute,
+    shouldMeasureRouteCatalogOnFailure,
     sortProtonRouteCandidates,
     type ProtonRouteCandidate,
     type ProtonRouteCatalogEntry,
@@ -793,6 +794,14 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
 
     const routes = React.useMemo(() => [...candidates.values()], [candidates]);
     const recommendedServer = React.useMemo(() => recommendProtonRoute(candidates.values()), [candidates]);
+    // Saída para a falha da otimização automática: sem rota já medida e
+    // selecionável, o catálogo é medido de novo para a lista manual aparecer
+    // ordenada por ping. Com rota utilizável na lista, nada é refeito.
+    const measureCatalogIfEmpty = React.useCallback(() => {
+        if (!active) return;
+        if (!shouldMeasureRouteCatalogOnFailure(routes)) return;
+        restart();
+    }, [active, routes, restart]);
 
     return {
         routes,
@@ -805,6 +814,7 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
         cancelSelection,
         restart,
         refresh,
+        measureCatalogIfEmpty,
     };
 }
 
@@ -871,7 +881,7 @@ function ProtonRouteSelection({
             </div>
             {optimization.error && (
                 <Paragraph role="alert" aria-live="assertive">
-                    <strong>{optimization.error}</strong> A seleção manual continua disponível na lista abaixo.
+                    <strong>{optimization.error}</strong> A seleção manual continua disponível na lista abaixo, ordenada por ping.
                 </Paragraph>
             )}
             <Paragraph><strong>{heading}</strong></Paragraph>
@@ -891,11 +901,15 @@ function ProtonRouteSelection({
                         </Paragraph>
                     )}
                     {ordered.length === 0 ? (
-                        <Paragraph role="status" aria-live="polite">
-                            {routeActive && activeRouteSummary
-                                ? <>O túnel está ativo com <strong>{activeRouteSummary}</strong>. A lista desta sessão ainda não foi carregada — use "Buscar rotas novamente" ou "Otimizar automaticamente" para medir outras rotas.</>
-                                : emptyMessage}
-                        </Paragraph>
+                        // Enquanto o catálogo é medido, "nenhuma rota catalogada" seria
+                        // falso: o aviso de atualização acima já descreve o estado.
+                        discovery.active ? null : (
+                            <Paragraph role="status" aria-live="polite">
+                                {routeActive && activeRouteSummary
+                                    ? <>O túnel está ativo com <strong>{activeRouteSummary}</strong>. A lista desta sessão ainda não foi carregada — use "Buscar rotas novamente" ou "Otimizar automaticamente" para medir outras rotas.</>
+                                    : emptyMessage}
+                            </Paragraph>
+                        )
                     ) : (
                         <ul aria-label="Rotas Proton disponíveis" tabIndex={0} style={protonRouteListStyle}>
                             {ordered.map(candidate => {
@@ -1418,6 +1432,9 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
                     updatedAt: Date.now(),
                 }));
                 setError(detail);
+                // A otimização automática não achou rota utilizável: a lista
+                // manual (ordenada por ping) é a saída, e precisa estar medida.
+                routeSelection.measureCatalogIfEmpty();
             }
         } finally {
             if (isOptimizationCurrent()) {
@@ -2226,6 +2243,7 @@ function VpnPanel() {
                 // disponível logo abaixo, sem esconder as rotas já medidas.
                 setOptimizationError(safeDiagnosticDetail(result.error || "Não foi possível otimizar a rota Proton.", 240));
                 setOptimizationNotice("otimização falhou; escolha uma rota na lista");
+                routeSelection.measureCatalogIfEmpty();
                 return;
             }
             setOptimizationNotice("rota Proton preparada");
@@ -2241,6 +2259,7 @@ function VpnPanel() {
             if (mountedRef.current) {
                 setOptimizationError(safeDiagnosticDetail(error || "Não foi possível otimizar a rota Proton.", 240));
                 setOptimizationNotice("otimização falhou; escolha uma rota na lista");
+                routeSelection.measureCatalogIfEmpty();
             }
         } finally {
             if (mountedRef.current) setOptimizing(false);

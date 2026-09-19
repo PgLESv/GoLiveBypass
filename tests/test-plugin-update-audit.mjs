@@ -49,14 +49,22 @@ test("a substituição revalida a origem local depois do download", () => {
 
 test("o journal é gravado antes da troca e recupera um checkout interrompido", () => {
     const updateBlock = nativeSource.slice(nativeSource.indexOf("async function performPluginUpdateLocked(policy"), nativeSource.indexOf("function runPluginUpdate(policy"));
-    const intent = updateBlock.indexOf('phase: "preparing"');
-    const move = updateBlock.indexOf("renameSync(target, backup)");
-    const prepared = updateBlock.indexOf('phase: "prepared"');
+    // Na sessão nada é movido nem compilado: o download validado vira journal "staged".
+    assert.match(updateBlock, /phase: "staged"[\s\S]*stagedPath: extracted\.source/);
+    assert.doesNotMatch(updateBlock, /renameSync\(target, backup\)/);
+    assert.doesNotMatch(updateBlock, /rebuildUserplugin\(/);
+
+    // A troca e o build ficam para o boot, e ali a intenção precede o primeiro rename.
+    const applyBlock = nativeSource.slice(nativeSource.indexOf("async function applyStagedPluginUpdate"), nativeSource.indexOf("async function recoverInterruptedPluginUpdate"));
+    const intent = applyBlock.indexOf('phase: "preparing"');
+    const move = applyBlock.indexOf("renameSync(target, backup)");
+    const prepared = applyBlock.indexOf('phase: "prepared"');
     assert.ok(intent >= 0 && move > intent, "a intenção precisa preceder o primeiro rename");
     assert.ok(prepared > move, "o estado preparado só pode vir depois da troca");
-    assert.match(nativeSource, /type PendingPluginUpdatePhase = "preparing" \| "prepared" \| "rolling-back"/);
-    assert.match(nativeSource, /function recoverInterruptedPluginUpdate\(/);
-    assert.match(nativeSource, /if \(hasBackup\)[\s\S]*renameSync\(backup, target\)[\s\S]*rebuildUserplugin\(projectRoot\)/);
+    assert.ok(applyBlock.indexOf("await rebuildUserplugin(projectRoot)") > move, "o build roda depois da troca");
+    assert.match(nativeSource, /type PendingPluginUpdatePhase = "preparing" \| "prepared" \| "rolling-back" \| "staged"/);
+    assert.match(nativeSource, /async function recoverPendingUpdateInternal\(options: \{ allowStaged\?: boolean \}\)/);
+    assert.match(nativeSource, /if \(hasBackup\)[\s\S]*renameSync\(backup, target\)[\s\S]*await rebuildUserplugin\(projectRoot\)/);
     assert.match(nativeSource, /update interrompido deixou a árvore nova sem backup/);
 });
 
@@ -106,7 +114,7 @@ test("um preparo no checkout não é confundido com reload do processo corrente"
 });
 
 test("reconfiguração idêntica preserva o voo, mas mudança real aborta downloads antigos", () => {
-    const configureBlock = nativeSource.slice(nativeSource.indexOf("export function configurePluginUpdates"), nativeSource.indexOf("export function getPluginUpdateStatus"));
+    const configureBlock = nativeSource.slice(nativeSource.indexOf("export async function configurePluginUpdates"), nativeSource.indexOf("export async function getPluginUpdateStatus"));
     assert.match(configureBlock, /if \(changed\) \{[\s\S]*pluginUpdatePolicyRevision\+\+[\s\S]*pluginUpdateCheckFlight\?\.controller\.abort\(\)[\s\S]*pluginUpdateFlight\?\.controller\.abort\(\)/);
     assert.doesNotMatch(configureBlock.slice(0, configureBlock.indexOf("if (changed) {")), /pluginUpdatePolicyRevision\+\+/);
 });
@@ -117,7 +125,8 @@ test("downloads e inspeção do arquivo têm cancelamento e prazo absoluto", () 
     assert.match(nativeSource, /setTimeout\(\(\) => abortRequest\("update request timed out"\), remaining\)/);
     assert.match(nativeSource, /options\.signal\?\.addEventListener\("abort", onAbort/);
     assert.match(nativeSource, /deadlineAt \}/);
-    assert.match(nativeSource, /timeout: PLUGIN_UPDATE_TIMEOUT_MS/);
+    assert.match(nativeSource, /timeoutMs: PLUGIN_UPDATE_TIMEOUT_MS/);
+    assert.doesNotMatch(nativeSource, /execFileSync\(\s*"(?:unzip|tar|pnpm)"/);
     assert.match(nativeSource, /try \{\n\s+void downloadBytes\(response\.headers\.location/);
     assert.match(nativeSource, /catch \(error\) \{\n\s+rejectOnce\(error\);\n\s+\}/);
     assert.match(nativeSource, /controller\.abort\(\);\n        throw error;/);
@@ -174,7 +183,7 @@ test("canal pendente é exposto separadamente do canal selecionado", () => {
 });
 
 test("observações e finally antigos não sobrevivem à troca de política", () => {
-    const configureBlock = nativeSource.slice(nativeSource.indexOf("export function configurePluginUpdates"), nativeSource.indexOf("export function getPluginUpdateStatus"));
+    const configureBlock = nativeSource.slice(nativeSource.indexOf("export async function configurePluginUpdates"), nativeSource.indexOf("export async function getPluginUpdateStatus"));
     assert.match(configureBlock, /pluginUpdateLastCheckedAt = null/);
     assert.match(configureBlock, /pluginUpdateLastError = null/);
     assert.match(nativeSource, /if \(revision === pluginUpdatePolicyRevision && policyKey === updatePolicyKey\(pluginUpdatePolicy\)\)\s*pluginUpdateLastCheckedAt = Date\.now\(\)/);

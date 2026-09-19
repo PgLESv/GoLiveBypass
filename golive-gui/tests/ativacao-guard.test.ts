@@ -233,7 +233,7 @@ describe("guarda de ativacao duplicada", () => {
 
   it("confirma que o Update.exe do Discord saiu antes de trocar a rota", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    const updaterProbe = src.slice(src.indexOf("function discordUpdaterProcessState"), src.indexOf("function killMacProcesses"));
+    const updaterProbe = src.slice(src.indexOf("const DISCORD_UPDATER_PROBE_SCRIPT"), src.indexOf("function killMacProcesses"));
     expect(updaterProbe).toContain("$_ .CommandLine".replace("$_ .", "$_."));
     expect(updaterProbe).toContain('return "unknown"');
     expect(updaterProbe).toContain("waitUntilDiscordUpdaterGone");

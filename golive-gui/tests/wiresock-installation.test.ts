@@ -4,7 +4,8 @@ import os from "node:os";
 import crypto from "node:crypto";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
-import { wireSockInstallerExitKind } from "../electron/wiresock";
+import { classifyWireSockActivationFailure, classifyWireSockDirectResult, formatAllowedApps, mayUseServiceCompatibility, readWireSockResult, wireSockExecError, wireSockInstallerExitKind } from "../electron/wiresock";
+import { elevatedPowerShellFileArgs, wireSockDirectScript, wireSockServiceScript } from "../electron/wiresock-service";
 
 const sourcePath = path.resolve(process.cwd(), "electron/wiresock.ts");
 const source = fs.readFileSync(sourcePath, "utf8");
@@ -160,5 +161,79 @@ describe("instalação WireSock extraída do fluxo real", () => {
     const run = makeEnsure(); const ctx = base(); const progress: string[] = [];
     await run(ctx, (message: string) => progress.push(message));
     expect(progress).toEqual(["Verificando instalação compatível do WireSock…"]);
+  });
+});
+
+describe("ativação extraída do fluxo real", () => {
+  function bodyOf(name: string): string {
+    let found: ts.FunctionLikeDeclaration | undefined;
+    const visit = (node: ts.Node) => { if (ts.isFunctionLike(node) && node.name?.getText(file) === name) found = node; if (!found) ts.forEachChild(node, visit); };
+    visit(file);
+    if (!found?.body || !ts.isBlock(found.body)) throw new Error(`${name} não encontrada`);
+    return ts.transpileModule(found.body.getText(file).slice(1, -1), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  }
+
+  const detalheErro = new Function(`return function detalheErro(err) {${bodyOf("detalheErro")}}`)();
+
+  function makeApply() {
+    return new Function(`return async function(ctx, installDir, rawConf, allowedAppPaths) {
+      const { fs, path, os, crypto, logger, ensureWireSockInstalled, wireSockDirectScript, wireSockServiceScript,
+        elevatedPowerShellFileArgs, readWireSockResult, classifyWireSockDirectResult, detalheErro,
+        esperarProcessoWireSock, mayUseServiceCompatibility, classifyWireSockActivationFailure,
+        stopWireSockService, WIRESOCK_SERVICE_NAMES, isServiceRunning, limparDnsDoAdaptadorWireSock,
+        formatAllowedApps, execFileWithWindow } = ctx;
+      ${bodyOf("applyWireSockProfile")}
+    }`)();
+  }
+
+  it("falha do wrapper elevado vira permissão com o stderr real, não perfil", async () => {
+    const run = makeApply();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-aplicacao-"));
+    const installDir = path.join(root, "dados");
+    const conf = path.join(root, "wireguard.conf");
+    fs.writeFileSync(conf, "[Interface]\nPrivateKey = chave-teste\n[Peer]\nAllowedIPs = 0.0.0.0/0\n");
+    const eventos: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    let elevados = 0;
+    const ctx = {
+      fs, path, crypto,
+      os: { tmpdir: () => os.tmpdir() },
+      logger: {
+        info: () => {},
+        warn: () => {},
+        createOperationId: (prefixo: string) => `${prefixo}-teste`,
+        logEvent: (_nivel: string, _categoria: string, event: string, _contexto: unknown, payload: Record<string, unknown>) => {
+          eventos.push({ event, payload: payload ?? {} });
+        },
+        clipLogText: (valor: unknown, max = 2000) => String(valor ?? "").trim().slice(0, max),
+      },
+      ensureWireSockInstalled: async () => "C:\\WireSock\\wiresock-client.exe",
+      wireSockDirectScript, wireSockServiceScript, elevatedPowerShellFileArgs,
+      readWireSockResult, classifyWireSockDirectResult, detalheErro, mayUseServiceCompatibility,
+      classifyWireSockActivationFailure, formatAllowedApps,
+      esperarProcessoWireSock: async () => false,
+      stopWireSockService: async () => ({ stopped: true, attempts: 1, resetNetworkLock: true, dnsCleared: true, dnsFlushed: true, servicesResidual: [], processResidual: false, residual: [] }),
+      WIRESOCK_SERVICE_NAMES: ["wiresock-client-service", "wiresock-pro-client-service"],
+      isServiceRunning: () => false,
+      limparDnsDoAdaptadorWireSock: async () => {},
+      execFileWithWindow: async () => {
+        elevados++;
+        throw wireSockExecError(
+          Object.assign(new Error("Command failed: powershell.exe -NoProfile -NonInteractive -EncodedCommand JABFAHIAcgBvAHIA"), { code: 1 }),
+          "powershell.exe",
+          "",
+          "Start-Process : A operação foi cancelada pelo usuário.",
+        );
+      },
+    };
+    try {
+      await expect(run(ctx, installDir, conf, ["C:\\Apps\\Discord.exe"])).rejects.toThrow("WIRESOCK_PERMISSION");
+      await expect(run(ctx, installDir, conf, ["C:\\Apps\\Discord.exe"])).rejects.not.toThrow(/perfil WireGuard/i);
+      expect(elevados).toBe(2);
+      const falha = eventos.find((evento) => evento.event === "activation.failed");
+      expect(String(falha?.payload.detalhe)).toContain("cancelada pelo usuário");
+      expect(String(falha?.payload.codigo)).toBe("WIRESOCK_PERMISSION");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

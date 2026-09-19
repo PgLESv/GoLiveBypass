@@ -8,10 +8,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildLinuxPrivilegedScript,
   formatLinuxWireGuardModuleIssue,
+  identifyLinuxDistroFamily,
+  kernelModulesInstallCommand,
   linuxAuthorizationGuidance,
   linuxDependencyStatus,
   linuxWireGuardModuleCheckCommand,
   linuxWireGuardModuleState,
+  pkexecMissingIssue,
+  polkitInstallCommand,
   resetLinuxWireGuardModuleCache,
   waitForFile,
 } from "../../goLiveBypass/vpn-linux";
@@ -23,6 +27,30 @@ describe("transporte Linux do plugin", () => {
     expect(formatLinuxWireGuardModuleIssue("missing", "7.2.5-1-cachyos", true)).toContain("módulo WireGuard");
     expect(formatLinuxWireGuardModuleIssue("loaded", "7.2.5-1-cachyos", false)).toBeNull();
     expect(formatLinuxWireGuardModuleIssue("available", "7.2.5-1-cachyos", true)).toBeNull();
+  });
+
+  it("aponta o pacote certo por distribuição em vez de um nome inexistente", () => {
+    // Ubuntu se identifica por ID=ubuntu + ID_LIKE=debian; o pacote do pkexec lá é policykit-1.
+    const ubuntu = 'NAME="Ubuntu"\nID=ubuntu\nID_LIKE=debian\n';
+    expect(identifyLinuxDistroFamily(ubuntu)).toBe("debian");
+    expect(polkitInstallCommand("debian")).toBe("sudo apt install policykit-1");
+    expect(pkexecMissingIssue("debian")).toContain("sudo apt install policykit-1");
+    expect(kernelModulesInstallCommand("debian", "6.8.0-139-generic"))
+      .toBe("sudo apt install linux-modules-6.8.0-139-generic");
+    const issue = formatLinuxWireGuardModuleIssue("missing", "6.8.0-139-generic", false, "debian");
+    expect(issue).toContain("6.8.0-139-generic");
+    expect(issue).toContain("sudo apt install linux-modules-6.8.0-139-generic");
+  });
+
+  it("reconhece as famílias por ID/ID_LIKE e não inventa comando para desconhecidas", () => {
+    expect(identifyLinuxDistroFamily('ID="cachyos"\nID_LIKE=arch\n')).toBe("arch");
+    expect(identifyLinuxDistroFamily("ID=fedora\n")).toBe("fedora");
+    expect(identifyLinuxDistroFamily('ID=linuxmint\nID_LIKE="ubuntu debian"\n')).toBe("debian");
+    expect(identifyLinuxDistroFamily("ID=void\n")).toBe("unknown");
+    expect(identifyLinuxDistroFamily(null)).toBe("unknown");
+    expect(polkitInstallCommand("unknown")).toBe("");
+    expect(pkexecMissingIssue("unknown")).toContain("polkit");
+    expect(kernelModulesInstallCommand("arch", "7.2.6-1-cachyos")).toBe("");
   });
 
   it("não solicita senha quando o módulo WireGuard está ausente", async () => {

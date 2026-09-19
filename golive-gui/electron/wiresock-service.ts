@@ -106,10 +106,15 @@ $resultPath = ${literal(resultPath)}
 $stdoutPath = ${literal(resultPath + '.stdout')}
 $stderrPath = ${literal(resultPath + '.stderr')}
 function Complete-WireSock([int]$code, [string]$detail) {
+  $payload = "$code\n$detail"
   try {
-    [IO.File]::WriteAllText(($resultPath + '.tmp'), "$code\n$detail", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText(($resultPath + '.tmp'), $payload, [Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath ($resultPath + '.tmp') -Destination $resultPath -Force
-  } catch {}
+  } catch {
+    # O resultado é o único canal de diagnóstico do worker elevado: se a troca
+    # do arquivo falhar, grava no destino final antes de sair.
+    try { [IO.File]::WriteAllText($resultPath, $payload, [Text.UTF8Encoding]::new($false)) } catch {}
+  }
   exit $code
 }
 function Read-Captured([string]$path) {

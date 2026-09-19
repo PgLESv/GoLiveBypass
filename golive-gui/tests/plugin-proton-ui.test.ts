@@ -8,6 +8,7 @@ import {
   protonRouteStateLabel,
   recommendProtonRoute,
   reduceProtonRouteEvent,
+  shouldMeasureRouteCatalogOnFailure,
   sortProtonRouteCandidates,
   type ProtonRouteCandidate,
 } from "../../goLiveBypass/proton-manual-selection";
@@ -163,6 +164,19 @@ describe("modelo de rotas Proton do plugin", () => {
       candidate("NL#2", { pingMs: 150, pingStatus: "success" }),
     ])).toBe("NL#2");
     expect(recommendProtonRoute([candidate("US#72", { pingStatus: "failed" })])).toBeUndefined();
+  });
+
+  it("mede o catálogo depois da falha só quando não sobrou rota selecionável", () => {
+    const noAnswer = candidate("US#99", { pingMs: 999, pingStatus: "success" });
+    const failedPing = candidate("US#72", { pingStatus: "failed" });
+    const failedPreflight = candidate("NL#2", { pingMs: 150, pingStatus: "success", preflightStatus: "failed" });
+    const usable = candidate("MX#14", { pingMs: 126, pingStatus: "success" });
+
+    expect(shouldMeasureRouteCatalogOnFailure([])).toBe(true);
+    expect(shouldMeasureRouteCatalogOnFailure(undefined)).toBe(true);
+    expect(shouldMeasureRouteCatalogOnFailure([noAnswer, failedPing])).toBe(true);
+    expect(shouldMeasureRouteCatalogOnFailure([failedPreflight])).toBe(true);
+    expect(shouldMeasureRouteCatalogOnFailure([failedPreflight, usable])).toBe(false);
   });
 });
 

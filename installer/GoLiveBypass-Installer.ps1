@@ -205,6 +205,15 @@ function Resolve-PnpmInvocation([string[]]$Arguments) {
     return [pscustomobject]@{ Command = $cmd; Arguments = @('/d', '/s', '/c', 'call', $fallbackShim) + $Arguments }
 }
 
+# Stderr de processo nativo e diagnostico, nunca falha — mas no Windows PowerShell 5.1 a
+# primeira linha que chega por ele vira erro TERMINATIVO enquanto ErrorActionPreference=Stop,
+# mesmo com 2>&1 (o mesmo caso que ja derrubava o probe do corepack mais abaixo). O pnpm
+# escreve o proprio banner (`$ node scripts/runInstaller.mjs ...`) em stderr e o Equilotl,
+# injetor atual do Equicord, loga TUDO em stderr: sem esta guarda a injecao morria em menos de
+# um segundo com exit=-1 e "pos-condicao nao confirmada", sem nunca ter chamado o injetor
+# (log do instalador na VM: installer.inject failure/POSTCONDITION_NOT_CONFIRMED com o banner
+# do pnpm como unico detalhe). O codigo de saida continua sendo lido aqui e a pos-condicao
+# segue autoridade sobre ele.
 function Invoke-Pnpm([string[]]$Arguments) {
     $invocation = Resolve-PnpmInvocation $Arguments
     if (-not $invocation) {
@@ -214,8 +223,14 @@ function Invoke-Pnpm([string[]]$Arguments) {
 
     $command = $invocation.Command
     $commandArguments = @($invocation.Arguments)
-    & $command @commandArguments
-    $script:PnpmExitCode = $LASTEXITCODE
+    $anterior = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $command @commandArguments 2>&1
+        $script:PnpmExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $anterior
+    }
 }
 
 
@@ -1619,7 +1634,9 @@ function Invoke-Injection($root, $targets) {
             try {
                 # O pnpm recebe os argumentos do script diretamente; o separador -- extra
                 # fazia alguns wrappers repassarem --location como argumento posicional.
-                $saida = @(Invoke-Pnpm @('run', 'inject', '--location', $loc) 2>&1)
+                # O Invoke-Pnpm ja junta o stderr na propria saida; aqui so capturamos tudo
+                # para o detalhe do erro que vira POSTCONDITION_NOT_CONFIRMED.
+                $saida = @(Invoke-Pnpm @('run', 'inject', '--location', $loc))
             } catch {
                 $excecao = $_.Exception.Message
                 if ($null -eq $script:PnpmExitCode) { $script:PnpmExitCode = -1 }
