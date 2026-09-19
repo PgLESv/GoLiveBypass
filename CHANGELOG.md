@@ -6,6 +6,8 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+## [2.0.8] - 2026-09-18
+
 ### Plugin: a configuração mostra a rota que está ativa
 
 - Sintoma (relato beta): com o túnel ativo e funcionando, o painel dizia "Estado da rota: pronta para otimizar" e "Nenhuma rota Proton foi catalogada" — o rótulo vinha só do fluxo de otimização e a identidade da rota existia apenas enquanto o catálogo Proton da sessão estava carregado.
