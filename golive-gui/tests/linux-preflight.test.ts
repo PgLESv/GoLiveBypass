@@ -564,7 +564,7 @@ describe("preflight Linux", () => {
     expect(source).not.toMatch(/elevate\s+zypper\s+update/);
   });
 
-  it("mantém o modo de reparo protegido contra a CLI standalone", () => {
+  it.runIf(process.platform === "linux")("mantém o modo de reparo protegido contra a CLI standalone", () => {
     const script = path.resolve(process.cwd(), "../standalone/golivebypass-standalone.sh");
     expect(() => execFileSync("bash", [script, "--ensure-dependencies"], { env: { ...process.env, GOLIVE_GUI: "" }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })).toThrow();
   });

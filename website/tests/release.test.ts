@@ -12,9 +12,9 @@ import { terminalCommands } from '../data/install'
 
 describe('release catalog', () => {
   it('mantém apenas um fallback de emergência da stable atual', () => {
-    expect(release.version).toBe('2.1.5')
+    expect(release.version).toBe('2.1.6')
     expect(fallbackReleaseCatalog.channel).toBe('stable')
-    expect(downloads.windowsGui).toContain('/releases/download/v2.1.5/')
+    expect(downloads.windowsGui).toContain('/releases/download/v2.1.6/')
   })
 
   it('monta os endpoints do catálogo e dos aliases', () => {
@@ -28,7 +28,7 @@ describe('release catalog', () => {
   })
 
   it('expõe os caminhos usados pelas páginas', () => {
-    expect(downloads.windowsGui).toContain('/releases/download/v2.1.5/')
+    expect(downloads.windowsGui).toContain('/releases/download/v2.1.6/')
     expect(downloads.installerPosix).toContain('/main/installer/golivebypass-installer.sh')
   })
 

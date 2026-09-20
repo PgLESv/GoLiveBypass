@@ -4,6 +4,26 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.6] - 2026-09-19
+
+### Sincronização Upstream (GoLiveBypass 2.0.6 Estável)
+- **Seleção Manual de Rotas Proton & Medição em Tempo Real:**
+  - Novo seletor de rotas Proton interativo (`ProtonRouteSelect`) com medições dinâmicas de ping e velocidade em paralelo.
+  - Feedback visual animado de medição via GSAP, respeitando preferências do sistema de redução de movimento.
+  - Fallbacks granulares e restauração de rota em falha transitória de conectividade.
+- **Canais de Atualização (`stable` e `beta`):**
+  - Suporte completo a canais de atualização no updater nativo do plugin e da GUI com persistência de preferências.
+  - Verificação rigorosa de integridade com checksum SHA-256 e validação de cabeçalhos PE/NSIS para executáveis no Windows.
+- **Hardening no Helper Go (`proton-confgen`):**
+  - Unificação das flags de comando (`-login`, `-session-username`, `-session-file`).
+  - Proteção e migração de sessão com ACLs e locks atômicos específicos por plataforma (Windows/Unix).
+  - Testes rigorosos de concorrência e catalogação de rotas.
+- **Recursos Exclusivos do Fork PgLESv Preservados:**
+  - Preservada a identidade e releases de `PgLESv/GoLiveBypass`.
+  - Ausência total de telemetria externa ou relatórios remotos legados em favor de diagnóstico e logs locais (`logs.html`).
+  - Correção de `EBUSY` no updater Windows pós-quit com encerramento garantido via PowerShell.
+  - Suporte completo a contas Proton pagas e normalização inteligente de credenciais.
+
 ## [2.1.5] - 2026-09-08
 
 ### Sincronização Upstream (GoLiveBypass 2.0.5 Estável)

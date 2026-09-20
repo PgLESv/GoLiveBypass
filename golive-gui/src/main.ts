@@ -639,6 +639,131 @@ const protonRetryMeasurementBtn = document.getElementById('protonRetryMeasuremen
 const protonContinueMeasurementBtn = document.getElementById('protonContinueMeasurementBtn') as HTMLButtonElement | null;
 const protonCloseMeasurementBtn = document.getElementById('protonCloseMeasurementBtn') as HTMLButtonElement | null;
 
+const PROTON_ALL_COUNTRIES: string[] = [
+  "AD","AE","AF","AL","AM","AO","AR","AT","AU","AZ","BA","BD","BE","BG","BH",
+  "BN","BO","BT","BY","CA","CD","CH","CI","CL","CM","CN","CO","CR","CU","CZ",
+  "DE","DK","DO","DZ","EC","EE","EG","ER","ES","ET","FI","FR","GA","GE","GH",
+  "GL","GN","GR","GT","HK","HN","HR","HT","HU","ID","IE","IL","IN","IQ","IS",
+  "IT","JM","JO","JP","KE","KG","KH","KM","KR","KW","KZ","LA","LB","LI","LK",
+  "LT","LU","LV","LY","MA","MC","MD","ME","MN","MO","MR","MT","MU","MX","MY",
+  "MZ","NG","NI","NL","NO","NP","NZ","OM","PA","PE","PG","PH","PK","PL","PR",
+  "PS","PT","PY","QA","RO","RS","RU","RW","SA","SD","SE","SG","SI","SK","SN",
+  "SO","SS","SV","SY","TD","TG","TH","TJ","TM","TN","TR","TW","TZ","UA","UG",
+  "UK","US","UY","UZ","VE","VN","XK","YE","ZA","ZW"
+];
+
+function getCountryFlag(code: string): string {
+  if (code === 'UK') code = 'GB';
+  if (code === 'XK') return '🇽🇰';
+  try {
+    const codePoints = code
+      .toUpperCase()
+      .split('')
+      .map((c) => 127397 + c.charCodeAt(0));
+    return String.fromCodePoint(...codePoints);
+  } catch {
+    return '🌐';
+  }
+}
+
+function getCountryName(code: string, displayNames: Intl.DisplayNames): string {
+  const norm = code === 'UK' ? 'GB' : code;
+  try {
+    return displayNames.of(norm) || code;
+  } catch {
+    return code;
+  }
+}
+
+let currentPopulatedIsPaid: boolean | null = null;
+
+function populateProtonCountries(isPaid: boolean, selectedCountry = '') {
+  const targetSelect = protonCountrySelectRoot as HTMLSelectElement | null;
+  if (!targetSelect) return;
+  if (currentPopulatedIsPaid === isPaid && targetSelect.options.length > 4) {
+    if (selectedCountry !== undefined && selectedCountry !== targetSelect.value) {
+      targetSelect.value = selectedCountry;
+    }
+    return;
+  }
+  currentPopulatedIsPaid = isPaid;
+
+  let displayNames: Intl.DisplayNames;
+  try {
+    displayNames = new Intl.DisplayNames(['pt-BR'], { type: 'region' });
+  } catch {
+    displayNames = { of: (c: string) => c } as any;
+  }
+
+  targetSelect.innerHTML = '';
+
+  if (!isPaid) {
+    const freeOptions = [
+      { value: '', label: 'Automático · menor ping (Free)' },
+      { value: 'US', label: `${getCountryFlag('US')} Estados Unidos · recomendado` },
+      { value: 'NL', label: `${getCountryFlag('NL')} Holanda` },
+      { value: 'JP', label: `${getCountryFlag('JP')} Japão` },
+      { value: 'PL', label: `${getCountryFlag('PL')} Polônia` },
+      { value: 'RO', label: `${getCountryFlag('RO')} Romênia` },
+    ];
+    for (const opt of freeOptions) {
+      const el = document.createElement('option');
+      el.value = opt.value;
+      el.textContent = opt.label;
+      targetSelect.appendChild(el);
+    }
+  } else {
+    const autoOpt = document.createElement('option');
+    autoOpt.value = '';
+    autoOpt.textContent = 'Automático · menor ping (recomendado)';
+    targetSelect.appendChild(autoOpt);
+
+    const southAmerica = ['AR', 'CL', 'UY', 'CO', 'PE', 'EC', 'PY', 'BO'];
+    const northAmerica = ['US', 'CA', 'MX'];
+    const europe = ['PT', 'ES', 'GB', 'DE', 'FR', 'NL', 'IT', 'CH', 'SE', 'NO', 'IE', 'BE', 'AT', 'PL', 'FI', 'DK'];
+    const asiaOceania = ['JP', 'SG', 'AU', 'NZ', 'KR', 'HK', 'TW'];
+
+    const addGroup = (label: string, codes: string[]) => {
+      const group = document.createElement('optgroup');
+      group.label = label;
+      for (const code of codes) {
+        const el = document.createElement('option');
+        el.value = code;
+        const flag = getCountryFlag(code);
+        const name = getCountryName(code, displayNames);
+        let extra = '';
+        if (code === 'AR') extra = ' · menor latência (~45ms)';
+        else if (code === 'CL') extra = ' (~70ms)';
+        else if (code === 'UY') extra = ' (~50ms)';
+        el.textContent = `${flag} ${name}${extra}`;
+        group.appendChild(el);
+      }
+      targetSelect.appendChild(group);
+    };
+
+    addGroup('América do Sul (menor latência / ping baixo)', southAmerica);
+    addGroup('América do Norte', northAmerica);
+    addGroup('Europa', europe);
+    addGroup('Ásia e Oceania', asiaOceania);
+
+    const allGroup = document.createElement('optgroup');
+    allGroup.label = 'Todos os países (A-Z)';
+    const sortedAll = PROTON_ALL_COUNTRIES
+      .map(code => ({ code, name: getCountryName(code, displayNames), flag: getCountryFlag(code) }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+    for (const item of sortedAll) {
+      const el = document.createElement('option');
+      el.value = item.code;
+      el.textContent = `${item.flag} ${item.name} (${item.code})`;
+      allGroup.appendChild(el);
+    }
+    targetSelect.appendChild(allGroup);
+  }
+
+  targetSelect.value = selectedCountry || '';
+}
+
 let currentVpnMode: 'proton' | 'custom' = 'proton';
 let isProtonAuthenticated = false;
 let protonStateGeneration = 0;
@@ -1293,10 +1418,16 @@ async function refreshProtonState(forcePlan = false) {
       if (generation !== protonStateGeneration) return;
       if (chk.valid) {
         isProtonAuthenticated = true;
+        populateProtonCountries(chk.isPaid ?? false, s.country || '');
         if (protonAuthForm) protonAuthForm.hidden = true;
         if (protonConnectedView) protonConnectedView.hidden = false;
         if (protonUserDisplay) protonUserDisplay.textContent = `Conta: ${s.username}`;
         if (protonDot) protonDot.style.background = '#22c55e';
+        if (protonPlanBadge) {
+          protonPlanBadge.textContent = chk.planTitle || (chk.isPaid ? 'Proton Plus' : 'Proton Free');
+          protonPlanBadge.classList.toggle('proton-plan-badge--free', !chk.isPaid);
+          protonPlanBadge.hidden = false;
+        }
         setProtonPlanLoading();
         try {
           const plan = await window.api.getProtonPlan({ force: forcePlan });
