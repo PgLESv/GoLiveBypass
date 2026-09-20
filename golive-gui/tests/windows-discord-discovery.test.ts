@@ -3,6 +3,7 @@ import path from "path";
 import {
   buildWindowsDiscoveryPowerShell,
   collectWindowsDiscoveryPowerShell,
+  collectWindowsDiscoveryPowerShellAsync,
   collectWindowsDiscoverySnapshot,
   createWindowsDiscoveryCache,
   flavourFromExecutableName,
@@ -350,6 +351,29 @@ describe("discovery Windows puro", () => {
     expect(buildWindowsDiscoveryPowerShell()).toContain("HKLM:\\Software\\WOW6432Node\\Classes");
   });
 
+  it("coleta o mesmo JSON pelo runner assincrono, com os mesmos erros mapeados", async () => {
+    let invocation: { file: string; args: readonly string[] } | undefined;
+    const raw = JSON.stringify({
+      schema: 1,
+      process: { status: "empty", rows: [], truncated: false },
+      registry: { status: "partial", rows: [], truncated: true, errorCode: "UNINSTALL_LIMIT" },
+    });
+    const parsed = await collectWindowsDiscoveryPowerShellAsync(async (file, args) => {
+      invocation = { file, args };
+      return raw;
+    });
+
+    expect(parsed.registry).toMatchObject({ status: "partial", truncated: true, errorCode: "UNINSTALL_LIMIT" });
+    expect(invocation?.file).toBe("powershell.exe");
+    const encoded = invocation?.args[3] ?? "";
+    expect(Buffer.from(encoded, "base64").toString("utf16le")).toBe(buildWindowsDiscoveryPowerShell());
+
+    await expect(collectWindowsDiscoveryPowerShellAsync(async () => {
+      throw new Error("caminho privado");
+    })).rejects.toThrow("POWERSHELL_EXIT");
+    await expect(collectWindowsDiscoveryPowerShellAsync(async () => "{}")).rejects.toThrow("JSON_INVALID");
+  });
+
   it("mapeia falha catastrófica e JSON inválido para erros sem expor exceção", () => {
     expect(() => collectWindowsDiscoveryPowerShell(() => {
       throw new Error("caminho privado");
@@ -685,5 +709,112 @@ describe("discovery Windows puro", () => {
     cache.read({ forceRefresh: true });
     expect(collectCalls).toBe(1);
     expect(seenEnv).not.toHaveProperty("LOCALAPPDATA");
+  });
+
+  it("readAsync entrega o snapshot sem chamar a coleta sincrona e respeita o TTL", async () => {
+    let nowMs = 0;
+    let syncCalls = 0;
+    let asyncCalls = 0;
+    const cache = createWindowsDiscoveryCache({
+      platform: () => "win32",
+      nowMs: () => nowMs,
+      readEnv: () => ({}),
+      rootsForEnv: () => [],
+      collectFresh: () => {
+        syncCalls += 1;
+        throw new Error("a variante sincrona nao pode rodar no caminho assincrono");
+      },
+      collectFreshAsync: async () => {
+        asyncCalls += 1;
+        return emptySnapshot(nowMs);
+      },
+    });
+
+    await expect(cache.readAsync()).resolves.toMatchObject({ stale: false });
+    expect(asyncCalls).toBe(1);
+    expect(syncCalls).toBe(0);
+
+    nowMs = 3_999;
+    await cache.readAsync();
+    expect(asyncCalls).toBe(1);
+
+    nowMs = 4_000;
+    await cache.readAsync();
+    expect(asyncCalls).toBe(2);
+    expect(syncCalls).toBe(0);
+  });
+
+  it("readAsync compartilha uma unica coleta entre chamadas concorrentes", async () => {
+    let nowMs = 0;
+    let calls = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const cache = createWindowsDiscoveryCache({
+      platform: () => "win32",
+      nowMs: () => nowMs,
+      readEnv: () => ({}),
+      rootsForEnv: () => [],
+      collectFresh: () => emptySnapshot(),
+      collectFreshAsync: async () => {
+        calls += 1;
+        await pending;
+        return emptySnapshot(nowMs);
+      },
+    });
+
+    const first = cache.readAsync();
+    const second = cache.readAsync();
+    release();
+    await expect(first).resolves.toMatchObject({ stale: false });
+    await expect(second).resolves.toMatchObject({ stale: false });
+    expect(calls).toBe(1);
+
+    // Depois do settle, uma nova leitura fora do TTL volta a coletar.
+    nowMs = 4_001;
+    await cache.readAsync();
+    expect(calls).toBe(2);
+  });
+
+  it("readAsync mantem o contrato antigo quando nao ha coletor assincrono injetado", async () => {
+    let calls = 0;
+    const cache = createWindowsDiscoveryCache({
+      platform: () => "win32",
+      nowMs: () => 0,
+      readEnv: () => ({}),
+      rootsForEnv: () => [],
+      collectFresh: () => { calls += 1; return emptySnapshot(); },
+    });
+
+    await expect(cache.readAsync({ forceRefresh: true })).resolves.toMatchObject({ stale: false });
+    expect(calls).toBe(1);
+  });
+
+  it("readAsync propaga falha sem stale e usa snapshot anterior dentro da janela stale", async () => {
+    let nowMs = 0;
+    let calls = 0;
+    let fail = false;
+    const cache = createWindowsDiscoveryCache({
+      platform: () => "win32",
+      nowMs: () => nowMs,
+      readEnv: () => ({}),
+      rootsForEnv: () => [],
+      collectFresh: () => emptySnapshot(),
+      collectFreshAsync: async () => {
+        calls += 1;
+        if (fail) throw new Error("fonte indisponivel");
+        return emptySnapshot(nowMs);
+      },
+    });
+
+    await cache.readAsync();
+    expect(calls).toBe(1);
+
+    fail = true;
+    nowMs = 4_001;
+    await expect(cache.readAsync({ allowStale: true })).resolves.toMatchObject({ stale: true });
+
+    fail = false;
+    nowMs = 8_000;
+    await expect(cache.readAsync({ allowStale: true })).resolves.toMatchObject({ stale: false });
   });
 });

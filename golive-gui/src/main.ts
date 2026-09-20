@@ -1,5 +1,6 @@
 import { gsap } from 'gsap';
 import { protonMeasurementText } from './proton-measurement';
+import { decideProtonSession, type ProtonSessionVerdict } from './proton-session';
 import { renderProtonCountryFlag } from './proton-flags';
 import { ProtonRouteSelect, type ProtonRouteOption } from './proton-route-select';
 import {
@@ -103,6 +104,8 @@ declare global {
         tier?: number;
         planTitle?: string;
         isPaid?: boolean;
+        code?: string;
+        retryable?: boolean;
         error?: string;
       }>;
       loginProton: (payload: { username: string; password?: string; twoFactorCode?: string }) => Promise<{
@@ -160,6 +163,8 @@ declare global {
         planTitle?: string;
         isPaid?: boolean;
         routePreference?: 'auto' | 'manual';
+        /** Perfil Proton ja gerado no disco (username + wireguard.conf). */
+        profileReady?: boolean;
         lastServer?: any;
       }>;
       getProtonPlan: (options?: { force?: boolean }) => Promise<{
@@ -361,11 +366,18 @@ document.querySelectorAll<HTMLButtonElement>('.theme-opt[data-theme-opt]').forEa
 
 // O warning do bypass ativo faz o conteudo crescer; a janela e fixa, entao reportamos a altura
 // necessaria para o main process redimensionar e nada ficar cortado.
+let fitWindowScheduled = false;
 function fitWindowToContent() {
+  // Rajadas de chamadas (fim de progresso, troca de estado, abertura de dialogo)
+  // nao podem empilhar varios rAF duplos: um agendamento pendente ja mede a
+  // altura final depois do layout.
+  if (fitWindowScheduled) return;
+  fitWindowScheduled = true;
   // Espera o layout apos hidden/details: sem rAF a medicao ainda ve a altura antiga
   // (Personalizado expandia e a janela nunca encolhia ao voltar para Tor/Gratuitas).
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
+      fitWindowScheduled = false;
       const container = document.querySelector('.container') as HTMLElement | null;
       if (!container) return;
       const height = Math.ceil(container.getBoundingClientRect().height + 1);
@@ -383,6 +395,7 @@ async function updateStatus() {
     statusIndicator.className = 'status-indicator';
     statusTag.className = 'status-tag';
     toggleBtn.classList.remove('loading', 'deactivate');
+    toggleBtn.title = '';
 
     if (status === 'ACTIVE') {
       statusText.innerText = 'GoLiveBypass está Ativo';
@@ -443,6 +456,9 @@ async function updateStatus() {
     } else {
       if (!hasSelectedConf) {
         toggleBtn.disabled = true;
+        toggleBtn.title = currentVpnMode === 'proton'
+          ? 'Conecte sua conta ProtonVPN para ativar'
+          : 'Importe uma configuração WireGuard (.conf) para ativar';
         btnText.innerText = 'Selecione uma Configuração';
         statusText.innerText = currentVpnMode === 'proton'
           ? 'Conecte sua conta ProtonVPN abaixo para ativar'
@@ -471,7 +487,10 @@ async function updateStatus() {
   if (restoreInternetBtn) {
     restoreInternetBtn.hidden = window.api.platform !== 'win32' || currentState === 'ACTIVE';
   }
-  if (protonOptimizationInFlight || protonManualSelectionInFlight) toggleBtn.disabled = true;
+  if (protonOptimizationInFlight || protonManualSelectionInFlight) {
+    toggleBtn.disabled = true;
+    toggleBtn.title = protonOptimizationInFlight ? 'Otimização de rota em andamento' : 'Aplicando a rota escolhida';
+  }
   // Depois de mudar o estado, ajusta a janela ao novo tamanho do conteudo.
   fitWindowToContent();
 }
@@ -766,6 +785,10 @@ function populateProtonCountries(isPaid: boolean, selectedCountry = '') {
 
 let currentVpnMode: 'proton' | 'custom' = 'proton';
 let isProtonAuthenticated = false;
+/** Perfil Proton no disco (username + wireguard.conf): o que a ativacao consome. */
+let protonProfileReady = false;
+const PROTON_SESSION_RETRY_MS = 20_000;
+let protonSessionRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let protonStateGeneration = 0;
 let protonOptimizationInFlight = false;
 let protonOptimizationRequestId = '';
@@ -1392,6 +1415,22 @@ protonRoutePreferenceOptions.forEach((option) => {
 
 tabProton?.addEventListener('click', () => switchVpnMode('proton'));
 tabCustom?.addEventListener('click', () => switchVpnMode('custom'));
+// Reconfere a sessao depois de uma verificacao que falhou por rede/helper: o estado
+// "nao verificado" nao pode virar permanente no painel.
+function clearProtonSessionRetry() {
+  if (protonSessionRetryTimer === null) return;
+  clearTimeout(protonSessionRetryTimer);
+  protonSessionRetryTimer = null;
+}
+
+function scheduleProtonSessionRetry() {
+  if (protonSessionRetryTimer !== null) return;
+  protonSessionRetryTimer = setTimeout(() => {
+    protonSessionRetryTimer = null;
+    void refreshProtonState();
+  }, PROTON_SESSION_RETRY_MS);
+}
+
 async function refreshProtonState(forcePlan = false) {
   const generation = ++protonStateGeneration;
   try {
@@ -1411,21 +1450,40 @@ async function refreshProtonState(forcePlan = false) {
       : null;
     if (autoFailoverToggle) autoFailoverToggle.checked = s.autoFailover !== false;
     if (protonCountrySelect) renderProtonMeasuredRouteOptions();
+    protonProfileReady = s.profileReady === true;
 
     if (s.username) {
       if (protonUsername) protonUsername.value = s.username;
-      const chk = await window.api.checkProtonSession(s.username);
-      if (generation !== protonStateGeneration) return;
-      if (chk.valid) {
+      let verdict: ProtonSessionVerdict = 'unverified';
+      let chk: Awaited<ReturnType<typeof window.api.checkProtonSession>> | undefined;
+      try {
+        chk = await window.api.checkProtonSession(s.username);
+        if (generation !== protonStateGeneration) return;
+        verdict = decideProtonSession(chk);
+        if (verdict === 'unverified') {
+          // Verificacao indisponivel agora (rede/helper): a conta e o perfil seguem
+          // como estavam e o botao de ativar nao e bloqueado por isso (#312/#316/#317).
+          scheduleProtonSessionRetry();
+          setProtonFeedback('Não consegui confirmar sua sessão Proton agora. A ativação com a rota já preparada continua disponível.', 'busy');
+        }
+      } catch (error) {
+        if (generation !== protonStateGeneration) return;
+        console.error('Falha ao consultar a sessão Proton:', error);
+        scheduleProtonSessionRetry();
+        setProtonFeedback('Não consegui confirmar sua sessão Proton agora. Verificando de novo em instantes…', 'busy');
+      }
+      if (verdict === 'unverified') return;
+      if (verdict === 'authenticated') {
+        clearProtonSessionRetry();
         isProtonAuthenticated = true;
-        populateProtonCountries(chk.isPaid ?? false, s.country || '');
+        populateProtonCountries(chk?.isPaid ?? false, s.country || '');
         if (protonAuthForm) protonAuthForm.hidden = true;
         if (protonConnectedView) protonConnectedView.hidden = false;
         if (protonUserDisplay) protonUserDisplay.textContent = `Conta: ${s.username}`;
         if (protonDot) protonDot.style.background = '#22c55e';
         if (protonPlanBadge) {
-          protonPlanBadge.textContent = chk.planTitle || (chk.isPaid ? 'Proton Plus' : 'Proton Free');
-          protonPlanBadge.classList.toggle('proton-plan-badge--free', !chk.isPaid);
+          protonPlanBadge.textContent = chk?.planTitle || (chk?.isPaid ? 'Proton Plus' : 'Proton Free');
+          protonPlanBadge.classList.toggle('proton-plan-badge--free', !chk?.isPaid);
           protonPlanBadge.hidden = false;
         }
         setProtonPlanLoading();
@@ -1441,6 +1499,7 @@ async function refreshProtonState(forcePlan = false) {
         return;
       }
     }
+    clearProtonSessionRetry();
     syncProtonRoutePreferenceUi(protonRoutePreference);
     protonRememberedManualRoute = null;
     protonSelectedRoute = null;
@@ -1456,18 +1515,11 @@ async function refreshProtonState(forcePlan = false) {
     if (protonConnectedView) protonConnectedView.hidden = true;
   } catch (err) {
     if (generation !== protonStateGeneration) return;
+    // Nao consegui ler o estado Proton (IPC/settings): isso tambem nao e logout.
+    // Mantem a ultima conta conhecida, avisa e tenta de novo em instantes.
     console.error('Falha ao verificar sessão Proton:', err);
-    isProtonAuthenticated = false;
-    if (protonPlanBadge) protonPlanBadge.hidden = true;
-    protonSelectedRoute = null;
-    clearProtonManualMeasurement();
-    clearProtonMeasuredRoutes();
-    protonRouteDiscoveryAfterOptimizationPending = false;
-    protonRouteDiscoveryMeasurePingPending = false;
-    protonRouteDiscoveryRetryPending = false;
-    renderProtonPlan({ success: false, status: 'unknown' });
-    if (protonAuthForm) protonAuthForm.hidden = false;
-    if (protonConnectedView) protonConnectedView.hidden = true;
+    scheduleProtonSessionRetry();
+    setProtonFeedback('Não consegui consultar sua conta Proton agora. Verificando de novo em instantes…', 'busy');
   }
 }
 
@@ -1883,6 +1935,11 @@ async function optimizeProtonRoute(onStartup = false, speedTest = true) {
     await updateStatus();
   } finally {
     stopProtonOptimizeAnimation();
+    // O flag libera o botao de ativar em updateStatus() e os gatilhos que o
+    // ignoram enquanto a medicao roda (ativar, trocar aba/rota, sair da conta).
+    // Sem este reset, qualquer otimizacao - inclusive a automatica da abertura -
+    // deixava o botao "Ativar Bypass" desativado ate reiniciar o programa.
+    protonOptimizationInFlight = false;
     protonOptimizationRequestId = '';
     if (tabProton) tabProton.disabled = false;
     if (tabCustom) tabCustom.disabled = false;
@@ -1921,7 +1978,10 @@ window.addEventListener('beforeunload', () => {
 
 async function atualizarStatusWgConf() {
   if (currentVpnMode === 'proton') {
-    hasSelectedConf = isProtonAuthenticated;
+    // O perfil Proton no disco (username + wireguard.conf) e o que a ativacao consome.
+    // Depender so da verificacao de sessao bloqueava o botao quando ela falhava por
+    // rede/helper com a conta ainda conectada (#312/#316/#317).
+    hasSelectedConf = isProtonAuthenticated || protonProfileReady;
   } else {
     try {
       const nome = await window.api.getWgConfName();

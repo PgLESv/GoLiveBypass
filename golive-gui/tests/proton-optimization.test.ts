@@ -176,12 +176,16 @@ function makeHarness(overrides: Record<string, any> = {}): Harness {
     readSharedSettings: () => settings,
     updateSharedSettings: (patch: any) => { Object.assign(settings, patch); return true; },
     getStatus: () => "INACTIVE",
+    getStatusAsync: async () => "INACTIVE",
     linuxStatus: async () => "INACTIVE",
     isWireSockActive: () => false,
+    isWireSockActiveAsync: async () => false,
     withWireSockLifecycle: async (_name: string, task: () => Promise<any>) => task(),
     refreshWindowStatus: () => {}, refreshTray: async () => {},
     beginWindowsRouteOperation: () => 1, stopWindowsRouteWatchdog: () => {}, pararWgStatsWatchdog: () => {},
-    windowsAllowedAppPaths: () => [], getDiscordInstalls: () => [], killDiscord: async () => { calls.killDiscord = (calls.killDiscord || 0) + 1; },
+    windowsAllowedAppPaths: () => [], getDiscordInstalls: () => [],
+    getDiscordInstallsAsync: async () => [],
+    killDiscord: async () => { calls.killDiscord = (calls.killDiscord || 0) + 1; },
     recoverWireSockNetwork: async () => ({ ok: true, residual: [] }), startWireSockService: async () => { calls.startWireSock = (calls.startWireSock || 0) + 1; },
     startDiscordAndConfirm: async () => { calls.startDiscord = (calls.startDiscord || 0) + 1; return true; },
     waitForWindowsRouteSettle: async () => {},
@@ -284,10 +288,13 @@ function makeManualHarness(overrides: Record<string, any> = {}): ManualHarness {
     readSharedSettings: () => settings,
     updateSharedSettings: (patch: any) => { Object.assign(settings, patch); return true; },
     getStatus: () => "INACTIVE",
+    getStatusAsync: async () => "INACTIVE",
     linuxStatus: async () => "INACTIVE",
+    isWireSockActiveAsync: async () => false,
     withWireSockLifecycle: async (_name: string, task: () => Promise<any>) => task(),
     refreshWindowStatus: () => {}, refreshTray: async () => {},
     windowsAllowedAppPaths: () => [], getDiscordInstalls: () => [],
+    getDiscordInstallsAsync: async () => [],
     killDiscord: async () => calls.killDiscord = (calls.killDiscord || 0) + 1,
     recoverWireSockNetwork: async () => ({ ok: true, residual: [] }),
     startWireSockService: async () => calls.startWireSock = (calls.startWireSock || 0) + 1,
@@ -443,7 +450,7 @@ describe("handler real de otimização Proton", () => {
   });
 
   it("adianta quando o túnel está ativo e há reutilização solicitada", async () => {
-    const h = makeHarness({ getStatus: () => "ACTIVE", isWireSockActive: () => true });
+    const h = makeHarness({ getStatusAsync: async () => "ACTIVE", isWireSockActiveAsync: async () => true });
     h.settings.protonLastServer = { server: "DE#1", endpoint: "198.51.100.2:51820" };
     const result = await h.run({ reuseMeasured: true });
     expect(result).toEqual({ success: true, deferred: true });
@@ -454,8 +461,8 @@ describe("handler real de otimização Proton", () => {
   it("adia a nova medição automática quando o túnel já está ativo", async () => {
     let generated = 0;
     const h = makeHarness({
-      getStatus: () => "ACTIVE",
-      isWireSockActive: () => true,
+      getStatusAsync: async () => "ACTIVE",
+      isWireSockActiveAsync: async () => true,
       proton: {
         canReuseMeasuredProfile: () => true,
         MEASUREMENT_CRITERION_VERSION: "test-v2",
@@ -474,7 +481,7 @@ describe("handler real de otimização Proton", () => {
 
   it("troca rota Windows ativa em ordem: pausa, mede, inicia WireSock e reabre Discord", async () => {
     const order: string[] = [];
-    const h = makeHarness({ IS_WINDOWS: true, getStatus: () => "ACTIVE", killDiscord: async () => order.push("kill"),
+    const h = makeHarness({ IS_WINDOWS: true, getStatusAsync: async () => "ACTIVE", killDiscord: async () => order.push("kill"),
       recoverWireSockNetwork: async () => { order.push("recover"); return { ok: true, residual: [] }; },
       startWireSockService: async () => order.push("start-wg"),
       waitForWindowsRouteSettle: async () => order.push("settle"),

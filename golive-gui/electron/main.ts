@@ -15,7 +15,7 @@ import { createRequire } from "module";
 import { homedir } from "os";
 import fs from "fs";
 import { randomUUID } from "crypto";
-import { execFileSync, execSync, spawn } from "child_process";
+import { execFile, execFileSync, execSync, spawn } from "child_process";
 import { runScript } from "./linux-helper";
 import {
   applyPendingUpdate,
@@ -36,7 +36,7 @@ import * as proton from "./proton";
 import { ProtonOptimizationCoordinator } from "./proton-optimization";
 import { restoreBypassOnStartup, type StartupOptimizationResult } from "./startup-restore";
 import { findWindowsDiscordInstall } from "./windows-discord-install";
-import { collectWindowsDiscoveryPowerShell, collectWindowsDiscoverySnapshot, createWindowsDiscoveryCache, rootsForEnvironment, toPublicWindowsDiscoveryInstall, type WindowsDiscoveryEnvironment, type WindowsDiscoverySnapshotCollectors } from "./windows-discord-discovery";
+import { assembleWindowsDiscoverySnapshotFromRaw, collectWindowsDiscoveryPowerShell, collectWindowsDiscoveryPowerShellAsync, collectWindowsDiscoverySnapshot, createWindowsDiscoveryCache, failedWindowsDiscoveryRawFor, rootsForEnvironment, toPublicWindowsDiscoveryInstall, type WindowsDiscoveryEnvironment, type WindowsDiscoveryRaw, type WindowsDiscoverySnapshot, type WindowsDiscoverySnapshotCollectors } from "./windows-discord-discovery";
 import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } from "./wait-condition";
 import { TUNNEL_STARTUP_SETTLE_MS, waitForTunnelStartupSettle } from "./tunnel-startup";
 import { linuxPreflightRepairable, parseLinuxPreflight, linuxPreflightMessage, type LinuxPreflight } from "./linux-preflight";
@@ -288,7 +288,25 @@ const windowsDiscoveryCache = createWindowsDiscoveryCache({
   readEnv: readWindowsDiscoveryEnvironment,
   rootsForEnv: rootsForEnvironment,
   collectFresh: (env, roots) => collectWindowsDiscoverySnapshot(env, windowsDiscoveryCollectors, Date.now(), roots),
+  collectFreshAsync: (env, roots) => collectFreshWindowsDiscoveryAsync(env, roots),
 });
+
+// Coleta sem bloquear a thread principal: a consulta do powershell.exe roda
+// assincrona e so a montagem (fs/atalhos) entra no `noAsar`.
+async function collectFreshWindowsDiscoveryAsync(
+  env: WindowsDiscoveryEnvironment,
+  roots: string[],
+): Promise<WindowsDiscoverySnapshot> {
+  let raw: WindowsDiscoveryRaw;
+  try {
+    raw = await collectWindowsDiscoveryPowerShellAsync();
+  } catch (error) {
+    raw = failedWindowsDiscoveryRawFor(error);
+  }
+  return withNoAsar(() =>
+    assembleWindowsDiscoverySnapshotFromRaw(raw, env, windowsDiscoveryCollectors, Date.now(), roots),
+  );
+}
 
 const MAC_APPS = [
   { flavour: "Discord", appName: "Discord.app", processName: "Discord" },
@@ -571,7 +589,7 @@ function linuxStatusLogAllowed(signature: string): boolean {
 async function refreshTray() {
   if (!tray) return;
   try {
-    const status = IS_LINUX ? await linuxStatus() : getStatus();
+    const status = IS_LINUX ? await linuxStatus() : await getStatusAsync();
     const label = statusLabel(status);
     const updateMenuItems = isUpdateReady()
       ? [{
@@ -652,7 +670,7 @@ async function toggleFromTray() {
       else await withWireSockLifecycle("ativar-linux-bandeja", async () => {
         return linuxActivate(() => {});
       });
-    } else if (getStatus() === "ACTIVE") {
+    } else if ((await getStatusAsync()) === "ACTIVE") {
       cancelStartupBypassRestore();
       await deactivateAll();
       persistBypassEnabled(false);
@@ -753,7 +771,7 @@ if (!gotLock) {
     // estado verificado é apenas de memória e nunca é herdado: refazemos a
     // ativação inteira (fecha, restaura, mede baseline, prova e reabre).
     if (IS_WINDOWS && sessaoAtiva()) {
-      if (isWireSockActive()) {
+      if (await isWireSockActiveAsync()) {
         logger.warn("wiresock", "boot.residual.detectado", {});
         try {
           await activateBypass({});
@@ -774,7 +792,7 @@ if (!gotLock) {
     // precisa retomar aqui — sem isto, so uma ativacao nova (clique) o arma.
     if (!isMac) {
       try {
-        const statusInicial = IS_LINUX ? await linuxStatus() : getStatus();
+        const statusInicial = IS_LINUX ? await linuxStatus() : await getStatusAsync();
         if (statusInicial === "ACTIVE") {
           iniciarWgStatsWatchdog(wgStatsProvider);
           startLinuxHealthWatchdog();
@@ -913,18 +931,7 @@ function getWinDiscordInstalls(options: WindowsDiscoveryReadOptions = {}): Disco
   discordscan.scanInicio("win32", env.LOCALAPPDATA);
   logWindowsDiscoveryRoots(env);
   const snapshot = withNoAsar(() => windowsDiscoveryCache.read(options));
-  logWindowsDiscoveryHealth(snapshot.sourceFailure);
-  for (const candidate of snapshot.installs) {
-    discordscan.scanCandidato(candidate.flavour, candidate.detectedBy);
-  }
-  const installs = snapshot.installs.map(toPublicWindowsDiscoveryInstall).map((install) => ({
-    flavour: install.flavour,
-    resources: install.resources,
-    exePath: install.exePath,
-  }));
-  for (const install of installs) discordscan.scanInstall(install.resources, install.flavour);
-  discordscan.scanResultado(installs.length);
-  return installs;
+  return installsFromWindowsSnapshot(snapshot);
 }
 
 function getMacDiscordInstalls(): DiscordInstall[] {
@@ -963,12 +970,54 @@ function getDiscordInstalls(options: WindowsDiscoveryReadOptions = {}): DiscordI
   );
 }
 
-function discordProcessState(): ProcessProbeState {
+function installsFromWindowsSnapshot(snapshot: WindowsDiscoverySnapshot): DiscordInstall[] {
+  logWindowsDiscoveryHealth(snapshot.sourceFailure);
+  for (const candidate of snapshot.installs) {
+    discordscan.scanCandidato(candidate.flavour, candidate.detectedBy);
+  }
+  const installs = snapshot.installs.map(toPublicWindowsDiscoveryInstall).map((install) => ({
+    flavour: install.flavour,
+    resources: install.resources,
+    exePath: install.exePath,
+  }));
+  for (const install of installs) discordscan.scanInstall(install.resources, install.flavour);
+  discordscan.scanResultado(installs.length);
+  return installs;
+}
+
+// Mesmo veredito da varredura sincrona, sem travar a janela: o PowerShell roda
+// fora do thread principal e so a montagem toca o disco.
+async function getWindowsDiscordInstallsAsync(options: WindowsDiscoveryReadOptions = {}): Promise<DiscordInstall[]> {
+  const env = readWindowsDiscoveryEnvironment();
+  discordscan.scanInicio("win32", env.LOCALAPPDATA);
+  logWindowsDiscoveryRoots(env);
+  const snapshot = await windowsDiscoveryCache.readAsync(options);
+  return installsFromWindowsSnapshot(snapshot);
+}
+
+async function getDiscordInstallsAsync(options: WindowsDiscoveryReadOptions = {}): Promise<DiscordInstall[]> {
+  if (IS_LINUX) return [];
+  if (isMac) return getMacDiscordInstalls();
+  return getWindowsDiscordInstallsAsync(options);
+}
+
+function execFileTextAsync(file: string, args: string[], timeout = 5000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: "utf8", windowsHide: true, timeout }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(String(stdout ?? ""));
+    });
+  });
+}
+
+// Mesmo veredito do tasklist/pgrep, fora do thread principal: o status da janela
+// e da bandeja consulta isto a cada mudanca de estado.
+async function discordProcessStateAsync(): Promise<ProcessProbeState> {
+  let probeFailed = false;
   if (isMac) {
-    let probeFailed = false;
     for (const { processName } of MAC_APPS) {
       try {
-        execFileSync("pgrep", ["-x", processName], { stdio: "ignore" });
+        await execFileTextAsync("pgrep", ["-x", processName]);
         discordscan.runningPgrep(processName, true);
         return "running";
       } catch (e) {
@@ -984,36 +1033,32 @@ function discordProcessState(): ProcessProbeState {
     return probeFailed ? "unknown" : "stopped";
   }
 
-  let probeFailed = false;
   for (const flavour of ALL_APPS) {
     try {
-      const out = execSync(`tasklist /FI "IMAGENAME eq ${flavour}.exe" /NH`, {
-        encoding: "utf8",
-        stdio: ["pipe", "pipe", "ignore"],
-      });
+      const out = await execFileTextAsync("tasklist", ["/FI", `IMAGENAME eq ${flavour}.exe`, "/NH"]);
       if (out.toLowerCase().includes(`${flavour}.exe`.toLowerCase())) {
         discordscan.runningTasklist(flavour, true);
         return "running";
       }
       discordscan.runningTasklist(flavour, false);
-    } catch (e) {
+    } catch (error) {
       probeFailed = true;
-      discordscan.runningTasklist(flavour, false, (e as Error)?.message);
+      discordscan.runningTasklist(flavour, false, (error as Error)?.message);
     }
   }
   return probeFailed ? "unknown" : "stopped";
 }
 
-function discordIsRunning(): boolean {
-  return discordProcessState() === "running";
+async function discordIsRunningAsync(): Promise<boolean> {
+  return (await discordProcessStateAsync()) === "running";
 }
 
 async function waitUntilDiscordGone(tries = 40, delayMs = 250) {
-  return waitForProcessStopped(() => discordProcessState(), { attempts: tries, delayMs });
+  return waitForProcessStopped(() => discordProcessStateAsync(), { attempts: tries, delayMs });
 }
 
 async function waitUntilDiscordRunning(tries = 40, delayMs = 250) {
-  return waitForProcessRunning(() => discordProcessState(), { attempts: tries, delayMs });
+  return waitForProcessRunning(() => discordProcessStateAsync(), { attempts: tries, delayMs });
 }
 
 function discordDidNotStop(): never {
@@ -1025,35 +1070,39 @@ function discordDidNotStop(): never {
  * O updater do Discord usa o nome genérico Update.exe e não aparece como
  * Discord*.exe. Se ele sobrevive ao encerramento, pode reabrir uma sessão velha
  * e ficar preso em “Checking for updates...”, disputando a sessão recém-criada.
- * Filtramos pelo command line para não matar atualizadores de outros produtos.
+ * Update.exe e' compartilhado por apps Squirrel: a identificacao usa a command line,
+ * nunca somente o nome do executavel, para nao matar atualizadores de outros produtos.
  */
-function killDiscordUpdater() {
+const DISCORD_UPDATER_PROBE_SCRIPT = "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction Stop | Where-Object { $_.CommandLine -match 'Discord' }); if ($procs.Count -gt 0) { exit 0 }; exit 1";
+const DISCORD_UPDATER_KILL_SCRIPT = "$procs = Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'Discord' }; $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+
+/**
+ * Encerra o updater fora do thread principal. Cada execucao e' um powershell.exe que
+ * pode levar segundos numa maquina carregada, e a troca de rota chama isto varias
+ * vezes seguidas: sincrono, a janela ficava "Nao respondendo" justamente enquanto o
+ * usuario clicava para ativar/desativar.
+ */
+async function killDiscordUpdater(): Promise<void> {
   if (!IS_WINDOWS) return;
   try {
-    const script = "$procs = Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'Discord' }; $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
-    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: "ignore", windowsHide: true, timeout: 5000 });
+    await execFileTextAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", DISCORD_UPDATER_KILL_SCRIPT]);
   } catch (err) {
     logger.warn("discord", "nao consegui encerrar o updater do Discord", { erro: String((err as Error)?.message ?? err) });
   }
 }
 
-// Update.exe e' compartilhado por apps Squirrel. Por isso a identificacao usa a
-// command line, nunca somente o nome do executavel. Uma falha na consulta nao e'
-// tratada como ausencia: alterar a rota com um updater desconhecido ainda vivo
-// pode relancar o Discord fora da janela controlada.
-function discordUpdaterProcessState(): ProcessProbeState {
+// Uma falha na consulta nao e' tratada como ausencia: alterar a rota com um updater
+// desconhecido ainda vivo pode relancar o Discord fora da janela controlada.
+async function discordUpdaterProcessState(): Promise<ProcessProbeState> {
   if (!IS_WINDOWS) return "stopped";
   try {
-    const script = "$procs = @(Get-CimInstance Win32_Process -Filter \"Name = 'Update.exe'\" -ErrorAction Stop | Where-Object { $_.CommandLine -match 'Discord' }); if ($procs.Count -gt 0) { exit 0 }; exit 1";
-    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      stdio: "ignore",
-      windowsHide: true,
-      timeout: 5000,
-    });
+    await execFileTextAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", DISCORD_UPDATER_PROBE_SCRIPT]);
     return "running";
   } catch (err) {
     // O exit 1 e' a resposta esperada do script para nenhuma instancia Discord.
-    if ((err as NodeJS.ErrnoException)?.status === 1) return "stopped";
+    // `execFileSync` expunha o codigo em `.status`; o assincrono usa `.code`.
+    const failure = err as NodeJS.ErrnoException & { status?: number };
+    if (failure.status === 1 || failure.code === 1) return "stopped";
     logger.warn("discord", "updater.estado_desconhecido", {
       erro: String((err as Error)?.message ?? err),
     });
@@ -1070,12 +1119,10 @@ function discordUpdaterDidNotStop(): never {
   throw new Error("Não foi possível encerrar o atualizador do Discord. Feche o cliente e tente novamente antes de alterar a rota.");
 }
 
-function killMacProcesses(names: readonly string[], signal?: "-9") {
+async function killMacProcesses(names: readonly string[], signal?: "-9") {
   for (const name of names) {
     try {
-      execFileSync("killall", signal ? [signal, name] : [name], {
-        stdio: "ignore",
-      });
+      await execFileTextAsync("killall", signal ? [signal, name] : [name]);
     } catch {}
   }
 }
@@ -1083,11 +1130,11 @@ function killMacProcesses(names: readonly string[], signal?: "-9") {
 async function killDiscord() {
   if (isMac) {
     const mains = MAC_APPS.map((macApp) => macApp.processName);
-    killMacProcesses(mains);
-    killMacProcesses(MAC_HELPER_PROCESSES);
+    await killMacProcesses(mains);
+    await killMacProcesses(MAC_HELPER_PROCESSES);
     if (!(await waitUntilDiscordGone())) {
-      killMacProcesses(mains, "-9");
-      killMacProcesses(MAC_HELPER_PROCESSES, "-9");
+      await killMacProcesses(mains, "-9");
+      await killMacProcesses(MAC_HELPER_PROCESSES, "-9");
       if (!(await waitUntilDiscordGone(20, 250))) discordDidNotStop();
     }
     return;
@@ -1095,21 +1142,21 @@ async function killDiscord() {
 
   for (const flavour of ALL_APPS) {
     try {
-      execSync(`taskkill /F /T /IM ${flavour}.exe`, { stdio: "ignore" });
+      await execFileTextAsync("taskkill", ["/F", "/T", "/IM", `${flavour}.exe`]);
     } catch {}
   }
-  killDiscordUpdater();
+  await killDiscordUpdater();
   if (!(await waitUntilDiscordGone())) {
     // Um Update.exe pode recriar o processo principal depois do primeiro taskkill.
     // Mata-o mais uma vez e falha de forma segura se a sessao antiga persistir.
-    killDiscordUpdater();
+    await killDiscordUpdater();
     if (!(await waitUntilDiscordGone(20, 250))) discordDidNotStop();
   }
   // O updater pode ter sido recriado no intervalo em que o processo principal
   // saiu; repete a verificação antes de qualquer nova instalação/rota.
-  killDiscordUpdater();
+  await killDiscordUpdater();
   if (!(await waitUntilDiscordUpdaterGone())) {
-    killDiscordUpdater();
+    await killDiscordUpdater();
     if (!(await waitUntilDiscordUpdaterGone(20, 250))) discordUpdaterDidNotStop();
   }
 }
@@ -1178,7 +1225,7 @@ function logRouteProbe(stage: "direct" | "tunnel", attempt: number, result: Rout
 async function diagnoseWindowsRoute(generation: number) {
   let scope: ReturnType<typeof prepareDiscordScopeProbes> | undefined;
   try {
-    scope = prepareDiscordScopeProbes(getDiscordInstalls({ allowStale: true }), proton.findProtonConfgenExe());
+    scope = prepareDiscordScopeProbes(await getDiscordInstallsAsync({ allowStale: true }), proton.findProtonConfgenExe());
     for (const probe of scope.probes) {
       if (generation !== windowsRouteGeneration || !windowsRouteStarted || quitting) return;
       await observeRouteDiagnostic(
@@ -1288,7 +1335,7 @@ async function activateBypass(event: any) {
 
 async function executarAtivacao(event: any) {
   if (isMac) throw new Error("O bypass por WireGuard ainda não está disponível no macOS.");
-  const installs = getDiscordInstalls({ forceRefresh: true });
+  const installs = await getDiscordInstallsAsync({ forceRefresh: true });
   if (installs.length === 0) {
     discordscan.ativacaoSemDiscord("nenhum install encontrado na varredura");
     throw new Error("Nenhum Discord encontrado.");
@@ -1299,7 +1346,7 @@ async function executarAtivacao(event: any) {
   const assinatura = assinaturaAtivacao("");
   if (
     assinatura === assinaturaUltimaAtivacao &&
-    getStatus({ forceRefresh: true }) === "ACTIVE"
+    await getStatusAsync({ forceRefresh: true }) === "ACTIVE"
   ) {
     logger.info("ativacao", "bypass ja ativo com a mesma proxy/modo; re-injecao ignorada");
     persistBypassEnabled(true);
@@ -1325,7 +1372,7 @@ async function executarAtivacao(event: any) {
     }
   }
 
-  const windowsWasActive = IS_WINDOWS && getStatus({ forceRefresh: true }) === "ACTIVE";
+  const windowsWasActive = IS_WINDOWS && (await getStatusAsync({ forceRefresh: true })) === "ACTIVE";
   const windowsGeneration = IS_WINDOWS ? beginWindowsRouteOperation() : 0;
   if (IS_WINDOWS) {
     try {
@@ -1345,7 +1392,7 @@ async function executarAtivacao(event: any) {
     await killDiscord();
   } catch (error) {
     if (IS_WINDOWS) {
-      windowsRouteState = isWireSockActive() ? "recovery_required" : "inactive";
+      windowsRouteState = (await isWireSockActiveAsync()) ? "recovery_required" : "inactive";
       refreshWindowStatus();
     }
     throw error;
@@ -1359,7 +1406,7 @@ async function executarAtivacao(event: any) {
       await withWireSockLifecycle("ativacao", async () => {
         // Uma sessao anterior pode ter sobrevivido ao fechamento da GUI. So
         // instala o perfil novo depois de comprovar que ela saiu por completo.
-        if (isWireSockActive()) {
+        if (await isWireSockActiveAsync()) {
           const recovery = await recoverWireSockNetwork();
           if (!recovery.ok) throw new Error(`Não consegui limpar a sessão WireSock anterior (${recovery.residual.join(", ") || recovery.error || "rede não validada"}). Use "Restaurar internet".`);
         }
@@ -1470,9 +1517,9 @@ async function deactivateAll() {
   }
   // Na arquitetura WireSock o app.asar fica propositalmente vanilla. Guarda o estado antes
   // de parar o servico: getStatus() deixa de ver o bypass assim que ele desce.
-  const hadWireSock = IS_WINDOWS && isWireSockActive();
+  const hadWireSock = IS_WINDOWS && (await isWireSockActiveAsync());
 
-  const installs = getDiscordInstalls({ forceRefresh: true });
+  const installs = await getDiscordInstallsAsync({ forceRefresh: true });
 
   // O estado atual é exclusivamente o túnel. Nunca restaure ou remova app.asar/_app.asar
   // durante a desativação; isso eliminava mods do usuário e causava falsos positivos.
@@ -1480,7 +1527,7 @@ async function deactivateAll() {
     await withWireSockLifecycle("desativacao", async () => {
       // Rele a condicao ja dentro da fila: uma troca de rota pode ter entrado
       // pouco antes desta desativacao e nao pode sobreviver a ela.
-      if (hadWireSock || isWireSockActive()) {
+      if (hadWireSock || (await isWireSockActiveAsync())) {
         await killDiscord();
         const recovery = await recoverWireSockNetwork();
         if (!recovery.ok) {
@@ -1501,21 +1548,24 @@ async function deactivateAll() {
   if (isMac) return;
 }
 
-function getStatus(options: WindowsDiscoveryReadOptions = { allowStale: true }): string {
-  // isWireSockRunning() sozinho (so o servico do Windows) deixava o status "INACTIVE" para
-  // sempre quando startWireSockService cai no fallback sem servico (usuario sem privilegio de
-  // admin para instalar/iniciar o servico, mas o processo direto sobe e o tunel funciona): a
-  // ativacao completava de verdade (Discord envelopado, WireSock rodando), mas a UI nunca via
-  // isso e ficava presa mostrando "Ativar" -- exatamente o relato do beta tester.
+// O status do Windows e sempre lido de forma assincrona (IPC get-status, bandeja
+// e handlers): isWireSockRunning() sozinho deixava o status "INACTIVE" para sempre
+// quando startWireSockService cai no fallback sem servico (usuario sem privilegio
+// de admin para instalar/iniciar o servico, mas o processo direto sobe e o tunel
+// funciona): a ativacao completava de verdade (Discord envelopado, WireSock
+// rodando), mas a UI nunca via isso e ficava presa mostrando "Ativar".
+async function getStatusAsync(options: WindowsDiscoveryReadOptions = { allowStale: true }): Promise<string> {
   if (isMac) return "UNSUPPORTED";
   if (IS_WINDOWS) {
-    const installs = getDiscordInstalls(options);
+    const installs = await getDiscordInstallsAsync(options);
     if (installs.length === 0) return "NOT_FOUND";
     if (windowsRouteState === "preparing") return "CONNECTING";
     if (windowsRouteState === "recovery_required") return "RECOVERY_REQUIRED";
-    return windowsRouteStarted && isWireSockActive() && discordIsRunning() ? "ACTIVE" : "INACTIVE";
+    return windowsRouteStarted && (await isWireSockActiveAsync()) && (await discordIsRunningAsync())
+      ? "ACTIVE"
+      : "INACTIVE";
   }
-  // getStatus e Windows-only: no Linux quem responde e linuxStatus().
+  // O status e Windows-only: no Linux quem responde e linuxStatus().
   return "INACTIVE";
 }
 
@@ -1612,7 +1662,9 @@ function startLinuxHealthWatchdog() {
 }
 
 function wgStatsProvider(): Promise<WgTunnelStats> | WgTunnelStats {
-  return IS_LINUX ? linuxWgStats() : getWgStats();
+  // No Windows o watchdog de 45s rodava `wg show ... dump` de forma sincrona na
+  // thread principal; a leitura assincrona entrega o mesmo dado sem travar a UI.
+  return IS_LINUX ? linuxWgStats() : getWgStatsAsync();
 }
 
 function protonRouteNumber(value: unknown, fallback = 0): number {
@@ -1942,7 +1994,7 @@ async function applyProtonRouteResult(
   let installsForWindows: DiscordInstall[] = [];
   try {
     if (IS_WINDOWS) {
-      installsForWindows = getDiscordInstalls({ forceRefresh: true });
+      installsForWindows = await getDiscordInstallsAsync({ forceRefresh: true });
       const generation = beginWindowsRouteOperation();
       stopWindowsRouteWatchdog();
       pararWgStatsWatchdog();
@@ -2019,10 +2071,10 @@ async function applyProtonFailoverCandidate(
   if (!fs.existsSync(canonical) || !fs.existsSync(candidate.confFile)) return false;
   if (generation !== protonFailoverGeneration || quitting) return false;
 
-  const installs = IS_WINDOWS ? getDiscordInstalls({ forceRefresh: true }) : [];
+  const installs = IS_WINDOWS ? await getDiscordInstallsAsync({ forceRefresh: true }) : [];
   const windowsGeneration = windowsRouteGeneration;
   if (IS_WINDOWS) {
-    if (windowsRouteState !== "active" || !windowsRouteStarted || !isWireSockActive() || !discordIsRunning()) return false;
+    if (windowsRouteState !== "active" || !windowsRouteStarted || !(await isWireSockActiveAsync()) || !(await discordIsRunningAsync())) return false;
     stopWindowsRouteWatchdog();
   } else if (IS_LINUX) {
     stopLinuxHealthWatchdog();
@@ -2169,7 +2221,7 @@ async function collectProtonFailoverSample(generation: number): Promise<void> {
       statsFailureEvidence: /namespace inativo|sem peer|interface .*inativ/i.test(stats.error || ""),
     };
   } else if (IS_WINDOWS) {
-    const discordRunning = discordIsRunning();
+    const discordRunning = await discordIsRunningAsync();
     const [traffic, wireSock, stats, tunnelActive] = await Promise.all([
       getWireSockAdapterTrafficAsync(),
       getWireSockConnectionStatusAsync(),
@@ -2235,7 +2287,7 @@ function startProtonFailoverMonitor(): void {
     if (!username) return;
     const plan = await resolveProtonPlan(username);
     if (generation !== protonFailoverGeneration || plan.status !== "free" || quitting) return;
-    const active = IS_LINUX ? await linuxStatus() === "ACTIVE" : windowsRouteState === "active" && windowsRouteStarted && isWireSockActive() && discordIsRunning();
+    const active = IS_LINUX ? await linuxStatus() === "ACTIVE" : windowsRouteState === "active" && windowsRouteStarted && (await isWireSockActiveAsync()) && (await discordIsRunningAsync());
     if (!active || generation !== protonFailoverGeneration) return;
     protonFailoverTracker = new FailoverHealthTracker();
     protonFailoverTracker.reset();
@@ -2293,12 +2345,20 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
   }, { timeout_ms: timeoutMs });
   const deadline = Date.now() + timeoutMs;
   let last: WgTunnelStats | undefined;
-  let lastWireSock: WireSockConnectionStatus = getWireSockConnectionStatus();
+  let lastWireSock: WireSockConnectionStatus = await getWireSockConnectionStatusAsync();
   let cliFlowSamples = 0;
   let adapterFlowSamples = 0;
   let previousAdapterTraffic: ReturnType<typeof getWireSockAdapterTraffic> = null;
   while (Date.now() < deadline) {
-    lastWireSock = getWireSockConnectionStatus();
+    // Três spawns por tique (wiresock-cli, wg.exe e powershell). Síncronos, eles
+    // seguravam a janela uma vez por segundo enquanto a rota subia; em paralelo e
+    // assíncronos o mesmo dado chega sem "Não respondendo" durante a ativação.
+    const [wireSockStatus, stats, traffic] = await Promise.all([
+      getWireSockConnectionStatusAsync(),
+      getWgStatsAsync(),
+      getWireSockAdapterTrafficAsync(),
+    ]);
+    lastWireSock = wireSockStatus;
     if (lastWireSock.source === "cli" && lastWireSock.state === "disconnected") {
       return finish({
         verified: false,
@@ -2307,7 +2367,7 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
         detail: "WireSock informou que a rota está desconectada",
       });
     }
-    last = getWgStats();
+    last = stats;
     const readiness = classifyWgReadiness(last, true);
     if (readiness.ready) {
       return finish({ verified: true, state: "connected", source: "wg", detail: "handshake recente e tráfego WireGuard bidirecional confirmados" });
@@ -2326,7 +2386,6 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
     // Algumas instalações oficiais expõem apenas wiresock-client.exe + ProTUN.
     // Depois de abrir o Discord (que está em AllowedApps), duas amostras RX/TX
     // provam o fluxo real pelo túnel sem depender do tráfego da própria GUI.
-    const traffic = getWireSockAdapterTraffic();
     const adapterTrafficIncreasing = hasWireSockAdapterTrafficIncrease(previousAdapterTraffic, traffic);
     previousAdapterTraffic = traffic;
     if (lastWireSock.source === "service" && lastWireSock.state === "unknown" && traffic && adapterTrafficIncreasing) {
@@ -2878,9 +2937,9 @@ ipcMain.handle("restore-internet", async () => {
     // Releia dentro da fila: uma ativação concorrente pode ter subido o túnel
     // depois da leitura original, e restaurar não pode sair deixando essa sessão
     // viva por causa de um snapshot obsoleto.
-    const hadWireSock = isWireSockActive();
+    const hadWireSock = await isWireSockActiveAsync();
     const installs = hadWireSock
-      ? getDiscordInstalls({ forceRefresh: true })
+      ? await getDiscordInstallsAsync({ forceRefresh: true })
       : [];
     if (hadWireSock) {
       try {
@@ -2913,7 +2972,7 @@ ipcMain.handle("get-platform", () => (IS_LINUX ? "linux" : isMac ? "mac" : "wind
 ipcMain.handle("get-app-version", () => app.getVersion());
 ipcMain.handle("get-status", async () => {
   if (IS_LINUX) return linuxStatus();
-  return getStatus();
+  return getStatusAsync();
 });
 ipcMain.handle("get-linux-preflight", async () => {
   if (!IS_LINUX) return null;
@@ -3059,7 +3118,7 @@ function restoreBypassFromWindowsStartup(): Promise<void> {
   const operation = restoreBypassOnStartup({
     enabled: true,
     signal: controller.signal,
-    isActive: () => getStatus() === "ACTIVE" || isWireSockActive(),
+    isActive: async () => (await getStatusAsync()) === "ACTIVE" || (await isWireSockActiveAsync()),
     optimize: (signal) => optimizeProtonRouteAtStartup(signal),
     activate: () => activateBypass({}),
     onOptimizationFailure: (error) => {
@@ -3550,9 +3609,11 @@ async function formatWgTunelDiagnostico(status: string): Promise<string> {
   return `handshake ${handshake} · ${trafego}`;
 }
 
-function formatWireSockDiagnostico(): string {
+async function formatWireSockDiagnostico(): Promise<string> {
   if (!IS_WINDOWS) return "n/a";
-  const s = getWireSockConnectionStatus();
+  // Assíncrono: a sonda é um wiresock-cli/powershell que pode levar segundos, e o
+  // relatório de diagnóstico é copiado a partir de um clique na janela.
+  const s = await getWireSockConnectionStatusAsync();
   return `${s.state} · fonte=${s.source}${s.detail ? ` · ${s.detail}` : ""}`;
 }
 
@@ -3567,7 +3628,7 @@ async function buildDiagnostic(status: string, extraNote = ""): Promise<string> 
     `| electron | ${process.versions.electron} |`,
     `| status | ${status} |`,
     `| routeMode | wireguard |`,
-    `| wireSock | ${formatWireSockDiagnostico()} |`,
+    `| wireSock | ${await formatWireSockDiagnostico()} |`,
     // "Carregando infinito" pos-WireGuard costuma ser tunel morto/saturado, nao mais gateway
     // zumbi de proxy: handshake velho ou trafego zerado com bypass ativo aponta pra isso direto.
     `| tunelWg | ${await formatWgTunelDiagnostico(status)} |`,
@@ -3774,12 +3835,12 @@ ipcMain.handle("test-wg-conf", async () => {
       };
     }
 
-    const status = IS_LINUX ? await linuxStatus() : getStatus();
+    const status = IS_LINUX ? await linuxStatus() : await getStatusAsync();
     let exitInfo: { ip?: string; country?: string } | undefined;
     let readiness: Record<string, unknown> | undefined;
 
     if (status === "ACTIVE" && IS_WINDOWS) {
-      const ws = getWireSockConnectionStatus();
+      const ws = await getWireSockConnectionStatusAsync();
       readiness = {
         ready: ws.verified,
         state: ws.state,
@@ -3868,6 +3929,9 @@ ipcMain.handle("get-proton-settings", async () => {
   return {
     vpnMode: (s.vpnMode as string) || "proton",
     username: recoveredUsername,
+    // O perfil Proton no disco e o que a ativacao consome; a verificacao de sessao
+    // (rede) nao pode segurar o botao de ativar por uma falha passageira (#312/#316/#317).
+    profileReady: Boolean(recoveredUsername) && fs.existsSync(path.join(settingsDir(), "wireguard.conf")),
     country: (s.protonCountry as string) || "",
     freeOnly: s.protonFreeOnly !== undefined ? Boolean(s.protonFreeOnly) : !isPaid,
     autoPing: s.protonAutoPing !== false,
@@ -4367,9 +4431,9 @@ ipcMain.handle("optimize-proton-route", async (event, options?: ProtonOptimizati
         }
       }
 
-      const status = IS_LINUX ? await linuxStatus() : getStatus();
+      const status = IS_LINUX ? await linuxStatus() : await getStatusAsync();
       if (signal.aborted) return { success: false, cancelled: true };
-      if ((options?.reuseMeasured || refreshOnStartup) && (status === "ACTIVE" || (IS_WINDOWS && isWireSockActive()))) {
+      if ((options?.reuseMeasured || refreshOnStartup) && (status === "ACTIVE" || (IS_WINDOWS && (await isWireSockActiveAsync())))) {
         return { success: true, deferred: true };
       }
       sendProgress({ phase: "ping", total: 0, tested: 0, succeeded: 0 });
@@ -4377,7 +4441,7 @@ ipcMain.handle("optimize-proton-route", async (event, options?: ProtonOptimizati
       // evict the existing connection, and current traffic biases measurements.
       if (speedTest) {
         try {
-          if (IS_WINDOWS && (status === "ACTIVE" || isWireSockActive())) {
+          if (IS_WINDOWS && (status === "ACTIVE" || (await isWireSockActiveAsync()))) {
             beginWindowsRouteOperation();
             stopWindowsRouteWatchdog();
             pararWgStatsWatchdog();
@@ -4449,7 +4513,7 @@ ipcMain.handle("optimize-proton-route", async (event, options?: ProtonOptimizati
         logger.info("proton", "bypass ativo, iniciando nova rota antes de reabrir o Discord", { server: gen.server });
         try {
           if (IS_WINDOWS) {
-            const installs = getDiscordInstalls({ forceRefresh: true });
+            const installs = await getDiscordInstallsAsync({ forceRefresh: true });
             const generation = beginWindowsRouteOperation();
             stopWindowsRouteWatchdog();
             await killDiscord();
@@ -4583,7 +4647,7 @@ ipcMain.handle("select-proton-route", async (event, options?: ProtonManualSelect
       if (country !== session.country || freeOnly !== session.freeOnly || autoPing !== session.autoPing) {
         return { success: false, error: "As preferências Proton mudaram. Execute a medição novamente." };
       }
-      const status = IS_LINUX ? await linuxStatus() : getStatus();
+      const status = IS_LINUX ? await linuxStatus() : await getStatusAsync();
       let generated: proton.ProtonManualRouteResult;
       try {
         generated = await proton.generateManualProtonConfig(settingsDir(), {

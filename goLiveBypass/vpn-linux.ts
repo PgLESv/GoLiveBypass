@@ -22,6 +22,34 @@ export const MAX_LINUX_INTERFACE_LEN = 15;
 export const MAX_LINUX_NAMESPACE_LEN = 31;
 export const PROTECTED_LINUX_NAMES = Object.freeze(["discord-vpn", "wg-discord"] as const);
 export const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
+
+// Explica falhas de elevação que o usuário pode resolver, em vez de devolver o texto cru do
+// pkexec ("Error executing command as another user: Request dismissed", que não diz nada).
+export function linuxAuthorizationGuidance(detail: string, filePath = ""): string | null {
+    if (/Request dismissed|No authentication agent|no agent|not authorized|dismissed|authentication agent/i.test(detail)) {
+        return "O polkit não conseguiu pedir autorização (diálogo recusado ou sem agente de autenticação). Instale ou inicie um agente do polkit (polkit-gnome, lxqt-policykit, kde-polkit ou o do seu ambiente) e tente de novo.";
+    }
+    if (/pkexec/i.test(filePath) && /expirou após \d+ms/i.test(detail)) {
+        return "O pedido de autorização não foi respondido a tempo. Responda o diálogo do polkit (ou configure um agente de autenticação) e tente de novo.";
+    }
+    return null;
+}
+
+// Espera um arquivo aparecer (usado pela confirmação do relaunch). Devolve false no timeout.
+export async function waitForFile(filePath: string, timeoutMs: number, pollMs = 100): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        try {
+            if (fs.existsSync(filePath)) return true;
+        } catch {
+            // segue tentando: um erro de leitura agora não é motivo para desistir da confirmação
+        }
+        if (Date.now() >= deadline) return false;
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, pollMs);
+        await promise;
+    }
+}
 export const DEFAULT_AUTH_PROMPT_TIMEOUT_MS = 60_000;
 export const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 
@@ -172,22 +200,130 @@ export function isFlatpak(env: NodeJS.ProcessEnv = process.env): boolean {
     return Boolean(env.FLATPAK_ID || env.FLATPAK_SANDBOX_DIR || fs.existsSync("/.flatpak-info"));
 }
 
+// O nome do pacote muda de distribuição para distribuição: "polkit" existe no Fedora e no
+// Arch, mas no Debian/Ubuntu o pacote se chama policykit-1 (que hoje entrega polkitd e pkexec
+// separados). A mensagem genérica ("instale o pacote polkit") mandava o usuário do Ubuntu
+// procurar um pacote que não existe e deixava o painel sem ação possível (relato com kernel
+// 6.8.0-139-generic). Mesma ideia do linux_dependency_plan() do standalone, sem executar
+// nada: lê /etc/os-release e escreve o comando que a pessoa consegue copiar.
+export type LinuxDistroFamily = "debian" | "fedora" | "arch" | "unknown";
+
+const LINUX_DISTRO_FAMILY_BY_ID: Record<string, LinuxDistroFamily> = {
+    debian: "debian", ubuntu: "debian", linuxmint: "debian", pop: "debian", raspbian: "debian", kali: "debian",
+    fedora: "fedora", rhel: "fedora", centos: "fedora", rocky: "fedora", almalinux: "fedora",
+    arch: "arch", manjaro: "arch", endeavouros: "arch", cachyos: "arch", garuda: "arch",
+};
+
+export function identifyLinuxDistroFamily(osRelease?: string | null): LinuxDistroFamily {
+    if (!osRelease) return "unknown";
+    const fields = new Map<string, string>();
+    for (const line of osRelease.split("\n")) {
+        const match = /^([A-Z_]+)=(.*)$/.exec(line.trim());
+        if (match) fields.set(match[1], match[2].replace(/^"|"$/g, "").trim());
+    }
+    for (const token of [fields.get("ID") ?? "", ...(fields.get("ID_LIKE") ?? "").split(/\s+/)]) {
+        const family = LINUX_DISTRO_FAMILY_BY_ID[token.toLowerCase()];
+        if (family) return family;
+    }
+    return "unknown";
+}
+
+// /etc/os-release não muda durante a sessão; a leitura entra no cache como a do módulo
+// WireGuard, porque o painel consulta as dependências a cada poucos segundos.
+let linuxDistroFamilyCache: LinuxDistroFamily | null = null;
+
+export function resetLinuxDistroFamilyCache(): void {
+    linuxDistroFamilyCache = null;
+}
+
+export function linuxDistroFamily(): LinuxDistroFamily {
+    if (linuxDistroFamilyCache) return linuxDistroFamilyCache;
+    let raw: string | null = null;
+    try {
+        raw = fs.readFileSync("/etc/os-release", "utf8");
+    } catch {
+        // Container/sandbox sem os-release: fica a mensagem genérica.
+        raw = null;
+    }
+    linuxDistroFamilyCache = identifyLinuxDistroFamily(raw);
+    return linuxDistroFamilyCache;
+}
+
+// Comando copiavel para instalar o pkexec. Vazio quando a familia nao e conhecida: melhor nao
+// mandar o usuario de uma distribuicao desconhecida rodar o gerenciador de pacotes errado.
+export function polkitInstallCommand(family: LinuxDistroFamily): string {
+    switch (family) {
+        case "debian": return "sudo apt install policykit-1";
+        case "fedora": return "sudo dnf install polkit";
+        case "arch": return "sudo pacman -S polkit";
+        default: return "";
+    }
+}
+
+export function kernelModulesInstallCommand(family: LinuxDistroFamily, kernelRelease: string): string {
+    // Só o Debian/Ubuntu empacota módulos por versão de kernel (linux-modules-<release>); nas
+    // outras famílias eles vêm junto do kernel e a ação útil continua sendo reiniciar.
+    if (family !== "debian") return "";
+    const release = kernelRelease.trim();
+    return `sudo apt install linux-modules-${release || "$(uname -r)"}`;
+}
+
+export function pkexecMissingIssue(family: LinuxDistroFamily = linuxDistroFamily()): string {
+    const command = polkitInstallCommand(family);
+    return command
+        ? `Utilitário 'pkexec' (polkit) não encontrado. Instale o polkit (${command}) para autorização administrativa.`
+        : "Utilitário 'pkexec' (polkit) não encontrado. Instale o pacote polkit da sua distribuição para autorização administrativa.";
+}
+
 export function formatLinuxWireGuardModuleIssue(
     state: LinuxWireGuardModuleState,
     kernelRelease: string,
     modulesDirectoryAvailable: boolean,
+    family: LinuxDistroFamily = linuxDistroFamily(),
 ): string | null {
     if (state !== "missing") return null;
     const release = kernelRelease.trim() || "atual";
     if (!modulesDirectoryAvailable) {
-        return `O kernel Linux em execução (${release}) não possui os módulos instalados. Reinicie no kernel instalado ou instale os módulos correspondentes antes de ativar.`;
+        const base = `O kernel Linux em execução (${release}) não possui os módulos instalados. Reinicie no kernel instalado ou instale os módulos correspondentes antes de ativar.`;
+        const command = kernelModulesInstallCommand(family, release);
+        return command ? `${base} No Debian/Ubuntu: ${command} e reinicie.` : base;
     }
     return `O módulo WireGuard não está disponível no kernel Linux em execução (${release}). Instale ou ative o módulo WireGuard antes de ativar.`;
 }
 
-export function linuxWireGuardModuleState(env: NodeJS.ProcessEnv = process.env): LinuxWireGuardModuleState {
-    if (!isLinux()) return "missing";
-    if (fs.existsSync("/sys/module/wireguard")) return "loaded";
+// O modulo WireGuard so muda de estado quando alguem roda modprobe, mas o painel consulta as
+// dependencias a cada poucos segundos e cada consulta spawna `modprobe -n -v` DE FORMA SINCRONA
+// na main thread do Electron (ate 2s de travamento por consulta, dentro do cliente). Por isso o
+// resultado fica em cache curto e e invalidado quando uma ativacao roda modprobe de verdade.
+const WIREGUARD_MODULE_CACHE_MS = 30_000;
+const WIREGUARD_MODULE_PATH = "/sys/module/wireguard";
+
+let wireGuardModuleCache: { key: string; state: LinuxWireGuardModuleState; at: number } | null = null;
+
+export function resetLinuxWireGuardModuleCache(): void {
+    wireGuardModuleCache = null;
+}
+
+export function wireGuardModuleLoadFailureMessage(): string {
+    const release = os.release().trim() || "atual";
+    return `O módulo WireGuard não carregou no kernel em execução (${release}). Ative ou instale o módulo (ex.: wireguard-dkms, ou o pacote de módulos do seu kernel) e tente de novo.`;
+}
+
+// Checagem que entra na MESMA sequencia elevada do modprobe: `modprobe` pode sair com 0 sem
+// carregar nada (modulo de outro kernel, assinatura recusada, embutido sem suporte) e o erro
+// que sobra e o `ip: Unknown device type`, que nao diz o que fazer (relato do beta-22 no Linux).
+export function linuxWireGuardModuleCheckCommand(
+    shellPath: string,
+    modulePath: string = WIREGUARD_MODULE_PATH,
+): LinuxPrivilegedCommand {
+    return [
+        shellPath,
+        ["-c", `test -e ${shellQuote(modulePath)} || { printf '%s\\n' ${shellQuote(wireGuardModuleLoadFailureMessage())} >&2; exit 1; }`],
+    ];
+}
+
+function detectLinuxWireGuardModuleState(env: NodeJS.ProcessEnv): LinuxWireGuardModuleState {
+    if (fs.existsSync(WIREGUARD_MODULE_PATH)) return "loaded";
 
     const modprobe = findSystemBinary("modprobe", env);
     if (!modprobe) return "missing";
@@ -209,6 +345,21 @@ export function linuxWireGuardModuleState(env: NodeJS.ProcessEnv = process.env):
     } catch {
         return "missing";
     }
+}
+
+export function linuxWireGuardModuleState(env: NodeJS.ProcessEnv = process.env): LinuxWireGuardModuleState {
+    if (!isLinux()) return "missing";
+
+    const key = `${isFlatpak(env) ? "flatpak" : "host"}|${findSystemBinary("modprobe", env) ?? ""}`;
+    const now = Date.now();
+    const cached = wireGuardModuleCache;
+    if (cached && cached.key === key && now - cached.at < WIREGUARD_MODULE_CACHE_MS) {
+        return cached.state;
+    }
+
+    const state = detectLinuxWireGuardModuleState(env);
+    wireGuardModuleCache = { key, state, at: now };
+    return state;
 }
 
 export function linuxWireGuardModuleIssue(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -272,10 +423,7 @@ function resolveCommandInvocation(
     if (options.elevated) {
         const pkexec = findSystemBinary("pkexec", env);
         if (!pkexec) {
-            throw new Error(
-                "Utilitário de elevação 'pkexec' (polkit) não encontrado no sistema. " +
-                "Instale o pacote polkit para permitir operações de rede privilegiadas."
-            );
+            throw new Error(pkexecMissingIssue());
         }
         cmdArgs = [cmdFile, ...cmdArgs];
         cmdFile = pkexec;
@@ -475,6 +623,23 @@ export function buildLinuxPrivilegedScript(
     return `${lines.join("\n")}\n`;
 }
 
+// O timeout do pkexec não pode virar só "Comando expirou após 15000ms: /usr/bin/pkexec": quando
+// o polkit está esperando o usuário (ou não tem agente), a mensagem precisa dizer o que fazer.
+// Era esse texto cru que aparecia no relato #313 e no log local do E2E.
+async function runPrivilegedCommand(
+    spec: CommandSpec,
+    options?: { timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv },
+): Promise<CommandResult> {
+    try {
+        return await runCommandAsync(spec, options);
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const guidance = linuxAuthorizationGuidance(detail, spec.file);
+        if (!guidance) throw error;
+        throw new Error(`${detail} ${guidance}`);
+    }
+}
+
 async function execPrivilegedSequence(
     commands: readonly LinuxPrivilegedCommand[],
     options?: {
@@ -494,7 +659,7 @@ async function execPrivilegedSequence(
         isFlatpakEnv: isFlatpak(env),
         env,
     });
-    let result = await runCommandAsync(spec, options);
+    let result = await runPrivilegedCommand(spec, options);
     const initialFailure = result.exitCode === null || result.exitCode === 0
         ? null
         : new LinuxAuthorizationError(
@@ -506,7 +671,7 @@ async function execPrivilegedSequence(
         const terminalSpec = pkexec
             ? resolveTerminalAuthorizationSpec(pkexec, shellPath, env, ["-c", script])
             : null;
-        if (terminalSpec) result = await runCommandAsync(terminalSpec, options);
+        if (terminalSpec) result = await runPrivilegedCommand(terminalSpec, options);
     }
     if (result.exitCode !== 0) {
         const match = /__GOLIVE_STEP__(\d+)/.exec(result.stderr);
@@ -519,10 +684,11 @@ async function execPrivilegedSequence(
                 || result.stdout
                 || `Exit code ${result.exitCode}`,
         );
+        const guidance = linuxAuthorizationGuidance(detail, spec.file);
         if (result.exitCode === 126) {
-            throw new LinuxAuthorizationError("A autorização administrativa foi cancelada.", result.exitCode);
+            throw new LinuxAuthorizationError(`A autorização administrativa foi cancelada.${guidance ? ` ${guidance}` : ""}`, result.exitCode);
         }
-        throw new Error(`Falha ao executar ${failedCommand ? path.basename(failedCommand[0]) : "comando privilegiado"}: ${detail}`);
+        throw new Error(`Falha ao executar ${failedCommand ? path.basename(failedCommand[0]) : "comando privilegiado"}: ${detail}${guidance ? ` ${guidance}` : ""}`);
     }
     return result;
 }
@@ -673,7 +839,7 @@ export function linuxDependencyIssues(env: NodeJS.ProcessEnv = process.env): str
         issues.push("Utilitário 'wg' (wireguard-tools) não encontrado. Instale o pacote wireguard-tools no sistema.");
     }
     if (!hasPkexec) {
-        issues.push("Utilitário 'pkexec' (polkit) não encontrado. Instale o pacote polkit para autorização administrativa.");
+        issues.push(pkexecMissingIssue());
     }
     const moduleIssue = linuxWireGuardModuleIssue(env);
     if (moduleIssue) {
@@ -1172,7 +1338,7 @@ export async function startLinuxNetwork(
     fs.writeFileSync(tempConfigFile, setconfContent, { mode: 0o600 });
 
     let tempResolvFile: string | null = null;
-    const timeoutMs = options?.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_AUTH_PROMPT_TIMEOUT_MS;
     const signal = options?.signal;
 
     options?.log?.("info", "linux.network.started", { phase: "preparing" });
@@ -1181,6 +1347,9 @@ export async function startLinuxNetwork(
         if (moduleState === "available") {
             if (!modprobePath) throw new Error("Utilitário 'modprobe' não encontrado para carregar o módulo WireGuard.");
             commands.push([modprobePath, ["wireguard"]]);
+            // Confirma a carga na MESMA sequência elevada: sem isto, o módulo não subir termina
+            // no erro críptico do `ip` ("Unknown device type") em vez de dizer o que fazer.
+            commands.push(linuxWireGuardModuleCheckCommand(findSystemBinary("sh") || "/bin/sh"));
         }
 
         // A sequência inteira roda sob uma única autorização; o rollback permanece dentro do
@@ -1231,7 +1400,18 @@ export async function startLinuxNetwork(
         if (tempResolvFile && rmPath) {
             rollback.unshift([rmPath, ["-rf", `/etc/netns/${namespace}`]]);
         }
-        await execPrivilegedSequence(commands, { timeoutMs, signal, rollback });
+        try {
+            await execPrivilegedSequence(commands, { timeoutMs, signal, rollback });
+        } catch (error) {
+            // Depois de rodar modprobe, o "available" em cache ficou velho: a proxima consulta
+            // (painel/watchdog) precisa ver o estado real.
+            resetLinuxWireGuardModuleCache();
+            if (moduleState === "available" && linuxWireGuardModuleState() !== "loaded") {
+                throw new Error(wireGuardModuleLoadFailureMessage());
+            }
+            throw error;
+        }
+        resetLinuxWireGuardModuleCache();
         options?.log?.("info", "linux.network.phase", { phase: "namespace" });
         options?.log?.("info", "linux.network.phase", { phase: "interface" });
         options?.log?.("info", "linux.network.phase", { phase: "routes" });

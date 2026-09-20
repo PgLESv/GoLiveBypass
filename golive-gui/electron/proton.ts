@@ -463,20 +463,118 @@ function ensureInstallDir(installDir: string) {
   fs.mkdirSync(installDir, { recursive: true });
 }
 
-export async function checkProtonSession(
-  installDir: string,
-  username?: string
-): Promise<{
+/**
+ * Contrato de `-check-session`. `retryable` marca falha de verificacao (rede,
+ * timeout, helper ausente) que NAO invalida a sessao: a GUI mantem o usuario
+ * autenticado e a ativacao continua disponivel com o perfil ja gerado.
+ */
+export type ProtonSessionCheckCode = 'INVALID_SESSION' | 'NETWORK_ERROR' | 'TIMEOUT' | 'MISSING_EXECUTABLE' | 'SESSION_PERSISTENCE' | 'UNKNOWN';
+
+export interface ProtonSessionCheckResult {
   valid: boolean;
   username?: string;
   expiresIn?: string;
   tier?: number;
   planTitle?: string;
   isPaid?: boolean;
+  code?: ProtonSessionCheckCode;
+  retryable?: boolean;
   error?: string;
-}> {
+}
+
+const PROTON_SESSION_CODES: Record<ProtonSessionCheckCode, true> = {
+  INVALID_SESSION: true,
+  NETWORK_ERROR: true,
+  TIMEOUT: true,
+  MISSING_EXECUTABLE: true,
+  SESSION_PERSISTENCE: true,
+  UNKNOWN: true,
+};
+
+/** Codigos que descrevem falha de verificacao, nao sessao invalida. */
+const RETRYABLE_SESSION_CODES: Record<ProtonSessionCheckCode, boolean> = {
+  INVALID_SESSION: false,
+  NETWORK_ERROR: true,
+  TIMEOUT: true,
+  MISSING_EXECUTABLE: true,
+  SESSION_PERSISTENCE: true,
+  UNKNOWN: false,
+};
+
+const INVALID_SESSION_MESSAGE = 'Sessão inválida ou não encontrada.';
+
+function isProtonSessionCode(value: unknown): value is ProtonSessionCheckCode {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(PROTON_SESSION_CODES, value);
+}
+
+export function sessionFailure(code: ProtonSessionCheckCode, message: string): ProtonSessionCheckResult {
+  return { valid: false, code, retryable: RETRYABLE_SESSION_CODES[code], error: message };
+}
+
+/**
+ * Traduz o JSON de `-check-session` para o renderer. Helpers anteriores ao campo
+ * `code` continuam corretos: a mensagem de falha temporaria ja existia e e a unica
+ * pista disponivel neles, entao ela e reconhecida explicitamente em vez de virar
+ * "sessao invalida" e deslogar o usuario por uma oscilacao de rede.
+ */
+export function normalizeProtonSessionResult(value: unknown, fallbackUsername = ''): ProtonSessionCheckResult {
+  if (!value || typeof value !== 'object') return sessionFailure('UNKNOWN', INVALID_SESSION_MESSAGE);
+  const fields = value as Record<string, unknown>;
+
+  if (fields.valid === true) {
+    const username = typeof fields.username === 'string' && fields.username.trim() ? fields.username.trim() : fallbackUsername;
+    return {
+      valid: true,
+      username: username || undefined,
+      expiresIn: typeof fields.expiresIn === 'string' ? fields.expiresIn : undefined,
+      tier: typeof fields.tier === 'number' ? fields.tier : undefined,
+      planTitle: typeof fields.planTitle === 'string' ? fields.planTitle : undefined,
+      isPaid: typeof fields.isPaid === 'boolean' ? fields.isPaid : undefined,
+    };
+  }
+
+  const message = typeof fields.error === 'string' && fields.error.trim() ? fields.error.trim() : INVALID_SESSION_MESSAGE;
+  const code = isProtonSessionCode(fields.code)
+    ? fields.code
+    : /temporariamente/i.test(message) ? 'NETWORK_ERROR' : 'INVALID_SESSION';
+  const result = sessionFailure(code, message);
+  if (typeof fields.retryable === 'boolean') result.retryable = fields.retryable;
+  return result;
+}
+
+async function runSessionCheck(exePath: string, sessionFile: string, username?: string): Promise<ProtonSessionCheckResult> {
+  try {
+    const args = [
+      '-session-file',
+      sessionFile,
+      '-check-session',
+      '-json',
+    ];
+    if (username && username.trim()) {
+      args.push('-username', username.trim());
+    }
+    const res = await runConfgen({
+      args,
+      timeoutMs: 15000,
+      exePath,
+    });
+    if (res.json !== undefined) return normalizeProtonSessionResult(res.json, username || '');
+    const classified = classifyProtonError(res.stderr || res.stdout || '', res.stderr, res.stdout);
+    const code: ProtonSessionCheckCode = res.code === null ? 'MISSING_EXECUTABLE' : classified.code === 'TIMEOUT' ? 'TIMEOUT' : 'UNKNOWN';
+    return sessionFailure(code, classified.message);
+  } catch (error) {
+    // Timeout/abort do sidecar e falha de verificacao, nunca sessao invalida.
+    const classified = classifyProtonError(error);
+    return sessionFailure(classified.code === 'TIMEOUT' ? 'TIMEOUT' : 'NETWORK_ERROR', classified.message);
+  }
+}
+
+export async function checkProtonSession(
+  installDir: string,
+  username?: string
+): Promise<ProtonSessionCheckResult> {
   if (username !== undefined && !username.trim()) {
-    return { valid: false, error: 'Usuário não especificado.' };
+    return { valid: false, code: 'INVALID_SESSION', retryable: false, error: 'Usuário não especificado.' };
   }
   ensureInstallDir(installDir);
   const sessionFile = getProtonSessionFile(installDir);
@@ -484,40 +582,11 @@ export async function checkProtonSession(
   try {
     exePath = await ensureProtonConfgen(installDir);
   } catch (error) {
-    return { valid: false, error: error instanceof Error ? error.message : String(error) };
+    // Helper indisponivel: nao ha verificacao, e isso nao invalida a sessao salva.
+    const classified = classifyProtonError(error);
+    return sessionFailure(classified.code === 'MISSING_EXECUTABLE' ? 'MISSING_EXECUTABLE' : 'NETWORK_ERROR', classified.message);
   }
-  const args = [
-    '-check-session',
-    '-session-file',
-    sessionFile,
-    '-json',
-  ];
-  if (username && username.trim()) {
-    args.push('-username', username.trim());
-  }
-
-  try {
-    const res = await runConfgen({ args, timeoutMs: 15000, exePath });
-    if (res.json && res.json.valid) {
-      return {
-        valid: true,
-        username: res.json.username,
-        expiresIn: res.json.expiresIn,
-        tier: res.json.tier,
-        planTitle: res.json.planTitle,
-        isPaid: res.json.isPaid,
-      };
-    }
-    return {
-      valid: false,
-      error: res.json?.error || 'Sessão inválida ou expirada.',
-    };
-  } catch (error) {
-    return {
-      valid: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+  return runSessionCheck(exePath, sessionFile, username);
 }
 
 /**

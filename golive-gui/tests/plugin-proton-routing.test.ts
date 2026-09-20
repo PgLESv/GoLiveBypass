@@ -462,6 +462,26 @@ describe("concorrência da descoberta", () => {
     expect(segunda.success).toBe(true);
     expect(helper.spawns).toBe(2);
   });
+
+  it("libera o catálogo depois de a otimização falhar no critério de velocidade", async () => {
+    const dir = dataDirWithSession(PERFIL_ANTERIOR);
+    const harness = controllerFor(dir);
+    helper.script({
+      code: 1,
+      json: { success: false, error: "nenhum servidor concluiu download e upload pelo túnel; a rota anterior foi preservada" },
+    });
+
+    const otimizacao = await harness.controller.optimizeProton({ requestId: "opt-1", speedTest: true, freeOnly: true, autoPing: true });
+    expect(otimizacao.success).toBe(false);
+    expect(otimizacao.error).toContain("nenhum servidor concluiu download e upload pelo túnel");
+
+    // A falha preserva o perfil e não pode deixar a medição travada: é a
+    // medição do catálogo que enche a lista manual (ordenada por ping) no
+    // lugar do beco sem saída "nenhuma rota Proton foi catalogada".
+    await discoverOnce(harness);
+    expect(harness.controller.getRouteDiscoveryStatus().routes.map(route => route.server)).toEqual(["US#1", "NL#2"]);
+    expect(fs.readFileSync(path.join(dir, "wireguard.conf"), "utf8")).toBe(PERFIL_ANTERIOR);
+  });
 });
 
 describe("aplicação da rota escolhida", () => {

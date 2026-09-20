@@ -119,13 +119,16 @@ describe("preflight Linux", () => {
       if (loaded) fs.mkdirSync(state, { recursive: true });
       const trace = path.join(root, "trace");
       const harness = path.join(root, "module.sh");
+      // O script resolve modprobe/modinfo por caminho absoluto (o PATH da GUI nao inclui
+      // /usr/sbin em varias distros): o harness precisa dos mesmos globais.
       fs.writeFileSync(harness, [
         "#!/bin/sh",
-        "have() { command -v \"$1\" >/dev/null 2>&1; }",
+        "MODPROBE_BINARY=\"$BIN_DIR/modprobe\"",
+        "MODINFO_BINARY=\"\"",
         "wireguard_module_loaded() { [ -e \"$MODULE_STATE\" ]; }",
         "elevate() {",
         "  printf '%s\\n' \"$*\" >> \"$TRACE\"",
-        "  if [ \"$1\" = modprobe ] && [ \"$MODPROBE_SUCCEEDS\" = 1 ]; then /bin/mkdir -p \"$MODULE_STATE\"; return 0; fi",
+        "  if [ \"$1\" = \"$MODPROBE_BINARY\" ] && [ \"$MODPROBE_SUCCEEDS\" = 1 ]; then /bin/mkdir -p \"$MODULE_STATE\"; return 0; fi",
         "  return 1",
         "}",
         ensureFunction,
@@ -143,6 +146,7 @@ describe("preflight Linux", () => {
         env: {
           ...process.env,
           PATH: bin,
+          BIN_DIR: bin,
           MODULE_STATE: state,
           MODPROBE_SUCCEEDS: modprobeSucceeds ? "1" : "0",
           TRACE: trace,
@@ -152,6 +156,7 @@ describe("preflight Linux", () => {
       return {
         run,
         trace: fs.existsSync(trace) ? fs.readFileSync(trace, "utf8") : "",
+        modprobe: path.join(bin, "modprobe"),
       };
     };
 
@@ -161,12 +166,12 @@ describe("preflight Linux", () => {
 
     const loadedByActivation = runCase(false, true);
     expect(loadedByActivation.run.status, loadedByActivation.run.stderr).toBe(0);
-    expect(loadedByActivation.trace).toBe("authorization\nmodprobe wireguard\nstop\nnamespace\nip link add\n");
+    expect(loadedByActivation.trace).toBe(`authorization\n${loadedByActivation.modprobe} wireguard\nstop\nnamespace\nip link add\n`);
 
     const loadFailed = runCase(false, false);
     expect(loadFailed.trace).not.toContain("ip link add");
     expect(loadFailed.run.stderr).toContain("ativacao foi cancelada antes de fechar o Discord");
-    expect(loadFailed.trace).toBe("authorization\nmodprobe wireguard\n");
+    expect(loadFailed.trace).toBe(`authorization\n${loadFailed.modprobe} wireguard\n`);
     expect(loadFailed.trace).not.toContain("stop");
     expect(loadFailed.trace).not.toContain("namespace");
   });

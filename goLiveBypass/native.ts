@@ -64,17 +64,20 @@ import { resolveWindowsPnpmBuildCommand } from "./plugin-build";
 import { defaultPluginVpnDataDir, PluginVpnController, type ProtonLoginPayload, type ProtonOptimizationOptions } from "./vpn-controller";
 import { disposeWireSockSnapshotWorker } from "./vpn-snapshot-worker";
 import {
+    DEFAULT_AUTH_PROMPT_TIMEOUT_MS,
     findSystemBinary,
     GOLIVE_PLUGIN_LINUX_NAMESPACE,
     isFlatpak as isLinuxFlatpak,
     isProcessInNamespace,
     isValidLinuxName,
+    linuxAuthorizationGuidance,
+    waitForFile,
 } from "./vpn-linux";
 import * as proton from "./vpn-proton";
 import { safeDiagnosticDetail } from "./vpn-types";
 import { createOperationId, createPluginLogger, trimJsonlTailByBytes, type PluginLogContext } from "./plugin-log";
 
-const PLUGIN_VERSION = "2.0.6";
+const PLUGIN_VERSION = "2.0.9";
 const PLUGIN_ASSET = "goLiveBypass-vencord.zip";
 const PLUGIN_CHECKSUM_ASSET = `${PLUGIN_ASSET}.sha256`;
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/PgLESv/GoLiveBypass/releases?per_page=20";
@@ -242,7 +245,7 @@ try {
 let quitting = false;
 
 type PluginUpdatePolicy = { enabled: boolean; channel: PluginUpdateChannel };
-type PendingPluginUpdatePhase = "preparing" | "prepared" | "rolling-back";
+type PendingPluginUpdatePhase = "preparing" | "prepared" | "rolling-back" | "staged";
 type PendingPluginUpdate = {
     version: string;
     channel: PluginUpdateChannel;
@@ -252,10 +255,14 @@ type PendingPluginUpdate = {
     // mas nunca são usados para confirmar ou descartar uma árvore preparada.
     sourceDigest?: string;
     // "preparing" é um journal de intenção: permite recuperar o checkout se o
-    // processo morrer durante a troca. Ausência significa o formato preparado
+    // processo morrer durante a troca. "staged" é o download já validado que
+    // espera a próxima abertura para trocar a árvore e compilar — nada no
+    // checkout é tocado durante a sessão. Ausência significa o formato preparado
     // usado antes do journal persistente.
     phase: PendingPluginUpdatePhase;
     displacedName?: string;
+    // Árvore em staging (dentro de UPDATE_STAGING_DIR) que o "staged" vai promover.
+    stagedPath?: string;
     backupName: string;
     createdAt: number;
 };
@@ -636,6 +643,9 @@ async function requestRelaunch(namespace: string | null): Promise<boolean> {
         const directNativeLaunch = currentlyInNamespace && !inFlatpak;
         let temporaryHostLauncher: string | undefined;
         let temporaryHostLauncherAccepted = false;
+        // Marcador combinado com o launcher (--confirm=): só existe depois que o novo processo
+        // entrou no namespace. Fica fora do try para ser limpo em qualquer saída.
+        const confirmMarker = join(VPN_DATA_DIR, `.relaunch-confirm-${randomUUID()}`);
         try {
             const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
             const gid = typeof process.getgid === "function" ? process.getgid() : undefined;
@@ -667,6 +677,10 @@ async function requestRelaunch(namespace: string | null): Promise<boolean> {
                     String(uid),
                     String(gid),
                     ...(inFlatpak ? ["--self-delete"] : []),
+                    // O launcher escreve este arquivo depois de entrar no namespace: é o sinal
+                    // para encerrar o cliente atual. Sem ele, sair do processo era uma aposta de
+                    // 200 ms e um polkit sem resposta deixava o usuário sem Discord (#313).
+                    `--confirm=${confirmMarker}`,
                     ...launcherEnvArgs,
                     "--",
                     target,
@@ -684,38 +698,49 @@ async function requestRelaunch(namespace: string | null): Promise<boolean> {
                 }
             }
 
-            const { promise, resolve, reject } = Promise.withResolvers<void>();
             const child = spawn(command, spawnArgs, {
                 detached: true,
                 stdio: ["ignore", "ignore", "pipe"],
                 env: childEnv,
             });
-            let settled = false;
             let stderrData = "";
-            const finish = (error?: Error) => {
-                if (settled) return;
-                settled = true;
-                if (error) reject(error);
-                else resolve();
+            const { promise: falhaDoRelaunch, resolve: relatarFalha } = Promise.withResolvers<Error>();
+            let falhaSettled = false;
+            const relatarUmaVez = (error: Error) => {
+                if (falhaSettled) return;
+                falhaSettled = true;
+                relatarFalha(error);
             };
             child.stderr?.on("data", chunk => { stderrData = (stderrData + chunk.toString("utf8")).slice(-1000); });
-            child.once("error", error => finish(error));
+            child.once("error", error => relatarUmaVez(error));
             child.once("close", (code, signal) => {
                 if (code === 0 || code === null) {
-                    finish();
+                    // Saiu cedo mas sem erro: só conta como falha se a confirmação ainda não veio
+                    // (o waitForFile decide pelo timeout).
+                    relatarUmaVez(new Error("O relançamento terminou antes de entrar no namespace."));
                     return;
                 }
                 const detail = `${stderrData.trim()} (código ${code}, sinal ${signal})`.trim();
                 if (/AccessDenied|Portal call failed|Permission denied/i.test(detail)) {
-                    finish(new Error(`O cliente Flatpak não possui permissão para executar o relaunch no host. Conceda: flatpak override --user --talk-name=org.freedesktop.Flatpak ${flatpakId || "<app-id>"}`));
+                    relatarUmaVez(new Error(`O cliente Flatpak não possui permissão para executar o relaunch no host. Conceda: flatpak override --user --talk-name=org.freedesktop.Flatpak ${flatpakId || "<app-id>"}`));
                     return;
                 }
-                finish(new Error(`Relaunch Linux encerrou prematuramente: ${detail}`));
+                relatarUmaVez(new Error(`Relaunch Linux encerrou prematuramente: ${detail}`));
             });
-            const timer = setTimeout(() => finish(), 200);
-            timer.unref?.();
             child.unref();
-            await promise;
+
+            const resultado = await Promise.race([
+                waitForFile(confirmMarker, DEFAULT_AUTH_PROMPT_TIMEOUT_MS).then(ok => (ok ? "confirmado" as const : "timeout" as const)),
+                falhaDoRelaunch,
+            ]);
+            try { rmSync(confirmMarker, { force: true }); } catch {}
+            if (resultado !== "confirmado") {
+                if (typeof resultado === "string") {
+                    const guidance = linuxAuthorizationGuidance("pkexec", "pkexec");
+                    throw new Error(`O relançamento não confirmou a entrada no namespace em ${Math.round(DEFAULT_AUTH_PROMPT_TIMEOUT_MS / 1000)}s.${guidance ? ` ${guidance}` : ""}`);
+                }
+                throw resultado;
+            }
             temporaryHostLauncherAccepted = true;
         } finally {
             if (temporaryHostLauncher && !temporaryHostLauncherAccepted) {
@@ -1655,12 +1680,15 @@ function validPendingUpdate(value: unknown): PendingPluginUpdate | null {
         : typeof raw.sourceDigest === "string" && SOURCE_DIGEST_PATTERN.test(raw.sourceDigest) ? raw.sourceDigest.toLowerCase() : null;
     const phase = raw.phase === undefined
         ? "prepared" as const
-        : raw.phase === "preparing" || raw.phase === "prepared" || raw.phase === "rolling-back" ? raw.phase : null;
+        : raw.phase === "preparing" || raw.phase === "prepared" || raw.phase === "rolling-back" || raw.phase === "staged" ? raw.phase : null;
     const displacedName = raw.displacedName === undefined
         ? undefined
         : typeof raw.displacedName === "string" && SAFE_DISPLACED_NAME.test(raw.displacedName) ? raw.displacedName : null;
+    const stagedPath = raw.stagedPath === undefined
+        ? undefined
+        : typeof raw.stagedPath === "string" && raw.stagedPath.length > 0 && raw.stagedPath.length <= 4096 ? raw.stagedPath : null;
     const backupName = typeof raw.backupName === "string" && SAFE_BACKUP_NAME.test(raw.backupName) ? raw.backupName : null;
-    if (!version || !channel || !digest || sourceDigest === null || !phase || displacedName === null || !backupName || typeof raw.createdAt !== "number" || !Number.isFinite(raw.createdAt)) return null;
+    if (!version || !channel || !digest || sourceDigest === null || !phase || displacedName === null || stagedPath === null || !backupName || typeof raw.createdAt !== "number" || !Number.isFinite(raw.createdAt)) return null;
     return {
         version,
         channel,
@@ -1669,6 +1697,7 @@ function validPendingUpdate(value: unknown): PendingPluginUpdate | null {
         sourceDigest,
         phase,
         displacedName,
+        stagedPath,
         backupName,
         createdAt: raw.createdAt,
     };
@@ -1726,11 +1755,136 @@ function clearPendingUpdate(pending: PendingPluginUpdate, projectRoot?: string):
     rmSync(pendingUpdatePath(), { force: true });
 }
 
-function recoverInterruptedPluginUpdate(): void {
+/** Árvore em staging confiável para o "staged": dentro de UPDATE_STAGING_DIR, existente e com o digest esperado. */
+function stagedPluginSourcePath(projectRoot: string, pending: PendingPluginUpdate): string | null {
+    const staged = pending.stagedPath;
+    if (typeof staged !== "string" || !staged) return null;
+    const stagingRoot = resolve(projectRoot, UPDATE_STAGING_DIR);
+    const resolved = resolve(staged);
+    const inside = resolved.startsWith(`${stagingRoot}${process.platform === "win32" ? "\\" : "/"}`);
+    if (!inside || !existsSync(resolved)) return null;
+    try {
+        if (pending.sourceDigest && hashPluginSourceTree(resolved) !== pending.sourceDigest) return null;
+    } catch {
+        return null;
+    }
+    return resolved;
+}
+
+/** Remove o diretório de trabalho do staging depois que a árvore foi promovida. */
+function cleanupStagedWork(projectRoot: string, stagedSource: string): void {
+    const stagingRoot = resolve(projectRoot, UPDATE_STAGING_DIR);
+    const work = resolve(stagedSource, "..", "..");
+    if (!work.startsWith(`${stagingRoot}${process.platform === "win32" ? "\\" : "/"}`)) return;
+    if (basename(work) === basename(stagingRoot)) return;
+    cleanupExtractedWork(work);
+}
+
+/**
+ * Promove o update baixado na abertura atual: troca a árvore, compila e deixa o
+ * journal em "prepared" (o cliente passa a pedir reload). Roda no boot de propósito —
+ * é o único momento em que dá para mexer na árvore do mod sem travar a sessão do
+ * usuário com um build de até USERPLUGIN_BUILD_TIMEOUT_MS.
+ */
+async function applyStagedPluginUpdate(projectRoot: string, target: string, pending: TrustedPendingPluginUpdate): Promise<void> {
+    const staged = stagedPluginSourcePath(projectRoot, pending);
+    if (!staged) {
+        // Sem staging confiável não há o que promover: descarta a intenção e deixa a
+        // consulta seguinte baixar de novo, em vez de trocar a árvore por nada.
+        rmSync(pendingUpdatePath(), { force: true });
+        log("warn", "update baixado não tem mais a fonte em staging; uma nova consulta vai baixar de novo", {
+            versão: pending.version,
+            canal: pending.channel,
+        });
+        return;
+    }
+    const currentVersion = readInstalledPluginVersion(target);
+    const backup = safeBackupPath(projectRoot, pending.backupName);
+    writePendingUpdate({ ...pending, phase: "preparing" });
+    let oldTreeMoved = false;
+    try {
+        renameSync(target, backup);
+        oldTreeMoved = true;
+        renameSync(staged, target);
+        await rebuildUserplugin(projectRoot);
+        const preparedSourceDigest = hashPluginSourceTree(target);
+        if (pending.sourceDigest && preparedSourceDigest !== pending.sourceDigest)
+            throw new Error("a árvore preparada mudou durante a recompilação");
+        writePendingUpdate({
+            version: pending.version,
+            channel: pending.channel,
+            prerelease: pending.prerelease,
+            digest: pending.digest,
+            sourceDigest: preparedSourceDigest,
+            phase: "prepared",
+            backupName: pending.backupName,
+            createdAt: pending.createdAt,
+        });
+        cleanupStagedWork(projectRoot, staged);
+        log("info", `plugin preparado de ${currentVersion} para ${pending.version}; reload necessário`);
+    } catch (error) {
+        if (!oldTreeMoved) {
+            try { rmSync(pendingUpdatePath(), { force: true }); }
+            catch (markerError) { log("warn", "não consegui remover intenção de update após falha inicial", { erro: markerError }); }
+            throw error;
+        }
+        let rollbackSucceeded = false;
+        try {
+            // Só apaga a árvore promovida com o backup garantido em mãos: sem isso o
+            // checkout ficava sem o plugin quando o backup tinha sumido (visto no
+            // teste de 18/09, quando duas execuções concorrentes se atropelaram).
+            if (existsSync(backup)) {
+                if (existsSync(target)) rmSync(target, { recursive: true, force: true });
+                renameSync(backup, target);
+            }
+            await rebuildUserplugin(projectRoot);
+            rollbackSucceeded = true;
+        } catch (rollbackError) {
+            log("error", "falha ao restaurar o build anterior", { erro: rollbackError });
+        }
+        if (rollbackSucceeded) {
+            try { rmSync(pendingUpdatePath(), { force: true }); }
+            catch (markerError) { log("warn", "não consegui remover journal de update revertido", { erro: markerError }); }
+        }
+        throw error;
+    }
+}
+
+/**
+ * Serializa a recuperação: painel, configuração e checagem chamam isto no mesmo
+ * processo. Duas execuções concorrentes mexiam na mesma árvore — uma promovia o
+ * staging enquanto a outra tratava o mesmo journal como interrompido e removia o
+ * backup, deixando o checkout sem o plugin.
+ */
+let pluginUpdateRecoveryFlight: Promise<void> | null = null;
+
+function recoverInterruptedPluginUpdate(options: { allowStaged?: boolean } = {}): Promise<void> {
+    if (pluginUpdateRecoveryFlight) return pluginUpdateRecoveryFlight;
+    const flight = recoverPendingUpdateInternal(options).finally(() => {
+        if (pluginUpdateRecoveryFlight === flight) pluginUpdateRecoveryFlight = null;
+    });
+    pluginUpdateRecoveryFlight = flight;
+    return flight;
+}
+
+async function recoverPendingUpdateInternal(options: { allowStaged?: boolean }): Promise<void> {
     const pending = readPendingUpdate();
     if (!pending || pending.phase === "prepared") return;
+    // "staged" é aplicado só na abertura do cliente (app.whenReady), quando o usuário
+    // ainda não está usando a janela: promover durante a sessão recompilaria o plugin
+    // dentro do cliente em uso, que é exatamente o travamento que este fluxo evita.
+    if (pending.phase === "staged" && !options.allowStaged) return;
 
     const { projectRoot, target } = userpluginSource(true);
+
+    if (pending.phase === "staged") {
+        // A prova do staging vem do próprio inspect (árvore dentro do staging com o
+        // digest esperado); sem ela o journal é descartado no apply.
+        const trusted = inspectPendingUpdate().trusted;
+        if (trusted) await applyStagedPluginUpdate(projectRoot, target, trusted);
+        return;
+    }
+
     const backup = safeBackupPath(projectRoot, pending.backupName);
     const hasTarget = existsSync(target);
     const hasBackup = existsSync(backup);
@@ -1742,7 +1896,7 @@ function recoverInterruptedPluginUpdate(): void {
             // qualquer árvore que tenha ficado no target após uma queda.
             if (hasTarget) rmSync(target, { recursive: true, force: true });
             renameSync(backup, target);
-            rebuildUserplugin(projectRoot);
+            await rebuildUserplugin(projectRoot);
             if (displaced) rmSync(displaced, { recursive: true, force: true });
             rmSync(pendingUpdatePath(), { force: true });
             log("warn", "rollback interrompido recuperado para a versão estável", { versão: pending.version });
@@ -1761,7 +1915,7 @@ function recoverInterruptedPluginUpdate(): void {
             // Sem o backup estável, ao menos preserve uma árvore válida em vez
             // de deixar o checkout vazio. O journal permanece para diagnóstico.
             renameSync(displaced, target);
-            rebuildUserplugin(projectRoot);
+            await rebuildUserplugin(projectRoot);
         }
         throw new Error("rollback interrompido sem backup estável recuperável");
     }
@@ -1772,7 +1926,7 @@ function recoverInterruptedPluginUpdate(): void {
         // autoritativa, mesmo que uma árvore nova tenha chegado a ser criada.
         if (hasTarget) rmSync(target, { recursive: true, force: true });
         renameSync(backup, target);
-        rebuildUserplugin(projectRoot);
+        await rebuildUserplugin(projectRoot);
         rmSync(pendingUpdatePath(), { force: true });
         log("warn", "update interrompido recuperado para a versão anterior", { versão: pending.version, canal: pending.channel });
         return;
@@ -1827,10 +1981,23 @@ function reconcileReachedPendingUpdate(currentVersion = currentPluginVersion(), 
     return pending;
 }
 
-function discardPendingBetaForStable(currentVersion = currentPluginVersion(), inspection = inspectPendingUpdate()): void {
+async function discardPendingBetaForStable(currentVersion = currentPluginVersion(), inspection = inspectPendingUpdate()): Promise<void> {
     if (inspection.error) throw new Error(inspection.error);
     const pending = inspection.trusted;
     if (!pending || pending.channel !== "beta") return;
+
+    if (pending.phase === "staged") {
+        // Nada foi trocado no checkout: descartar é apagar o download e o journal. O
+        // caminho abaixo moveria a árvore em uso e a recompilaria à toa.
+        const { projectRoot } = userpluginSource(true);
+        const staged = stagedPluginSourcePath(projectRoot, pending);
+        try { clearPendingUpdate(pending, projectRoot); }
+        catch { clearPendingUpdate(pending); }
+        if (staged) cleanupStagedWork(projectRoot, staged);
+        log("info", `update beta baixado descartado ao selecionar stable (${pending.version})`);
+        return;
+    }
+
     if (isKnownPluginVersion(pluginRuntimeVersion) && isKnownPluginVersion(currentVersion)
         && compareUpdateVersion(pluginRuntimeVersion, pending.version) >= 0
         && compareUpdateVersion(currentVersion, pending.version) >= 0) {
@@ -1860,7 +2027,7 @@ function discardPendingBetaForStable(currentVersion = currentPluginVersion(), in
     try {
         renameSync(backup, target);
         stableMoved = true;
-        rebuildUserplugin(projectRoot);
+        await rebuildUserplugin(projectRoot);
     } catch (error) {
         try {
             // Se a recompilação falhar, devolva também o backup estável ao seu
@@ -1869,7 +2036,7 @@ function discardPendingBetaForStable(currentVersion = currentPluginVersion(), in
             if (stableMoved && existsSync(target) && !existsSync(backup)) renameSync(target, backup);
             if (!existsSync(target) && existsSync(displaced)) renameSync(displaced, target);
             if (!existsSync(target)) throw new Error("não consegui restaurar a fonte beta após falha do rollback");
-            rebuildUserplugin(projectRoot);
+            await rebuildUserplugin(projectRoot);
         } catch (rollbackError) {
             log("error", "falha ao restaurar o build anterior", { erro: rollbackError });
         }
@@ -1907,13 +2074,16 @@ function releaseInfo(channel: PluginUpdateChannel, currentVersion: string, signa
     });
 }
 
-function validateArchiveEntries(archive: string, extracted: string): void {
-    let listing: string;
+async function listArchiveEntries(archive: string): Promise<string> {
     try {
-        listing = execFileSync("unzip", ["-Z1", archive], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: PLUGIN_UPDATE_TIMEOUT_MS });
+        return (await execFileAsync("unzip", ["-Z1", archive], { timeoutMs: PLUGIN_UPDATE_TIMEOUT_MS })).stdout;
     } catch {
-        listing = execFileSync("tar", ["-tf", archive], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: PLUGIN_UPDATE_TIMEOUT_MS });
+        return (await execFileAsync("tar", ["-tf", archive], { timeoutMs: PLUGIN_UPDATE_TIMEOUT_MS })).stdout;
     }
+}
+
+async function validateArchiveEntries(archive: string, extracted: string): Promise<void> {
+    const listing = await listArchiveEntries(archive);
     const root = resolve(extracted);
     for (const entry of listing.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
         const normalized = entry.replaceAll("\\", "/");
@@ -2011,6 +2181,23 @@ function inspectPendingUpdate(): PendingUpdateInspection {
     const pending = readPendingUpdate();
     if (!pending) return { pending: null, trusted: null, error: null };
 
+    if (pending.phase === "staged") {
+        // Download validado que espera a próxima abertura: a prova dele é a árvore em
+        // staging (o target ainda tem a versão em uso). Sem isso o painel acusava
+        // "update interrompido" e cada consulta tentava promover o download na sessão.
+        const { projectRoot } = userpluginSource(true);
+        const staged = stagedPluginSourcePath(projectRoot, pending);
+        const digest = pending.sourceDigest;
+        if (!staged || typeof digest !== "string") {
+            return {
+                pending,
+                trusted: null,
+                error: "update baixado não tem mais a fonte em staging; uma nova consulta vai baixar de novo",
+            };
+        }
+        return { pending, trusted: { ...pending, sourceDigest: digest }, error: null };
+    }
+
     if (pending.phase !== "prepared") {
         return {
             pending,
@@ -2064,7 +2251,7 @@ function cleanupExtractedWork(work: string): void {
     catch (error) { log("warn", "não consegui limpar os temporários do update", { erro: error }); }
 }
 
-function extractAndValidatePlugin(zip: Buffer, release: PluginReleaseCandidate, projectRoot?: string): { work: string; source: string; sourceDigest: string } {
+async function extractAndValidatePlugin(zip: Buffer, release: PluginReleaseCandidate, projectRoot?: string): Promise<{ work: string; source: string; sourceDigest: string }> {
     const parent = projectRoot ? join(projectRoot, UPDATE_STAGING_DIR) : tmpdir();
     if (projectRoot) mkdirSync(parent, { recursive: true });
     const work = mkdtempSync(join(parent, "golivebypass-update-"));
@@ -2073,9 +2260,9 @@ function extractAndValidatePlugin(zip: Buffer, release: PluginReleaseCandidate, 
     writeFileSync(archive, zip, { mode: 0o600 });
     mkdirSync(extracted);
     try {
-        validateArchiveEntries(archive, extracted);
-        try { execFileSync("unzip", ["-q", archive, "-d", extracted], { stdio: "ignore", timeout: PLUGIN_UPDATE_TIMEOUT_MS }); }
-        catch { execFileSync("tar", ["-xf", archive, "-C", extracted], { stdio: "ignore", timeout: PLUGIN_UPDATE_TIMEOUT_MS }); }
+        await validateArchiveEntries(archive, extracted);
+        try { await execFileAsync("unzip", ["-q", archive, "-d", extracted], { timeoutMs: PLUGIN_UPDATE_TIMEOUT_MS }); }
+        catch { await execFileAsync("tar", ["-xf", archive, "-C", extracted], { timeoutMs: PLUGIN_UPDATE_TIMEOUT_MS }); }
         validateExtractedTree(extracted);
         const source = join(extracted, USERPLUGIN_DIR);
         const sourceResolved = resolve(source);
@@ -2094,7 +2281,7 @@ function extractAndValidatePlugin(zip: Buffer, release: PluginReleaseCandidate, 
 }
 
 async function performPluginUpdateCheckLocked(policy: PluginUpdatePolicy, signal?: AbortSignal): Promise<PluginUpdateCheckResult> {
-    if (policy.channel === "stable") discardPendingBetaForStable();
+    if (policy.channel === "stable") await discardPendingBetaForStable();
     const currentVersion = currentPluginVersion();
     requireKnownPluginVersion(currentVersion);
     const pendingInspection = inspectPendingUpdate();
@@ -2126,7 +2313,7 @@ async function performPluginUpdateCheckLocked(policy: PluginUpdatePolicy, signal
 async function performPluginUpdateCheck(policy: PluginUpdatePolicy, signal?: AbortSignal): Promise<PluginUpdateCheckResult> {
     const lock = acquirePluginUpdateLock();
     try {
-        recoverInterruptedPluginUpdate();
+        await recoverInterruptedPluginUpdate();
         return await performPluginUpdateCheckLocked(policy, signal);
     } finally {
         releasePluginUpdateLock(lock);
@@ -2167,7 +2354,7 @@ function runPluginUpdateCheck(policy: PluginUpdatePolicy): Promise<PluginUpdateC
 async function performPluginUpdateLocked(policy: PluginUpdatePolicy, revision: number, controller: AbortController): Promise<PluginUpdateResult> {
     const { signal } = controller;
     assertCurrentPluginUpdatePolicy(policy, revision);
-    if (policy.channel === "stable") discardPendingBetaForStable();
+    if (policy.channel === "stable") await discardPendingBetaForStable();
     const sourceAtStart = userpluginSource();
     const currentVersion = readInstalledPluginVersion(sourceAtStart.target);
     const sourceDigestAtStart = hashPluginSourceTree(sourceAtStart.target);
@@ -2207,7 +2394,10 @@ async function performPluginUpdateLocked(policy: PluginUpdatePolicy, revision: n
 
     // O staging fica no mesmo volume do checkout para que a troca final use
     // rename atômico também em instalações Windows com TEMP em outro disco.
-    const extracted = extractAndValidatePlugin(zip, release, sourceAtStart.projectRoot);
+    const extracted = await extractAndValidatePlugin(zip, release, sourceAtStart.projectRoot);
+    // O staging precisa sobreviver ao processo quando o update é adiado para a
+    // próxima abertura; só a falha/troca imediata limpa o diretório de trabalho.
+    let stagedForNextStart = false;
     try {
         assertCurrentPluginUpdatePolicy(policy, revision);
         const { projectRoot, target } = userpluginSource();
@@ -2221,69 +2411,33 @@ async function performPluginUpdateLocked(policy: PluginUpdatePolicy, revision: n
         const backupRoot = join(projectRoot, BACKUP_DIR);
         mkdirSync(backupRoot, { recursive: true });
         const backupName = `${USERPLUGIN_DIR}-${Date.now()}`;
-        const backup = safeBackupPath(projectRoot, backupName);
+        safeBackupPath(projectRoot, backupName); // valida o nome antes de gravar o journal
         assertCurrentPluginUpdatePolicy(policy, revision);
-        // Grave a intenção antes do primeiro rename. Se o processo morrer com
-        // o target ausente, o próximo boot sabe que deve restaurar o backup em
-        // vez de tratar o checkout como uma instalação inválida irrecuperável.
+        // Nada é movido nem compilado durante a sessão: o download já validado fica em
+        // staging e a troca + build acontecem na próxima abertura
+        // (recoverInterruptedPluginUpdate). Antes o rebuild rodava aqui, com o cliente
+        // em execução: a thread principal ficava presa até USERPLUGIN_BUILD_TIMEOUT_MS
+        // (relato beta: "o Discord congela e fecha, só com o plugin ativo").
         writePendingUpdate({
             version: release.version,
             channel: policy.channel,
             prerelease: release.prerelease,
             digest,
             sourceDigest: extracted.sourceDigest,
-            phase: "preparing",
+            phase: "staged",
+            stagedPath: extracted.source,
             backupName,
             createdAt: Date.now(),
         });
-        let oldTreeMoved = false;
-        try {
-            renameSync(target, backup);
-            oldTreeMoved = true;
-            assertCurrentPluginUpdatePolicy(policy, revision);
-            renameSync(extracted.source, target);
-            assertCurrentPluginUpdatePolicy(policy, revision);
-            rebuildUserplugin(projectRoot);
-            assertCurrentPluginUpdatePolicy(policy, revision);
-            const preparedSourceDigest = hashPluginSourceTree(target);
-            if (preparedSourceDigest !== extracted.sourceDigest)
-                throw new Error("a árvore preparada mudou durante a recompilação");
-            assertCurrentPluginUpdatePolicy(policy, revision);
-            writePendingUpdate({
-                version: release.version,
-                channel: policy.channel,
-                prerelease: release.prerelease,
-                digest,
-                sourceDigest: preparedSourceDigest,
-                phase: "prepared",
-                backupName,
-                createdAt: Date.now(),
-            });
-        } catch (error) {
-            if (!oldTreeMoved) {
-                try { rmSync(pendingUpdatePath(), { force: true }); }
-                catch (markerError) { log("warn", "não consegui remover intenção de update após falha inicial", { erro: markerError }); }
-                throw error;
-            }
-            let rollbackSucceeded = false;
-            try {
-                if (existsSync(target)) rmSync(target, { recursive: true, force: true });
-                if (existsSync(backup)) renameSync(backup, target);
-                rebuildUserplugin(projectRoot);
-                rollbackSucceeded = true;
-            } catch (rollbackError) {
-                log("error", "falha ao restaurar o build anterior", { erro: rollbackError });
-            }
-            if (rollbackSucceeded) {
-                try { rmSync(pendingUpdatePath(), { force: true }); }
-                catch (markerError) { log("warn", "não consegui remover journal de update revertido", { erro: markerError }); }
-            }
-            throw error;
-        }
-        log("info", `plugin preparado de ${currentVersion} para ${release.version}; reload necessário`);
+        stagedForNextStart = true;
+        log("info", `plugin ${release.version} baixado e validado; a troca e o build ficam para a próxima abertura do Discord`, {
+            versao_atual: currentVersion,
+            versao_nova: release.version,
+            canal: policy.channel,
+        });
         return {
             ok: true,
-            updated: true,
+            updated: false,
             current: pluginRuntimeVersion,
             latest: release.version,
             channel: policy.channel,
@@ -2292,14 +2446,16 @@ async function performPluginUpdateLocked(policy: PluginUpdatePolicy, revision: n
             reloadRequired: true,
         };
     } finally {
-        cleanupExtractedWork(extracted.work);
+        // No caminho adiado o diretório de trabalho é a fonte que a próxima abertura
+        // promove; só a troca imediata (ou uma falha) pode limpar o staging.
+        if (!stagedForNextStart) cleanupExtractedWork(extracted.work);
     }
 }
 
 async function performPluginUpdate(policy: PluginUpdatePolicy, revision: number, controller: AbortController): Promise<PluginUpdateResult> {
     const lock = acquirePluginUpdateLock();
     try {
-        recoverInterruptedPluginUpdate();
+        await recoverInterruptedPluginUpdate();
         return await performPluginUpdateLocked(policy, revision, controller);
     } finally {
         releasePluginUpdateLock(lock);
@@ -2352,7 +2508,7 @@ async function automaticPluginUpdate(policy: PluginUpdatePolicy): Promise<void> 
     }
 }
 
-export function configurePluginUpdates(_: IpcMainInvokeEvent, value?: unknown): PluginUpdatePolicy {
+export async function configurePluginUpdates(_: IpcMainInvokeEvent, value?: unknown): Promise<PluginUpdatePolicy> {
     const next = policyFrom(value, { enabled: true, channel: "stable" });
     const changed = next.enabled !== pluginUpdatePolicy.enabled || next.channel !== pluginUpdatePolicy.channel;
     pluginUpdatePolicy = next;
@@ -2376,8 +2532,8 @@ export function configurePluginUpdates(_: IpcMainInvokeEvent, value?: unknown): 
         try {
             const lock = acquirePluginUpdateLock();
             try {
-                recoverInterruptedPluginUpdate();
-                discardPendingBetaForStable();
+                await recoverInterruptedPluginUpdate();
+                await discardPendingBetaForStable();
             } finally {
                 releasePluginUpdateLock(lock);
             }
@@ -2396,11 +2552,11 @@ export function configurePluginUpdates(_: IpcMainInvokeEvent, value?: unknown): 
     return next;
 }
 
-export function getPluginUpdateStatus(_: IpcMainInvokeEvent) {
+export async function getPluginUpdateStatus(_: IpcMainInvokeEvent) {
     let lock: PluginUpdateLock | undefined;
     try {
         lock = acquirePluginUpdateLock();
-        recoverInterruptedPluginUpdate();
+        await recoverInterruptedPluginUpdate();
         const installedVersion = currentPluginVersion();
         const pendingInspection = inspectPendingUpdate();
         const pending = reconcileReachedPendingUpdate(installedVersion, pendingInspection);
@@ -2521,7 +2677,41 @@ function resolveWindowsPnpm(): string {
     return candidates.find(candidate => existsSync(candidate)) ?? "pnpm.cmd";
 }
 
-function rebuildUserplugin(projectRoot: string): void {
+/**
+ * Roda um utilitário externo sem segurar a thread principal do Discord.
+ *
+ * O build do userplugin pode levar minutos e antes era `execFileSync`: a janela do
+ * cliente congelava pelo tempo inteiro da compilação (relato beta: "o Discord congela
+ * e fecha, só com o plugin ativo").
+ */
+function execFileAsync(
+    file: string,
+    args: string[],
+    options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs: number },
+): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+        execFile(file, args, {
+            cwd: options.cwd,
+            env: options.env,
+            timeout: options.timeoutMs,
+            windowsHide: true,
+            shell: false,
+            encoding: "utf8",
+            maxBuffer: 16 * 1024 * 1024,
+        }, (error, stdout, stderr) => {
+            const captured = { stdout: String(stdout ?? ""), stderr: String(stderr ?? "") };
+            if (error) {
+                // O erro do execFile não carrega os buffers; o detalhe do build depende deles.
+                Object.assign(error, { capturedStdout: captured.stdout, capturedStderr: captured.stderr });
+                reject(error);
+                return;
+            }
+            resolve(captured);
+        });
+    });
+}
+
+async function rebuildUserplugin(projectRoot: string): Promise<void> {
     const windows = process.platform === "win32";
     const pnpm = windows ? resolveWindowsPnpm() : "pnpm";
     const build = windows
@@ -2532,10 +2722,10 @@ function rebuildUserplugin(projectRoot: string): void {
         env.Path = [...new Set([...build.pathEntries, env.Path ?? env.PATH ?? ""].filter(Boolean))].join(";");
     }
     try {
-        execFileSync(build.command, build.args, { cwd: projectRoot, env, stdio: "pipe", windowsHide: true, shell: false, timeout: USERPLUGIN_BUILD_TIMEOUT_MS });
+        await execFileAsync(build.command, build.args, { cwd: projectRoot, env, timeoutMs: USERPLUGIN_BUILD_TIMEOUT_MS });
     } catch (error) {
-        const failure = error as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string };
-        const detail = [failure.message, failure.stderr, failure.stdout].filter(Boolean).map(value => String(value).trim()).join("\n").slice(-1200);
+        const failure = error as { capturedStderr?: string; capturedStdout?: string; message?: string };
+        const detail = [failure.message, failure.capturedStderr, failure.capturedStdout].filter(Boolean).map(value => String(value).trim()).join("\n").slice(-1200);
         throw new Error(`não consegui recompilar o plugin${detail ? `: ${detail}` : ""}`);
     }
 }
@@ -2583,7 +2773,7 @@ app.whenReady().then(async () => {
     log("info", `abrindo plugin VPN | ${process.platform} ${process.arch} | electron ${process.versions.electron}`);
     try {
         const lock = acquirePluginUpdateLock();
-        try { recoverInterruptedPluginUpdate(); }
+        try { await recoverInterruptedPluginUpdate({ allowStaged: true }); }
         finally { releasePluginUpdateLock(lock); }
     } catch (error) {
         log("warn", "não consegui concluir a recuperação de update interrompido", { erro: error });

@@ -86,6 +86,46 @@ func jsonErrorResponse(err error) map[string]any {
 	return response
 }
 
+// sessionCheckResponse monta o contrato JSON de -check-session. O codigo separa
+// "sessao invalida" de "nao consegui verificar agora" (NETWORK_ERROR + retryable):
+// a GUI usa essa distincao para nao deslogar o usuario - nem bloquear o botao de
+// ativar - por uma falha de rede passageira.
+func sessionCheckResponse(session *api.Session, err error, username string, timeUntilExpiry time.Duration) map[string]any {
+	if err == nil && session != nil {
+		return map[string]any{
+			"success":   true,
+			"valid":     true,
+			"username":  username,
+			"expiresIn": timeUntilExpiry.String(),
+		}
+	}
+	if err == nil {
+		// Sessao ausente sem erro tipado: invalida, nunca temporaria.
+		err = errors.New("session unavailable")
+	}
+	errorMessage := "Sessão expirada ou não encontrada"
+	if auth.IsTemporarySessionError(err) {
+		errorMessage = "Não foi possível verificar a sessão Proton temporariamente"
+	}
+	classified := jsonErrorResponse(err)
+	response := map[string]any{
+		"success": false,
+		"valid":   false,
+		"error":   errorMessage,
+	}
+	if code, ok := classified["code"]; ok {
+		response["code"] = code
+	} else {
+		response["code"] = "INVALID_SESSION"
+	}
+	retryable, ok := classified["retryable"]
+	if !ok {
+		retryable = false
+	}
+	response["retryable"] = retryable
+	return response
+}
+
 func run() error {
 	if hasArg("-route-probe", "--route-probe") {
 		result := routeprobe.Run(context.Background())
@@ -130,21 +170,14 @@ func run() error {
 
 	if cfg.CheckSession {
 		session, timeUntilExpiry, err := authClient.CheckSession()
-		if err != nil || session == nil {
-			errorMessage := "Sessão expirada ou não encontrada"
-			if auth.IsTemporarySessionError(err) {
-				errorMessage = "Não foi possível verificar a sessão Proton temporariamente"
-			}
+		payload := sessionCheckResponse(session, err, cfg.Username, timeUntilExpiry)
+		if payload["valid"] != true {
 			if cfg.JSONOutput {
-				data, _ := json.Marshal(map[string]any{
-					"success": false,
-					"valid":   false,
-					"error":   errorMessage,
-				})
+				data, _ := json.Marshal(payload)
 				fmt.Println(string(data))
 				return nil
 			}
-			return errors.New(errorMessage)
+			return errors.New(payload["error"].(string))
 		}
 		vpnClient := vpn.NewClient(cfg, session)
 		tier := 0
@@ -159,17 +192,12 @@ func run() error {
 			}
 			isPaid = tier >= api.TierPlus
 		}
+		payload["tier"] = tier
+		payload["planTitle"] = planTitle
+		payload["isPaid"] = isPaid
 
 		if cfg.JSONOutput {
-			data, _ := json.Marshal(map[string]any{
-				"success":   true,
-				"valid":     true,
-				"username":  cfg.Username,
-				"expiresIn": timeUntilExpiry.String(),
-				"tier":      tier,
-				"planTitle": planTitle,
-				"isPaid":    isPaid,
-			})
+			data, _ := json.Marshal(payload)
 			fmt.Println(string(data))
 			return nil
 		}

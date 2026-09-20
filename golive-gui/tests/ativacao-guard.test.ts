@@ -72,7 +72,7 @@ describe("guarda de ativacao duplicada", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     expect(src).toContain("if (ativacaoCorrente !== null)");
     expect(src).toContain("assinaturaUltimaAtivacao = assinatura;");
-    expect(src).toContain('getStatus() === "ACTIVE"');
+    expect(src).toContain('getStatusAsync({ forceRefresh: true }) === "ACTIVE"');
   });
 
   it("o boot migra o estado legado para WireGuard", () => {
@@ -90,7 +90,7 @@ describe("guarda de ativacao duplicada", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const fnStart = src.indexOf("async function deactivateAll()");
     const fnBody = src.slice(fnStart, fnStart + 2200);
-    expect(fnBody).toContain("const hadWireSock = IS_WINDOWS && isWireSockActive();");
+    expect(fnBody).toContain("const hadWireSock = IS_WINDOWS && (await isWireSockActiveAsync());");
     expect(fnBody).toContain('withWireSockLifecycle("desativacao"');
     expect(fnBody).toMatch(/await killDiscord\(\);[\s\S]{0,300}await recoverWireSockNetwork\(\);[\s\S]{0,500}startDiscordAndConfirm\(installs, "desativacao"\)/);
     expect(fnBody).toContain("if (!recovery.ok)");
@@ -103,7 +103,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(fnBody).toContain('withWireSockLifecycle("restaurar-internet"');
     expect(fnBody).toContain("const recovery = await recoverWireSockNetwork();");
     expect(fnBody).toContain("if (hadWireSock && recovery.ok)");
-    expect(fnBody).toContain("const hadWireSock = isWireSockActive();");
+    expect(fnBody).toContain("const hadWireSock = await isWireSockActiveAsync();");
   });
 
   it("inicia o túnel antes do cliente e observa a rota em segundo plano", () => {
@@ -145,11 +145,11 @@ describe("guarda de ativacao duplicada", () => {
     expect(src).toContain("assertWindowsRouteGeneration(generation)");
     expect(src).toContain('if (IS_WINDOWS && sessaoAtiva())');
     expect(src).toContain('await activateBypass({});');
-    const statusStart = src.indexOf("function getStatus(options: WindowsDiscoveryReadOptions");
+    const statusStart = src.indexOf("async function getStatusAsync(options: WindowsDiscoveryReadOptions");
     const status = src.slice(statusStart, src.indexOf("async function linuxStatus", statusStart));
     expect(status).toContain('return "CONNECTING"');
     expect(status).toContain('return "RECOVERY_REQUIRED"');
-    expect(status).toContain("windowsRouteStarted && isWireSockActive() && discordIsRunning()");
+    expect(status).toContain("windowsRouteStarted && (await isWireSockActiveAsync()) && (await discordIsRunningAsync())");
   });
 
   it("aguarda a limpeza WireSock terminar antes de concluir o quit", () => {
@@ -231,12 +231,12 @@ describe("guarda de ativacao duplicada", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
     const probe = src.slice(src.indexOf("function discordProcessState"), src.indexOf("function discordDidNotStop"));
     expect(probe).toContain('return probeFailed ? "unknown" : "stopped"');
-    expect(probe).toContain("waitForProcessStopped(() => discordProcessState()");
+    expect(probe).toContain("waitForProcessStopped(() => discordProcessStateAsync()");
   });
 
   it("confirma que o Update.exe do Discord saiu antes de trocar a rota", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    const updaterProbe = src.slice(src.indexOf("function discordUpdaterProcessState"), src.indexOf("function killMacProcesses"));
+    const updaterProbe = src.slice(src.indexOf("const DISCORD_UPDATER_PROBE_SCRIPT"), src.indexOf("function killMacProcesses"));
     expect(updaterProbe).toContain("$_ .CommandLine".replace("$_ .", "$_."));
     expect(updaterProbe).toContain('return "unknown"');
     expect(updaterProbe).toContain("waitUntilDiscordUpdaterGone");
@@ -257,7 +257,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(deactivation).toContain("A rede foi restaurada, mas o Discord não iniciou");
 
     const restore = src.slice(src.indexOf('ipcMain.handle("restore-internet"'), src.indexOf('ipcMain.handle("get-platform"'));
-    const discovery = restore.indexOf("getDiscordInstalls({ forceRefresh: true })");
+    const discovery = restore.indexOf("getDiscordInstallsAsync({ forceRefresh: true })");
     const kill = restore.indexOf("await killDiscord()");
     expect(discovery).toBeGreaterThanOrEqual(0);
     expect(discovery).toBeLessThan(kill);

@@ -259,6 +259,20 @@ export function recommendProtonRoute(candidates: Iterable<ProtonRouteCandidate>)
     return sortProtonRouteCandidates(eligible)[0]?.server;
 }
 
+/**
+ * Falha da otimização automática não pode deixar o usuário sem saída. Sem
+ * nenhuma rota selecionável — lista vazia, só pings sem resposta ou todas
+ * reprovadas no preflight — o catálogo precisa ser medido de novo para a lista
+ * manual (ordenada por ping) voltar a oferecer escolha. Com uma rota já
+ * selecionável, remedir só custaria outra rodada de ping sem mudar a decisão.
+ */
+export function shouldMeasureRouteCatalogOnFailure(candidates: Iterable<ProtonRouteCandidate> | null | undefined): boolean {
+    for (const candidate of candidates ?? []) {
+        if (isProtonRouteSelectable(candidate)) return false;
+    }
+    return true;
+}
+
 // ------------------------------------------------------------------ apresentação
 
 export function formatProtonRoutePing(pingMs?: number): string {

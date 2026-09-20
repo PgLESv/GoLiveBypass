@@ -90,25 +90,58 @@ static int self_delete_launcher(const char *path) {
     return fail_message("não foi possível remover o launcher temporário");
 }
 
+/* O relançador (plugin) só pode encerrar o cliente antigo depois de o novo processo ter entrado
+ * no namespace. Antes isto era adivinhado por tempo: o plugin saía ~200 ms depois do pkexec e,
+ * com o polkit esperando resposta (ou recusando), o Discord ficava fechado e não voltava
+ * (relato #313). A confirmação é escrita DEPOIS de abandonar privilégios, então o arquivo fica
+ * com o dono certo; o marcador é combinado por argumento e nunca herdado pelo cliente. */
+static int write_confirmation(const char *path, const char *namespace) {
+    char line[160];
+    int length;
+    int descriptor;
+
+    if (path == NULL || path[0] == '\0') return 0;
+    length = snprintf(line, sizeof(line), "ok %s\n", namespace);
+    if (length <= 0 || length >= (int)sizeof(line)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (descriptor < 0) return -1;
+    if (write(descriptor, line, (size_t)length) != (ssize_t)length) {
+        close(descriptor);
+        return -1;
+    }
+    if (close(descriptor) != 0) return -1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     char namespace_path[PATH_MAX];
     uid_t uid;
     uid_t gid;
     int namespace_fd;
-    int separator = 4;
-    int environment_start = 4;
+    int separator;
+    int environment_start;
     int delete_after_start = 0;
+    const char *confirm_path = NULL;
     struct passwd *account;
+    int option_index = 4;
 
     if (argc < 6 || !valid_component(argv[1]) || !parse_id(argv[2], &uid) || !parse_id(argv[3], &gid)) {
         errno = EINVAL;
         return fail_message("argumentos inválidos");
     }
-    if (strcmp(argv[environment_start], "--self-delete") == 0) {
+    if (option_index < argc && strcmp(argv[option_index], "--self-delete") == 0) {
         delete_after_start = 1;
-        environment_start++;
-        separator = environment_start;
+        option_index++;
     }
+    while (option_index < argc && strncmp(argv[option_index], "--confirm=", 10) == 0) {
+        confirm_path = argv[option_index] + 10;
+        option_index++;
+    }
+    environment_start = option_index;
+    separator = option_index;
     while (separator < argc && strcmp(argv[separator], "--") != 0) separator++;
     if (separator >= argc || separator + 1 >= argc) {
         errno = EINVAL;
@@ -148,6 +181,12 @@ int main(int argc, char **argv) {
     if (geteuid() != uid || getegid() != gid) {
         errno = EPERM;
         return fail_message("o processo não abandonou privilégios administrativos");
+    }
+
+    /* Depois disto o cliente já pode ser encerrado do outro lado: falhar aqui mantém o
+     * Discord antigo aberto, em vez de deixar o usuário sem cliente nenhum. */
+    if (write_confirmation(confirm_path, argv[1]) != 0) {
+        return fail_message("não foi possível confirmar o relançamento");
     }
 
     execv(argv[separator + 1], &argv[separator + 1]);

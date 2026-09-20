@@ -57,15 +57,74 @@ describe("updater nativo do plugin", () => {
     expect(native).toContain("pendingChannel");
   });
 
-  it("grava journal antes da troca e recupera um update interrompido", () => {
+  it("grava journal antes da troca, adia o build para o boot e recupera um update interrompido", () => {
     const start = native.indexOf("async function performPluginUpdateLocked");
     const end = native.indexOf("function runPluginUpdate(policy", start);
     const block = native.slice(start, end);
-    expect(block.indexOf('phase: "preparing"')).toBeGreaterThanOrEqual(0);
-    expect(block.indexOf("renameSync(target, backup)")).toBeGreaterThan(block.indexOf('phase: "preparing"'));
-    expect(block.indexOf('phase: "prepared"')).toBeGreaterThan(block.indexOf("renameSync(target, backup)"));
-    expect(native).toContain("function recoverInterruptedPluginUpdate()");
+    // A sessão só baixa, valida e registra: trocar a árvore ou compilar aqui travava
+    // a thread principal do Discord por até USERPLUGIN_BUILD_TIMEOUT_MS.
+    expect(block).toContain('phase: "staged"');
+    expect(block).toContain("stagedPath: extracted.source");
+    expect(block).not.toContain("renameSync(target, backup)");
+    expect(block).not.toContain("rebuildUserplugin(");
+
+    // A troca e o build acontecem no boot, com o journal já gravado antes do rename.
+    const applyStart = native.indexOf("async function applyStagedPluginUpdate");
+    const applyEnd = native.indexOf("async function recoverInterruptedPluginUpdate", applyStart);
+    expect(applyStart).toBeGreaterThanOrEqual(0);
+    const apply = native.slice(applyStart, applyEnd);
+    expect(apply.indexOf('phase: "preparing"')).toBeGreaterThanOrEqual(0);
+    expect(apply.indexOf("renameSync(target, backup)")).toBeGreaterThan(apply.indexOf('phase: "preparing"'));
+    expect(apply.indexOf("await rebuildUserplugin(projectRoot)")).toBeGreaterThan(apply.indexOf("renameSync(target, backup)"));
+    expect(apply.indexOf('phase: "prepared"')).toBeGreaterThan(apply.indexOf("await rebuildUserplugin(projectRoot)"));
+
+    expect(native).toContain("async function recoverPendingUpdateInternal(options: { allowStaged?: boolean }): Promise<void>");
+    expect(native).toContain('if (pending.phase === "staged")');
     expect(native).toContain("update interrompido deixou a árvore nova sem backup");
+  });
+
+  it("não bloqueia a thread principal do Discord com build ou extração", () => {
+    // Nenhuma etapa do updater pode voltar para a variante síncrona: o build roda
+    // dentro do processo principal do cliente e um `execFileSync` ali congela a
+    // janela inteira (relato beta: "congela e fecha").
+    expect(native).toContain("await execFileAsync(build.command, build.args, { cwd: projectRoot, env, timeoutMs: USERPLUGIN_BUILD_TIMEOUT_MS })");
+    expect(native).toContain('await execFileAsync("unzip"');
+    expect(native).toContain('await execFileAsync("tar"');
+    expect(native).toContain("async function rebuildUserplugin(projectRoot: string): Promise<void>");
+    expect(native).toContain("async function extractAndValidatePlugin");
+    expect(native).not.toMatch(/execFileSync\(\s*build\.command/);
+    const remainingSync = [...native.matchAll(/execFileSync\(\s*"([a-z.]+)"/g)].map(match => match[1]);
+    expect(remainingSync).toEqual(["tasklist"]);
+  });
+
+  it("aplica o download adiado só na abertura do cliente", () => {
+    // Enquanto a sessão roda, painel/configuração/checagem chamam a recuperação. Se
+    // qualquer uma delas promovesse o staging, o plugin seria recompilado dentro do
+    // cliente em uso (relato beta) e a promoção podia cruzar com a própria checagem.
+    const calls = native.match(/recoverInterruptedPluginUpdate\((?:\{[^}]*\})?\)/g) ?? [];
+    expect(calls.filter(call => call.includes("allowStaged: true")).length).toBe(1);
+    expect(calls.length).toBe(5);
+    const boot = native.slice(native.indexOf("app.whenReady().then(async () => {"), native.indexOf("pluginRuntimeVersion = currentPluginVersion();"));
+    expect(boot).toContain("recoverInterruptedPluginUpdate({ allowStaged: true })");
+    expect(native).toContain('if (pending.phase === "staged" && !options.allowStaged) return;');
+  });
+
+  it("serializa a recuperação para não atropelar a mesma árvore", () => {
+    expect(native).toContain("let pluginUpdateRecoveryFlight: Promise<void> | null = null;");
+    expect(native).toContain("if (pluginUpdateRecoveryFlight) return pluginUpdateRecoveryFlight;");
+    // O rollback nunca apaga a árvore promovida sem o backup em mãos.
+    const apply = native.slice(native.indexOf("async function applyStagedPluginUpdate"), native.indexOf("async function recoverInterruptedPluginUpdate"));
+    expect(apply).toContain("if (existsSync(backup)) {\n                if (existsSync(target)) rmSync(target, { recursive: true, force: true });");
+  });
+
+  it("reconhece o download adiado como pendente e o descarta sem mexer na árvore", () => {
+    const inspection = native.slice(native.indexOf("function inspectPendingUpdate"), native.indexOf("function trustedPendingResultState"));
+    expect(inspection).toContain('if (pending.phase === "staged")');
+    expect(inspection).toContain("stagedPluginSourcePath(projectRoot, pending)");
+    const discard = native.slice(native.indexOf("async function discardPendingBetaForStable"), native.indexOf("function releaseInfo"));
+    expect(discard).toContain('if (pending.phase === "staged")');
+    expect(discard).toContain("cleanupStagedWork(projectRoot, staged)");
+    expect(discard.indexOf("cleanupStagedWork(projectRoot, staged)")).toBeLessThan(discard.indexOf("const displacedName"));
   });
 
   it("serializa updates entre processos", () => {
@@ -106,8 +165,8 @@ describe("updater nativo do plugin", () => {
     expect(block).not.toMatch(/app\.(quit|relaunch)\s*\(/);
     expect(native).toMatch(/export function enable\([^)]*IpcMainInvokeEvent[^)]*\)/);
     expect(native).toMatch(/export function shutdown\([^)]*IpcMainInvokeEvent[^)]*\)/);
-    expect(native).toContain("export function configurePluginUpdates");
-    expect(native).toContain("export function getPluginUpdateStatus");
+    expect(native).toContain("export async function configurePluginUpdates");
+    expect(native).toContain("export async function getPluginUpdateStatus");
     expect(native).toMatch(/export (?:async )?function checkPluginUpdate/);
     expect(native).toMatch(/export (?:async )?function updatePlugin/);
   });

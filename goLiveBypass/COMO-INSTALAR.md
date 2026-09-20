@@ -15,7 +15,7 @@ modificado por esta migração.
 
 ## Linha v2 beta
 
-A versão atual do plugin é **2.0.6**. Nesta linha, a VPN WireGuard/WireSock é
+A versão atual do plugin é **2.0.9**. Nesta linha, a VPN WireGuard/WireSock é
 iniciada e controlada pelo próprio plugin, com estado privado em
 `%LOCALAPPDATA%\\GoLiveBypass\\plugin-vpn` no Windows ou
 `$XDG_DATA_HOME/GoLiveBypass/plugin-vpn` no Linux (por padrão `~/.local/share/GoLiveBypass/plugin-vpn`).
@@ -29,7 +29,7 @@ necessária para o build empacotado.
 
 O beta ainda não é um release estável. O updater ignora prereleases quando consulta o
 canal estável; para testar esta linha, instale o código-fonte do plugin e recompile o
-checkout do Equicord/Vencord. A release usa `2.0.6`; a tag GitHub acrescenta
+checkout do Equicord/Vencord. A release usa `2.0.9`; a tag GitHub acrescenta
 apenas o prefixo `v`.
 
 ## Atualizações do plugin
@@ -47,8 +47,11 @@ as releases do repositório do projeto e instala somente o asset
 - **Atualização automática** vem ligada por padrão. Quando ligada, o plugin verifica em
   segundo plano e prepara a atualização; quando desligada, as verificações automáticas são
   interrompidas, mas **Verificar agora** e **Atualizar** continuam disponíveis no painel.
-- Antes de substituir os arquivos, o updater confere HTTPS, o manifesto do plugin, o
-  tamanho do arquivo e o **SHA-256** publicado. Se a validação ou a recompilação falhar,
+- Antes de aplicar, o updater confere HTTPS, o manifesto do plugin, o tamanho do arquivo e
+  o **SHA-256** publicado; o download validado fica em staging dentro do checkout e o
+  journal registra o estado `staged`. A troca dos arquivos e a recompilação acontecem
+  **na próxima abertura do cliente**, quando você ainda não está usando a janela: a
+  compilação nunca roda com o Discord em uso. Se a validação ou a recompilação falhar,
   o backup anterior é restaurado e a VPN, a chamada e o Discord permanecem intactos.
 - A atualização nunca reinicia o Discord silenciosamente. Depois de uma atualização
   preparada, o painel informa que é necessário fazer um **reload/recarregar manualmente o
@@ -69,16 +72,24 @@ Trocar o usuário inicia uma nova sessão e o botão para sair remove a sessão 
 
 Na etapa da rota, o progresso exibido vem dos eventos reais do controlador: fase atual,
 servidores testados/aprovados, servidor escolhido e latência/velocidades quando medidas.
-Cancelar interrompe a otimização sem ativar ou reiniciar o Discord. A conclusão apenas
-salva a preparação; a ativação do túnel continua sendo uma ação separada no painel. O
-assistente pode ser adiado e reaberto pelo botão **Abrir guia de configuração** ou pela
-ação do Toolbox do Vencord/Equicord.
+Cancelar interrompe a otimização sem ativar ou reiniciar o Discord. Se a otimização
+automática falhar sem nenhuma rota utilizável — o critério exige download e upload
+completos pelo túnel —, o próprio assistente mede o catálogo Proton de novo e mostra a
+lista manual ordenada por ping (com a rota recomendada em destaque) para a escolha seguir
+dali; nenhuma rota já medida é remedida. A conclusão apenas salva a preparação; a ativação
+do túnel continua sendo uma ação separada no painel. O assistente pode ser adiado e
+reaberto pelo botão **Abrir guia de configuração** ou pela ação do Toolbox do
+Vencord/Equicord.
 
 ## Instalação resumida
 
 1. Tenha o **Git**, **Node.js 22+** e **pnpm** instalados. No Linux, instale também
-   `iproute2`, `wireguard-tools` e `polkit`; o cliente precisa de uma sessão `systemd --user`
-   quando o relaunch sair da namespace.
+   `iproute2`, `wireguard-tools` e o polkit — `policykit-1` no Debian/Ubuntu (`sudo apt
+   install policykit-1`), `polkit` no Fedora (`sudo dnf install polkit`) e no Arch (`sudo
+   pacman -S polkit`); o cliente precisa de uma sessão `systemd --user`
+   quando o relaunch sair da namespace. Se o kernel em execução estiver sem os módulos,
+   reinicie no kernel instalado ou instale o pacote de módulos correspondente (no
+   Debian/Ubuntu: `sudo apt install linux-modules-$(uname -r)`).
 2. Baixe o código do Equicord (ou Vencord):
    `git clone https://github.com/Equicord/Equicord` (ou Vencord/Vencord)
 3. Copie **esta pasta** (`goLiveBypass`) para dentro de `src/userplugins/`
@@ -126,6 +137,40 @@ Discord estiver aberto e o painel avisa disso antes do login. Senhas e códigos 
 Para um perfil próprio, escolha **Arquivo WireGuard personalizado** e informe o caminho do
 `.conf`; o plugin copia o perfil para sua pasta privada, remove DNS do perfil e isola somente
 o executável do Discord e o `Update.exe` da instalação atual (ou o cliente dentro da namespace Linux).
+
+## Cliente que não abre depois de instalar (Windows ou Linux)
+
+O instalador troca o `app.asar` do cliente para carregar o mod e guarda o original em
+`_app.asar`. Se o checkout, o build ou a versão do mod mudarem depois, o cliente pode ficar
+sem abrir — e até agora não havia caminho de volta pelo instalador. Agora há:
+
+```sh
+# Linux — mostra o estado da injeção em cada cliente (não altera nada)
+./golivebypass-installer.sh --client-status
+
+# devolve o app.asar original de todos os clientes com patch/backup
+./golivebypass-installer.sh --restore-client
+
+# só um cliente, e desfazendo também um mod que está funcionando
+./golivebypass-installer.sh --restore-client Equibop --force
+```
+
+```powershell
+# Windows — equivalente
+.\GoLiveBypass-Installer.ps1 -Mode ClientStatus
+.\GoLiveBypass-Installer.ps1 -Mode RestoreClient
+.\GoLiveBypass-Installer.ps1 -Mode RestoreClient -Client Equibop -Force
+```
+
+O comando fecha o Discord, copia `_app.asar` de volta para `app.asar` (guardando o patch
+anterior em `app.asar.golive-patched.bak`), reabre o cliente e continua funcionando sem rede.
+Ele restaura sozinho quando o patch é nosso ou quando a injeção do mod aponta para um alvo que
+não existe mais; **recusa** desfazer um mod Vencord/Equicord que está funcionando (ou um patch
+de outro programa) sem `--force`/`-Force`, porque nesse caso o cliente perderia o mod.
+
+Se o cliente ainda não abrir, o caminho manual é o mesmo passo: com o cliente fechado,
+`cp _app.asar app.asar` na pasta `resources` dele (no Windows, em
+`%LOCALAPPDATA%\<cliente>\app-<versão>\resources`).
 
 ## Tutorial completo
 

@@ -17,7 +17,9 @@ export function findStandaloneScript(): string {
   const beside = path.join(path.dirname(process.execPath), 'standalone', 'golivebypass-standalone.sh');
   if (fs.existsSync(beside)) return beside;
 
-  throw new Error('Nao encontrei golivebypass-standalone.sh');
+  // Sem os caminhos tentados, "nao encontrei" nao dizia nem onde procurar (relato: a
+  // limpeza no encerramento falhava assim depois de uma atualizacao do AppImage).
+  throw new Error(`Nao encontrei golivebypass-standalone.sh (procurei em ${[dev, bundled, beside].join(', ')})`);
 }
 
 export interface ScriptResult {

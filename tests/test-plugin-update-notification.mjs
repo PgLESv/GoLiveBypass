@@ -62,7 +62,7 @@ test("updater restringe metadata e artefatos ao GitHub oficial", () => {
   assert.match(nativeSource, /isCompatiblePluginManifest\(manifest, PLUGIN_ASSET\)/);
   assert.match(source, /checkPluginUpdate\(selectedUpdatePolicy\)/);
   assert.match(source, /updatePlugin\(selectedUpdatePolicy\)/);
-  assert.match(nativeSource, /api\.github\.com\/repos\/bezumiya\/GoLiveBypass\/releases/);
+  assert.match(nativeSource, /api\.github\.com\/repos\/(bezumiya|PgLESv)\/GoLiveBypass\/releases/);
   const asset = "https://github.com/bezumiya/GoLiveBypass/releases/download/v2.0.6-beta-3/goLiveBypass-vencord.zip";
   assert.equal(releaseAssetUrl(asset), asset);
   assert.equal(releaseAssetUrl("https://evil.example/releases/download/v2.0.6/goLiveBypass-vencord.zip"), null);
@@ -111,26 +111,32 @@ test("voos nativos não misturam canais e recusam instalações concorrentes", (
 });
 
 test("checagem automática limpa erro antigo quando o canal se recupera", () => {
-  const automaticBlock = nativeSource.slice(nativeSource.indexOf("async function automaticPluginUpdate"), nativeSource.indexOf("export function configurePluginUpdates"));
+  const automaticBlock = nativeSource.slice(nativeSource.indexOf("async function automaticPluginUpdate"), nativeSource.indexOf("export async function configurePluginUpdates"));
   assert.match(nativeSource, /let pluginUpdatePolicyRevision = 0/);
   assert.match(nativeSource, /function setPluginUpdateLastError\(/);
   assert.match(nativeSource, /revision !== pluginUpdatePolicyRevision/);
   assert.match(automaticBlock, /setPluginUpdateLastError\(policy, revision, null\)/);
   assert.match(automaticBlock, /setPluginUpdateLastError\(policy, revision, update\.ok \? null : update\.error\)/);
 });
-test("canal stable remove beta pendente mesmo sem troca de política", () => {
-  const configureBlock = nativeSource.slice(nativeSource.indexOf("export function configurePluginUpdates"), nativeSource.indexOf("export function getPluginUpdateStatus"));
-  const statusBlock = nativeSource.slice(nativeSource.indexOf("export function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
-  assert.match(configureBlock, /if \(next\.channel === "stable"\)[\s\S]*?discardPendingBetaForStable\(\)/);
-  assert.doesNotMatch(configureBlock, /if \(changed && next\.channel === "stable"\)/);
-  assert.match(statusBlock, /if \(pluginUpdatePolicy\.channel === "stable"\) discardPendingBetaForStable\(\)/);
-  assert.match(nativeSource, /policy\?\.channel === "stable" && inspection\.trusted\?\.channel === "beta"/);
+test("canal stable remove beta pendente sem abortar voo em andamento", () => {
+  const configureBlock = nativeSource.slice(nativeSource.indexOf("export async function configurePluginUpdates"), nativeSource.indexOf("export async function getPluginUpdateStatus"));
+  const statusBlock = nativeSource.slice(nativeSource.indexOf("export async function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
+  // A troca de política é que descarta o beta pendente; montar o painel com a mesma
+  // política não pode abortar um update automático em andamento (fluxo staged).
+  assert.match(configureBlock, /if \(changed && next\.channel === "stable"\)[\s\S]*?discardPendingBetaForStable\(\)/);
+  assert.match(configureBlock, /pluginUpdateCheckFlight\?\.controller\.abort\(\)/);
+  assert.match(nativeSource, /if \(!pending \|\| pending\.channel !== "beta"\) return;/);
+  // O descarte vive nos caminhos que decidem de verdade (checagem e update) com política
+  // stable; o status só recupera o que ficou interrompido, sem abortar voo em andamento.
+  const descartesComPoliticaStable = nativeSource.match(/if \(policy\.channel === "stable"\) await discardPendingBetaForStable\(\)/g) ?? [];
+  assert.ok(descartesComPoliticaStable.length >= 2, "checagem e update precisam descartar o beta pendente com política stable");
+  assert.match(statusBlock, /recoverInterruptedPluginUpdate\(\)/);
 });
 
 test("instalação tem orçamento maior que a consulta de update", () => {
   assert.match(source, /PLUGIN_UPDATE_CHECK_TIMEOUT_MS = 2 \* 60_000 \+ 15_000/);
   assert.match(source, /PLUGIN_UPDATE_INSTALL_TIMEOUT_MS = 3 \* 60_000/);
-  assert.match(nativeSource, /PLUGIN_UPDATE_TIMEOUT_MS = 2 \* 60_000/);
+  assert.match(nativeSource, /PLUGIN_UPDATE_TIMEOUT_MS = 30_000/);
   assert.match(source, /native\.checkPluginUpdate[\s\S]*?PLUGIN_UPDATE_CHECK_TIMEOUT_MS/);
   assert.match(source, /native\.updatePlugin[\s\S]*?PLUGIN_UPDATE_INSTALL_TIMEOUT_MS/);
 });
@@ -175,7 +181,11 @@ test("falha manual não duplica o overlay automático", () => {
 test("commit do update revalida a política antes de tocar no plugin", () => {
   assert.match(nativeSource, /function assertCurrentPluginUpdatePolicy\(policy: PluginUpdatePolicy, revision: number\)/);
   assert.match(nativeSource, /assertCurrentPluginUpdatePolicy\(policy, revision\);\n\s+const \{ projectRoot, target \} = userpluginSource\(\)/);
-  assert.match(nativeSource, /assertCurrentPluginUpdatePolicy\(policy, revision\);\n\s+renameSync\(extracted\.source, target\)/);
+  // A sessão não toca mais na árvore: a troca e o build ficam para o boot, e ali só
+  // uma árvore de staging que prova o digest esperado é promovida.
+  assert.match(nativeSource, /function stagedPluginSourcePath\(/);
+  assert.match(nativeSource, /hashPluginSourceTree\(resolved\) !== pending\.sourceDigest\) return null/);
+  assert.match(nativeSource, /if \(!staged\) \{[\s\S]*rmSync\(pendingUpdatePath\(\), \{ force: true \}\)/);
   assert.match(nativeSource, /revision: number;/);
   assert.match(nativeSource, /pluginUpdateFlight\.revision === revision/);
 });
@@ -185,7 +195,7 @@ test("o status reporta a versão em execução enquanto o checkout aguarda reloa
   assert.match(nativeSource, /let pluginRuntimeVersion = UNKNOWN_PLUGIN_VERSION/);
   assert.match(nativeSource, /const installedVersion = currentPluginVersion\(\);/);
   assert.match(nativeSource, /pending = reconcileReachedPendingUpdate\(installedVersion, pendingInspection\)/);
-  const statusBlock = nativeSource.slice(nativeSource.indexOf("export function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
+  const statusBlock = nativeSource.slice(nativeSource.indexOf("export async function getPluginUpdateStatus"), nativeSource.indexOf("export async function checkPluginUpdate"));
   assert.match(statusBlock, /current: pluginRuntimeVersion/);
 });
 
