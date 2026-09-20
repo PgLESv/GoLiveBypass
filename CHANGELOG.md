@@ -6,7 +6,7 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
-## [2.0.9-beta-1] - 2026-09-19
+## [2.0.9] - 2026-09-19
 
 ### GUI Windows: a ativação elevada deixa de ser reportada como problema de perfil
 
