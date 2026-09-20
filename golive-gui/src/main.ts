@@ -698,7 +698,7 @@ let currentPopulatedIsPaid: boolean | null = null;
 
 function populateProtonCountries(isPaid: boolean, selectedCountry = '') {
   const targetSelect = protonCountrySelectRoot as HTMLSelectElement | null;
-  if (!targetSelect) return;
+  if (!targetSelect || targetSelect.tagName !== 'SELECT') return;
   if (currentPopulatedIsPaid === isPaid && targetSelect.options.length > 4) {
     if (selectedCountry !== undefined && selectedCountry !== targetSelect.value) {
       targetSelect.value = selectedCountry;

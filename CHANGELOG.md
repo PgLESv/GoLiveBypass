@@ -4,6 +4,14 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.8] - 2026-09-20
+
+### Corrigido
+- **Interface Gráfica (GUI):**
+  - Corrigido o seletor de rotas Proton para não expandir todas as opções e países verticalmente na tela ao conectar uma conta Proton.
+  - O método de preenchimento legado agora ignora nós que não sejam `<select>` nativos, mantendo o componente moderno `ProtonRouteSelect` íntegro com seu botão trigger combobox e menu suspenso flutuante com rolagem.
+  - Prevenido o estouro vertical do card direito que ocultava e empurrava outros controles para fora dos limites da janela.
+
 ## [2.1.7] - 2026-09-20
 
 ### Sincronização Upstream (GoLiveBypass 2.0.9 Estável)
