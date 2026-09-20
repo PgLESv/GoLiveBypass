@@ -71,7 +71,9 @@ TUNNEL_STARTUP_SETTLE_SECONDS=2
 # Comparar o primeiro campo evita rejeitar o formato sem sufixo e tambem evita
 # confundir um namespace com nome apenas semelhante (ex.: discord-vpn-old).
 netns_exists() {
-    ip netns list 2>/dev/null | awk -v name="$NETNS_NAME" '$1 == name { found=1 } END { exit !found }'
+    _glb_ip="${IP_BINARY:-}"
+    [ -n "$_glb_ip" ] || _glb_ip=ip
+    "$_glb_ip" netns list 2>/dev/null | awk -v name="$NETNS_NAME" '$1 == name { found=1 } END { exit !found }'
 }
 
 # ---------------------------------------------------------------------------
@@ -696,7 +698,32 @@ done
 # rodadas sao de teste/CI. Usuario de verdade sem --yes reporta.
 [ "$ASSUME_YES" -eq 1 ] && REPORT_NO_AUTO=1 || REPORT_NO_AUTO=0
 
+# PATH do processo que chama este script (app iniciado pela interface grafica, AppImage,
+# sessao de usuario) nao inclui /usr/sbin em varias distros, e `modprobe`, `modinfo` e `ip`
+# moram la no Debian/Ubuntu. O `command -v` dava falso negativo com o pacote instalado: a
+# ativacao parava em "o comando modprobe nao esta disponivel" depois do sudo autorizado
+# (relato 19/09) e o diagnostico acusava iproute2 ausente. O PATH e a primeira tentativa
+# (respeita instalacao do usuario); os diretorios do sistema entram como reserva.
+resolve_binary() {
+    _glb_resolved="$(command -v "$1" 2>/dev/null || true)"
+    if [ -n "$_glb_resolved" ]; then
+        printf '%s\n' "$_glb_resolved"
+        return 0
+    fi
+    for _glb_dir in /usr/sbin /sbin /usr/bin /bin /usr/local/sbin /usr/local/bin; do
+        if [ -x "$_glb_dir/$1" ]; then
+            printf '%s\n' "$_glb_dir/$1"
+            return 0
+        fi
+    done
+    return 1
+}
+
 have() { command -v "$1" >/dev/null 2>&1; }
+
+IP_BINARY="$(resolve_binary ip || true)"
+MODPROBE_BINARY="$(resolve_binary modprobe || true)"
+MODINFO_BINARY="$(resolve_binary modinfo || true)"
 
 # Senha digitada numa janela (zenity/kdialog) para o sudo -S. Cacheada em arquivo
 # temporario para nao repetir a pergunta a cada operacao da injecao (mv, mkdir, cp).
@@ -1555,14 +1582,14 @@ ensure_wireguard_module() {
         return 0
     fi
 
-    if ! have modprobe; then
-        printf '%s\n' 'Falha: o comando modprobe nao esta disponivel para carregar o modulo WireGuard.' >&2
+    if [ -z "$MODPROBE_BINARY" ]; then
+        printf '%s\n' 'Falha: o comando modprobe nao esta disponivel para carregar o modulo WireGuard (instale o pacote kmod).' >&2
         return 1
     fi
 
     # Nunca encaminhar stderr do modprobe: caminhos do kernel e mensagens do
     # provedor de elevacao nao pertencem ao diagnostico exibido ao usuario.
-    if ! elevate modprobe wireguard >/dev/null 2>&1; then
+    if ! elevate "$MODPROBE_BINARY" wireguard >/dev/null 2>&1; then
         printf '%s\n' 'Falha: nao foi possivel carregar o modulo WireGuard; a ativacao foi cancelada antes de fechar o Discord.' >&2
         return 1
     fi
@@ -1571,7 +1598,7 @@ ensure_wireguard_module() {
         return 0
     fi
 
-    if have modinfo && modinfo wireguard >/dev/null 2>&1; then
+    if [ -n "$MODINFO_BINARY" ] && "$MODINFO_BINARY" wireguard >/dev/null 2>&1; then
         printf '%s\n' 'Falha: o modulo WireGuard existe, mas o kernel nao o ativou.' >&2
     else
         printf '%s\n' 'Falha: o modulo WireGuard nao esta disponivel neste kernel.' >&2
@@ -1829,8 +1856,8 @@ linux_preflight_json() {
     if have ip && ip netns list >/dev/null 2>&1; then netns_ok=true; else errors="${errors}${errors:+,}ip netns"; fi
     if wireguard_module_loaded; then
         kernel="loaded"
-    elif have modinfo; then
-        if modinfo wireguard >/dev/null 2>&1; then
+    elif [ -n "$MODINFO_BINARY" ]; then
+        if "$MODINFO_BINARY" wireguard >/dev/null 2>&1; then
             kernel="available"
         else
             kernel="missing"
