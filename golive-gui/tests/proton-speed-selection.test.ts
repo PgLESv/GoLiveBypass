@@ -6,6 +6,8 @@ import os from 'os';
 
 const state = vi.hoisted(() => ({
   success: true,
+  json: undefined as any,
+  error: '',
   executable: '',
   args: [] as string[],
   existed: false,
@@ -33,10 +35,24 @@ vi.mock('child_process', () => ({
       return true;
     });
     queueMicrotask(() => {
+      const routeCatalog = args.includes('-route-catalog');
       const routePool = args.includes('-route-pool');
       const outputDirAt = args.indexOf('-route-pool-output-dir');
       const outputDir = outputDirAt >= 0 ? args[outputDirAt + 1] : '';
-      const result = routePool
+      const result = state.json !== undefined
+        ? state.json
+        : routeCatalog
+        ? {
+          success: state.success,
+          routes: [0, 1, 2].map((index) => ({
+            server: index === 0 ? 'US#1' : index === 1 ? 'NL#2' : 'CH#3',
+            country: index === 0 ? 'US' : index === 1 ? 'NL' : 'CH',
+            city: index === 0 ? 'New York' : index === 1 ? 'Amsterdam' : 'Zurich',
+            tier: 'Free', load: 10 + index, score: 1 + index,
+            ...(args.includes('-auto-ping') ? { pingMs: 80 + index } : {}),
+          })),
+        }
+        : routePool
         ? {
           success: state.success,
           expiresAt: Math.floor(Date.now() / 1000) + 3600,
@@ -50,9 +66,19 @@ vi.mock('child_process', () => ({
             confFile: outputDir ? path.join(outputDir, `route-0${index}.conf`) : '',
           })),
         }
+        : args.includes('-manual-probe')
+        ? state.success
+          ? {
+            success: true,
+            manual: true,
+            server: args[args.indexOf('-server') + 1] || 'US#8',
+            pingMs: 188,
+            endpoint: '192.0.2.8:51820',
+          }
+          : { success: false, error: state.error || 'rota manual indisponível' }
         : state.success
         ? { success: true, server: 'US#1', pingMs: 100, downloadMbps: state.downloadMbps, uploadMbps: state.uploadMbps, speedTested: 6, speedSucceeded: 5 }
-        : { success: false, error: 'nenhum candidato completou a medição' };
+        : { success: false, error: state.error || 'nenhum candidato completou a medição' };
       child.stdout.emit('data', Buffer.from(JSON.stringify(result)));
       if (state.createOutput && routePool && outputDir) {
         fs.mkdirSync(outputDir, { recursive: true });
@@ -70,12 +96,115 @@ vi.mock('child_process', () => ({
   }),
 }));
 
-import { canReuseMeasuredProfile, generateOptimalProtonConfig, generateProtonRoutePool, findProtonConfgenExe, MEASUREMENT_CRITERION_VERSION, runConfgen } from '../electron/proton';
+import { canReuseMeasuredProfile, generateManualProtonConfig, generateOptimalProtonConfig, generateProtonRouteCatalog, generateProtonRoutePool, findProtonConfgenExe, MEASUREMENT_CRITERION_VERSION, removeStagedProtonConfig, runConfgen } from '../electron/proton';
+import * as logger from '../electron/logger';
 
 describe('medidor isolado da regra WireSock', () => {
   beforeEach(() => {
-    state.success = true; state.code = 0; state.closeDelay = 0; state.createOutput = true;
+    state.success = true; state.json = undefined; state.error = ''; state.code = 0; state.closeDelay = 0; state.createOutput = true;
     state.progressChunks = []; state.killAt = 0; state.downloadMbps = 30; state.uploadMbps = 10;
+  });
+
+  it('gera somente a rota manual solicitada e deixa o perfil ativo intacto', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-manual-route-'));
+    fs.writeFileSync(path.join(dir, 'wireguard.conf'), 'existing profile');
+    try {
+      const result = await generateManualProtonConfig(dir, {
+        username: 'test@example.test',
+        server: 'US#8',
+        countries: 'US',
+        freeOnly: true,
+        autoPing: true,
+      });
+
+      expect(state.args).toEqual(expect.arrayContaining([
+        '-server', 'US#8', '-manual-probe',
+      ]));
+      expect(state.args).not.toContain('-speed-test');
+      expect(result).toMatchObject({
+        success: true,
+        server: 'US#8',
+        pingMs: 188,
+        staged: true,
+      });
+      expect(result.confFile).toBeTruthy();
+      expect(fs.readFileSync(path.join(dir, 'wireguard.conf'), 'utf8'))
+        .toBe('existing profile');
+      expect(fs.readFileSync(result.confFile!, 'utf8')).toContain('US#1');
+    } finally {
+      if (state.args.length > 0) {
+        const staged = fs.readdirSync(dir).find((name) => name.includes('.manual-proton-route.'));
+        if (staged) removeStagedProtonConfig(path.join(dir, staged));
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejeita JSON manual inválido e limpa o staged', async () => {
+    state.json = { success: true, manual: false, server: 'US#8', pingMs: 188 };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-manual-invalid-json-'));
+    try {
+      const result = await generateManualProtonConfig(dir, {
+        username: 'test@example.test', server: 'US#8',
+      });
+      expect(result.success).toBe(false);
+      expect(fs.readdirSync(dir).filter((name) => name.includes('.manual-proton-route.'))).toHaveLength(0);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('não promove saída não zero nem deixa arquivo staged', async () => {
+    state.success = false;
+    state.code = 1;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-manual-nonzero-'));
+    try {
+      const result = await generateManualProtonConfig(dir, {
+        username: 'test@example.test', server: 'US#8',
+      });
+      expect(result.success).toBe(false);
+      expect(fs.readdirSync(dir).filter((name) => name.includes('.manual-proton-route.'))).toHaveLength(0);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('rejeita sucesso sem arquivo staged e limpa o diretório', async () => {
+    state.createOutput = false;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-manual-no-output-'));
+    try {
+      const result = await generateManualProtonConfig(dir, {
+        username: 'test@example.test', server: 'US#8',
+      });
+      expect(result.success).toBe(false);
+      expect(fs.readdirSync(dir).filter((name) => name.includes('.manual-proton-route.'))).toHaveLength(0);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('redige a conta nos erros manuais', async () => {
+    state.success = false;
+    state.error = 'falha ao validar test@example.test na sessão';
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-manual-redaction-'));
+    try {
+      const result = await generateManualProtonConfig(dir, {
+        username: 'test@example.test', server: 'US#8',
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).not.toContain('test@example.test');
+      expect(result.error).toContain('[account]');
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('leva o motivo do helper para o log do relato quando a rota ótima falha', async () => {
+    state.success = false;
+    state.code = 1;
+    state.error = 'nenhum servidor concluiu download e upload pelo túnel; a rota anterior foi preservada';
+    logger._resetForTests();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-optimal-failure-report-'));
+    try {
+      const result = await generateOptimalProtonConfig(dir, { username: 'test', speedTest: true });
+      expect(result.success).toBe(false);
+      // O relato de bug envia o ring buffer: sem o motivo, a issue chega só com
+      // "codigo_saida=1" e a causa precisa ser reproduzida de novo.
+      const recent = logger.getRecent();
+      expect(recent).toContain('erro ao gerar configuração ótima');
+      expect(recent).toContain(state.error);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
   it('usa outro executável temporário, transmite Mbps reais e remove a cópia', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-speed-result-'));
@@ -90,6 +219,81 @@ describe('medidor isolado da regra WireSock', () => {
       expect(fs.readFileSync(path.join(dir, 'wireguard.conf'), 'utf8')).toContain('US#1');
       expect(fs.existsSync(path.dirname(state.executable))).toBe(false);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('carrega o catálogo completo sem ping, perfil ou arquivo temporário', async () => {
+    state.progressChunks = [
+      'GOLIVE_PROGRESS {"phase":"catalog","total":3,"tested":2,"succeeded":2,"server":"NL#2","country":"NL","city":"Amsterdam","tier":"Free","load":11,"score":2,"status":"success"}\n',
+    ];
+    const progress: any[] = [];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-route-catalog-'));
+    try {
+      const result = await generateProtonRouteCatalog(dir, {
+        username: 'test',
+        countries: 'US,NL',
+        freeOnly: true,
+        excludeServers: ['OLD#1'],
+        onProgress: (event) => progress.push(event),
+      });
+      expect(result).toEqual({
+        success: true,
+        routes: [
+          { server: 'US#1', country: 'US', city: 'New York', tier: 'Free', load: 10, score: 1 },
+          { server: 'NL#2', country: 'NL', city: 'Amsterdam', tier: 'Free', load: 11, score: 2 },
+          { server: 'CH#3', country: 'CH', city: 'Zurich', tier: 'Free', load: 12, score: 3 },
+        ],
+      });
+      expect(state.args).toEqual(expect.arrayContaining([
+        '-route-catalog', '-json', '-exclude-countries', 'BR', '-countries', 'US,NL',
+        '-free-only', '-exclude-servers', 'OLD#1', '-progress-json',
+      ]));
+      expect(state.args).not.toContain('-route-pool');
+      expect(state.args).not.toContain('-route-pool-output-dir');
+      expect(result.routes?.[0]).not.toHaveProperty('endpoint');
+      expect(result.routes?.[0]).not.toHaveProperty('confFile');
+      expect(progress).toEqual([
+        { phase: 'catalog', total: 3, tested: 2, succeeded: 2, server: 'NL#2', country: 'NL', city: 'Amsterdam', tier: 'Free', load: 11, score: 2, status: 'success' },
+      ]);
+      expect(fs.readdirSync(dir).filter((name) => name.includes('route-pool') || name.includes('manual-proton-route'))).toHaveLength(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('mede ping regional sem gerar perfil temporário', async () => {
+    state.progressChunks = [
+      'GOLIVE_PROGRESS {"phase":"ping","total":2,"tested":1,"succeeded":1,"server":"NL#2","pingMs":81,"status":"success"}\n',
+      'GOLIVE_PROGRESS {"phase":"catalog","total":3,"tested":2,"succeeded":2,"server":"NL#2","country":"NL","city":"Amsterdam","tier":"Free","load":11,"score":2,"pingMs":81,"status":"success"}\n',
+    ];
+    const progress: any[] = [];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-route-catalog-ping-'));
+    try {
+      const result = await generateProtonRouteCatalog(dir, {
+        username: 'test',
+        countries: 'US,NL',
+        freeOnly: true,
+        measurePing: true,
+        onProgress: (event) => progress.push(event),
+      });
+      expect(result).toMatchObject({
+        success: true,
+        routes: [
+          { server: 'US#1', pingMs: 80 },
+          { server: 'NL#2', pingMs: 81 },
+          { server: 'CH#3', pingMs: 82 },
+        ],
+      });
+      expect(state.args).toEqual(expect.arrayContaining([
+        '-route-catalog', '-json', '-auto-ping', '-progress-json',
+      ]));
+      expect(state.args).not.toContain('-speed-test');
+      expect(state.args).not.toContain('-route-pool');
+      expect(progress).toEqual([
+        { phase: 'ping', total: 2, tested: 1, succeeded: 1, server: 'NL#2', pingMs: 81, status: 'success' },
+        { phase: 'catalog', total: 3, tested: 2, succeeded: 2, server: 'NL#2', country: 'NL', city: 'Amsterdam', tier: 'Free', load: 11, score: 2, pingMs: 81, status: 'success' },
+      ]);
+      expect(fs.readdirSync(dir).filter((name) => name.includes('route-pool') || name.includes('manual-proton-route'))).toHaveLength(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('prepara duas reservas em pasta temporária sem promover o perfil ativo', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-route-pool-result-'));
@@ -106,6 +310,28 @@ describe('medidor isolado da regra WireSock', () => {
       expect(fs.readFileSync(path.join(dir, 'wireguard.conf'), 'utf8')).toBe('active profile');
       expect(result.stagingDir).toBeTruthy();
       expect(fs.existsSync(result.routes![0].confFile)).toBe(true);
+      fs.rmSync(result.stagingDir!, { recursive: true, force: true });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('propaga progresso de ping enquanto prepara reservas', async () => {
+    state.progressChunks = [
+      'GOLIVE_PROGRESS {"phase":"ping","total":24,"tested":1,"succeeded":1,"server":"NL#12","pingMs":42,"status":"success"}\n',
+    ];
+    const progress: any[] = [];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-route-pool-progress-'));
+    try {
+      const result = await generateProtonRoutePool(dir, {
+        username: 'test',
+        size: 2,
+        countries: 'US,NL',
+        excludeServers: ['OLD#1'],
+        onProgress: (event) => progress.push(event),
+      });
+      expect(result.success).toBe(true);
+      expect(state.args).toContain('-progress-json');
+      expect(progress).toEqual([
+        { phase: 'ping', total: 24, tested: 1, succeeded: 1, server: 'NL#12', pingMs: 42, status: 'success' },
+      ]);
       fs.rmSync(result.stagingDir!, { recursive: true, force: true });
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });

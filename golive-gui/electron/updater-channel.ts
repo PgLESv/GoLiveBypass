@@ -16,21 +16,24 @@ export interface ReleaseCandidata {
   url: string | null; // browser_download_url do exe (null = sem exe anexado)
   digest: string | null; // sha256 que a propria API do GitHub devolve no asset
   prerelease: boolean;
+  assetName?: string;
+  size?: number;
 }
 
 export interface AssetWindows {
   name: string;
   browser_download_url?: string;
   digest?: string;
+  size?: number;
 }
 
 // O portable tem o nome exato da tag sem o prefixo "v". Não aceite apenas o
-// prefixo GoLiveBypass-: a mesma release também carrega o proton-confgen.exe.
+// prefixo "GoLiveBypass-": a mesma release também carrega o proton-confgen.exe.
 export function escolherAssetWindows(tag: string, assets: AssetWindows[]): AssetWindows | null {
   const semV = tag.replace(/^v/, "");
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(semV)) return null;
 
-  const esperado = `GoLiveBypass-${semV}.exe`;
+  const esperado = "GoLiveBypass-" + semV + ".exe";
   return assets.find((asset) => {
     if (!asset || typeof asset.name !== "string" || asset.name !== esperado) return false;
     if (asset.browser_download_url === undefined) return true;

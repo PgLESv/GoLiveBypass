@@ -1,4 +1,4 @@
-﻿<#
+<#
     GoLiveBypass - instalador automatico
 
     Encontra sozinho o Equicord ou o Vencord que voce tem, instala o plugin, compila e
@@ -6,12 +6,17 @@
 
     Uso:
       .\GoLiveBypass-Installer.ps1
+      .\GoLiveBypass-Installer.ps1 -Channel stable
+      .\GoLiveBypass-Installer.ps1 -Channel beta -Mode Update
       .\GoLiveBypass-Installer.ps1 -Source "C:\caminho\do\Equicord"
       .\GoLiveBypass-Installer.ps1 -PluginSource "C:\caminho\do\GoLiveBypass\goLiveBypass"
       .\GoLiveBypass-Installer.ps1 -Mod Equicord -Yes
       .\GoLiveBypass-Installer.ps1 -Mode Uninstall
-      .\GoLiveBypass-Installer.ps1 -Mode CheckUpdate   # so consulta o GitHub, nao mexe
+      .\GoLiveBypass-Installer.ps1 -Mode CheckUpdate   # consulta a API e pode persistir o canal, sem baixar ZIP
       .\GoLiveBypass-Installer.ps1 -Mode Update        # aplica update se houver
+      .\GoLiveBypass-Installer.ps1 -Mode ClientStatus  # estado da injecao em cada cliente (nao altera nada)
+      .\GoLiveBypass-Installer.ps1 -Mode RestoreClient # devolve o app.asar original (cliente que nao abre)
+      .\GoLiveBypass-Installer.ps1 -Mode RestoreClient -Client Equibop -Force
 
     Obrigado ao Vithor (https://github.com/Vith0r), que escreveu o primeiro instalador do
     GoLiveBypass e abriu o caminho para este aqui.
@@ -19,7 +24,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu', 'Install', 'Uninstall', 'Restore', 'CheckUpdate', 'Update')]
+    [ValidateSet('Menu', 'Install', 'Uninstall', 'Restore', 'CheckUpdate', 'Update', 'RestoreClient', 'ClientStatus')]
     [string] $Mode = 'Menu',
 
     [ValidateSet('Equicord', 'Vencord')]
@@ -32,15 +37,31 @@ param(
     # e um teste feito assim mede a versao errada sem avisar.
     [string] $PluginSource = '',
 
-    [switch] $Yes
+    [ValidateSet('stable', 'beta')]
+    [string] $Channel = 'stable',
+
+    [switch] $Yes,
+
+    # -Mode RestoreClient: nome do cliente a restaurar (Equibop, Vesktop, Legcord, Discord).
+    # Vazio restaura todos os que tem patch/backup.
+    [string] $Client = '',
+
+    # Desfaz tambem um mod Vencord/Equicord que esta funcionando (o cliente perde o mod).
+    [switch] $Force
 )
 
+$script:ChannelExplicit = $PSBoundParameters.ContainsKey('Channel')
+$script:SelectedChannel = $Channel
+
 Write-Host ''
-Write-Host '  [AVISO] Plugin e standalone CLI estao temporariamente fora do ar.' -ForegroundColor Yellow
-Write-Host '          O novo sistema WireGuard ainda esta sendo portado para essas variantes.' -ForegroundColor DarkGray
-Write-Host '          Use a GUI 2.0.0 de teste enquanto isso. Nenhuma instalacao foi realizada.' -ForegroundColor DarkGray
+Write-Host '  GoLiveBypass para Equicord/Vencord — escolha seu canal de atualizacoes.' -ForegroundColor Cyan
+Write-Host '         Stable e a opcao recomendada: canal mais previsivel, somente releases estaveis.' -ForegroundColor DarkGray
+Write-Host '         Beta e opcional: canal de testes; voce ajuda a comunidade ao testar, encontrar' -ForegroundColor DarkGray
+Write-Host '         e corrigir erros antes da versao estavel. O sistema ainda nao e estavel; nenhum canal promete estabilidade.' -ForegroundColor DarkGray
+Write-Host '         Ao testar, encontrar e corrigir erros, relate em https://github.com/bezumiya/GoLiveBypass/issues.' -ForegroundColor DarkGray
+Write-Host '         O standalone continua separado e nao e alterado por este instalador.' -ForegroundColor DarkGray
 Write-Host ''
-exit 1
+
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -50,7 +71,26 @@ $ErrorActionPreference = 'Stop'
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }
 
 $RepoRaw = 'https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main'
-$PluginFiles = @('goLiveBypass/index.tsx', 'goLiveBypass/native.ts', 'goLiveBypass/stability.ts', 'goLiveBypass/manifest.json')
+$PluginFiles = @(
+    'goLiveBypass/index.tsx',
+    'goLiveBypass/native.ts',
+    'goLiveBypass/plugin-build.ts',
+    'goLiveBypass/plugin-log.ts',
+    'goLiveBypass/bug-report.ts',
+    'goLiveBypass/update-channel.ts',
+    'goLiveBypass/update-security.ts',
+    'goLiveBypass/proton-manual-selection.ts',
+    'goLiveBypass/stability.ts',
+    'goLiveBypass/vpn-controller.ts',
+    'goLiveBypass/vpn-proton.ts',
+    'goLiveBypass/vpn-types.ts',
+    'goLiveBypass/vpn-snapshot.ts',
+    'goLiveBypass/vpn-snapshot-worker.ts',
+    'goLiveBypass/vpn-windows.ts',
+    'goLiveBypass/vpn-linux.ts',
+    'goLiveBypass/manifest.json'
+)
+$PluginHelperRelative = 'bin\win32-x64\proton-confgen.exe'
 $PluginDirName = 'goLiveBypass'
 $DiscordNames = @('Discord', 'DiscordCanary', 'DiscordPTB')
 
@@ -75,18 +115,6 @@ $Mods = @{
     Vencord  = @{ Git = 'https://github.com/Vendicated/Vencord'; Label = 'Vencord'; Note = 'o original, mais enxuto' }
 }
 
-# Tor embutido: mesma versao e mesmos hashes da GUI (golive-gui/electron/main.ts), para os
-# instaladores de linha de comando entregarem exatamente o mesmo daemon que ela usa. A porta
-# dedicada 9060 evita conflito com um Tor do sistema (9050) ou do Tor Browser (9150).
-$TorBundle = '13.5'
-$TorPort = 9060
-$TorUrls = @{
-    'tor-expert-bundle-windows-x86_64-13.5.tar.gz' = @{
-        Url = 'https://archive.torproject.org/tor-package-archive/torbrowser/13.5/tor-expert-bundle-windows-x86_64-13.5.tar.gz'
-        Sha256 = '5978ccc2a7fed783c329474888e87f5e6349aa132d9c43016418bff296c7becb'
-    }
-}
-
 function Write-Step($text) { Write-Host "  [*] $text" -ForegroundColor DarkGray }
 function Write-Ok($text) { Write-Host "  [OK] $text" -ForegroundColor Green }
 function Write-Warn($text) { Write-Host "  [!] $text" -ForegroundColor Yellow }
@@ -105,6 +133,106 @@ function Remove-CaminhoSilencioso($caminho) {
         if ([System.IO.Directory]::Exists($cheio)) { [System.IO.Directory]::Delete($cheio, $true) }
     } catch { }
 }
+# O npm instala pnpm.ps1, pnpm.cmd e, em algumas variantes, pnpm.exe lado a lado. O
+# command discovery do PowerShell prefere o .ps1, mas esse shim pode apontar para um
+# entrypoint antigo e falhar mesmo depois de `pnpm --version` responder. Resolva somente
+# Application (.exe/.cmd) e, para .cmd, execute o entrypoint do pacote diretamente com Node.
+$script:PnpmEntrypoints = @('pnpm.cjs', 'pnpm.mjs', 'pnpm')
+$script:PnpmExitCode = 0
+
+function Find-PnpmApplications {
+    $candidates = @()
+    $found = Get-Command 'pnpm' -CommandType Application -ErrorAction SilentlyContinue
+    if ($found) { $candidates += @($found | ForEach-Object { $_.Source }) }
+    $candidates += @(
+        $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'pnpm\pnpm.exe' }),
+        $(if ($env:APPDATA) { Join-Path $env:APPDATA 'npm\pnpm.cmd' }),
+        $(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE 'AppData\Roaming\npm\pnpm.cmd' }),
+        $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'pnpm\pnpm.cmd' }),
+        $(if ($env:ProgramW6432) { Join-Path $env:ProgramW6432 'nodejs\pnpm.cmd' }),
+        $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'nodejs\pnpm.cmd' }),
+        $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'nodejs\pnpm.cmd' })
+    )
+
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if (-not $candidate -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $key = $candidate.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $candidate
+    }
+}
+
+function Resolve-PnpmInvocation([string[]]$Arguments) {
+    $fallbackShim = $null
+    foreach ($shim in @(Find-PnpmApplications)) {
+        if ([IO.Path]::GetExtension($shim) -ieq '.exe') {
+            return [pscustomobject]@{ Command = $shim; Arguments = $Arguments }
+        }
+        if (-not $fallbackShim) { $fallbackShim = $shim }
+
+        $shimDir = Split-Path -Parent $shim
+        $packageRoots = @(
+            (Join-Path $shimDir 'node_modules\pnpm'),
+            (Join-Path (Split-Path -Parent $shimDir) 'pnpm')
+        )
+        foreach ($root in $packageRoots) {
+            foreach ($name in $script:PnpmEntrypoints) {
+                $entrypoint = Join-Path $root "bin\$name"
+                if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) { continue }
+
+                $nodeCandidates = @(
+                    (Join-Path $shimDir 'node.exe'),
+                    $(if ($env:ProgramW6432) { Join-Path $env:ProgramW6432 'nodejs\node.exe' }),
+                    $(if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'nodejs\node.exe' }),
+                    $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe' })
+                )
+                $node = $nodeCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+                if (-not $node) { $node = 'node.exe' }
+                return [pscustomobject]@{ Command = $node; Arguments = @($entrypoint) + $Arguments }
+            }
+        }
+    }
+
+    if (-not $fallbackShim) { return $null }
+    $windowsRoot = if ($env:SystemRoot) { $env:SystemRoot } elseif ($env:WINDIR) { $env:WINDIR } else { 'C:\Windows' }
+    $cmd = if ($env:ComSpec -and (Test-Path -LiteralPath $env:ComSpec -PathType Leaf)) {
+        $env:ComSpec
+    } else {
+        Join-Path $windowsRoot 'System32\cmd.exe'
+    }
+    return [pscustomobject]@{ Command = $cmd; Arguments = @('/d', '/s', '/c', 'call', $fallbackShim) + $Arguments }
+}
+
+# Stderr de processo nativo e diagnostico, nunca falha — mas no Windows PowerShell 5.1 a
+# primeira linha que chega por ele vira erro TERMINATIVO enquanto ErrorActionPreference=Stop,
+# mesmo com 2>&1 (o mesmo caso que ja derrubava o probe do corepack mais abaixo). O pnpm
+# escreve o proprio banner (`$ node scripts/runInstaller.mjs ...`) em stderr e o Equilotl,
+# injetor atual do Equicord, loga TUDO em stderr: sem esta guarda a injecao morria em menos de
+# um segundo com exit=-1 e "pos-condicao nao confirmada", sem nunca ter chamado o injetor
+# (log do instalador na VM: installer.inject failure/POSTCONDITION_NOT_CONFIRMED com o banner
+# do pnpm como unico detalhe). O codigo de saida continua sendo lido aqui e a pos-condicao
+# segue autoridade sobre ele.
+function Invoke-Pnpm([string[]]$Arguments) {
+    $invocation = Resolve-PnpmInvocation $Arguments
+    if (-not $invocation) {
+        $script:PnpmExitCode = 127
+        return
+    }
+
+    $command = $invocation.Command
+    $commandArguments = @($invocation.Arguments)
+    $anterior = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $command @commandArguments 2>&1
+        $script:PnpmExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $anterior
+    }
+}
+
 
 function Show-Banner {
     Write-Host ''
@@ -157,6 +285,113 @@ function Confirm-Action($question) {
 }
 
 
+# =========================================================================== log local
+# Observabilidade LOCAL do instalador (escopo B): eventos em installer.log (JSONL) no
+# diretorio de dados existente. Nao ha POST, webhook ou telemetria — o usuario copia a
+# saida do terminal ou abre o log manualmente. Falha de escrita NUNCA derruba a instalacao.
+$script:InstallerLogMaxBytes = 256 * 1024
+$script:InstallerComponent = 'installer.windows'
+$script:InstallerOperationId = 'installer-' + ([guid]::NewGuid().ToString('N').Substring(0, 12))
+$script:InstallerPhase = 'detect'
+# Chave proibida vira <redacted>; chave fora da allowlist e descartada (fail-closed).
+$script:InstallerForbiddenKey = '(?i)(password|senha|token|captcha|secret|private[_]?key|public[_]?key|authorization|cookie|session|credential|stdin|rawconfig|^config$|endpoint)'
+$script:InstallerAllowedKeys = @(
+    'mode', 'channel', 'permanent', 'we_injected', 'target_count', 'candidate_count', 'candidate_kind',
+    'discord_count', 'mod_kind', 'reason', 'reason_code', 'result', 'exit_code',
+    'duration_ms', 'path_present', 'path_kind', 'active', 'preserved', 'identity', 'count'
+)
+
+function Get-InstallerLogDir {
+    if ($env:GLB_INSTALLER_LOG_DIR) { return $env:GLB_INSTALLER_LOG_DIR }
+    return (Join-Path (Get-EffectiveLocalApp) 'GoLiveBypass')
+}
+
+function Get-InstallerLogFile { return (Join-Path (Get-InstallerLogDir) 'installer.log') }
+
+function ConvertTo-InstallerSafeText([string]$value, [int]$max = 300) {
+    # fail-closed: credenciais e caminhos pessoais nunca chegam ao log compartilhavel.
+    $text = [string]$value
+    if (-not $text) { return '' }
+    $text = [regex]::Replace($text, '[\r\n\t]+', ' ')
+    # Cabecalho de autenticacao consome o resto; token Bearer isolado tambem.
+    $text = [regex]::Replace($text, '(?i)((?:proxy-)?authorization\s*:\s*)(?:\S+\s+)?\S+', '$1<redacted>')
+    $text = [regex]::Replace($text, '(?i)(bearer\s+)\S+', '$1<redacted>')
+    $text = [regex]::Replace($text, '(?i)\bmfa\.[A-Za-z0-9_-]{20,}', '<redacted>')
+    $text = [regex]::Replace($text, '\b[A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}\b', '<redacted>')
+    # URL com credenciais: usuário, senha, host e path são privados.
+    $text = [regex]::Replace($text, '(?i)\b[a-z][a-z0-9+.-]*://[^/\s@]+(?::[^/\s@]*)?@[^\s]+', '<redacted-url>')
+    # E-mail.
+    $text = [regex]::Replace($text, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', '<email>')
+    # chave=valor de credencial.
+    $text = [regex]::Replace($text, '(?i)(password|senha|token|secret|private[_]?key|public[_]?key|authorization|cookie|session|credential|captchatoken|twofactorcode)\s*[:=]\s*\S+', '$1=<redacted>')
+    # Caminhos: Windows, UNC e POSIX absoluto. As regras exigem fronteira/nao-barra
+    # para nao destruir URL publica (https://...) nem o "s:/" do proprio scheme.
+    $text = [regex]::Replace($text, '(?i)(^|[^A-Za-z0-9])[a-z]:[\\/][^\s]*', '$1<path>')
+    $text = [regex]::Replace($text, '\\\\[^\s]+', '<path>')
+    $text = [regex]::Replace($text, '(^|[\s:=])/[^/\s][^\s]*', '$1<path>')
+    if ($text.Length -gt $max) { $text = $text.Substring(0, $max) }
+    return $text
+}
+
+function ConvertTo-InstallerData($data) {
+    $out = [ordered]@{}
+    if ($null -eq $data) { return $out }
+    foreach ($k in @($data.Keys)) {
+        $key = [string]$k
+        if ($key -match $script:InstallerForbiddenKey) { $out[$key] = '<redacted>'; continue }
+        if ($script:InstallerAllowedKeys -notcontains $key) { continue }
+        $value = $data[$k]
+        if ($value -is [bool]) { $out[$key] = $value; continue }
+        if ($value -is [int] -or $value -is [long] -or $value -is [double]) { $out[$key] = $value; continue }
+        if ($value -is [System.Collections.IDictionary] -or ($value -is [System.Collections.IEnumerable] -and $value -isnot [string])) {
+            # Objeto/lista nunca e stringificado: chave aninhada poderia carregar segredo.
+            $out[$key] = '<redacted>'
+            continue
+        }
+        $out[$key] = ConvertTo-InstallerSafeText ([string]$value)
+    }
+    return $out
+}
+
+function Trim-InstallerLogFile([string]$file) {
+    if (-not (Test-Path -LiteralPath $file)) { return }
+    $bytes = [IO.File]::ReadAllBytes($file)
+    if ($bytes.Length -le $script:InstallerLogMaxBytes) { return }
+    $keep = [int][Math]::Floor($script:InstallerLogMaxBytes / 2)
+    $start = [Math]::Max(0, $bytes.Length - $keep)
+    $tail = [Text.Encoding]::UTF8.GetString($bytes, $start, $bytes.Length - $start)
+    $nl = $tail.IndexOf("`n")
+    $tail = if ($nl -lt 0) { '' } else { $tail.Substring($nl + 1) }
+    [IO.File]::WriteAllText($file, $tail, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-InstallerEvent([string]$level, [string]$event, [string]$phase, $data = $null) {
+    try {
+        $record = [ordered]@{
+            schema_version = 1
+            ts             = ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z')
+            level          = $level
+            component      = $script:InstallerComponent
+            event          = $event
+            operation_id   = $script:InstallerOperationId
+            phase          = $phase
+            platform       = 'win32'
+            arch           = $(if ($env:PROCESSOR_ARCHITECTURE) { [string]$env:PROCESSOR_ARCHITECTURE } else { 'unknown' })
+            data           = (ConvertTo-InstallerData $data)
+        }
+        $line = ConvertTo-Json -InputObject $record -Compress -Depth 6
+        $file = Get-InstallerLogFile
+        $dir = Split-Path -Parent $file
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        Trim-InstallerLogFile $file
+        [IO.File]::AppendAllText($file, $line + [Environment]::NewLine, $utf8)
+        Trim-InstallerLogFile $file
+    } catch {
+        # Diagnostico nunca pode derrubar a instalacao.
+    }
+}
+# =========================================================================== /log local
 
 # =========================================================================== TUI (PowerShell)
 # Interface no estilo OpenCode: dark, caixas, setas/Enter. Mouse: o console do Windows
@@ -361,14 +596,6 @@ function Tui-MenuMulti([string]$title, [string[]]$items) {
     return $out
 }
 
-function Tui-Input([string]$label, [string]$initial = '') {
-    Write-Host "$($script:TuiBg)$($script:TuiFg)  ${label}: $($script:TuiAccent)$initial" -NoNewline
-    Tui-ShowCursor
-    $v = Read-Host
-    Tui-HideCursor
-    return ($v -replace '\s+$', '')
-}
-
 function Tui-Confirm([string]$question) {
     if (-not (Test-TuiInteractive)) { return (Confirm-Action $question) }
     $ans = Read-Host "$($script:TuiBg)$($script:TuiFg)  $question [s/N]"
@@ -407,16 +634,6 @@ function Test-Tool($name) {
     return [bool] (Get-Command $name -ErrorAction SilentlyContinue)
 }
 
-# O endereco da proxy pode carregar usuario e senha, e ele e mostrado na tela e em resumo de
-# instalacao. A senha some daqui.
-function Hide-ProxySecret($proxy) {
-    if ($proxy -match '^([a-z0-9]+)://(?:([^:@]+)(?::[^@]*)?@)?(.+)$') {
-        $user = if ($matches[2]) { "$($matches[2]):***@" } else { '' }
-        return "$($matches[1])://$user$($matches[3])"
-    }
-    return $proxy
-}
-
 # O corepack cria o atalho do pnpm antes de saber que versao usar. Na primeira execucao ele
 # busca essa versao no registro do npm e confere a assinatura com chaves embutidas nele; as
 # chaves do corepack que vem no Node 22 estao velhas, entao o atalho existe e mesmo assim
@@ -424,19 +641,10 @@ function Hide-ProxySecret($proxy) {
 $script:PnpmVersion = ''
 
 function Test-Pnpm {
-    if (-not (Test-Tool 'pnpm')) { return $false }
-
     # Um atalho do corepack existe mesmo quando nao funciona, entao a unica prova que vale e
-    # executar. O 2>$null evita assustar quem so vai ver a instalacao seguir depois.
-    # A saida e capturada inteira antes de olhar o codigo. Filtrar com Select-Object no meio do
-    # cano interrompe o comando por cima, e o codigo de saida deixa de valer: um pnpm que
-    # funciona era reprovado.
-    # O atalho do corepack pode nao so falhar como EXPLODIR: a pergunta "Corepack is about to
-    # download" sem resposta vira erro terminante por causa do ErrorActionPreference=Stop daqui.
-    # Sem o try/catch a excecao escapava do probe e derrubava o instalador inteiro, em vez de
-    # cair no npm install -g. Relato real: o instalador morria apontando a linha 16 do shim.
-    try { $found = & pnpm --version 2>$null } catch { return $false }
-    if ($LASTEXITCODE -ne 0) { return $false }
+    # executar o resolvedor real. A saida e capturada inteira antes de olhar o codigo.
+    try { $found = @(Invoke-Pnpm @('--version') 2>$null) } catch { return $false }
+    if ($script:PnpmExitCode -ne 0) { return $false }
 
     $script:PnpmVersion = ($found | Select-Object -First 1)
     return $true
@@ -529,6 +737,20 @@ function Get-InstalledMod {
     return $null
 }
 
+function Test-TargetInjectedFromCheckout($root, $resources) {
+    if (-not $root -or -not $resources) { return $false }
+    $injected = Get-InjectedPath $resources
+    if (-not $injected) { return $false }
+    try {
+        $normalizedRoot = [IO.Path]::GetFullPath($root).TrimEnd('\', '/')
+        $normalizedInjected = [IO.Path]::GetFullPath($injected)
+        return $normalizedInjected.Equals($normalizedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            $normalizedInjected.StartsWith("$normalizedRoot\", [StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
 function Find-CheckoutFromInjection {
     foreach ($resources in Get-DiscordResources) {
         $injected = Get-InjectedPath $resources
@@ -579,31 +801,48 @@ function Find-CheckoutOnDisk {
 }
 
 function Find-Checkout {
+    $discordCount = @(Get-DiscordResources).Count
+    Write-InstallerEvent 'info' 'installer.discord_detected' 'detect' @{ discord_count = $discordCount }
+    $installedMod = Get-InstalledMod
+    if ($installedMod) { Write-InstallerEvent 'info' 'installer.mod_detected' 'detect' @{ mod_kind = $installedMod } }
+
     if ($Source) {
-        if (Test-ModCheckout $Source) { return $Source }
+        Write-InstallerEvent 'info' 'installer.checkout_candidate' 'detect' @{ candidate_kind = 'source'; candidate_count = 1 }
+        if (Test-ModCheckout $Source) {
+            Write-InstallerEvent 'info' 'installer.selected' 'detect' @{ candidate_kind = 'source'; path_present = $true }
+            return $Source
+        }
+        Write-InstallerEvent 'warn' 'installer.checkout_rejected' 'detect' @{ candidate_kind = 'source'; reason_code = 'SOURCE_NOT_A_CHECKOUT' }
         throw "Nao encontrei um checkout do Equicord ou Vencord em $Source"
     }
 
+    Write-InstallerEvent 'info' 'installer.checkout_candidate' 'detect' @{ candidate_kind = 'injection' }
     $root = Find-CheckoutFromInjection
     if ($root) {
+        Write-InstallerEvent 'info' 'installer.selected' 'detect' @{ candidate_kind = 'injection'; path_present = $true }
         Write-Ok "Achei pelo Discord: $root"
         return $root
     }
 
+    Write-InstallerEvent 'info' 'installer.checkout_candidate' 'detect' @{ candidate_kind = 'disk' }
     $root = Find-CheckoutOnDisk
     if ($root) {
+        Write-InstallerEvent 'info' 'installer.selected' 'detect' @{ candidate_kind = 'disk'; path_present = $true }
         Write-Ok "Achei no disco: $root"
         return $root
     }
 
+    # Mod detectado sem checkout provado (#293): o caminho nao substitui app.asar; a
+    # distincao fica por codigo, sem levar caminho pessoal ao log.
+    $reasonCode = if ($installedMod) { 'MOD_INSTALLED_WITHOUT_CHECKOUT' } else { 'CHECKOUT_NOT_FOUND' }
+    Write-InstallerEvent 'warn' 'installer.checkout_rejected' 'detect' @{ reason_code = $reasonCode; mod_kind = [string]$installedMod }
     return $null
 }
 
 function Test-InjectedFromCheckout($root) {
     if (-not $root) { return $false }
     foreach ($resources in Get-DiscordResources) {
-        $injected = Get-InjectedPath $resources
-        if ($injected -and $injected.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if (Test-TargetInjectedFromCheckout $root $resources) { return $true }
     }
     return $false
 }
@@ -728,6 +967,13 @@ function Copy-PatchParallel($root, $resources) {
         return [pscustomobject]@{ Ok = $false; Motivo = $motivo }
     }
     $appAsar = Join-Path $resources 'app.asar'
+    $existingInjection = Get-InjectedPath $resources
+    if ($existingInjection) {
+        Write-InstallerEvent 'warn' 'installer.preserved' 'inject' @{ reason_code = 'PARALLEL_ALREADY_PATCHED'; target_count = 1 }
+        $motivo = "$nome ja tem um patch em $existingInjection; app.asar e _app.asar foram preservados."
+        Write-Warn $motivo
+        return [pscustomobject]@{ Ok = $false; Motivo = $motivo }
+    }
     $backup = Join-Path $resources '_app.asar'
     if (-not (Test-Path -LiteralPath $backup) -and (Test-Path -LiteralPath $appAsar)) {
         Copy-Item -LiteralPath $appAsar -Destination $backup
@@ -736,6 +982,216 @@ function Copy-PatchParallel($root, $resources) {
     Copy-Item -LiteralPath $asar -Destination $appAsar -Force
     Write-Ok "$nome patcheado: $appAsar"
     return [pscustomobject]@{ Ok = $true; Motivo = '' }
+}
+
+# ---------------------------------------------------------------- restauracao de cliente
+#
+# Copy-PatchParallel troca o app.asar do cliente paralelo pelo dist\<cliente>.asar do checkout e
+# guarda o original em _app.asar. Se o checkout, o build ou a versao do mod mudarem depois, o
+# cliente fica sem abrir -- e nao havia caminho de volta: Uninstall/Restore removiam o userplugin
+# e recompilavam, deixando o app.asar patchado no lugar. Estas funcoes devolvem o original.
+
+function Get-ClientLabel($resources) {
+    switch -Regex ($resources) {
+        '(?i)equibop' { return 'Equibop' }
+        '(?i)vesktop' { return 'Vesktop' }
+        '(?i)legcord' { return 'Legcord' }
+        default       { return 'Discord' }
+    }
+}
+
+function Test-AsarContainsMark($path) {
+    # O build do mod feito com o GoLiveBypass dentro carrega o nome do plugin; o stub do
+    # Vencord/Equicord (so um require, <64 KB) nunca casa.
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        # Latin-1 mapeia byte a byte (sem perder posicoes como o UTF-8 faria) e o IndexOf roda
+        # em codigo nativo: varrer 16 MB de asar em script levaria minutos.
+        $text = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+        return $text.IndexOf('GoLiveBypass', [System.StringComparison]::Ordinal) -ge 0
+    } catch {
+        return $false
+    }
+}
+
+function Get-ClientAsarState($resources) {
+    # Rotulos estaveis (menu, log e suporte):
+    #   golive       patch do GoLiveBypass (copia do dist do checkout)
+    #   mod-quebrado stub do Vencord/Equicord com alvo ausente -> o cliente nao abre
+    #   mod          stub do Vencord/Equicord funcionando (nao e nosso; so com -Force)
+    #   outro        tem _app.asar mas o app.asar atual nao e reconhecido
+    #   vanilla      sem _app.asar: nunca foi injetado
+    #   ausente      sem app.asar nesse resources
+    $app = Join-Path $resources 'app.asar'
+    $backup = Join-Path $resources '_app.asar'
+    if (-not (Test-Path -LiteralPath $app)) {
+        if (Test-Path -LiteralPath $backup) { return 'outro' }
+        return 'ausente'
+    }
+    if (Test-AsarContainsMark $app) { return 'golive' }
+    $injected = Get-InjectedPath $resources
+    if ($injected) {
+        if (Test-Path -LiteralPath $injected) { return 'mod' }
+        return 'mod-quebrado'
+    }
+    if (Test-Path -LiteralPath $backup) { return 'outro' }
+    return 'vanilla'
+}
+
+function Get-ClientStateLabel($state) {
+    switch ($state) {
+        'golive'       { return 'patch do GoLiveBypass (revertivel)' }
+        'mod-quebrado' { return 'injecao QUEBRADA: o alvo do require nao existe, o cliente nao abre' }
+        'mod'          { return 'mod Vencord/Equicord funcionando' }
+        'outro'        { return 'patch de outro programa (nao mexemos sem -Force)' }
+        'vanilla'      { return 'original, sem injecao' }
+        default        { return 'sem app.asar nesse diretorio' }
+    }
+}
+
+function Restore-ClientAsar($resources, $label, [switch]$Force) {
+    $app = Join-Path $resources 'app.asar'
+    $backup = Join-Path $resources '_app.asar'
+    $state = Get-ClientAsarState $resources
+
+    switch ($state) {
+        'golive' { }
+        'mod-quebrado' { Write-Warn "$label : a injecao do mod aponta para um alvo que nao existe mais; devolvendo o original." }
+        'mod' {
+            if (-not $Force) {
+                Write-Warn "$label : o mod Vencord/Equicord esta funcionando; restaurar tiraria o mod deste cliente. Use -Force se e isso mesmo."
+                Write-InstallerEvent 'warn' 'installer.client_restore' 'restore' @{ reason_code = 'MOD_FUNCIONANDO'; target_count = 1 }
+                return $false
+            }
+        }
+        'outro' {
+            if (-not $Force) {
+                Write-Warn "$label : o app.asar atual nao e um patch reconhecido do GoLiveBypass. Use -Force para devolver o backup mesmo assim."
+                Write-InstallerEvent 'warn' 'installer.client_restore' 'restore' @{ reason_code = 'PATCH_DESCONHECIDO'; target_count = 1 }
+                return $false
+            }
+        }
+        'vanilla' {
+            Write-Warn "$label : o app.asar ja e o original; nada para restaurar."
+            return $false
+        }
+        default {
+            Write-Warn "$label : nao encontrei app.asar em $resources."
+            return $false
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $backup)) {
+        Write-Warn "$label : nao ha backup _app.asar; sem ele nao da para devolver o original automaticamente."
+        Write-InstallerEvent 'warn' 'installer.client_restore' 'restore' @{ reason_code = 'BACKUP_AUSENTE'; target_count = 1 }
+        return $false
+    }
+
+    Write-InstallerEvent 'info' 'installer.client_restore' 'restore' @{ reason_code = $state; target_count = 1 }
+
+    # Preserva o patch atual: se o cliente voltar a precisar do mod, o arquivo fica ali.
+    try { Copy-Item -LiteralPath $app -Destination "$app.golive-patched.bak" -Force } catch { }
+
+    # Copia para um temporario no MESMO diretorio e so entao troca: um erro no meio nao deixa o
+    # cliente sem app.asar nenhum.
+    try {
+        Copy-Item -LiteralPath $backup -Destination "$app.restore.tmp" -Force
+        $hashTmp = (Get-FileHash -LiteralPath "$app.restore.tmp" -Algorithm SHA256).Hash
+        $hashBackup = (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash
+        if ($hashTmp -ne $hashBackup) {
+            Remove-Item -LiteralPath "$app.restore.tmp" -Force -ErrorAction SilentlyContinue
+            Write-Warn "$label : a copia de restauracao saiu diferente do backup; nao toquei no app.asar."
+            return $false
+        }
+        Move-Item -LiteralPath "$app.restore.tmp" -Destination $app -Force
+    } catch {
+        Write-Warn "$label : falhei ao devolver o app.asar ($($_.Exception.Message))."
+        return $false
+    }
+
+    if ((Get-FileHash -LiteralPath $app -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash) {
+        Write-Warn "$label : o app.asar restaurado nao confere com o backup; o _app.asar foi preservado."
+        return $false
+    }
+
+    # O backup cumpriu o papel; sai do caminho para o proximo install criar um limpo.
+    Move-Item -LiteralPath $backup -Destination "$resources\_app.asar.restaurado.bak" -Force -ErrorAction SilentlyContinue
+
+    Write-Ok "$label : app.asar original restaurado (patch anterior em app.asar.golive-patched.bak)"
+    Write-InstallerEvent 'info' 'installer.client_restore' 'done' @{ reason_code = $state; target_count = 1 }
+    return $true
+}
+
+function Show-ClientStates {
+    $seen = 0
+    foreach ($resources in Get-DiscordResources) {
+        if (-not $resources) { continue }
+        $label = Get-ClientLabel $resources
+        $state = Get-ClientAsarState $resources
+        Write-Host ("    {0,-9} {1}" -f $label, (Get-ClientStateLabel $state)) -ForegroundColor DarkGray
+        Write-Host ("      {0}" -f $resources) -ForegroundColor DarkGray
+        $seen++
+    }
+    if ($seen -eq 0) { Write-Host '    nenhum cliente encontrado' -ForegroundColor DarkGray }
+}
+
+function Invoke-RestoreClient($alvo = '') {
+    $alvo = "$alvo".Trim().ToLowerInvariant()
+    $alvos = @()
+    foreach ($resources in Get-DiscordResources) {
+        if (-not $resources) { continue }
+        $label = Get-ClientLabel $resources
+        $state = Get-ClientAsarState $resources
+        if ($state -eq 'vanilla' -or $state -eq 'ausente') { continue }
+        if ($alvo -and -not $label.ToLowerInvariant().StartsWith($alvo)) { continue }
+        $alvos += , @{ Resources = $resources; Label = $label }
+    }
+
+    if ($alvos.Count -eq 0) {
+        Write-Warn 'Nenhum cliente com injecao ou backup para restaurar.'
+        return
+    }
+
+    # O app.asar restaurado so vale no proximo inicio, e deixar o cliente aberto rodando o patch
+    # antigo confunde o diagnostico.
+    Stop-Discord
+    $algum = $false
+    foreach ($item in $alvos) {
+        if (Restore-ClientAsar $item.Resources $item.Label -Force:$Force) { $algum = $true }
+    }
+    Start-Discord
+    if (-not $algum) { throw 'Nenhum cliente pode ser restaurado com os argumentos dados.' }
+}
+
+function Update-ParallelPatches($root) {
+    # Depois de remover o userplugin, um cliente paralelo continuaria rodando o build antigo (que
+    # ainda tem o GoLiveBypass dentro): recopia o asar recem-buildado, quando ele existir.
+    if (-not $root) { return }
+    $mod = Get-CheckoutMod $root
+    foreach ($resources in Get-DiscordResources) {
+        if (-not $resources) { continue }
+        if ($resources -notmatch '(?i)equibop|vesktop|legcord') { continue }
+        $app = Join-Path $resources 'app.asar'
+        if (-not (Test-AsarContainsMark $app)) { continue }
+        $label = Get-ClientLabel $resources
+        $asarName = $ParallelAsarPorMod[$mod][$label]
+        if (-not $asarName) {
+            Write-Warn "$label : patch antigo preservado (o checkout $mod nao gera build para ele)."
+            continue
+        }
+        $asar = Join-Path $root "dist\$asarName"
+        if (-not (Test-Path -LiteralPath $asar)) {
+            Write-Warn "$label : rode 'pnpm build' em $root e reinstale para tirar o plugin do cliente."
+            continue
+        }
+        try {
+            Copy-Item -LiteralPath $asar -Destination $app -Force
+            Write-Ok "$label : patch atualizado com o build sem o plugin."
+        } catch {
+            Write-Warn "$label : nao consegui atualizar o patch; o cliente segue com o build antigo."
+        }
+    }
 }
 
 function Show-ModChoice {
@@ -879,6 +1335,8 @@ function Install-Toolchain($needGit) {
 function Install-Mod($choice) {
     $info = $Mods[$choice]
     $target = Join-Path $env:USERPROFILE $info.Label
+    $script:InstallerPhase = 'preparing'
+    Write-InstallerEvent 'info' 'installer.selected' 'preparing' @{ mode = 'download'; mod_kind = $choice; path_present = $true }
 
     Write-Host ''
     Write-Host '  Vou fazer:' -ForegroundColor White
@@ -906,21 +1364,235 @@ function Install-Mod($choice) {
     return $target
 }
 
-function Stop-Discord {
-    if (-not (Get-Process -Name $DiscordNames -ErrorAction SilentlyContinue)) { return }
-
-    Write-Step 'Fechando o Discord'
-    Get-Process -Name $DiscordNames -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
-    for ($i = 0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 300
-        if (-not (Get-Process -Name $DiscordNames -ErrorAction SilentlyContinue)) { return }
+# O Update.exe (Squirrel) mora na raiz da instalacao do Discord e e ele quem reabre o
+# cliente depois que o processo morre. Sem fecha-lo, o injetor encontra o app.asar em uso
+# no meio do unpatch (Equilotl: "Discord's files are used by a different process") e o
+# cliente pode ficar sem o mod. Outros Update.exe (Vesktop, Equibop, apps de terceiros)
+# tem outro caminho e nao entram aqui.
+function Get-DiscordUpdaterProcesses {
+    $raizes = @()
+    $localApp = Get-EffectiveLocalApp
+    foreach ($base in @($localApp, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) {
+        if (-not $base) { continue }
+        foreach ($nome in $DiscordNames) { $raizes += (Join-Path $base $nome) }
     }
+    $raizes = @($raizes | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    if ($raizes.Count -eq 0) { return @() }
 
-    throw 'O Discord nao fechou. Feche pelo icone na bandeja e rode de novo.'
+    $achados = @()
+    foreach ($proc in @(Get-Process -Name 'Update' -ErrorAction SilentlyContinue)) {
+        $caminho = $null
+        try { $caminho = $proc.Path } catch { }
+        if (-not $caminho) { continue }
+        foreach ($raiz in $raizes) {
+            if ($caminho.StartsWith($raiz + '\', [StringComparison]::OrdinalIgnoreCase)) { $achados += $proc; break }
+        }
+    }
+    return $achados
 }
 
-function Copy-Plugin($root) {
+function Get-DiscordProcesses {
+    return @(@(Get-Process -Name $DiscordNames -ErrorAction SilentlyContinue) + @(Get-DiscordUpdaterProcesses) | Where-Object { $_ })
+}
+
+function Stop-DiscordProcesses($processos) {
+    foreach ($proc in @($processos)) {
+        if ($proc) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Processo morto nao devolve o handle na hora, e um updater pode reabrir o cliente no meio
+# do caminho. Abrir o arquivo sem compartilhamento e a mesma prova que o injetor precisa
+# para gravar: se falha, o Equilotl vai falhar logo depois com "files are used by a
+# different process" — melhor descobrir antes de desfazer o patch do cliente.
+function Test-ArquivoLivre([string]$caminho) {
+    if (-not $caminho -or -not (Test-Path -LiteralPath $caminho)) { return $true }
+    try {
+        $fluxo = [IO.File]::Open($caminho, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $fluxo.Close()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-DiscordResourcesTravados($resources) {
+    $travados = @()
+    foreach ($item in @($resources)) {
+        if (-not $item) { continue }
+        foreach ($nome in @('app.asar', '_app.asar')) {
+            $arquivo = Join-Path $item $nome
+            if ((Test-Path -LiteralPath $arquivo) -and -not (Test-ArquivoLivre $arquivo)) { $travados += $arquivo }
+        }
+    }
+    return $travados
+}
+
+function Stop-Discord {
+    [CmdletBinding()]
+    param(
+        # Recursos que vao ser injetados: alem de fechar os processos, espera a trava de
+        # app.asar sair antes de deixar o injetor trabalhar.
+        [string[]] $Resources = @(),
+        [int] $TentativasProcessos = 30,
+        [int] $TentativasTravas = 20
+    )
+
+    $processos = Get-DiscordProcesses
+    if ($processos.Count -gt 0) {
+        Write-Step 'Fechando o Discord'
+        Stop-DiscordProcesses $processos
+    }
+
+    for ($i = 0; $i -lt $TentativasProcessos; $i++) {
+        Start-Sleep -Milliseconds 300
+        $processos = Get-DiscordProcesses
+        if ($processos.Count -eq 0) { break }
+        Stop-DiscordProcesses $processos
+    }
+    if ((Get-DiscordProcesses).Count -gt 0) {
+        throw 'O Discord nao fechou. Feche pelo icone na bandeja e rode de novo.'
+    }
+
+    if (@($Resources).Count -eq 0) { return }
+
+    for ($i = 0; $i -lt $TentativasTravas; $i++) {
+        $travados = Get-DiscordResourcesTravados $Resources
+        if ($travados.Count -eq 0) { return }
+        $processos = Get-DiscordProcesses
+        if ($processos.Count -gt 0) { Stop-DiscordProcesses $processos }
+        Start-Sleep -Milliseconds 500
+    }
+
+    $travados = Get-DiscordResourcesTravados $Resources
+    if ($travados.Count -gt 0) {
+        $lista = (@($travados) | Select-Object -First 3) -join ', '
+        throw "Os arquivos do Discord continuam em uso ($lista). Feche o Discord pelo icone da bandeja, confirme no Gerenciador de Tarefas que nao sobrou nem 'Discord' nem 'Update' e rode de novo."
+    }
+}
+
+function Resolve-LocalPluginHelper($source) {
+    # Somente layouts que o usuario apontou (-PluginSource) ou onde o proprio
+    # instalador esta (um pacote de release extraido). Nada de varrer Downloads:
+    # copiar um binario arbitrario de la para dentro do userplugin seria pior do
+    # que falhar e mandar baixar da release com SHA-256 conferido.
+    $candidates = @()
+    $bases = @()
+    if ($source -and -not [string]::IsNullOrWhiteSpace($source)) { $bases += $source }
+    if ($PSScriptRoot -and $PSScriptRoot -ne $source) { $bases += $PSScriptRoot }
+
+    foreach ($base in $bases) {
+        if (-not (Test-Path -LiteralPath $base)) { continue }
+        if (Test-Path -LiteralPath $base -PathType Leaf) { $base = Split-Path -Parent $base }
+        $candidates += (Join-Path $base $PluginHelperRelative)
+        # Pacote de release extraido: os fontes do plugin (e o bin) ficam sob goLiveBypass\.
+        $candidates += (Join-Path $base (Join-Path 'goLiveBypass' $PluginHelperRelative))
+        # Checkout do repositorio: o binario e produzido por npm run build:proton.
+        $candidates += (Join-Path $base 'tools\proton-confgen\build\proton-confgen.exe')
+        $candidates += (Join-Path (Join-Path $base '..') 'tools\proton-confgen\build\proton-confgen.exe')
+        $candidates += (Join-Path (Join-Path $base '..') (Join-Path 'goLiveBypass' $PluginHelperRelative))
+        # Helper baixado avulso da release, com o nome do asset ao lado do instalador.
+        $candidates += (Join-Path $base 'proton-confgen.exe')
+        $candidates += @(Get-ChildItem -LiteralPath $base -Filter 'proton-confgen*-win-x64.exe' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
+
+    foreach ($cand in $candidates) {
+        if ($cand -and (Test-Path -LiteralPath $cand)) {
+            $item = Get-Item -LiteralPath $cand -ErrorAction SilentlyContinue
+            if ($item -and -not $item.PSIsContainer -and $item.Length -gt 0) {
+                return $item.FullName
+            }
+        }
+    }
+
+    return $null
+}
+
+function Test-HelperSha256($filePath) {
+    if (-not (Test-Path -LiteralPath $filePath)) { return $false }
+    $dir = Split-Path -Parent $filePath
+    $manifestPath = Join-Path $dir 'proton-confgen-manifest.json'
+    $expectedSha = $null
+    if (Test-Path -LiteralPath $manifestPath) {
+        try {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.assets -and $manifest.assets.'win32-x64' -and $manifest.assets.'win32-x64'.sha256) {
+                $expectedSha = $manifest.assets.'win32-x64'.sha256.ToLowerInvariant()
+            }
+        } catch { }
+    }
+    if (-not $expectedSha) {
+        $shaFile = "$filePath.sha256"
+        if (Test-Path -LiteralPath $shaFile) {
+            try {
+                $content = (Get-Content -LiteralPath $shaFile -Raw).Trim()
+                $expectedSha = ($content -split '\s+')[0].ToLowerInvariant()
+            } catch { }
+        }
+    }
+    if ($expectedSha -and $expectedSha -match '^[0-9a-f]{64}$') {
+        $actual = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        return ($actual -eq $expectedSha)
+    }
+    return $true
+}
+
+function Copy-PluginHelper($target) {
+    $destination = Join-Path $target $PluginHelperRelative
+    $destinationDir = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $destinationDir)) {
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+    }
+
+    # 1. Verificar candidatos locais (checkout local, PluginSource, Downloads, zip descompactado)
+    $local = Resolve-LocalPluginHelper $PluginSource
+    if ($local -and (Test-Path -LiteralPath $local)) {
+        if (Test-HelperSha256 $local) {
+            Copy-Item -LiteralPath $local -Destination $destination -Force
+            Write-Ok "Helper Proton copiado de $local"
+            return
+        } else {
+            Write-Warn "Helper local em $local divergiu do hash esperado; tentando download da release."
+        }
+    }
+
+    # 2. O helper e binario e nao pode ser obtido por raw.githubusercontent.com.
+    # O canal escolhido decide a release do helper quando a fonte local nao o traz.
+    $asset = Get-LatestBetaHelperAsset
+    if (-not $asset) {
+        throw "Nao encontrei o helper proton-confgen do canal $script:SelectedChannel. Use um pacote de release ou -PluginSource com bin\win32-x64\proton-confgen.exe."
+    }
+
+    $temporary = Join-Path $env:TEMP ("golivebypass-proton-confgen-{0}.exe" -f ([guid]::NewGuid().ToString('N')))
+    try {
+        Write-Step "Baixando helper Proton do canal $script:SelectedChannel ($($asset.Tag))"
+        Invoke-WebRequest -Uri $asset.Url -OutFile $temporary -UseBasicParsing -TimeoutSec 60
+        $actual = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $asset.Sha256) {
+            throw "SHA-256 do helper nao confere: esperado $($asset.Sha256), obtido $actual."
+        }
+        Copy-Item -LiteralPath $temporary -Destination $destination -Force
+        Write-Ok 'Helper Proton instalado (SHA-256 confere)'
+    } finally {
+        Remove-CaminhoSilencioso $temporary
+    }
+}
+function Assert-PluginSourceTree($target) {
+    if (-not $target) { throw 'Destino invalido para a fonte do plugin.' }
+    foreach ($file in $PluginFiles) {
+        $leaf = Split-Path -Leaf $file
+        $candidate = Join-Path $target $leaf
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            throw "Arquivo obrigatorio do plugin ausente: $leaf."
+        }
+        $item = Get-Item -LiteralPath $candidate
+        if ($item.Length -le 0) {
+            throw "Arquivo obrigatorio do plugin vazio: $leaf."
+        }
+    }
+}
+
+function Copy-PluginFromRepo($root) {
     if (-not $root) { throw 'Caminho do checkout invalido para copiar o plugin.' }
     $target = Join-Path $root "src\userplugins\$PluginDirName"
     Write-Step "Instalando o plugin em $target"
@@ -931,6 +1603,16 @@ function Copy-Plugin($root) {
     $stale = Join-Path $target 'index.ts'
     if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
 
+    $sourceBase = $PluginSource
+    if ($PluginSource -and -not [string]::IsNullOrWhiteSpace($PluginSource)) {
+        if (-not (Test-Path -LiteralPath (Join-Path $PluginSource (Split-Path -Leaf $PluginFiles[0])))) {
+            $sub = Join-Path $PluginSource $PluginDirName
+            if (Test-Path -LiteralPath (Join-Path $sub (Split-Path -Leaf $PluginFiles[0]))) {
+                $sourceBase = $sub
+            }
+        }
+    }
+
     foreach ($file in $PluginFiles) {
         $leaf = Split-Path -Leaf $file
         if (-not $PluginSource -or [string]::IsNullOrWhiteSpace($PluginSource)) {
@@ -938,39 +1620,95 @@ function Copy-Plugin($root) {
             continue
         }
 
-        $local = Join-Path $PluginSource $leaf
-        if (-not (Test-Path -LiteralPath $local)) { throw "Nao achei $leaf em $PluginSource." }
+        $local = Join-Path $sourceBase $leaf
+        if (-not (Test-Path -LiteralPath $local -PathType Leaf)) { throw "Nao achei $leaf em $PluginSource." }
         Copy-Item -LiteralPath $local -Destination (Join-Path $target $leaf) -Force
     }
+
+    # Nunca compilar uma arvore parcial: um arquivo ausente ou vazio deve interromper a
+    # instalacao explicitamente, em vez de reutilizar um modulo stale no destino.
+    Assert-PluginSourceTree $target
+    Copy-PluginHelper $target
 
     if ($PluginSource -and -not [string]::IsNullOrWhiteSpace($PluginSource)) {
         Write-Warn "Plugin copiado de $PluginSource, e nao do GitHub."
     }
 }
 
+
+# De onde vem o plugin instalado. A fonte normal e uma release validada pelo canal.
+function Install-PluginSource($root) {
+    if ($PluginSource -and -not [string]::IsNullOrWhiteSpace($PluginSource)) {
+        Copy-PluginFromRepo $root
+        return
+    }
+
+    if ($PSScriptRoot) {
+        $parent = Split-Path -Parent $PSScriptRoot
+        if ($parent -and (Test-Path -LiteralPath (Join-Path $parent "$PluginDirName\index.tsx"))) {
+            Write-Step 'Usando o checkout do repositorio que esta ao lado do instalador'
+            Copy-PluginFromRepo $root
+            return
+        }
+    }
+
+    $release = Get-PluginInstallRelease $script:SelectedChannel
+    if (-not $release) {
+        throw "Nao encontrei uma release $script:SelectedChannel valida com zip e SHA-256; ela pode estar ausente, em metadata incoerente ou indisponivel por rede/rate limit. Use -PluginSource com uma fonte local explicita."
+    }
+    Write-Step "Instalando o plugin da release $($release.Version) (canal $script:SelectedChannel)"
+    Invoke-UpdateFromZip $root $release.AssetUrl $release.Version $release.ShaUrl
+}
 function Build-Mod($root) {
     if (-not $root) { throw 'Caminho do checkout invalido para compilar o mod.' }
+    $script:InstallerPhase = 'build'
+    Write-InstallerEvent 'info' 'installer.build' 'build' @{ mod_kind = (Get-CheckoutMod $root) }
     Push-Location -LiteralPath $root
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $root 'node_modules'))) {
             Write-Step 'Instalando dependencias (na primeira vez demora alguns minutos)'
-            & pnpm install
-            if ($LASTEXITCODE -ne 0) { throw 'pnpm install falhou' }
+            Invoke-Pnpm @('install') | Out-Host
+            if ($script:PnpmExitCode -ne 0) { throw 'pnpm install falhou' }
         }
 
         Write-Step 'Compilando'
-        & pnpm build
-        if ($LASTEXITCODE -ne 0) { throw 'pnpm build falhou' }
+        Invoke-Pnpm @('build') | Out-Host
+        if ($script:PnpmExitCode -ne 0) { throw 'pnpm build falhou' }
+    } finally {
+        Pop-Location
+    }
+}
+function Remove-PluginSource($root) {
+    $target = Join-Path $root "src\userplugins\$PluginDirName"
+    if (-not (Test-Path -LiteralPath $target)) { return }
+    Write-Step 'Removendo apenas o plugin GoLiveBypass'
+    Remove-CaminhoSilencioso $target
+    Push-Location -LiteralPath $root
+    try {
+        Invoke-Pnpm @('build') | Out-Host
+        if ($script:PnpmExitCode -ne 0) { Write-Warn 'Nao consegui recompilar o mod sem o GoLiveBypass.' }
     } finally {
         Pop-Location
     }
 }
 
+function Format-InjectionDetail($value) {
+    $text = (@($value) | ForEach-Object { [string]$_ }) -join ' '
+    $text = ($text -replace '\s+', ' ').Trim()
+    $text = ConvertTo-InstallerSafeText $text 600
+    if ($text.Length -gt 600) { return $text.Substring(0, 600) + '...' }
+    return $text
+}
 function Invoke-Injection($root, $targets) {
     if (-not $root) { throw 'Caminho do checkout invalido para injetar o mod.' }
     Push-Location -LiteralPath $root
     try {
-        Stop-Discord
+        $script:InstallerPhase = 'inject'
+        Write-InstallerEvent 'info' 'installer.inject' 'inject' @{ result = 'started'; target_count = @($targets).Count }
+        # A trava de app.asar e conferida antes de qualquer unpatch: o Equilotl desfaz o
+        # patch atual antes de aplicar o novo, e um arquivo em uso no meio disso deixa o
+        # cliente sem o mod.
+        Stop-Discord -Resources @(@($targets) | ForEach-Object { $_.Resources })
         $falha = $false
         # Detalhe por alvo: sem isto o relato automatico chegava so com a mensagem
         # generica e o log do RUNTIME (que nada diz sobre a injecao) -- issue #120.
@@ -980,28 +1718,63 @@ function Invoke-Injection($root, $targets) {
                 $resultado = Copy-PatchParallel $root $t.Resources
                 if (-not $resultado.Ok) {
                     $falha = $true
-                    # O motivo real (nao mais "no aviso acima"): antes disto, o motivo so ia
-                    # para o console via Write-Warn e nunca chegava no relato automatico de bug
-                    # (issues #123/#130/#132/#133, todas com "--- logs ---" vazio).
                     $detalhes.Add("cliente paralelo ($($t.Resources)): $($resultado.Motivo)")
                 }
                 continue
             }
             Write-Step "Injetando no $($t.Flavour)"
-            # O --location espera a RAIZ da instalacao (...\Discord), nao o app-1.0.x:
-            # e de la que o instalador do mod varre os app-*\resources. Espelho do
-            # install_location() do .sh (dois dirnames). Passar o app-1.0.x fazia o
-            # injector nao achar a instalacao e toda instalacao nova pela linha de
-            # comando falhar (relato 1.1.11-beta.1).
+            # O --location espera a RAIZ da instalacao (...\Discord), nao o app-1.0.x.
             $loc = Split-Path -Parent (Split-Path -Parent $t.Resources)
-            & pnpm run inject -- --location $loc
-            if ($LASTEXITCODE -ne 0) {
-                # Nem todo pnpm come o -- : cai no caminho de sempre (o instalador
-                # do mod pergunta) — espelho do run_inject do .sh.
-                & pnpm inject
-                if ($LASTEXITCODE -ne 0) {
-                    $falha = $true
-                    $detalhes.Add("$($t.Flavour): pnpm inject saiu com codigo $LASTEXITCODE ($($t.Resources))")
+            $tentativa = 0
+            while ($true) {
+                $tentativa++
+                $script:PnpmExitCode = $null
+                $saida = @()
+                $excecao = $null
+                try {
+                    # O pnpm recebe os argumentos do script diretamente; o separador -- extra
+                    # fazia alguns wrappers repassarem --location como argumento posicional.
+                    # O Invoke-Pnpm ja junta o stderr na propria saida; aqui so capturamos tudo
+                    # para o detalhe do erro que vira POSTCONDITION_NOT_CONFIRMED.
+                    $saida = @(Invoke-Pnpm @('run', 'inject', '--location', $loc))
+                } catch {
+                    $excecao = $_.Exception.Message
+                    if ($null -eq $script:PnpmExitCode) { $script:PnpmExitCode = -1 }
+                }
+                # Exit code e diagnostico, nao autoridade: o stub deste alvo precisa apontar
+                # para o checkout selecionado, sem permitir que outro Discord aprove este.
+                $confirmado = Test-TargetInjectedFromCheckout $root $t.Resources
+                $detalhe = Format-InjectionDetail @($saida, $excecao)
+                if ($confirmado) { break }
+                # O Equilotl avisa que o arquivo esta em uso e desfaz o patch antes de tentar:
+                # o Discord pode ter sido reaberto pelo updater entre o Stop-Discord e o
+                # injetor. Fecha tudo de novo (agora esperando a trava sair) e repete UMA vez.
+                if ($tentativa -lt 2 -and ($detalhe -match 'used by a different process|already patched\. Unpatching first')) {
+                    Write-Warn 'O injetor achou arquivo do Discord em uso; vou fechar de novo e repetir uma vez.'
+                    Stop-Discord -Resources @($t.Resources)
+                    continue
+                }
+                break
+            }
+            if (-not $confirmado) {
+                $falha = $true
+                $motivo = "pos-condicao nao confirmada (exit=$($script:PnpmExitCode))"
+                if ($detalhe) { $motivo += ": $detalhe" }
+                $detalhes.Add("$($t.Flavour): $motivo")
+                Write-InstallerEvent 'error' 'installer.inject' 'inject' @{
+                    result = 'failure'
+                    reason_code = 'POSTCONDITION_NOT_CONFIRMED'
+                    exit_code = if ($null -eq $script:PnpmExitCode) { -1 } else { [int]$script:PnpmExitCode }
+                }
+                continue
+            }
+            if ($excecao -or ($null -ne $script:PnpmExitCode -and $script:PnpmExitCode -ne 0)) {
+                $motivo = "injecao confirmada pela pos-condicao apesar de exit=$($script:PnpmExitCode)"
+                if ($detalhe) { $motivo += ": $detalhe" }
+                Write-InstallerEvent 'warn' 'installer.inject' 'inject' @{
+                    result = 'warning'
+                    reason_code = 'POSTCONDITION_CONFIRMED_NONZERO'
+                    exit_code = [int]$script:PnpmExitCode
                 }
             }
         }
@@ -1039,11 +1812,12 @@ function Invoke-Install($root) {
     if (-not $root -or -not (Test-Path -LiteralPath $root)) {
         throw 'Nao consegui preparar a pasta do Equicord/Vencord. Rode de novo, ou use -Source "C:\caminho\do\Equicord" apontando para um checkout que voce ja tenha.'
     }
-    $proxy = Select-Proxy
+    [void](Select-UpdateChannel $root)
+    Write-InstallerEvent 'info' 'installer.selected' 'preparing' @{ mode = 'install'; mod_kind = (Get-CheckoutMod $root); path_present = $true; channel = $script:SelectedChannel }
     $permanent = Select-Persistence
 
     Install-Toolchain $false
-    Copy-Plugin $root
+    Install-PluginSource $root
     Build-Mod $root
 
     $targets = @(Select-InjectionTargets @(Get-PatchTargets))
@@ -1057,7 +1831,12 @@ function Invoke-Install($root) {
         if (-not $inj -or -not $inj.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $oficialPendente = $true }
     }
 
-    if ($oficialPendente -or $paralelos.Count -gt 0) {
+    # Nos injetamos = havia alvo pendente entre os escolhidos. Esta gravacao e o que o modo
+    # temporario le no fim da funcao: sem ela $weInjected fica nulo, o instalador cai sempre
+    # no aviso de "ja estava injetado" e a injecao sobrevive ao fechamento do Discord — o
+    # modo temporario virava permanente. (perdida no commit da multi-selecao de alvos)
+    $weInjected = $oficialPendente -or $paralelos.Count -gt 0
+    if ($weInjected) {
         Invoke-Injection $root $targets
     } else {
         Write-Step 'O Discord ja carrega deste checkout, so reiniciando'
@@ -1066,19 +1845,16 @@ function Invoke-Install($root) {
 
     # Com o Discord fechado: aberto, ele regrava o settings.json a partir da memoria e
     # apaga o que escrevemos aqui.
-    Set-PluginSettings $root $proxy
+    Set-PluginSettings $root
 
     Start-Discord
 
+    $script:InstallerPhase = 'completed'
+    Write-InstallerEvent 'info' 'installer.completed' 'completed' @{ permanent = [bool]$permanent; we_injected = [bool]$weInjected; channel = $script:SelectedChannel }
+
     Write-Host ''
     Write-Ok 'Pronto. O plugin ja vem ativado, nao precisa mexer em nada.'
-    if ($proxy) {
-        # A senha nao aparece na tela: a pessoa costuma tirar print desta parte para mostrar que
-        # deu certo.
-        Write-Host "  Proxy: $(Hide-ProxySecret $proxy)" -ForegroundColor DarkGray
-    } else {
-        Write-Host '  Proxy: gratuita, escolhida e testada sozinha a cada abertura' -ForegroundColor DarkGray
-    }
+    Write-Host '  Na primeira ativacao o plugin pede a conta Proton, dentro do Discord.' -ForegroundColor DarkGray
     Write-Host '  Entre numa call e use Go Live ou a camera.' -ForegroundColor DarkGray
 
     if (-not $permanent) {
@@ -1106,6 +1882,9 @@ function Invoke-Uninstall {
     Remove-Tor
     Build-Mod $root
     Stop-Discord
+    # Cliente paralelo patchado continuaria rodando o build antigo, que ainda tem o plugin
+    # dentro: atualiza o patch com o build recem-saido (sem o plugin).
+    Update-ParallelPatches $root
     Start-Discord
 
     Write-Host ''
@@ -1136,13 +1915,75 @@ function Get-ModSettingsFile($root) {
     #   SETTINGS_FILE = DATA_DIR\settings\settings.json
     $mod = Get-CheckoutMod $root
 
+
     $override = [Environment]::GetEnvironmentVariable("$($mod.ToUpper())_USER_DATA_DIR")
     if ($override) { return (Join-Path $override 'settings\settings.json') }
 
     return (Join-Path $env:APPDATA "$mod\settings\settings.json")
 }
+function Get-PersistedUpdateChannel($root) {
+    if (-not $root) { return $null }
+    $file = Get-ModSettingsFile $root
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $null }
+    try {
+        $settings = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+        $value = $settings.plugins.GoLiveBypass.updateChannel
+        if ($value -eq 'stable' -or $value -eq 'beta') { return [string]$value }
+    } catch { }
+    return $null
+}
 
-function Set-PluginSettings($root, $proxy) {
+function Set-UpdateChannelPreference($root, [string]$channel) {
+    if (-not $root -or $channel -notin @('stable', 'beta')) { return $false }
+    $file = Get-ModSettingsFile $root
+    $settings = $null
+    if (Test-Path -LiteralPath $file -PathType Leaf) {
+        try { $settings = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json }
+        catch {
+            Write-Warn "Nao consegui ler $file; a preferencia do canal nao foi alterada."
+            return $false
+        }
+    }
+    if ($null -eq $settings -or $settings -is [array] -or $settings -is [string]) { $settings = [pscustomobject]@{} }
+    if (-not $settings.PSObject.Properties['plugins'] -or $null -eq $settings.plugins -or $settings.plugins -is [array] -or $settings.plugins -is [string]) {
+        $settings | Add-Member -NotePropertyName plugins -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $plugin = if ($settings.plugins.PSObject.Properties['GoLiveBypass'] -and $settings.plugins.GoLiveBypass -isnot [array] -and $settings.plugins.GoLiveBypass -isnot [string]) {
+        $settings.plugins.GoLiveBypass
+    } else { [pscustomobject]@{} }
+    $plugin | Add-Member -NotePropertyName updateChannel -NotePropertyValue $channel -Force
+    $settings.plugins | Add-Member -NotePropertyName GoLiveBypass -NotePropertyValue $plugin -Force
+    try {
+        Save-Text $file ($settings | ConvertTo-Json -Depth 100)
+        return $true
+    } catch {
+        Write-Warn "Nao consegui salvar a preferencia do canal em $file."
+        return $false
+    }
+}
+
+function Select-UpdateChannel($root) {
+    if ($script:ChannelExplicit) { $script:SelectedChannel = $Channel; return $Channel }
+    $persisted = Get-PersistedUpdateChannel $root
+    $interactive = $false
+    try { $interactive = -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected } catch { }
+    if ($Yes -or -not $interactive) {
+        $script:SelectedChannel = if ($persisted) { $persisted } else { 'stable' }
+        return $script:SelectedChannel
+    }
+    Write-Host ''
+    Write-Host '  Canal de atualizacoes do plugin:' -ForegroundColor White
+    Write-Host '    [1] Stable (recomendado)' -ForegroundColor Green
+    Write-Host '        Canal mais previsivel, somente releases estaveis.' -ForegroundColor DarkGray
+    Write-Host '    [2] Beta (opt-in)' -ForegroundColor Yellow
+    Write-Host '        Canal de testes; voce ajuda a comunidade ao testar, encontrar e corrigir erros antes da versao estavel.' -ForegroundColor DarkGray
+    Write-Host '        Nenhum canal promete estabilidade.' -ForegroundColor DarkGray
+    $choice = Read-Escolha '  Escolha [1]'
+    $script:SelectedChannel = if ($choice -eq '2') { 'beta' } else { 'stable' }
+    return $script:SelectedChannel
+}
+
+function Set-PluginSettings($root) {
     $file = Get-ModSettingsFile $root
 
     $settings = $null
@@ -1170,14 +2011,16 @@ function Set-PluginSettings($root, $proxy) {
     $plugin = if ($existing) { $existing.Value } else { [pscustomobject]@{} }
 
     $plugin | Add-Member -NotePropertyName enabled -NotePropertyValue $true -Force
-    $plugin | Add-Member -NotePropertyName proxy -NotePropertyValue $proxy -Force
     if (-not $plugin.PSObject.Properties['excludedCountries']) {
         $plugin | Add-Member -NotePropertyName excludedCountries -NotePropertyValue 'BR' -Force
     }
 
+    if ($script:SelectedChannel -in @('stable', 'beta')) {
+        $plugin | Add-Member -NotePropertyName updateChannel -NotePropertyValue $script:SelectedChannel -Force
+    }
     $settings.plugins | Add-Member -NotePropertyName GoLiveBypass -NotePropertyValue $plugin -Force
 
-    Save-Text $file ($settings | ConvertTo-Json -Depth 10)
+    Save-Text $file ($settings | ConvertTo-Json -Depth 100)
 
     $written = $null
     try { $written = (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json).plugins.GoLiveBypass } catch { }
@@ -1202,6 +2045,9 @@ function Show-Status($root) {
 
     if ($root) {
         Write-Host "    Fonte     $root" -ForegroundColor DarkGray
+        $currentChannel = Get-PersistedUpdateChannel $root
+        if (-not $currentChannel) { $currentChannel = 'stable' }
+        Write-Host "    Canal     $currentChannel" -ForegroundColor DarkGray
         $plugin = Join-Path $root "src\userplugins\$PluginDirName"
         if (Test-Path -LiteralPath $plugin) { Write-Host '    Plugin    ja instalado' -ForegroundColor Green }
         else { Write-Host '    Plugin    nao instalado' -ForegroundColor DarkGray }
@@ -1210,7 +2056,6 @@ function Show-Status($root) {
     }
     Write-Host ''
 }
-
 function Select-Target($root) {
     if (-not $root) { return (Install-Mod (Show-ModChoice)) }
     if ($Yes) { return $root }
@@ -1236,7 +2081,13 @@ function Select-Target($root) {
     }
 }
 
-# =============================================================== Tor embutido
+
+# =============================================================== Tor legado
+
+# O instalador nao oferece mais escolha de saida: a conta Proton e configurada dentro do
+# plugin na primeira ativacao, e o plugin WireGuard nao le `proxy` do settings.json. O que
+# sobra aqui e a limpeza do que as versoes anteriores deste instalador deixaram na maquina
+# de quem escolheu aquela opcao.
 
 function Get-TorBaseDir {
     return (Join-Path (Get-EffectiveLocalApp) 'GoLiveBypass\Tor')
@@ -1246,172 +2097,16 @@ function Get-TorExe {
     return (Join-Path (Get-TorBaseDir) 'tor\tor.exe')
 }
 
-function Test-TorReady {
-    # O probe barato: se a porta 9060 aceita conexao, um Tor ja esta escutando. Quem instalou
-    # o Tor por aqui tem o daemon verificado na hora; se for o Tor da GUI, ele tambem serve.
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $task = $client.ConnectAsync('127.0.0.1', $TorPort)
-        if (-not $task.Wait(1500)) { $client.Close(); return $false }
-        if (-not $client.Connected) { $client.Close(); return $false }
-        $client.Close()
-        return $true
-    } catch { return $false }
-}
-
-function Get-TorServiceStatus {
-    try {
-        $svc = Get-CimInstance Win32_Service -Filter "Name='tor'" -ErrorAction SilentlyContinue
-        if ($svc -and $svc.State -eq 'Running') { return 'running' }
-        return 'absent'
-    } catch { return 'unknown' }
-}
-
-function Install-Tor {
-    $base = Get-TorBaseDir
-    $exe = Get-TorExe
-    $torrc = Join-Path $base 'torrc'
-
-    # Ja esta pondo a luz? Nada a fazer. Isso cobre um Tor do sistema (9050/9150) e o da GUI
-    # (9060) que ja esteja rodando — a GUI morre com ela, mas se esta de pe agora, serve.
-    if (Test-TorReady) {
-        Write-Ok "Tor ja esta atendendo em 127.0.0.1:$TorPort — reaproveitando."
-        return $true
-    }
-
-    # Primeiro tenta achar um Tor do sistema para reaproveitar o binario (sem baixar nada).
-    if (Test-Tool 'tor') {
-        Write-Step 'Tor do sistema encontrado; verificando se ele atende'
-        # Um tor do sistema usa a porta dele; o nosso servicio usa a 9060. O daemon do sistema
-        # so vale se ele ja estiver escutando na 9060 — senao, baixamos o nosso.
-        if (-not (Test-TorReady)) {
-            Write-Step 'Tor do sistema nao atende na porta 9060; baixando o bundle'
-        }
-    }
-
-    if (-not (Test-Path -LiteralPath $exe)) {
-        Write-Step 'Baixando o Tor (tor-expert-bundle 13.5, ~30 MB)'
-        $asset = $TorUrls.Values | Select-Object -First 1
-        $temp = if ($env:TEMP -and (Test-Path -LiteralPath $env:TEMP)) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
-        $archive = Join-Path $temp $asset.Url.Split('/')[-1]
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $asset.Url -OutFile $archive
-        } catch {
-            Write-Warn "Falha ao baixar o Tor: $($_.Exception.Message)"
-            return $false
-        }
-
-        Write-Step 'Conferindo SHA-256'
-        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
-        if ($hash -ne $asset.Sha256.ToLower()) {
-            Remove-CaminhoSilencioso $archive
-            Write-Warn 'O download do Tor veio corrompido (SHA-256 diferente). Abortando.'
-            return $false
-        }
-
-        Write-Step 'Extraindo o Tor'
-        New-Item -ItemType Directory -Path $base -Force | Out-Null
-        # O bundle compacta um único diretório "tor"; tar.exe do Windows 11+ extrai direto.
-        & tar -xzf $archive -C $base --exclude 'tor/pluggable_transports/*' --exclude 'debug/*'
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn 'Falha ao extrair o bundle do Tor.'
-            return $false
-        }
-        Remove-CaminhoSilencioso $archive
-    }
-
-    if (-not (Test-Path -LiteralPath $exe)) {
-        Write-Warn "O binario do Tor nao apareceu em $exe."
-        return $false
-    }
-
-    # torrc com a porta dedicada, como a GUI usa.
-    $dataDir = Join-Path $base 'data-state'
-    New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-    $geoip = Join-Path $base 'tor\data'
-    $torrcText = @"
-SocksPort $TorPort
-DataDirectory $($dataDir -replace '\\','\')
-$(
-    if (Test-Path -LiteralPath (Join-Path $base 'tor\data\geoip')) {
-        "GeoIPFile $(Join-Path $base 'tor\data\geoip')"
-    }
-)
-$(
-    if (Test-Path -LiteralPath (Join-Path $base 'tor\data\geoip6')) {
-        "GeoIPv6File $(Join-Path $base 'tor\data\geoip6')"
-    }
-)
-Log notice stdout
-"@
-    Save-Text $torrc $torrcText
-
-    # O caminho do Windows: o servico (tor.exe --service install) roda como LocalService e
-    # nao tem acesso a %LOCALAPPDATA% do usuario, entao o Tor nao consegue escrever no
-    # DataDirectory e o servico fica parado. A Run key sobe o Tor no logon do USUARIO — mesmo
-    # contexto da GUI — e e o caminho que funciona aqui, com ou sem admin. So vale a pena o
-    # servico se o DataDirectory morar em ProgramData (caso da GUI), nao dos instaladores.
-    Write-Step 'Registrando o Tor na inicializacao do usuario (sobe no logon)'
-    Set-RunKey $exe $torrc
-
-    # A Run key so vale no proximo logon; para a sessao atual, sobe o daemon agora.
-    Write-Step 'Iniciando o Tor'
-    Start-Process -FilePath $exe -ArgumentList '-f', $torrc -WindowStyle Hidden
-
-    # Espera subir e valida com um tunel SOCKS de verdade.
-    Write-Step 'Esperando o Tor subir'
-    for ($i = 0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 1000
-        if (Test-TorReady) { break }
-    }
-
-    if (-not (Test-TorReady)) {
-        Write-Warn 'Tor nao subiu em 30s. Veja o log em tor/data-state.'
-        return $false
-    }
-    Write-Ok "Tor atendendo em 127.0.0.1:$TorPort"
-    return $true
-}
-
-function Set-RunKey($exe, $torrc) {
-    try {
-        # ATENCAO: nada de "New-Item -Path <chave> -Force" aqui. No provider de
-        # registro (diferente do de arquivos) o -Force numa chave que ja existe
-        # APAGA a chave e recria vazia, levando junto todas as entradas de
-        # inicializacao do usuario (Spotify, Steam, Discord...).
-        # A chave Run sempre existe no Windows; so criamos se realmente faltar.
-        $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-        if (-not (Test-Path -LiteralPath $key)) {
-            New-Item -Path $key -Force | Out-Null
-        }
-        # O tor.exe e binario CONSOLE: a Run key apontando direto para ele abre uma
-        # janela de terminal visivel a cada logon. O wrapper .vbs via wscript.exe
-        # (aplicacao GUI-subsystem) lanca o tor com janela 0 = invisivel, sem o
-        # flash de console.
-        $vbs = Join-Path (Split-Path -Parent $torrc) 'GoLiveBypassTor.vbs'
-        $inner = "`"$exe`" -f `"$torrc`"".Replace('"', '""')
-        # Unicode (UTF-16 com BOM): wscript detecta o BOM e le caminhos com acento
-        # que o ANSI do sistema nao representaria.
-        [System.IO.File]::WriteAllText($vbs, "CreateObject(`"WScript.Shell`").Run `"$inner`", 0, False", [System.Text.Encoding]::Unicode)
-        $command = "`"$env:SystemRoot\System32\wscript.exe`" `"$vbs`""
-        Set-ItemProperty -Path $key -Name 'GoLiveBypassTor' -Value $command
-        Write-Ok 'Tor registrado para subir no proximo logon, sem janela de terminal (GoLiveBypassTor).'
-        return $true
-    } catch {
-        Write-Warn "Nao consegui registrar a inicializacao: $($_.Exception.Message)"
-        return $false
-    }
-}
-
 function Remove-Tor {
-    # Desinstala o que este instalador criou: a Run key. Se existir um servico "tor" apontando
-    # para a nossa pasta (instalacao anterior), remove tambem; se for de outra pessoa, nao mexe.
+    # Desinstala o que as versoes anteriores deste instalador criaram: a Run key e o wrapper
+    # .vbs. Se existir um servico "tor" apontando para a nossa pasta, remove tambem; se for de
+    # outra pessoa, nao mexe.
     $exe = Get-TorExe
     try {
         $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
         Remove-ItemProperty -Path $key -Name 'GoLiveBypassTor' -ErrorAction SilentlyContinue
     } catch { }
-    # O wrapper invisivel que o Set-RunKey gravou ao lado do torrc tambem sai.
+    # O wrapper invisivel gravado ao lado do torrc tambem sai.
     try {
         Remove-Item -LiteralPath (Join-Path (Get-TorBaseDir) 'GoLiveBypassTor.vbs') -Force -ErrorAction SilentlyContinue
     } catch { }
@@ -1430,68 +2125,6 @@ function Remove-Tor {
     # O binario fica: a GUI usa o mesmo e sem ela nao faz mal.
     if (Test-Path -LiteralPath $exe) {
         Write-Host '  [*] O binario do Tor em %LOCALAPPDATA%\GoLiveBypass\Tor permanece (usado tambem pela GUI).' -ForegroundColor DarkGray
-    }
-}
-
-function Select-Proxy {
-    if ($Yes) { return '' }
-
-    if (Test-TuiInteractive) {
-        $tui = Tui-Menu 'Como o bypass vai sair para fora do Brasil?' @(
-            'Proxy gratuita (escolhida e testada sozinha)',
-            'Tor automatico (baixa e sobe sozinho)',
-            'Proxy minha (socks5://host:porta)'
-        )
-        switch ($tui) {
-            2 {
-                if (-not (Install-Tor)) {
-                    Write-Warn 'Nao deu para preparar o Tor. Seguindo com proxy gratuita.'
-                    return ''
-                }
-                return "socks5://127.0.0.1:$TorPort"
-            }
-            3 {
-                $manual = (Tui-Input 'Endereco da proxy').Trim()
-                if ($manual -notmatch '^(socks5|https?)://(?:.+@)?[a-z0-9.-]{1,253}:\d{1,5}(?:-\d{1,5})?$') {
-                    throw 'Formato invalido. Use socks5://host:porta, ou socks5://usuario:senha@host:porta.'
-                }
-                return $manual
-            }
-            default { return '' }
-        }
-    }
-
-    Write-Host ''
-    Write-Host '  Como o bypass vai sair para fora do Brasil?' -ForegroundColor White
-    Write-Host ''
-    Write-Host '    [1] Proxy gratuita, escolhida e testada sozinha' -ForegroundColor Green
-    Write-Host '        Nao precisa instalar nada. O plugin testa varias e usa a que passar.' -ForegroundColor DarkGray
-    Write-Host '    [2] Tor automatico' -ForegroundColor Cyan
-    Write-Host '        Baixa e instala o Tor sozinho (uma vez) e deixa ele sempre rodando.' -ForegroundColor DarkGray
-    Write-Host '    [3] Proxy minha' -ForegroundColor Cyan
-    Write-Host '        Voce informa o endereco, no formato socks5://host:porta.' -ForegroundColor DarkGray
-    Write-Host ''
-
-    switch (Read-Escolha '  Escolha') {
-        '2' {
-            if (-not (Install-Tor)) {
-                Write-Warn 'Nao deu para preparar o Tor. Seguindo com proxy gratuita.'
-                return ''
-            }
-            return "socks5://127.0.0.1:$TorPort"
-        }
-        '3' {
-            Write-Host '  Se a sua proxy pedir login, use socks5://usuario:senha@host:porta' -ForegroundColor DarkGray
-            Write-Host '  Senha com @ ou : precisa vir codificada (@ vira %40, : vira %3A)' -ForegroundColor DarkGray
-            $manual = (Read-Escolha '  Endereco da proxy').Trim()
-            # O trecho antes do @ e opcional e casado com ganancia, para a senha poder conter @ e
-            # : codificados. Recusar isso aqui deixaria o suporte a login existindo so no plugin.
-            if ($manual -notmatch '^(socks5|https?)://(?:.+@)?[a-z0-9.-]{1,253}:\d{1,5}(?:-\d{1,5})?$') {
-                throw 'Formato invalido. Use socks5://host:porta, ou socks5://usuario:senha@host:porta.'
-            }
-            return $manual
-        }
-        default { return '' }
     }
 }
 
@@ -1521,7 +2154,7 @@ function Select-Persistence {
 function Wait-DiscordExit($root) {
     Write-Host ''
     Write-Ok 'Discord aberto com o GoLiveBypass.'
-    Write-Warn 'Deixe esta janela aberta. Quando voce fechar o Discord, eu desfaco a injecao.'
+    Write-Warn 'Deixe esta janela aberta. Quando voce fechar o Discord, removo apenas o plugin GoLiveBypass.'
     Write-Host '  Se fechar esta janela antes, rode: .\GoLiveBypass-Installer.ps1 -Mode Uninstall' -ForegroundColor DarkGray
 
     try {
@@ -1533,88 +2166,138 @@ function Wait-DiscordExit($root) {
         }
 
         if (-not (Get-Process -Name $DiscordNames -ErrorAction SilentlyContinue)) {
-            Write-Warn 'O Discord nao abriu em 90s. Vou desfazer a injecao agora.'
+            Write-Warn 'O Discord nao abriu em 90s. Vou remover apenas o GoLiveBypass agora.'
         } else {
             while (Get-Process -Name $DiscordNames -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 }
             Write-Host ''
-            Write-Step 'Discord fechado, desfazendo a injecao'
+            Write-Step 'Discord fechado, removendo apenas o plugin GoLiveBypass'
         }
     } finally {
-        # finally para que Ctrl+C tambem desfaca, em vez de deixar o Discord injetado.
-        Push-Location -LiteralPath $root
-        try {
-            & pnpm uninject
-            if ($LASTEXITCODE -ne 0) { Write-Warn 'O pnpm uninject falhou. Rode "pnpm uninject" na pasta do mod.' }
-            else { Write-Ok 'Discord restaurado.' }
-        } finally { Pop-Location }
+        Remove-PluginSource $root
+        Write-Ok 'GoLiveBypass removido; Vencord/Equicord preservado.'
     }
 }
 
 function Invoke-RestoreEverything {
     $root = Find-Checkout
     if ($root) {
-        $target = Join-Path $root "src\userplugins\$PluginDirName"
-        if (Test-Path -LiteralPath $target) {
-            Write-Step "Removendo $target"
-            Remove-Item -LiteralPath $target -Recurse -Force
-        }
-
+        Remove-PluginSource $root
         Stop-Discord
-        Push-Location -LiteralPath $root
-        try {
-            Write-Step 'Desfazendo a injecao'
-            & pnpm uninject
-        } finally { Pop-Location }
     } else {
         Write-Warn 'Nao achei o fonte do mod, entao so posso parar por aqui.'
     }
 
     Remove-Tor
     Write-Host ''
-    Write-Ok 'Tudo restaurado. Seu Discord voltou ao normal.'
+    Write-Ok 'GoLiveBypass removido; Vencord/Equicord e o Discord foram preservados.'
 }
-
-function Show-MainMenu {
-    $root = Find-Checkout
-    Show-Status $root
-
-    if (Test-TuiInteractive) {
-        $tui = Tui-Menu 'O que voce quer fazer?' @(
-            'Instalar o GoLiveBypass',
-            'Verificar atualizacoes do plugin',
-            'Atualizar o plugin',
-            'Remover so o plugin (o mod continua)',
-            'Restaurar tudo (remove o plugin e desfaz a injecao)',
-            'Sair'
-        )
-        switch ($tui) {
-            1 { Invoke-Install $root }
-            2 { Invoke-CheckUpdate }
-            3 { Invoke-Update }
-            4 { Invoke-Uninstall }
-            5 { Invoke-RestoreEverything }
-            default { Write-Host '  Ate mais.' -ForegroundColor DarkGray }
-        }
+function Invoke-ChangeChannel($root) {
+    if (-not $root) {
+        Write-Warn 'Para persistir o canal, primeiro prepare um checkout do Equicord/Vencord.'
+        Write-Host '  A instalacao inicial perguntara o canal depois de preparar o mod.' -ForegroundColor DarkGray
+        return
+    }
+    $current = Get-PersistedUpdateChannel $root
+    if (-not $current) { $current = 'stable' }
+    if ($script:ChannelExplicit) {
+        Write-Host "  Canal fixado por -Channel: $Channel. Nada foi alterado pelo submenu." -ForegroundColor DarkGray
+        return
+    }
+    if ($Yes) {
+        if (Set-UpdateChannelPreference $root $current) { Write-Ok "Canal mantido em $current." }
         return
     }
 
-    Write-Host '  O que voce quer fazer?' -ForegroundColor White
-    Write-Host ''
-    Write-Host '    [1] Instalar o GoLiveBypass' -ForegroundColor Green
-    Write-Host '    [2] Verificar atualizacoes do plugin' -ForegroundColor Cyan
-    Write-Host '    [3] Atualizar o plugin' -ForegroundColor Green
-    Write-Host '    [4] Remover so o plugin (o mod continua)' -ForegroundColor Yellow
-    Write-Host '    [5] Restaurar tudo (remove o plugin e desfaz a injecao)' -ForegroundColor Red
-    Write-Host '    [0] Sair' -ForegroundColor Gray
-    Write-Host ''
+    $selected = $null
+    if (Test-TuiInteractive) {
+        $choice = Tui-Menu "Canal de atualizacoes (atual: $current)" @(
+            'Stable (recomendado) — canal mais previsivel, somente releases estaveis',
+            'Beta (opt-in) — canal de testes; ajuda a encontrar e corrigir erros',
+            'Cancelar'
+        )
+        if ($choice -eq 1) { $selected = 'stable' }
+        elseif ($choice -eq 2) { $selected = 'beta' }
+    } else {
+        Write-Host ''
+        Write-Host "  Canal de atualizacoes (atual: $current)" -ForegroundColor White
+        Write-Host '    [1] Stable (recomendado)' -ForegroundColor Green
+        Write-Host '        Canal mais previsivel, somente releases estaveis.' -ForegroundColor DarkGray
+        Write-Host '    [2] Beta (opt-in)' -ForegroundColor Yellow
+        Write-Host '        Canal de testes; voce ajuda a comunidade a testar, encontrar e corrigir erros antes da versao estavel.' -ForegroundColor DarkGray
+        Write-Host '    [0] Cancelar' -ForegroundColor DarkGray
+        $choice = Read-Escolha '  Escolha'
+        if ($choice -eq '1') { $selected = 'stable' }
+        elseif ($choice -eq '2') { $selected = 'beta' }
+    }
+    if (-not $selected) {
+        Write-Host '  Canal nao alterado. Voltando ao menu.' -ForegroundColor DarkGray
+        return
+    }
+    if (-not (Set-UpdateChannelPreference $root $selected)) {
+        Write-Warn 'Nao consegui salvar o canal; nenhuma instalacao ou atualizacao foi executada.'
+        return
+    }
+    if ((Get-PersistedUpdateChannel $root) -eq $selected) {
+        Write-Ok "Canal salvo: $selected. Voltando ao menu."
+    } else {
+        Write-Warn 'Nao consegui confirmar o canal salvo; nenhuma outra acao foi executada.'
+    }
+}
 
-    switch (Read-Escolha '  Escolha') {
-        '1' { Invoke-Install $root }
-        '2' { Invoke-CheckUpdate }
-        '3' { Invoke-Update }
-        '4' { Invoke-Uninstall }
-        '5' { Invoke-RestoreEverything }
-        default { Write-Host '  Ate mais.' -ForegroundColor DarkGray }
+function Show-MainMenu {
+    :menuLoop while ($true) {
+        $root = Find-Checkout
+        Show-Status $root
+
+        if (Test-TuiInteractive) {
+            $tui = Tui-Menu 'O que voce quer fazer?' @(
+                'Instalar o GoLiveBypass',
+                'Verificar atualizacoes do plugin',
+                'Atualizar o plugin',
+                'Mudar canal de atualizacoes',
+                'Remover so o plugin (o mod continua)',
+                'Restaurar tudo (remove o plugin; preserva o mod)',
+                'Ver estado dos clientes (injecao/backup)',
+                'Restaurar cliente que nao abre (devolve o app.asar)',
+                'Sair'
+            )
+            switch ($tui) {
+                1 { Invoke-Install $root; return }
+                2 { Invoke-CheckUpdate; return }
+                3 { Invoke-Update; return }
+                4 { Invoke-ChangeChannel $root; continue menuLoop }
+                5 { Invoke-Uninstall; return }
+                6 { Invoke-RestoreEverything; return }
+                7 { Show-ClientStates; continue menuLoop }
+                8 { Invoke-RestoreClient $Client; continue menuLoop }
+                default { Write-Host '  Ate mais.' -ForegroundColor DarkGray; return }
+            }
+        }
+
+        Write-Host '  O que voce quer fazer?' -ForegroundColor White
+        Write-Host ''
+        Write-Host '    [1] Instalar o GoLiveBypass' -ForegroundColor Green
+        Write-Host '    [2] Verificar atualizacoes do plugin' -ForegroundColor Cyan
+        Write-Host '    [3] Atualizar o plugin' -ForegroundColor Green
+        Write-Host '    [4] Mudar canal de atualizacoes' -ForegroundColor Cyan
+        Write-Host '    [5] Remover so o plugin (o mod continua)' -ForegroundColor Yellow
+        Write-Host '    [6] Restaurar tudo (remove o plugin; preserva o mod)' -ForegroundColor Red
+        Write-Host '    [7] Ver estado dos clientes (injecao/backup)' -ForegroundColor Cyan
+        Write-Host '    [8] Restaurar cliente que nao abre (devolve o app.asar)' -ForegroundColor Yellow
+        Write-Host '    [0] Sair' -ForegroundColor Gray
+        Write-Host ''
+
+        switch (Read-Escolha '  Escolha') {
+            '1' { Invoke-Install $root; return }
+            '2' { Invoke-CheckUpdate; return }
+            '3' { Invoke-Update; return }
+            '4' { Invoke-ChangeChannel $root; continue menuLoop }
+            '5' { Invoke-Uninstall; return }
+            '6' { Invoke-RestoreEverything; return }
+            '7' { Show-ClientStates; continue menuLoop }
+            '8' { Invoke-RestoreClient $Client; continue menuLoop }
+            default { Write-Host '  Ate mais.' -ForegroundColor DarkGray; return }
+        }
     }
 }
 
@@ -1631,75 +2314,199 @@ function Show-MainMenu {
 $GitHubRepo = 'PgLESv/GoLiveBypass'
 $GitHubApi  = "https://api.github.com/repos/$GitHubRepo"
 
-# Consulta a release mais recente. Devolve um objeto com .Tag e .AssetUrl
-# (pode ser $null para qualquer um). RC=0 mesmo se a consulta falhou: o
-# --check-update nao pode derrubar o instalador por falta de rede.
-function Get-LatestRelease {
+function Get-LatestBetaHelperAsset {
     try {
-        $headers = @{ 'User-Agent' = 'GoLiveBypass-Installer'; 'Accept' = 'application/vnd.github+json' }
-        $release = Invoke-RestMethod -Uri "$GitHubApi/releases/latest" -Headers $headers -TimeoutSec 15
+        $headers = @{ 'User-Agent' = 'GoLiveBypass-Installer' }
+        $apiHeaders = @{ 'User-Agent' = 'GoLiveBypass-Installer'; 'Accept' = 'application/vnd.github+json' }
+        $releases = Invoke-RestMethod -Uri "$GitHubApi/releases?per_page=20" -Headers $apiHeaders -TimeoutSec 15
+        foreach ($release in @($releases)) {
+            if ($release.draft) { continue }
+            $releaseVersion = ConvertTo-PluginVersion $release.tag_name
+            if (-not $releaseVersion) { continue }
+            $releaseIsBeta = $releaseVersion.Pre.Count -gt 0
+            if (($script:SelectedChannel -eq 'stable' -and $releaseIsBeta) -or
+                ($script:SelectedChannel -eq 'beta' -and -not $releaseIsBeta)) { continue }
+
+            # 1. Preferir proton-confgen-manifest.json para nome canonico e hash SHA-256
+            $manifestAsset = @($release.assets) |
+                Where-Object { $_.name -eq 'proton-confgen-manifest.json' } |
+                Select-Object -First 1
+            if ($manifestAsset) {
+                try {
+                    $manifestContent = Invoke-RestMethod -Uri $manifestAsset.browser_download_url -Headers $headers -TimeoutSec 15
+                    if ($manifestContent.assets -and $manifestContent.assets.'win32-x64') {
+                        $expectedName = $manifestContent.assets.'win32-x64'.asset
+                        $expectedSha = $manifestContent.assets.'win32-x64'.sha256
+                        if ($expectedName -and $expectedSha -and $expectedSha -match '^[0-9a-f]{64}$') {
+                            $asset = @($release.assets) | Where-Object { $_.name -eq $expectedName } | Select-Object -First 1
+                            if ($asset) {
+                                $sha256 = $expectedSha.ToLowerInvariant()
+                            }
+                        }
+                    }
+                } catch { }
+            }
+
+            # 2. Fallback: procurar executavel por padrao de nome e arquivo companion .sha256
+            if (-not $asset) {
+                $asset = @($release.assets) |
+                    Where-Object { $_.name -match '(^|-)proton-confgen.*-win-x64\.exe$' } |
+                    Select-Object -First 1
+            }
+            if (-not $asset) { continue }
+
+            if (-not $sha256) {
+                $shaAsset = @($release.assets) |
+                    Where-Object { $_.name -eq "$($asset.name).sha256" } |
+                    Select-Object -First 1
+                if (-not $shaAsset) { continue }
+
+                $shaResponse = Invoke-WebRequest -Uri $shaAsset.browser_download_url -Headers $headers -UseBasicParsing -TimeoutSec 15
+                $shaContent = if ($shaResponse.Content -is [byte[]]) {
+                    [Text.Encoding]::UTF8.GetString($shaResponse.Content).Trim()
+                } else {
+                    ([string]$shaResponse.Content).Trim()
+                }
+                $sha256 = ($shaContent -split '\s+')[0].ToLowerInvariant()
+            }
+
+            if (-not $sha256 -or $sha256 -notmatch '^[0-9a-f]{64}$') { continue }
+
+            return [PSCustomObject]@{
+                Tag = ($release.tag_name -replace '^v', '')
+                Url = $asset.browser_download_url
+                Sha256 = $sha256
+            }
+        }
     } catch {
         return $null
     }
+    return $null
+}
 
-    $tag = $null
-    if ($release.PSObject.Properties['tag_name'] -and $release.tag_name) {
-        # tag_name vem como "v1.1.8"; o manifest usa "1.1.8" (sem o v)
-        $tag = $release.tag_name -replace '^v', ''
+# Release candidates are selected from the API collection for both channels. Never
+function ConvertTo-PluginVersion($value) {
+    if ($null -eq $value) { return $null }
+    $text = ([string]$value).Trim()
+    $match = [regex]::Match($text, '^[vV]?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$')
+    if (-not $match.Success) { return $null }
+    foreach ($part in @($match.Groups[1].Value, $match.Groups[2].Value, $match.Groups[3].Value)) {
+        if ($part.Length -gt 1 -and $part.StartsWith('0')) { return $null }
     }
-
-    $zip = $null
-    foreach ($a in $release.assets) {
-        if ($a.name -like 'goLiveBypass-vencord*.zip') {
-            $zip = $a.browser_download_url
-            break
+    $identifiers = @()
+    if ($match.Groups[4].Success) {
+        $pre = $match.Groups[4].Value
+        $legacy = [regex]::Match($pre, '^beta[.-]([0-9]+)$')
+        if ($legacy.Success) {
+            if ($legacy.Groups[1].Value.Length -gt 1 -and $legacy.Groups[1].Value.StartsWith('0')) { return $null }
+            $identifiers = @('beta', $legacy.Groups[1].Value)
+        } else {
+            $identifiers = @($pre -split '\.')
+            foreach ($identifier in $identifiers) {
+                if ($identifier -match '^[0-9]+$' -and $identifier.Length -gt 1 -and $identifier.StartsWith('0')) { return $null }
+            }
         }
     }
+    [pscustomobject]@{
+        Major = [System.Numerics.BigInteger]::Parse($match.Groups[1].Value)
+        Minor = [System.Numerics.BigInteger]::Parse($match.Groups[2].Value)
+        Patch = [System.Numerics.BigInteger]::Parse($match.Groups[3].Value)
+        Pre = $identifiers
+        Normalized = "$($match.Groups[1].Value).$($match.Groups[2].Value).$($match.Groups[3].Value)" + $(if ($identifiers.Count) { "-$($identifiers -join '-')" } else { '' })
+    }
+}
 
-    return [PSCustomObject]@{ Tag = $tag; AssetUrl = $zip }
+function Compare-Version($installed, $latest) {
+    $a = ConvertTo-PluginVersion $installed
+    $b = ConvertTo-PluginVersion $latest
+    if (-not $b) { return 0 }
+    if (-not $a) { return -1 }
+    foreach ($name in @('Major', 'Minor', 'Patch')) {
+        if ($a.$name -lt $b.$name) { return -1 }
+        if ($a.$name -gt $b.$name) { return 1 }
+    }
+    if ($a.Pre.Count -eq 0 -and $b.Pre.Count -eq 0) { return 0 }
+    if ($a.Pre.Count -eq 0) { return 1 }
+    if ($b.Pre.Count -eq 0) { return -1 }
+    $count = [Math]::Max($a.Pre.Count, $b.Pre.Count)
+    for ($i = 0; $i -lt $count; $i++) {
+        if ($i -ge $a.Pre.Count) { return -1 }
+        if ($i -ge $b.Pre.Count) { return 1 }
+        $left = [string]$a.Pre[$i]; $right = [string]$b.Pre[$i]
+        $leftNumeric = $left -match '^[0-9]+$'; $rightNumeric = $right -match '^[0-9]+$'
+        if ($leftNumeric -and $rightNumeric) {
+            $cmp = [System.Numerics.BigInteger]::Compare([System.Numerics.BigInteger]::Parse($left), [System.Numerics.BigInteger]::Parse($right))
+        } elseif ($leftNumeric -ne $rightNumeric) {
+            $cmp = if ($leftNumeric) { -1 } else { 1 }
+        } else {
+            $cmp = [string]::CompareOrdinal($left, $right)
+        }
+        if ($cmp -ne 0) { return $(if ($cmp -lt 0) { -1 } else { 1 }) }
+    }
+    return 0
+}
+# Consulta a coleção /releases?per_page=30; não usa /releases/latest, pois o
+# endpoint latest oculta prereleases e não fornece o contrato completo de assets.
+function Get-PluginReleaseCandidates([string]$channel = $script:SelectedChannel) {
+    try {
+        $headers = @{ 'User-Agent' = 'GoLiveBypass-Installer'; 'Accept' = 'application/vnd.github+json' }
+        $releases = Invoke-RestMethod -Uri "$GitHubApi/releases?per_page=30" -Headers $headers -TimeoutSec 15
+        foreach ($release in @($releases)) {
+            if (-not $release -or -not $release.PSObject.Properties['draft'] -or $release.draft -ne $false -or -not $release.tag_name) { continue }
+            $version = ConvertTo-PluginVersion $release.tag_name
+            if (-not $version) { continue }
+            $isPrerelease = $version.Pre.Count -gt 0
+            if (-not $release.PSObject.Properties['prerelease'] -or $release.prerelease -isnot [bool] -or [bool]$release.prerelease -ne $isPrerelease) { continue }
+            if ($channel -eq 'stable' -and $isPrerelease) { continue }
+            $zip = @($release.assets) | Where-Object { $_.name -eq 'goLiveBypass-vencord.zip' } | Select-Object -First 1
+            $sha = @($release.assets) | Where-Object { $_.name -eq 'goLiveBypass-vencord.zip.sha256' } | Select-Object -First 1
+            if (-not $zip -or -not $sha) { continue }
+            if ($zip.browser_download_url -notmatch '^https://') { continue }
+            if ($sha.browser_download_url -notmatch '^https://') { continue }
+            [pscustomobject]@{
+                Tag = $version.Normalized
+                Version = $version.Normalized
+                AssetUrl = [string]$zip.browser_download_url
+                ShaUrl = [string]$sha.browser_download_url
+                Prerelease = [bool]$isPrerelease
+                Release = $release
+            }
+        }
+    } catch {
+        return
+    }
+}
+
+function Get-PluginReleaseForChannel([string]$channel = $script:SelectedChannel) {
+    $best = $null
+    foreach ($candidate in @(Get-PluginReleaseCandidates $channel)) {
+        if (-not $best -or (Compare-Version $best.Version $candidate.Version) -lt 0) { $best = $candidate }
+    }
+    return $best
+}
+
+function Get-PluginInstallRelease([string]$channel = $script:SelectedChannel) {
+    return Get-PluginReleaseForChannel $channel
+}
+
+# The update check intentionally uses the same fully validated release object as install/update.
+function Get-LatestRelease([string]$channel = $script:SelectedChannel) {
+    return Get-PluginReleaseForChannel $channel
 }
 
 # Le a versao do manifest.json em $root/src/userplugins/$PluginDirName.
-# Devolve $null se nao existir.
 function Get-InstalledPluginVersion($root) {
     if (-not $root) { return $null }
     $manifest = Join-Path $root "src\userplugins\$PluginDirName\manifest.json"
     if (-not (Test-Path -LiteralPath $manifest)) { return $null }
     try {
         $j = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-        if ($j.PSObject.Properties['version'] -and $j.version) { return [string]$j.version }
+        $version = if ($j.PSObject.Properties['version']) { [string]$j.version } else { $null }
+        if (ConvertTo-PluginVersion $version) { return $version }
     } catch {}
     return $null
 }
 
-# Compara duas versoes semver. Retorna -1/0/+1.
-# [version] casts lidam com 1.2.3 mas nao com "1.2.3-beta" - usamos o tipo
-# apenas para a parte numerica.
-function Compare-Version($installed, $latest) {
-    if (-not $latest) { return 0 }   # sem informacao do GitHub: sem atualizacao
-    if (-not $installed) { return -1 }  # sem versao local: vale conferir
-
-    $local = [string]$installed -replace '^[vV]', ''
-    $remote = [string]$latest -replace '^[vV]', ''
-    $localDash = $local.IndexOf('-')
-    $remoteDash = $remote.IndexOf('-')
-    $localCore = if ($localDash -ge 0) { $local.Substring(0, $localDash) } else { $local }
-    $localPre = if ($localDash -ge 0) { $local.Substring($localDash + 1) } else { '' }
-    $remoteCore = if ($remoteDash -ge 0) { $remote.Substring(0, $remoteDash) } else { $remote }
-    $remotePre = if ($remoteDash -ge 0) { $remote.Substring($remoteDash + 1) } else { '' }
-
-    $a = [version]$localCore
-    $b = [version]$remoteCore
-    if ($b -gt $a) { return -1 }
-    if ($b -lt $a) { return  1 }
-
-    # Mesma versao base: um sufixo de pre-release (-beta.N) sempre conta como
-    # mais antigo que a mesma base sem sufixo, nunca como versao igual.
-    if ($localPre -and -not $remotePre) { return -1 }
-    if (-not $localPre -and $remotePre) { return 1 }
-    if ($localPre -and $remotePre) { return [string]::Compare($localPre, $remotePre, [System.StringComparison]::Ordinal) }
-    return 0
-}
 
 # Faz backup do plugin atual em $root/src/userplugins/.$PluginDirName.bak/
 # com timestamp YYYYMMDDHHMMSS, mantendo so os 3 mais recentes.
@@ -1724,126 +2531,88 @@ function Backup-Plugin($root) {
     }
 }
 
-# --check-update: imprime o status e sai. NUNCA baixa nada.
+# --check-update: consulta canal selecionado e nunca baixa.
 function Invoke-CheckUpdate {
     $root = Find-Checkout
     if (-not $root) {
-        Write-Host "  plugin: " -NoNewline
-        Write-Host "nao encontrado" -ForegroundColor Yellow -NoNewline
-        Write-Host " (rode uma vez para instalar)"
+        Write-Host "  plugin: nao encontrado (rode uma vez para instalar)"
         return
     }
-
+    $channel = Select-UpdateChannel $root
     $installed = Get-InstalledPluginVersion $root
-    if ($installed) {
-        Write-Host "  plugin: instalado (" -NoNewline
-        Write-Host "v$installed" -ForegroundColor DarkGray -NoNewline
-        Write-Host ")"
-    } else {
-        Write-Host "  plugin: " -NoNewline
-        Write-Host "instalado (versao desconhecida)" -ForegroundColor Yellow
-    }
-
-    $release = Get-LatestRelease
-    if (-not $release -or -not $release.Tag) {
-        Write-Host "  remote: " -NoNewline
-        Write-Host "nao consegui consultar (rede ou rate limit)" -ForegroundColor DarkGray
+    if ($installed) { Write-Host "  plugin: instalado (v$installed)" }
+    else { Write-Host "  plugin: instalado (versao desconhecida)" -ForegroundColor Yellow }
+    $release = Get-LatestRelease $channel
+    if (-not $release) {
+        Write-Host "  remote: nenhuma release $channel valida com zip e SHA-256 (ausente, metadata incoerente, rede ou rate limit)" -ForegroundColor DarkGray
         return
     }
-
-    Write-Host "  remote: " -NoNewline
-        Write-Host "v$($release.Tag)" -ForegroundColor DarkGray
-
+    [void](Set-UpdateChannelPreference $root $channel)
+    Write-Host "  canal: $channel"
+    Write-Host "  remote: $($release.Version)"
     if (-not $installed) {
-        Write-Host "  resultado: " -NoNewline
-        Write-Host "versao local desconhecida - rode --update para alinhar" -ForegroundColor Yellow
+        Write-Host "  resultado: versao local desconhecida - rode -Mode Update para alinhar" -ForegroundColor Yellow
         return
     }
-
-    $cmp = Compare-Version $installed $release.Tag
-    switch ($cmp) {
-        0  { Write-Host "  resultado: " -NoNewline
-        Write-Host "voce esta na versao mais recente" -ForegroundColor Green }
-        1  { Write-Host "  resultado: " -NoNewline
-        Write-Host "versao local mais nova que a release (fork?)" -ForegroundColor DarkGray }
-        -1 { Write-Host "  resultado: " -NoNewline
-        Write-Host "ha versao nova - rode sem --check-update para atualizar" -ForegroundColor Yellow }
+    switch (Compare-Version $installed $release.Version) {
+        0  { Write-Host "  resultado: voce esta na versao mais recente" -ForegroundColor Green }
+        1  { Write-Host "  resultado: versao local mais nova que a release (nenhum downgrade)" -ForegroundColor DarkGray }
+        -1 { Write-Host "  resultado: ha versao nova - rode -Mode Update para atualizar" -ForegroundColor Yellow }
     }
 }
 
-# --update: faz o trabalho. Baixa o zip, valida SHA-256, extrai.
+# --update: baixa somente o zip da release validada do canal e nunca faz downgrade.
 function Invoke-Update {
     $root = Find-Checkout
     if (-not $root) { throw "Nao achei o checkout do mod. Rode o instalador uma vez (sem --update) para descobrir." }
-
+    $channel = Select-UpdateChannel $root
     $installed = Get-InstalledPluginVersion $root
-    $release = Get-LatestRelease
-    if (-not $release -or -not $release.Tag) { throw "Nao consegui consultar a release mais recente (rede ou rate limit do GitHub)." }
-
-    if ($installed) {
-        $cmp = Compare-Version $installed $release.Tag
-        if ($cmp -eq 0) {
-            Write-Ok "Voce ja esta na v$($release.Tag) (a mais recente)."
-            return
-        }
-        if ($cmp -eq 1) {
-            Write-Warn "Versao local (v$installed) e mais nova que a release (v$($release.Tag))."
-            if (-not $Yes -and $Host.UI.RawUI) {
-                $ans = Read-Escolha "  Atualizar mesmo assim? (S/N)"
-                if ($ans -ne 'S' -and $ans -ne 's') { Write-Warn 'Atualizacao cancelada.'; return }
-            }
-        }
+    if (-not $installed -and (Test-Path -LiteralPath (Join-Path $root "src\userplugins\$PluginDirName\manifest.json"))) {
+        throw "A versao instalada do plugin e invalida; nenhum update seguro foi aplicado."
     }
-
+    $release = Get-LatestRelease $channel
+    if (-not $release) { throw "Nao encontrei uma release $channel valida com zip e SHA-256; ela pode estar ausente, em metadata incoerente ou indisponivel por rede/rate limit." }
+    if ($installed -and (Compare-Version $installed $release.Version) -ge 0) {
+        [void](Set-UpdateChannelPreference $root $channel)
+        if ((Compare-Version $installed $release.Version) -eq 0) { Write-Ok "Voce ja esta na versao $($release.Version) (canal $channel)." }
+        else { Write-Warn "Versao local (v$installed) e mais nova; nenhum downgrade foi feito." }
+        return
+    }
     Write-Step "Fazendo backup do plugin atual"
     Backup-Plugin $root
-
-    if ($release.AssetUrl) {
-        Invoke-UpdateFromZip $root $release.AssetUrl $release.Tag
-    } else {
-        # Fallback: a release nao tem o asset do userplugin
-        Write-Warn "Release v$($release.Tag) nao tem o zip do userplugin. Caindo no download via RepoRaw."
-        Copy-Plugin $root
-    }
-
+    Invoke-UpdateFromZip $root $release.AssetUrl $release.Version $release.ShaUrl
     Build-Mod $root
     if (-not (Test-InjectedFromCheckout $root)) { Invoke-Injection $root @((Get-PatchTargets) | Where-Object { $_.Tipo -eq 'O' }) }
-
+    [void](Set-UpdateChannelPreference $root $channel)
     Write-Host ''
-    Write-Ok "Atualizado para v$($release.Tag). Reinicie o Discord para carregar a nova versao."
+    Write-Ok "Atualizado para $($release.Version) (canal $channel). Reinicie o Discord para carregar a nova versao."
 }
 
-# Baixa o zip, valida SHA-256, extrai por cima do plugin atual.
-function Invoke-UpdateFromZip($root, $zipUrl, $expectedVersion) {
-    $tempDir = Join-Path $env:TEMP "GoLiveBypass-update-$expectedVersion"
+# Baixa o zip do userplugin, valida SHA-256 e extrai. O SHA URL vem do mesmo
+# objeto de release para evitar misturar assets de canais/releases diferentes.
+function Invoke-UpdateFromZip($root, $zipUrl, $expectedVersion, $shaUrl = $null) {
+    $tempDir = Join-Path $env:TEMP "GoLiveBypass-plugin-$expectedVersion"
     if (Test-Path -LiteralPath $tempDir) { Remove-Item -LiteralPath $tempDir -Recurse -Force }
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
     $zipFile = Join-Path $tempDir 'plugin.zip'
-
     Write-Step "Baixando $zipUrl"
-    try {
-        Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing -TimeoutSec 60
-    } catch {
-        Remove-CaminhoSilencioso $tempDir
-        throw "Download do zip falhou: $($_.Exception.Message)"
-    }
-
+    try { Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile -UseBasicParsing -TimeoutSec 60 }
+    catch { Remove-CaminhoSilencioso $tempDir; throw "Download do zip falhou: $($_.Exception.Message)" }
     Write-Step "Validando SHA-256"
-    $shaUrl = "$zipUrl.sha256"
-    $shaExpected = $null
+    if (-not $shaUrl) { $shaUrl = "$zipUrl.sha256" }
     try {
         $shaResponse = Invoke-WebRequest -Uri $shaUrl -UseBasicParsing -TimeoutSec 15
-        # Windows PowerShell 5.1 pode expor Content como byte[] para assets
-        # binários/redirects do GitHub; normalize antes de aplicar Trim().
         $shaContent = if ($shaResponse.Content -is [byte[]]) {
             [Text.Encoding]::UTF8.GetString($shaResponse.Content).Trim()
-        } else {
-            ([string]$shaResponse.Content).Trim()
-        }
+        } else { ([string]$shaResponse.Content).Trim() }
         $shaExpected = ($shaContent -split '\s+')[0].ToLower()
     } catch {
         Remove-CaminhoSilencioso $tempDir
         throw "Release sem arquivo .sha256 (asset companion). Sem hash, sem update."
+    }
+    if ($shaExpected -notmatch '^[0-9a-f]{64}$') {
+        Remove-CaminhoSilencioso $tempDir
+        throw 'Release com SHA-256 invalido. Sem hash, sem update.'
     }
     $shaActual = (Get-FileHash -LiteralPath $zipFile -Algorithm SHA256).Hash.ToLower()
     if ($shaActual -ne $shaExpected) {
@@ -1851,42 +2620,47 @@ function Invoke-UpdateFromZip($root, $zipUrl, $expectedVersion) {
         throw "SHA-256 nao confere: esperado $shaExpected, obtido $shaActual."
     }
     Write-Ok 'SHA-256 confere'
-
-    Write-Step "Extraindo o plugin"
     $extractDir = Join-Path $tempDir 'extract'
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-    try {
-        Expand-Archive -LiteralPath $zipFile -DestinationPath $extractDir -Force
-    } catch {
-        Remove-CaminhoSilencioso $tempDir
-        throw "Extracao falhou: $($_.Exception.Message)"
-    }
-
-    $target = Join-Path $root "src\userplugins\$PluginDirName"
-    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
-    New-Item -ItemType Directory -Path $target -Force | Out-Null
-
-    # O zip tem a pasta raiz goLiveBypass/; copia o conteudo
+    try { Expand-Archive -LiteralPath $zipFile -DestinationPath $extractDir -Force }
+    catch { Remove-CaminhoSilencioso $tempDir; throw "Extracao falhou: $($_.Exception.Message)" }
     $extracted = Get-ChildItem -LiteralPath $extractDir -Directory | Select-Object -First 1
-    if (-not $extracted) {
+    if (-not $extracted -or $extracted.Name -ne $PluginDirName) {
         Remove-CaminhoSilencioso $tempDir
         throw 'Zip nao tem a pasta esperada (goLiveBypass/).'
     }
+    $manifestPath = Join-Path $extracted.FullName 'manifest.json'
+    $extractedVersion = $null
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        if ($manifest.PSObject.Properties['version']) { $extractedVersion = [string]$manifest.version }
+    } catch { }
+    if (-not $extractedVersion -or -not (ConvertTo-PluginVersion $extractedVersion) -or (Compare-Version $extractedVersion $expectedVersion) -ne 0) {
+        Remove-CaminhoSilencioso $tempDir
+        throw "Manifest do plugin nao corresponde a release $expectedVersion."
+    }
+    $target = Join-Path $root "src\userplugins\$PluginDirName"
+    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
     Get-ChildItem -LiteralPath $extracted.FullName -Force | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force
     }
-
     Remove-CaminhoSilencioso $tempDir
     Write-Ok 'Plugin extraido'
 }
 
 Show-Banner
 
+$script:InstallerPhase = 'detect'
+Write-InstallerEvent 'info' 'installer.detect.started' 'detect' @{ mode = $Mode }
+
 try {
     switch ($Mode) {
         'Install'     { Invoke-Install (Find-Checkout) }
         'Uninstall'   { Invoke-Uninstall }
         'Restore'     { Invoke-RestoreEverything }
+        'RestoreClient' { Invoke-RestoreClient $Client }
+        'ClientStatus'  { Show-ClientStates }
         'CheckUpdate' { Invoke-CheckUpdate }
         'Update'      { Invoke-Update }
         default       { Show-MainMenu }
@@ -1902,6 +2676,10 @@ try {
         Write-Host "      linha $($info.ScriptLineNumber): $($info.Line.Trim())" -ForegroundColor DarkGray
     }
     Write-Host '      Se for relatar, mande esta linha junto.' -ForegroundColor DarkGray
+    Write-Host "      Log local: $(Get-InstallerLogFile)" -ForegroundColor DarkGray
+    Write-Host '      Copie a saida acima ou abra o log para relatar.' -ForegroundColor DarkGray
+
+    Write-InstallerEvent 'error' 'installer.failed' $script:InstallerPhase @{ reason = $_.Exception.Message }
     Wait-AntesDeFechar
     exit 1
 }

@@ -40,11 +40,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	broker := updates.NewBroker()
-	e := server.NewWithBroker(cfg, client, logger, broker)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	broker := updates.NewBroker()
+	e := server.NewWithBroker(cfg, client, logger, broker, client)
 	updates.NewReleasePoller(cfg.GitHubToken, cfg.GitHubRepo, broker, logger).Start(ctx)
 
 	sc := echo.StartConfig{

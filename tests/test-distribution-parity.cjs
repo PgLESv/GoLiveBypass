@@ -37,6 +37,32 @@ function section(source, from, to) {
     assert.notEqual(end, -1, `fim ausente: ${to}`);
     return source.slice(start, end);
 }
+function pluginSourceFilesFromNative() {
+    const required = section(pluginNative, "function requiredFilesForPlatform", "const files =");
+    return [...required.matchAll(/"([A-Za-z0-9_.-]+\.(?:tsx|ts|json))"/g)].map(match => match[1]);
+}
+
+function pluginFilesFromInstaller(source, from, to) {
+    const list = section(source, from, to);
+    return [...list.matchAll(/goLiveBypass\/([A-Za-z0-9_.-]+\.(?:tsx|ts|json))/g)].map(match => match[1]);
+}
+
+function assertPluginDistributionList(files, listed, label) {
+    const required = new Set(files);
+    assert.ok(files.length >= 10, `fontes comuns esperadas em native.ts, achei ${files.length}`);
+    assert.equal(required.size, files.length, `${label}: requiredFilesForPlatform contém fonte duplicada`);
+    assert.ok(required.has("plugin-log.ts"), "requiredFilesForPlatform precisa listar plugin-log.ts");
+    for (const file of files) {
+        assert.ok(fs.existsSync(path.join(root, "goLiveBypass", file)),
+            `${label}: native.ts exige goLiveBypass/${file}, mas o arquivo não existe na árvore/arquivo`);
+    }
+    for (const file of listed) {
+        assert.ok(required.has(file), `${label}: lista do instalador contém fonte antiga/inexistente goLiveBypass/${file}`);
+    }
+    assert.deepEqual([...new Set(listed)].sort(), [...required].sort(),
+        `${label}: lista do instalador diverge de requiredFilesForPlatform`);
+}
+
 
 test("standalone limita RTC a uma tentativa", () => {
     assert.match(standalone, /const VOICE_TENTATIVAS = 1;/);
@@ -96,8 +122,8 @@ test("plugin mantém AllowedApps estreito e network-lock desativado", () => {
 });
 
 test("plugin bloqueia WireSock externo e respeita o slot global do serviço", () => {
-    assert.match(pluginWindows, /allServicesOwned/);
-    assert.match(pluginWindows, /allProcessesOwned/);
+    assert.match(pluginWindows, /const hasOwn = ownServices\.length \+ ownProcesses\.length > 0/);
+    assert.match(pluginWindows, /const externalCount =/);
     assert.match(pluginWindows, /assertPluginServiceSlot/);
     assert.match(pluginController, /blocked_external/);
 });
@@ -149,22 +175,82 @@ test("instalador Windows distribui stability.ts", () => {
     assert.match(windowsInstaller, /goLiveBypass\/stability\.ts/);
 });
 
+test("instalador Windows explica canais stable/beta sem prometer estabilidade", () => {
+    const banner = windowsInstaller.slice(0, windowsInstaller.indexOf("$ErrorActionPreference"));
+    assert.match(banner, /ValidateSet\('stable', 'beta'\)/);
+    assert.match(banner, /Stable e a opcao recomendada/);
+    assert.match(banner, /Beta e opcional/);
+    assert.match(banner, /sistema ainda nao e estavel/);
+    assert.match(banner, /GoLiveBypass\/issues/);
+    assert.doesNotMatch(banner, /Nenhuma instalacao foi realizada/);
+});
+
+test("instalador Linux explica canais stable/beta sem prometer estabilidade", () => {
+    const banner = linuxInstaller.slice(0, linuxInstaller.indexOf("\nset -eu"));
+    assert.match(banner, /Stable e a opcao recomendada/);
+    assert.match(banner, /Beta e opcional/);
+    assert.match(banner, /sistema ainda nao e estavel/);
+    assert.match(banner, /GoLiveBypass\/issues/);
+    assert.doesNotMatch(banner, /^\s*exit\b/m);
+    assert.doesNotMatch(banner, /Nenhuma instalacao foi realizada/);
+});
+
+test("instalador Linux copia exatamente as fontes existentes exigidas pelo plugin", () => {
+    // native.ts é a fonte da verdade. O teste também confirma que cada nome ainda existe
+    // na árvore do archive: assim uma lista herdada de uma release antiga não passa só por
+    // estar repetida no instalador.
+    const files = pluginSourceFilesFromNative();
+    const listed = pluginFilesFromInstaller(linuxInstaller, "PLUGIN_FILES=", "\nPLUGIN_DIR_NAME=");
+    assertPluginDistributionList(files, listed, "Linux");
+});
+
+test("instalador Windows copia exatamente as fontes existentes exigidas pelo plugin", () => {
+    const files = pluginSourceFilesFromNative();
+    const listed = pluginFilesFromInstaller(
+        windowsInstaller,
+        "$PluginFiles = @(",
+        "$PluginHelperRelative",
+    );
+    assertPluginDistributionList(files, listed, "Windows");
+    assert.match(windowsInstaller, /PluginHelperRelative/);
+    assert.match(windowsInstaller, /Copy-PluginHelper/);
+    assert.match(windowsInstaller, /Get-LatestBetaHelperAsset/);
+    assert.match(windowsInstaller, /Get-FileHash.*SHA256/);
+});
+
+test("instaladores do plugin nao distribuem o seletor de saida legado", () => {
+    // A saida e a conta Proton, configurada dentro do plugin: nenhum arquivo de goLiveBypass/
+    // le a chave `proxy`, entao o instalador nao deve grava-la — reescrever a chave de uma
+    // instalacao antiga com "" apagaria o que estava la — nem oferecer a escolha de saida.
+    assert.doesNotMatch(linuxInstaller, /plugin\.proxy =/);
+    assert.doesNotMatch(windowsInstaller, /NotePropertyName proxy/);
+    assert.doesNotMatch(linuxInstaller, /^select_proxy\(\) \{/m);
+    assert.doesNotMatch(windowsInstaller, /^function Select-Proxy \{/m);
+    assert.doesNotMatch(linuxInstaller, /socks5:\/\//);
+    assert.doesNotMatch(windowsInstaller, /socks5:\/\//);
+    // A limpeza do que a versao anterior registrou continua: sem ela, o servico do usuario e
+    // a Run key do Tor ficariam para tras em quem escolheu aquela opcao.
+    assert.match(linuxInstaller, /^remove_tor\(\) \{/m);
+    assert.match(windowsInstaller, /^function Remove-Tor \{/m);
+});
+
 test("manifesto local e linha v2 beta", () => {
-    assert.equal(manifest.version, "2.0.0-beta.1");
+    assert.equal(manifest.version, "2.0.6");
 });
 
 test("plugin mostra versao e oferece verificacao na configuracao", () => {
-    assert.match(pluginRenderer, /PLUGIN_VERSION = "2\.0\.0-beta\.1"/);
-    assert.match(pluginRenderer, /checkPluginUpdate\(\)/);
+    assert.match(pluginRenderer, /PLUGIN_VERSION = "2\.0\.6"/);
+    assert.match(pluginRenderer, /checkPluginUpdate\(/);
     assert.match(pluginRenderer, /Atualizar/);
 });
 
 test("check() de update do plugin trata rejeicao igual a update() (nao deixa promise sem dono)", () => {
-    // Native.checkPluginUpdate() em si nunca rejeita, mas a chamada IPC por baixo pode --
-    // update(), a funcao irma, ja tratava; check() nao tratava ate esta correcao.
+    // Native.checkPluginUpdate() em si pode encapsular a rejeição da chamada
+    // IPC; o fluxo de configuração precisa encerrar o estado busy em qualquer
+    // caminho de erro.
     const checkBody = section(pluginRenderer, "const check = async () => {", "const update = async () => {");
     assert.match(checkBody, /\}\s*catch\s*\(error\)\s*\{/);
-    assert.match(checkBody, /finally\s*\{\s*setBusy\(false\);/);
+    assert.match(checkBody, /finally\s*\{[\s\S]*?setBusy\(false\);/);
 });
 
 test("plugin atualiza somente no processo nativo com checksum e backup", () => {
@@ -175,19 +261,18 @@ test("plugin atualiza somente no processo nativo com checksum e backup", () => {
 });
 
 test("updater do plugin nunca substitui o bundle dist do Vencord/Equicord", () => {
-    assert.match(pluginNative, /function userpluginSource\(\)/);
+    assert.match(pluginNative, /function userpluginSource\(allowMissingTarget = false\)/);
     assert.match(pluginNative, /src", "userplugins", USERPLUGIN_DIR/);
     assert.match(pluginNative, /rebuildUserplugin\(projectRoot\)/);
     assert.match(pluginNative, /\.golivebypass-update-backups/);
     assert.doesNotMatch(pluginNative, /const target = __dirname;/);
 });
 
-test("updater localiza pnpm e recompila pelo cmd.exe no Windows", () => {
+test("updater localiza pnpm e recompila por comando seguro no Windows", () => {
     assert.match(pluginNative, /function resolveWindowsPnpm\(\)/);
     assert.match(pluginNative, /AppData.*npm.*pnpm\.cmd/);
     assert.match(pluginNative, /ProgramFiles.*nodejs.*pnpm\.cmd/);
-    assert.match(pluginNative, /windowsRoot, "System32", "cmd\.exe"/);
-    assert.match(pluginNative, /"call",\s*pnpm,\s*"build"/);
+    assert.match(pluginNative, /resolveWindowsPnpmBuildCommand/);
     assert.match(pluginNative, /shell: false/);
     assert.match(pluginNative, /env,/);
     assert.match(pluginNative, /failure\.message/);
@@ -209,8 +294,8 @@ test("TUI standalone tem consulta e update separados", () => {
 });
 
 test("shutdown do plugin restaura a rede própria e não mata WireSock externo", () => {
-    assert.match(pluginNative, /controller\.shutdown\(true\)/);
     assert.match(pluginNative, /controller\.shutdown\(false\)/);
+    assert.match(pluginNative, /export function restartDiscord/);
     assert.match(pluginController, /stopOwnedWireSock/);
     assert.match(pluginController, /inspection\.active && !inspection\.owned/);
     assert.match(pluginController, /recovery_required/);

@@ -4,8 +4,9 @@
     Testes do auto-update do instalador GoLiveBypass para Windows.
 .DESCRIPTION
     Valida a sintaxe do PowerShell, as funcoes de auto-update (Get-LatestRelease,
-    Get-InstalledPluginVersion, Compare-Version, Backup-Plugin, Invoke-CheckUpdate,
-    Invoke-Update, Invoke-UpdateFromZip), e a integracao com manifest.json.
+    Get-PluginInstallRelease, Get-InstalledPluginVersion, Compare-Version, Backup-Plugin,
+    Invoke-CheckUpdate, Invoke-Update, Invoke-UpdateFromZip), a escolha da fonte do plugin
+    (Install-PluginSource, Copy-PluginFromRepo) e a integracao com manifest.json.
 .NOTES
     Requer PowerShell 7+ (pwsh). Em Windows, pode ser executado com powershell
     ou pwsh (PowerShell Core).
@@ -68,7 +69,7 @@ if ($content -match "ValidateSet\('Menu', 'Install', 'Uninstall', 'Restore', 'Ch
 # 4. Funcoes de auto-update definidas
 Write-Host ""
 Write-Host "== 4. Funcoes de auto-update definidas =="
-$funcs = @('Get-LatestRelease', 'Get-InstalledPluginVersion', 'Compare-Version', 'Backup-Plugin', 'Invoke-CheckUpdate', 'Invoke-Update', 'Invoke-UpdateFromZip')
+$funcs = @('Get-LatestRelease', 'Get-PluginInstallRelease', 'Get-InstalledPluginVersion', 'Compare-Version', 'Backup-Plugin', 'Invoke-CheckUpdate', 'Invoke-Update', 'Invoke-UpdateFromZip', 'Install-PluginSource', 'Copy-PluginFromRepo')
 foreach ($fn in $funcs) {
     $cmd = Get-Command $fn -ErrorAction SilentlyContinue
     if ($cmd) { Ok "funcao $fn definida" } else { Bad "funcao $fn NAO definida" }
@@ -148,6 +149,152 @@ for ($i = 0; $i -lt 4; $i++) {
 $count = (Get-ChildItem $backupDir -Directory).Count
 if ($count -le 3) { Ok "Backup-Plugin retem <=3 backups (encontrou $count)" } else { Bad "Backup-Plugin tem $count backups (esperado <=3)" }
 Remove-Item $root -Recurse -Force
+
+# 8. Canais, SemVer, assets e persistencia
+Write-Host ""
+Write-Host "== 8. Canais stable/beta e persistencia =="
+if ($content -match "ValidateSet\('stable', 'beta'\)") { Ok "parametro -Channel aceita stable/beta" } else { Bad "parametro -Channel ausente" }
+if ($content -match 'Stable e a opcao recomendada' -and $content -match 'Beta e opcional' -and $content -match 'ajuda a comunidade') {
+    Ok "mensagens de canal sao claras e encorajadoras"
+} else { Bad "mensagens de canal ausentes" }
+if ($content -match 'CheckUpdate.*pode persistir.*sem baixar ZIP') { Ok "CheckUpdate documenta persistencia sem download" } else { Bad "documentacao CheckUpdate desatualizada" }
+if ($content -match "installer\.selected.*channel" -and $content -match "installer\.completed.*channel") { Ok "eventos selected/completed incluem canal" } else { Bad "eventos selected/completed sem canal" }
+$detectBlock = [regex]::Match($content, 'function Find-Checkout[\s\S]*?function Test-InjectedFromCheckout').Value
+if ($detectBlock -notmatch "installer\.selected.*detect.*channel" -and
+    $content -match "installer\.selected.*preparing.*channel" -and
+    $content -match "installer\.completed.*channel") {
+    Ok "settings beta nao cria canal falso no detect; preparing/completed mantem canal"
+} else { Bad "canal aparece falso no detect ou falta apos selecao" }
+$installModBlock = [regex]::Match($content, 'function Install-Mod[\s\S]*?function Stop-Discord').Value
+if ($installModBlock -notmatch "installer\.selected.*channel") { Ok "download do mod nao fixa stable antes da selecao" } else { Bad "download do mod registra canal antes da selecao" }
+if ($content -match 'Get-PluginReleaseCandidates' -and $content -match 'releases\?per_page=30' -and $content -notmatch 'Get-PluginReleaseCandidates[\s\S]{0,3000}releases/latest') {
+    Ok "selecao de canal nao usa /releases/latest"
+} else { Bad "selecao de canal usa endpoint latest" }
+if ($content -match 'function Invoke-ChangeChannel' -and
+    $content -match 'Mudar canal de atualizacoes' -and
+    $content -match 'Invoke-ChangeChannel \$root; continue') {
+    Ok "menu Windows possui item de canal e retorna ao menu apos acoes"
+} else { Bad "menu Windows sem item/retorno do canal" }
+$originalFindCheckout = (Get-Command Find-Checkout -CommandType Function).ScriptBlock
+$script:tuiCalls = 0
+$script:changeCalls = 0
+$script:textMenuCalls = 0
+function Find-Checkout { return $null }
+function Show-Status($root) { }
+function Test-TuiInteractive { return $true }
+function Tui-Menu {
+    $script:tuiCalls++
+    if ($script:tuiCalls -eq 1) { return 4 }
+    return 7
+}
+function Invoke-ChangeChannel($root) { $script:changeCalls++ }
+function Read-Escolha($prompt) { $script:textMenuCalls++; return '0' }
+Show-MainMenu
+if ($script:tuiCalls -eq 2 -and $script:changeCalls -eq 1 -and $script:textMenuCalls -eq 0) {
+    Ok "TUI volta ao loop apos mudar canal sem cair no menu textual"
+} else {
+    Bad "TUI caiu no menu textual ou nao voltou apos mudar canal"
+}
+Set-Item -Path Function:\Find-Checkout -Value $originalFindCheckout
+
+function Invoke-RestMethod {
+    param([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec)
+    return @(
+        [pscustomobject]@{ draft = $true; prerelease = $true; tag_name = 'v9.9.9-beta-1'; assets = @(
+            [pscustomobject]@{ name = 'goLiveBypass-vencord.zip'; browser_download_url = 'https://fake/draft.zip' },
+            [pscustomobject]@{ name = 'goLiveBypass-vencord.zip.sha256'; browser_download_url = 'https://fake/draft.sha' }
+        ) },
+        [pscustomobject]@{ draft = $false; prerelease = $true; tag_name = 'v2.1.0-beta-10'; assets = @(
+            [pscustomobject]@{ name = 'goLiveBypass-vencord.zip'; browser_download_url = 'https://fake/b10.zip' },
+            [pscustomobject]@{ name = 'goLiveBypass-vencord.zip.sha256'; browser_download_url = 'https://fake/b10.sha' }
+        ) },
+        [pscustomobject]@{ draft = $false; prerelease = $false; tag_name = 'v2.0.0'; assets = @(
+            [pscustomobject]@{ name = 'goLiveBypass-vencord.zip'; browser_download_url = 'https://fake/stable.zip' },
+            [pscustomobject]@{ name = 'goLiveBypass-vencord.zip.sha256'; browser_download_url = 'https://fake/stable.sha' }
+        ) },
+        [pscustomobject]@{ draft = $false; prerelease = $false; tag_name = 'v3.0.0'; assets = @(
+            [pscustomobject]@{ name = 'goLiveBypass-vencord.zip.sha256'; browser_download_url = 'https://fake/no-zip.sha' }
+        ) }
+    )
+}
+$stable = Get-PluginReleaseForChannel stable
+$beta = Get-PluginReleaseForChannel beta
+if ($stable.Version -eq '2.0.0') { Ok "stable ignora beta/draft/missing SHA" } else { Bad "stable selecionou release incorreta" }
+if ($beta.Version -eq '2.1.0-beta-10') { Ok "beta seleciona maior SemVer mesmo com lista embaralhada" } else { Bad "beta selecionou release incorreta" }
+if ((Compare-Version '2.0.0-beta-9' '2.0.0-beta-10') -lt 0 -and
+    (Compare-Version '2.0.0-beta-10' '2.0.0-beta-9') -gt 0 -and
+    (Compare-Version '2.0.0' '2.0.0-beta-10') -gt 0) {
+    Ok "SemVer beta-9/beta-10 e stable sem downgrade"
+} else { Bad "ordem SemVer ou no-downgrade incorreta" }
+
+$settingsRoot = Join-Path ([IO.Path]::GetTempPath()) ("golive-channel-" + [guid]::NewGuid().ToString('N'))
+$archiveRoot = Join-Path ([IO.Path]::GetTempPath()) ("golive-archive-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path (Join-Path $archiveRoot 'goLiveBypass') -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $archiveRoot 'goLiveBypass\manifest.json') -Value '{"name":"GoLiveBypass","version":"1.9.9"}'
+$badZip = Join-Path $archiveRoot 'bad.zip'
+Compress-Archive -Path (Join-Path $archiveRoot 'goLiveBypass') -DestinationPath $badZip -Force
+$badHash = (Get-FileHash -LiteralPath $badZip -Algorithm SHA256).Hash.ToLowerInvariant()
+$updateRoot = Join-Path $archiveRoot 'Equicord'
+New-Item -ItemType Directory -Path (Join-Path $updateRoot 'src\userplugins\goLiveBypass') -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $updateRoot 'src\userplugins\goLiveBypass\manifest.json') -Value '{"name":"GoLiveBypass","version":"1.0.0"}'
+$script:fakeDownloadZip = $badZip
+$script:fakeDownloadSha = $badHash
+function Invoke-WebRequest {
+    param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [int]$TimeoutSec)
+    if ($OutFile) { Copy-Item -LiteralPath $script:fakeDownloadZip -Destination $OutFile -Force; return }
+    return [pscustomobject]@{ Content = "$script:fakeDownloadSha  plugin.zip" }
+}
+try {
+    Invoke-UpdateFromZip $updateRoot 'https://fake/plugin.zip' '2.0.0'
+    Bad "zip com manifest divergente foi aceito"
+} catch {
+    $kept = Get-Content -LiteralPath (Join-Path $updateRoot 'src\userplugins\goLiveBypass\manifest.json') -Raw
+    if ($kept -match '"version":"1.0.0"') { Ok "manifest divergente e rejeitado antes de substituir target" } else { Bad "target foi substituido antes da validacao do manifest" }
+}
+Set-Content -LiteralPath (Join-Path $archiveRoot 'goLiveBypass\manifest.json') -Value '{"name":"GoLiveBypass","version":"2.0.0"}'
+$goodZip = Join-Path $archiveRoot 'good.zip'
+Compress-Archive -Path (Join-Path $archiveRoot 'goLiveBypass') -DestinationPath $goodZip -Force
+$script:fakeDownloadZip = $goodZip
+$script:fakeDownloadSha = (Get-FileHash -LiteralPath $goodZip -Algorithm SHA256).Hash.ToLowerInvariant()
+try {
+    Invoke-UpdateFromZip $updateRoot 'https://fake/plugin.zip' '2.0.0'
+    $accepted = Get-Content -LiteralPath (Join-Path $updateRoot 'src\userplugins\goLiveBypass\manifest.json') -Raw
+    if ($accepted -match '"version":"2.0.0"') { Ok "manifest correspondente e aceito antes de substituir target" } else { Bad "zip valido nao foi instalado" }
+} catch {
+    Bad "manifest correspondente foi rejeitado: $($_.Exception.Message)"
+}
+Remove-Item $archiveRoot -Recurse -Force
+$env:APPDATA = $settingsRoot
+New-Item -ItemType Directory -Path (Join-Path $settingsRoot 'Equicord\settings') -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $settingsRoot 'Equicord\settings\settings.json') -Value '{"autoUpdate":false,"other":{"keep":true}}'
+$fakeCheckout = Join-Path $settingsRoot 'Equicord'
+New-Item -ItemType Directory -Path (Join-Path $fakeCheckout 'src\utils') -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $fakeCheckout 'package.json') -Value '{"name":"Equicord"}'
+Set-Content -LiteralPath (Join-Path $fakeCheckout 'src\utils\types.ts') -Value 'type T = string'
+Set-UpdateChannelPreference $fakeCheckout beta | Out-Null
+$merged = Get-Content -LiteralPath (Join-Path $settingsRoot 'Equicord\settings\settings.json') -Raw | ConvertFrom-Json
+if ($merged.autoUpdate -eq $false -and $merged.other.keep -and $merged.plugins.GoLiveBypass.updateChannel -eq 'beta') {
+    Ok "merge persiste updateChannel e preserva outras configuracoes"
+} else { Bad "merge de settings perdeu configuracoes" }
+Set-Content -LiteralPath (Join-Path $settingsRoot 'Equicord\settings\settings.json') -Value '{invalid'
+$beforeInvalid = Get-Content -LiteralPath (Join-Path $settingsRoot 'Equicord\settings\settings.json') -Raw
+Set-UpdateChannelPreference $fakeCheckout stable | Out-Null
+$afterInvalid = Get-Content -LiteralPath (Join-Path $settingsRoot 'Equicord\settings\settings.json') -Raw
+if ($beforeInvalid -eq $afterInvalid) { Ok "settings JSON invalido permanece intacto" } else { Bad "settings invalido foi sobrescrito" }
+
+$script:webRequests = 0
+function Invoke-WebRequest { $script:webRequests++ }
+$Source = $fakeCheckout
+$Channel = 'beta'
+$script:ChannelExplicit = $true
+$Yes = $true
+$checkOutput = (Invoke-CheckUpdate 6>&1 | Out-String)
+if ($script:webRequests -eq 0 -and $checkOutput -match 'canal:\s*beta' -and $checkOutput -match 'remote:\s*2\.1\.0-beta-10') {
+    Ok "-Mode CheckUpdate restaura Find-Checkout real, mostra canal/remote e nao baixa zip"
+} else {
+    Bad "-Mode CheckUpdate ficou falso-verde ou fez download"
+}
+Remove-Item $settingsRoot -Recurse -Force
 
 # Resultado
 Write-Host ""

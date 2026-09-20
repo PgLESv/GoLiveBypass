@@ -43,9 +43,15 @@ describe("compararVersoes (semver minimo do projeto)", () => {
     expect(compararVersoes("1.1.12-beta.10", "1.1.12-beta.9")).toBeGreaterThan(0); // numerico, nao lexicografico
   });
 
-  it("ordena o novo formato beta-10 acima de beta-9 e mantém compatibilidade", () => {
-    expect(compararVersoes("1.1.12-beta-10", "1.1.12-beta-9")).toBeGreaterThan(0);
-    expect(compararVersoes("1.1.12-beta-8", "1.1.12-beta.7")).toBeGreaterThan(0);
+  it("ordena beta-N numericamente e preserva equivalencia com beta.N", () => {
+    expect(compararVersoes("2.0.6-beta-10", "2.0.6-beta-9")).toBeGreaterThan(0);
+    expect(compararVersoes("2.0.6-beta-9", "2.0.6-beta-10")).toBeLessThan(0);
+    expect(compararVersoes("2.0.6-beta-10", "2.0.6-beta.10")).toBe(0);
+    expect(compararVersoes("2.0.6", "2.0.6-beta-10")).toBeGreaterThan(0);
+    const beta10 = release({ tag: "v2.0.6-beta-10", prerelease: true });
+    expect(escolherRelease([beta10], "2.0.6-beta-9", "beta")?.tag).toBe(beta10.tag);
+    expect(escolherRelease([release({ tag: "v2.0.6-beta-9", prerelease: true })], "2.0.6-beta-10", "beta")).toBeNull();
+    expect(escolherRelease([beta10], "2.0.6-beta-9", "stable")).toBeNull();
   });
 
   it("prerelease de triplo maior ganha de stable de triplo menor", () => {
@@ -119,10 +125,34 @@ describe("escolherAssetWindows (portable da release)", () => {
         {
           name: "GoLiveBypass-2.0.5-beta-12.exe",
           browser_download_url:
-            "https://github.com/bezumiya/GoLiveBypass/releases/download/v2.0.5-beta-12/GoLiveBypass-2.0.5-beta-12-proton-confgen-win-x64.exe",
+            "https://github.com/PgLESv/GoLiveBypass/releases/download/v2.0.5-beta-12/GoLiveBypass-2.0.5-beta-12-proton-confgen-win-x64.exe",
         },
       ]),
     ).toBeNull();
+  });
+
+  it("não escolhe proton-confgen como executável da GUI", () => {
+    const assets = [
+      {
+        name: "GoLiveBypass-2.0.6-beta-4-proton-confgen-win-x64.exe",
+        browser_download_url: "https://github.com/x/y/releases/download/v/GoLiveBypass-2.0.6-beta-4-proton-confgen-win-x64.exe",
+      },
+      {
+        name: "GoLiveBypass-2.0.6-beta-4.exe",
+        browser_download_url: "https://github.com/x/y/releases/download/v/GoLiveBypass-2.0.6-beta-4.exe",
+      },
+    ];
+    expect(escolherAssetWindows("v2.0.6-beta-4", assets)?.name).toBe("GoLiveBypass-2.0.6-beta-4.exe");
+  });
+
+  it("recusa nome ou URL que só compartilha o prefixo", () => {
+    const assets = [
+      {
+        name: "GoLiveBypass-2.0.6-beta-4-helper.exe",
+        browser_download_url: "https://github.com/x/y/releases/download/v/GoLiveBypass-2.0.6-beta-4-helper.exe",
+      },
+    ];
+    expect(escolherAssetWindows("v2.0.6-beta-4", assets)).toBeNull();
   });
 });
 
@@ -153,8 +183,9 @@ describe("wiring do canal no updater e no workflow", () => {
       "utf8",
     );
     expect(workflow).toContain("canal:");
-    expect(workflow).toContain("prerelease: true");
-    expect(workflow).toContain("inputs.canal == 'beta'");
+    expect(workflow).toContain("--config.publish.channel=beta --config.publish.releaseType=prerelease");
+    expect(workflow).toContain("beta-marcar");
+    expect(workflow).toContain("--repo PgLESv/GoLiveBypass");
   });
 
   it("o updater não abre popup nativo para atualizações", () => {

@@ -1,4 +1,4 @@
-# PowerShell test script for error handling and null-safety validation
+﻿# PowerShell test script for error handling and null-safety validation
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $repoRoot) { $repoRoot = (Get-Location).Path }
@@ -50,16 +50,26 @@ $tempInstaller = Join-Path ([System.IO.Path]::GetTempPath()) "test-temp-installe
 Set-Content -LiteralPath $tempInstaller -Value $truncatedInstaller -Encoding UTF8
 . $tempInstaller
 
-# Salva referencia para Test-ShouldReport do instalador
-$installerShouldReport = ${function:Test-ShouldReport}
 $installerWaitAntesDeFechar = ${function:Wait-AntesDeFechar}
 $installerTestJanela = ${function:Test-JanelaTransitoria}
 
-# Carrega funcoes do standalone
+# Carrega funcoes do standalone; o marcador contempla LF e CRLF.
 $standaloneContent = Get-Content -LiteralPath $standalonePath -Raw
 $idx2 = $standaloneContent.IndexOf("Write-Host ''`nWrite-Host '  GoLiveBypass standalone'")
 if ($idx2 -lt 0) { $idx2 = $standaloneContent.IndexOf("Write-Host ''`r`nWrite-Host '  GoLiveBypass standalone'") }
-$truncatedStandalone = $standaloneContent.Substring(0, $idx2)
+if ($idx2 -lt 0) { throw 'Nao consegui localizar o inicio seguro do standalone para o teste.' }
+
+# O standalone mantido está pausado por um `exit 1` top-level antes das funções.
+# Dot-sourcear esse recorte sem remover somente esse bloqueio encerra o próprio
+# harness antes de Get-InjectionState existir. Remova a primeira ocorrência em
+# uma cópia temporária; o CLI real nunca é executado e exits condicionais ficam
+# intactos para não mascarar outros caminhos.
+$standalonePrefix = $standaloneContent.Substring(0, $idx2)
+$topLevelExit = [regex]::Match($standalonePrefix, '(?m)^[ \t]*exit 1[ \t]*(?:\r?\n|$)')
+if ($topLevelExit.Success) {
+    $standalonePrefix = $standalonePrefix.Remove($topLevelExit.Index, $topLevelExit.Length)
+}
+$truncatedStandalone = $standalonePrefix
 $tempStandalone = Join-Path ([System.IO.Path]::GetTempPath()) "test-temp-standalone.ps1"
 Set-Content -LiteralPath $tempStandalone -Value $truncatedStandalone -Encoding UTF8
 . $tempStandalone
@@ -81,7 +91,7 @@ function Assert-Equal($actual, $expected, $desc) {
     }
 }
 
-Write-Host "`n-- 2.1 Test-ShouldReport (Instalador e Standalone) --" -ForegroundColor Yellow
+Write-Host "`n-- 2.1 Test-ShouldReport (Standalone) --" -ForegroundColor Yellow
 
 $testMessages = @(
     # Mensagens que NAO devem reportar (retornam $false)
@@ -103,10 +113,9 @@ $testMessages = @(
     @{ Msg = "Erro desconhecido ao processar pacote asar."; Expected = $true; Desc = "Erro desconhecido" }
 )
 
+# O instalador nao decide mais sobre envio remoto (escopo B): Test-ShouldReport saiu
+# junto com a chamada automatica. O standalone mantem o comportamento proprio.
 foreach ($t in $testMessages) {
-    $resInst = & $installerShouldReport $t.Msg
-    Assert-Equal $resInst $t.Expected "Installer Test-ShouldReport: $($t.Desc)"
-    
     $resStand = & $standaloneShouldReport $t.Msg
     Assert-Equal $resStand $t.Expected "Standalone Test-ShouldReport: $($t.Desc)"
 }
@@ -177,7 +186,7 @@ try {
     $InstallDir = $origInstallDir
 }
 
-Write-Host "`n-- 2.4 Get-EffectiveLocalApp / Get-ReportMeta (caminho 8.3, issue #94) --" -ForegroundColor Yellow
+Write-Host "`n-- 2.4 Get-EffectiveLocalApp (caminho 8.3, issue #94) --" -ForegroundColor Yellow
 
 $origLocalAppData = $env:LOCALAPPDATA
 try {
@@ -196,19 +205,258 @@ try {
     $env:LOCALAPPDATA = $origLocalAppData
 }
 
-try {
-    # Get-ReportMeta: flag caminho_8_3 marca variaveis gravadas na forma curta
-    # (ex. C:\Users\CSAR~1) -- o cenario reportado na issue #94.
-    $env:LOCALAPPDATA = 'C:\Users\CSAR~1\AppData\Local'
-    $metaCurto = Get-ReportMeta $null
-    Assert-Equal $metaCurto['caminho_8_3'] 'sim' "Get-ReportMeta marca caminho_8_3=sim para forma curta"
+# Get-ReportMeta saiu junto com o envio automatico (escopo B: log local/manual).
 
-    $env:LOCALAPPDATA = $origLocalAppData
-    $metaNormal = Get-ReportMeta $null
-    Assert-Equal $metaNormal['caminho_8_3'] 'nao' "Get-ReportMeta marca caminho_8_3=nao para forma longa"
-    Assert-Equal ($null -eq $metaNormal['excecao']) $true "Get-ReportMeta sem ErrorRecord nao define 'excecao'"
+Write-Host "`n-- 2.5 Descoberta e injecao segura de mod --" -ForegroundColor Yellow
+$selectTargetStart = $installerContent.IndexOf('function Select-Target')
+$selectTargetBody = $installerContent.Substring($selectTargetStart, 700)
+Assert-Equal ($selectTargetBody -match 'Detectei .*nao encontrei o checkout fonte') $false "Fonte ausente nao bloqueia mod detectado"
+Assert-Equal ($selectTargetBody -match 'Install-Mod \(Show-ModChoice\)') $true "Fonte ausente oferece download explicito"
+Assert-Equal ($installerContent -match 'Get-InstallerLogFile') $true "Instalador grava log local"
+Assert-Equal ($installerContent -match 'installer\.checkout_rejected') $true "Instalador registra rejeicao de checkout (#293)"
+Assert-Equal ($installerContent -match 'MOD_INSTALLED_WITHOUT_CHECKOUT') $true "Rejeicao da #293 tem codigo proprio"
+Assert-Equal ($installerContent -match 'Invoke-SendAutoReport|BugApiToken|includeLogs') $false "Instalador nao envia relatorio remoto"
+
+Write-Host "`n-- 2.6 Log local do instalador (installer.log, sem telemetria) --" -ForegroundColor Yellow
+
+$logTemp = Join-Path ([System.IO.Path]::GetTempPath()) "glb-installer-log-$([Guid]::NewGuid().ToString('N'))"
+$origLogDir = $env:GLB_INSTALLER_LOG_DIR
+$env:GLB_INSTALLER_LOG_DIR = $logTemp
+try {
+    Assert-Equal (Test-Path -LiteralPath $logTemp) $false "Diretorio de log nao existe antes do primeiro evento"
+
+    Write-InstallerEvent 'info' 'installer.detect.started' 'detect' @{ mode = 'Install' }
+    $logFile = Get-InstallerLogFile
+    Assert-Equal (Test-Path -LiteralPath $logFile) $true "Write-InstallerEvent cria installer.log"
+    Assert-Equal ($logFile -like '*GoLiveBypass') $false "Log de teste fica fora do diretorio de dados real"
+    Assert-Equal (Split-Path -Leaf $logFile) 'installer.log' "log se chama installer.log"
+
+    $lineRaw = (Get-Content -LiteralPath $logFile -First 1)
+    $line = $lineRaw | ConvertFrom-Json
+    Assert-Equal $line.schema_version 1 "linha JSONL tem schema_version"
+    Assert-Equal $line.level 'info' "linha tem level"
+    Assert-Equal $line.component 'installer.windows' "linha identifica installer.windows"
+    Assert-Equal $line.event 'installer.detect.started' "linha tem o evento"
+    Assert-Equal $line.phase 'detect' "linha tem a fase"
+    Assert-Equal ($line.ts -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$') $true "ts ISO-8601 UTC com milissegundos"
+    Assert-Equal $line.data.mode 'Install' "campo observável mode preservado"
+
+    Write-InstallerEvent 'error' 'installer.failed' 'detect' @{ reason = 'falhou em C:\Users\alice\Equicord'; token = 'abc123'; senha = 's3cr3t'; campo_desconhecido = 'x' }
+    $lastRaw = (Get-Content -LiteralPath $logFile -Last 1)
+    $last = $lastRaw | ConvertFrom-Json
+    Assert-Equal ($lastRaw -match 'alice|abc123|s3cr3t') $false "segredos originais nao fluem para o raw"
+    Assert-Equal ([string]$last.data.reason -match '<path>$') $true "caminho absoluto vira <path> no fim do valor parseado"
+    Assert-Equal $last.data.token '<redacted>' "chave proibida token vira <redacted>"
+    Assert-Equal $last.data.senha '<redacted>' "chave proibida senha vira <redacted>"
+    Assert-Equal ($last.data.PSObject.Properties.Name -contains 'campo_desconhecido') $false "chave desconhecida e descartada"
+
+    # Cabecalho de autenticacao, URL com credencial e e-mail tambem sao redigidos.
+    Write-InstallerEvent 'warn' 'installer.probe' 'detect' @{ reason = 'Authorization: Bearer eyJhbGciOi.abc.def em https://alice:s3cr3t@example.test/x contato alice@example.com' }
+    $lastRaw = (Get-Content -LiteralPath $logFile -Last 1)
+    $last = $lastRaw | ConvertFrom-Json
+    Assert-Equal ($lastRaw -match 'eyJhbGciOi|s3cr3t|alice@example.com|example\.test/x') $false "segredos e host/path originais nao fluem para o raw"
+    $reason = [string]$last.data.reason
+    Assert-Equal ($reason -match 'Authorization=<redacted>') $true "cabecalho Authorization e redigido no valor parseado"
+    Assert-Equal ($reason -match '<redacted-url>') $true "URL com credencial vira <redacted-url> no valor parseado"
+    Assert-Equal ($reason -match 'example\.test/x') $false "host/path privado nao fluem no valor parseado"
+    Assert-Equal ($reason -match '<email>') $true "e-mail vira <email> no valor parseado"
+
+    # Valor aninhado nao e stringificado.
+    Write-InstallerEvent 'warn' 'installer.probe' 'detect' @{ reason = @('a', 'b') }
+    $last = (Get-Content -LiteralPath $logFile -Last 1) | ConvertFrom-Json
+    Assert-Equal ([string]$last.data.reason) '<redacted>' "valor nao escalar vira <redacted> no valor parseado"
+
+    # Falha de escrita nao pode lancar nem interromper o instalador.
+    $env:GLB_INSTALLER_LOG_DIR = Join-Path $logFile 'nao-e-pasta'
+    try {
+        Write-InstallerEvent 'info' 'installer.probe' 'detect' @{ count = 1 }
+        Assert-Equal $true $true "falha de escrita no log nao lanca"
+    } catch {
+        Assert-Equal $false $true "falha de escrita no log lancou: $($_.Exception.Message)"
+    }
 } finally {
-    $env:LOCALAPPDATA = $origLocalAppData
+    $env:GLB_INSTALLER_LOG_DIR = $origLogDir
+    if (Test-Path -LiteralPath $logTemp) { Remove-Item -LiteralPath $logTemp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n-- 2.7 Fixture de pnpm/injecao por alvo --" -ForegroundColor Yellow
+$originalInvokePnpm = ${function:Invoke-Pnpm}
+$originalFindPnpmApplications = ${function:Find-PnpmApplications}
+$originalGetInjectedPath = ${function:Get-InjectedPath}
+$originalStopDiscord = ${function:Stop-Discord}
+$origInjectionLogDir = $env:GLB_INSTALLER_LOG_DIR
+$injectionRoot = Join-Path ([System.IO.Path]::GetTempPath()) "GoLiveBypassInjection_$([Guid]::NewGuid().ToString('N'))"
+$injectionLogDir = Join-Path $injectionRoot 'logs'
+New-Item -ItemType Directory -Path $injectionRoot -Force | Out-Null
+$resourcesOne = Join-Path $injectionRoot 'Discord\app-1.0.0\resources'
+$resourcesTwo = Join-Path $injectionRoot 'DiscordPTB\app-1.0.0\resources'
+$script:mockInjectedPaths = @{}
+$script:mockInjectionMode = 'minus-one'
+$script:mockInjectionArgs = @()
+try {
+    # Sem app pnpm descoberto, o wrapper devolve um código determinístico, sem executar
+    # fallback cego nem confundir um LASTEXITCODE herdado.
+    function Find-PnpmApplications { @() }
+    $script:PnpmExitCode = -1
+    Invoke-Pnpm @('run', 'inject', '--location', (Split-Path -Parent (Split-Path -Parent $resourcesOne)))
+    Assert-Equal $script:PnpmExitCode 127 "Invoke-Pnpm usa exit=127 quando nao ha application pnpm"
+
+    # Regressao do log real da VM: no Windows PowerShell 5.1 a primeira linha que um processo
+    # nativo escreve em stderr vira erro TERMINATIVO com ErrorActionPreference=Stop, mesmo com
+    # 2>&1 — era assim que a injecao morria em exit=-1/POSTCONDITION_NOT_CONFIRMED no banner do
+    # pnpm antes de chamar o Equilotl (que loga tudo em stderr). O wrapper real tem que seguir,
+    # guardar o codigo de saida e manter o texto no detalhe.
+    $originalResolvePnpmInvocation = ${function:Resolve-PnpmInvocation}
+    function Resolve-PnpmInvocation([string[]]$Arguments) {
+        $hostExe = (Get-Process -Id $PID).Path
+        # -Command com aspas cai no quoting do Windows PowerShell 5.1: o argumento com
+        # espacos chega fatiado ao processo nativo, o stub nem compila e o teste mede
+        # outra coisa. -EncodedCommand e um argumento base64 unico — o caso real fica
+        # isolado: stderr do filho nativo e codigo de saida 7.
+        $payload = '[Console]::Error.WriteLine("banner-de-teste"); exit 7'
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+        return [pscustomobject]@{
+            Command = $hostExe
+            Arguments = @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
+        }
+    }
+    try {
+        $saidaStderr = @()
+        $saidaStderr = @(Invoke-Pnpm @('run', 'inject'))
+        Assert-Equal $script:PnpmExitCode 7 "stderr nativo nao interrompe o Invoke-Pnpm real"
+        Assert-Equal (($saidaStderr -join ' ') -match 'banner-de-teste') $true "stderr fica capturado na saida do Invoke-Pnpm"
+    } catch {
+        Assert-Equal $false $true "stderr nativo lancou do Invoke-Pnpm real: $($_.Exception.Message)"
+    } finally {
+        Set-Item -Path Function:Resolve-PnpmInvocation -Value $originalResolvePnpmInvocation
+    }
+
+    function Invoke-Pnpm([string[]]$Arguments) {
+        $script:mockInjectionArgs = @($Arguments)
+        switch ($script:mockInjectionMode) {
+            'zero' { $script:PnpmExitCode = 0; Write-Output 'injecao sintetica'; return }
+            'nine' { $script:PnpmExitCode = 9; Write-Output ('diagnostico sintetico ' + ('x' * 700)); return }
+            'exception' { $script:PnpmExitCode = $null; throw ('erro sintetico ' + ('x' * 700)) }
+            # Primeiro tiro: o Equilotl avisa que o arquivo esta em uso e a pos-condicao
+            # falha; segundo tiro: injeta e confirma. E o caminho do cliente reaberto pelo
+            # Update.exe entre o Stop-Discord e o injetor.
+            'lockonce' {
+                $script:mockLockCalls = [int]$script:mockLockCalls + 1
+                if ($script:mockLockCalls -eq 1) {
+                    $script:PnpmExitCode = 1
+                    $script:mockInjectedPaths.Remove([string]$script:mockLockKey)
+                    Write-Output "INFO Patching $($script:mockLockKey) INFO is already patched. Unpatching first... ERROR Cannot patch because the files are used by a different process."
+                    return
+                }
+                $script:PnpmExitCode = 0
+                $script:mockInjectedPaths[[string]$script:mockLockKey] = Join-Path $injectionRoot 'dist\desktop'
+                Write-Output 'injecao aplicada na segunda tentativa'
+                return
+            }
+            default { $script:PnpmExitCode = -1; Write-Output ('diagnostico sintetico ' + ('x' * 700)) }
+        }
+    }
+    function Get-InjectedPath($resources) { return $script:mockInjectedPaths[$resources] }
+    $script:mockStopDiscordCalls = 0
+    function Stop-Discord { $script:mockStopDiscordCalls = [int]$script:mockStopDiscordCalls + 1 }
+    $env:GLB_INSTALLER_LOG_DIR = $injectionLogDir
+
+    $targetOne = [pscustomobject]@{ Flavour = 'Discord'; Resources = $resourcesOne; Tipo = 'O' }
+    $targetTwo = [pscustomobject]@{ Flavour = 'DiscordPTB'; Resources = $resourcesTwo; Tipo = 'O' }
+    $script:mockInjectedPaths[$resourcesOne] = Join-Path $injectionRoot 'dist\desktop'
+    Invoke-Injection $injectionRoot @($targetOne)
+    Assert-Equal (($script:mockInjectionArgs -join '|') -eq 'run|inject|--location|' + (Split-Path -Parent (Split-Path -Parent $resourcesOne))) $true "Invoke-Injection envia a raiz sem -- extra"
+    Assert-Equal $script:PnpmExitCode -1 "exit=-1 com stub confirmado nao falha"
+    $events = @(Get-Content -LiteralPath (Get-InstallerLogFile) | ForEach-Object { $_ | ConvertFrom-Json })
+    $warning = $events | Where-Object { $_.event -eq 'installer.inject' -and $_.data.result -eq 'warning' } | Select-Object -Last 1
+    Assert-Equal ($null -ne $warning -and $warning.data.reason_code -eq 'POSTCONDITION_CONFIRMED_NONZERO' -and $warning.data.exit_code -eq -1) $true "exit=-1 confirmado vira warning no evento canonico"
+    Assert-Equal ((Format-InjectionDetail ('x' * 700)).Length -le 603) $true "saida do injector e limitada"
+    $redacted = Format-InjectionDetail 'Authorization: Bearer secret-token https://alice:secret@example.test/x mfa.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    Assert-Equal ($redacted -notmatch 'secret-token|secret@example|mfa\.A') $true "detalhe do injector nao vaza credencial ou token"
+
+    $script:mockInjectionMode = 'zero'
+    $script:mockInjectedPaths.Remove($resourcesOne)
+    try {
+        Invoke-Injection $injectionRoot @($targetOne)
+        Assert-Equal $false $true "Exit zero sem pos-condicao deveria falhar"
+    } catch {
+        Assert-Equal ($_.Exception.Message -match 'pos-condicao nao confirmada') $true "Exit zero sem pos-condicao falha pelo estado do alvo"
+    }
+
+    $script:mockInjectedPaths[$resourcesOne] = Join-Path $injectionRoot 'dist\desktop'
+    $script:mockInjectionMode = 'nine'
+    Invoke-Injection $injectionRoot @($targetOne)
+    Assert-Equal $script:PnpmExitCode 9 "exit=9 com stub confirmado nao falha"
+
+    $script:mockInjectionMode = 'exception'
+    Invoke-Injection $injectionRoot @($targetOne)
+    Assert-Equal $script:PnpmExitCode -1 "excecao sem codigo recebe exit=-1 deterministico"
+
+    $script:mockInjectionMode = 'zero'
+    try {
+        Invoke-Injection $injectionRoot @($targetOne, $targetTwo)
+        Assert-Equal $false $true "Um alvo nao pode aprovar outro"
+    } catch {
+        Assert-Equal ($_.Exception.Message -match 'DiscordPTB: pos-condicao nao confirmada') $true "Pos-condicao e independente por alvo"
+    }
+
+    # Cliente reaberto pelo Update.exe entre o Stop-Discord e o injetor: o Equilotl avisa
+    # que o arquivo esta em uso e desfaz o patch. O instalador tem que fechar de novo
+    # (agora esperando a trava sair) e repetir UMA vez em vez de deixar o cliente sem o mod.
+    $script:mockInjectionMode = 'lockonce'
+    $script:mockLockCalls = 0
+    $script:mockLockKey = $resourcesOne
+    $script:mockInjectedPaths[$resourcesOne] = Join-Path $injectionRoot 'dist\desktop'
+    $script:mockStopDiscordCalls = 0
+    Invoke-Injection $injectionRoot @($targetOne)
+    Assert-Equal $script:mockLockCalls 2 "injetor que acusa arquivo em uso e repetido uma vez"
+    Assert-Equal $script:mockStopDiscordCalls 2 "a repeticao fecha o Discord de novo (1 inicial + 1 do retry)"
+    Assert-Equal $script:PnpmExitCode 0 "segunda tentativa confirmada nao falha"
+} finally {
+    $env:GLB_INSTALLER_LOG_DIR = $origInjectionLogDir
+    Set-Item -Path Function:Invoke-Pnpm -Value $originalInvokePnpm
+    Set-Item -Path Function:Find-PnpmApplications -Value $originalFindPnpmApplications
+    Set-Item -Path Function:Get-InjectedPath -Value $originalGetInjectedPath
+    Set-Item -Path Function:Stop-Discord -Value $originalStopDiscord
+    if (Test-Path -LiteralPath $injectionRoot) { Remove-Item -LiteralPath $injectionRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n-- 2.8 Travas de arquivo do Discord (app.asar) --" -ForegroundColor Yellow
+# O standalone define o proprio Stop-Discord e, por ser dot-sourced depois do instalador,
+# ele sombreia o do instalador. Estas provas sao do instalador: recarrega as funcoes dele
+# e devolve o standalone ao lugar no fim.
+. $tempInstaller
+$lockRoot = Join-Path ([System.IO.Path]::GetTempPath()) "GoLiveBypassLock_$([Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $lockRoot -Force | Out-Null
+$lockFile = Join-Path $lockRoot 'app.asar'
+Set-Content -LiteralPath $lockFile -Value 'asar sintetico' -Encoding UTF8
+$originalGetDiscordProcesses = ${function:Get-DiscordProcesses}
+$trava = $null
+try {
+    # Nada de tocar em processos reais do Discord numa maquina de desenvolvimento.
+    function Get-DiscordProcesses { return @() }
+    Assert-Equal (Test-ArquivoLivre $lockFile) $true "app.asar sem trava passa"
+    $trava = [IO.File]::Open($lockFile, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    Assert-Equal (Test-ArquivoLivre $lockFile) $false "app.asar com handle aberto nao passa"
+    $travados = @(Get-DiscordResourcesTravados @($lockRoot))
+    Assert-Equal ($travados.Count -eq 1 -and $travados[0] -eq $lockFile) $true "Get-DiscordResourcesTravados aponta o app.asar travado"
+    try {
+        Stop-Discord -Resources @($lockRoot) -TentativasProcessos 1 -TentativasTravas 2
+        Assert-Equal $false $true "Stop-Discord nao pode liberar a injecao com o arquivo travado"
+    } catch {
+        Assert-Equal ($_.Exception.Message -match 'continuam em uso') $true "Stop-Discord explica a trava antes do unpatch do cliente"
+    }
+    $trava.Close(); $trava = $null
+    Assert-Equal ((@(Get-DiscordResourcesTravados @($lockRoot))).Count -eq 0) $true "trava liberada sai da lista"
+    $erroLivre = $null
+    try { Stop-Discord -Resources @($lockRoot) -TentativasProcessos 1 -TentativasTravas 2 } catch { $erroLivre = $_.Exception.Message }
+    Assert-Equal $erroLivre $null "Stop-Discord segue quando o arquivo esta livre"
+} finally {
+    if ($trava) { $trava.Close() }
+    Set-Item -Path Function:Get-DiscordProcesses -Value $originalGetDiscordProcesses
+    Remove-Item -LiteralPath $lockRoot -Recurse -Force -ErrorAction SilentlyContinue
+    # A secao 3 volta a medir o standalone: devolve as definicoes dele ao lugar.
+    . $tempStandalone
 }
 
 Write-Host "`n========================================================" -ForegroundColor Cyan

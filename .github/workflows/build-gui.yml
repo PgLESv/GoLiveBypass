@@ -45,6 +45,9 @@ jobs:
           cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
+      - name: Regressões do updater portable antes de publicar
+        run: npm test -- tests/updater-channel.test.ts tests/updater-identity.test.ts tests/updater-replace.test.ts tests/proton-packaging.test.ts
+        working-directory: golive-gui
       # --publish always: gera o GoLiveBypass.exe + latest.yml e faz upload na release
       # (o GH_TOKEN do workflow vira o GH_TOKEN que o electron-builder usa).
       # No canal beta a release nasce como draft; beta-marcar aplica a classificação
@@ -54,6 +57,8 @@ jobs:
         working-directory: golive-gui
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # O nome beta do metadata depende do channel explicito. releaseType sozinho
+      # marca a release, mas deixa o electron-builder escrever latest.yml.
       - run: npm run publish:win -- --config.publish.channel=beta --config.publish.releaseType=prerelease
         if: ${{ inputs.canal == 'beta' }}
         working-directory: golive-gui
@@ -75,9 +80,9 @@ jobs:
           cache-dependency-path: tools/proton-confgen/go.sum
       - run: npm ci
         working-directory: golive-gui
-      # No canal beta publica AppImage + beta.yml (electron-updater com
-      # allowPrerelease consome o canal beta.yml que o electron-builder gera
-      # sozinho para versao com sufixo de prerelease).
+      # No canal beta publica AppImage + beta.yml. O channel precisa ser explicito:
+      # uma versao com sufixo beta e releaseType prerelease, sozinha, ainda gera
+      # latest.yml e deixa o canal estavel enxergar metadata de teste.
       - run: npm run publish:linux
         if: ${{ inputs.canal != 'beta' }}
         working-directory: golive-gui
@@ -90,9 +95,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   proton-runtime-assets:
-    # Os helpers sao um reparo de contingencia para instalacoes que perderam
-    # extraResources. Compila com as mesmas flags deterministicas do build local
-    # e so publica depois dos dois artefatos da GUI estarem prontos.
+    # Reparo para instalações que perderam ou não conseguiram extrair o helper
+    # Proton de extraResources. As saídas usam as mesmas flags determinísticas
+    # da build local e o manifesto é publicado junto com os hashes.
     needs: [windows, linux]
     runs-on: ubuntu-latest
     steps:
@@ -112,18 +117,19 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
-          MANIFEST="golive-gui/../tools/proton-confgen/build/proton-confgen-manifest.json"
+          MANIFEST="tools/proton-confgen/build/proton-confgen-manifest.json"
           node golive-gui/scripts/build-proton.mjs
           test "$(jq -r '.version' "$MANIFEST")" = "$VERSION"
           mkdir -p runtime
           cp tools/proton-confgen/build/proton-confgen \
-            "runtime/GoLiveBypass-${VERSION}-proton-confgen-linux-x64"
+            "runtime/proton-confgen-${VERSION}-linux-x64"
           cp tools/proton-confgen/build/proton-confgen.exe \
-            "runtime/GoLiveBypass-${VERSION}-proton-confgen-win-x64.exe"
-          sha256sum runtime/GoLiveBypass-"${VERSION}"-proton-confgen-linux-x64 \
-            > runtime/GoLiveBypass-"${VERSION}"-proton-confgen-linux-x64.sha256
-          sha256sum runtime/GoLiveBypass-"${VERSION}"-proton-confgen-win-x64.exe \
-            > runtime/GoLiveBypass-"${VERSION}"-proton-confgen-win-x64.exe.sha256
+            "runtime/proton-confgen-${VERSION}-win-x64.exe"
+          sha256sum runtime/proton-confgen-"${VERSION}"-linux-x64 \
+            > runtime/proton-confgen-"${VERSION}"-linux-x64.sha256
+          sha256sum runtime/proton-confgen-"${VERSION}"-win-x64.exe \
+            > runtime/proton-confgen-"${VERSION}"-win-x64.exe.sha256
+          cp "$MANIFEST" runtime/proton-confgen-manifest.json
       - name: Comparar hashes do manifesto com os assets
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -133,8 +139,8 @@ jobs:
           MANIFEST="tools/proton-confgen/build/proton-confgen-manifest.json"
           test "$(jq -r '.version' "$MANIFEST")" = "$VERSION"
           for pair in \
-            "linux-x64|GoLiveBypass-${VERSION}-proton-confgen-linux-x64" \
-            "win32-x64|GoLiveBypass-${VERSION}-proton-confgen-win-x64.exe"; do
+            "linux-x64|proton-confgen-${VERSION}-linux-x64" \
+            "win32-x64|proton-confgen-${VERSION}-win-x64.exe"; do
             key="${pair%%|*}"
             asset="${pair#*|}"
             expected="$(jq -r --arg key "$key" '.assets[$key].sha256' "$MANIFEST")"
@@ -149,12 +155,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
-          draft: ${{ inputs.rascunho }}
+          draft: ${{ inputs.rascunho || inputs.canal == 'beta' }}
           files: |
-            runtime/GoLiveBypass-*-proton-confgen-linux-x64
-            runtime/GoLiveBypass-*-proton-confgen-linux-x64.sha256
-            runtime/GoLiveBypass-*-proton-confgen-win-x64.exe
-            runtime/GoLiveBypass-*-proton-confgen-win-x64.exe.sha256
+            runtime/proton-confgen-*-linux-x64
+            runtime/proton-confgen-*-linux-x64.sha256
+            runtime/proton-confgen-*-win-x64.exe
+            runtime/proton-confgen-*-win-x64.exe.sha256
+            runtime/proton-confgen-manifest.json
           fail_on_unmatched_files: true
 
   macos:
@@ -190,10 +197,8 @@ jobs:
   release-assets:
     # Sobe os assets de update que NAO dependem do electron-builder: o zip do
     # userplugin Vencord e o bypass standalone "puro". Roda em paralelo com os
-    # builds da GUI (sao independentes). No canal beta pula: plugin/CLI nao estao
-    # no ciclo de teste da GUI, e um goLiveBypass-vencord.zip beta numa prerelease
-    # poderia ser pego pelo updater do plugin.
-    if: ${{ inputs.canal != 'beta' }}
+    # builds da GUI (sao independentes). No beta, todos os assets permanecem em
+    # draft ate beta-marcar concluir a classificacao da release.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -221,11 +226,14 @@ jobs:
           # Vencord sempre baixe o asset mais recente independente da tag.
           echo "vencord_basename=goLiveBypass-vencord" >> $GITHUB_OUTPUT
 
+      - name: Validar contrato do archive do plugin antes do upload
+        run: node --test tests/test-plugin-update-archive.mjs
+
       - name: Zip do userplugin Vencord (Onda 2 do auto-update)
         run: |
           mkdir -p goLiveBypass/bin/win32-x64
           cd tools/proton-confgen
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' \
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w -buildid=' \
             -o ../../goLiveBypass/bin/win32-x64/proton-confgen.exe ./cmd/protonvpn-wg
           cd ../..
           cd goLiveBypass
@@ -247,7 +255,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "${{ inputs.tag }}"
-          draft: ${{ inputs.rascunho }}
+          draft: ${{ inputs.rascunho || inputs.canal == 'beta' }}
           files: |
             ${{ steps.version.outputs.vencord_basename }}.zip
             ${{ steps.version.outputs.vencord_basename }}.zip.sha256
@@ -263,7 +271,7 @@ jobs:
     # prerelease: true
     if: ${{ inputs.canal == 'beta' && !inputs.rascunho }}
     runs-on: ubuntu-latest
-    needs: [windows, linux, proton-runtime-assets]
+    needs: [windows, linux, release-assets, proton-runtime-assets]
     steps:
       - name: Marcar prerelease e escrever a linha do canal
         env:

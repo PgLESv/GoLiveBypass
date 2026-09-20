@@ -23,14 +23,14 @@ Você não precisa usar todas as opções. Escolha uma delas:
 |---|---|---|
 | **[GUI](#-versão-200-interface-gráfica-com-wireguard-por-aplicativo)** | quer ativar e desativar com poucos cliques, sem terminal | baixe o aplicativo para Windows ou Linux |
 | **[Standalone](#modo-standalone-só-o-discord-sem-equicord-e-sem-vencord)** | usa o Discord puro e não quer instalar Equicord/Vencord | temporariamente indisponível na 2.0.0 |
-| **[Plugin](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop)** | já usa Equicord, Vencord ou Vesktop | temporariamente indisponível na 2.0.0 |
+| **[Plugin](#instalação-do-plugin-recomendado-para-equicord-vencord-e-vesktop)** | já usa Equicord, Vencord ou Vesktop | instalador em beta, para Windows e Linux |
 
 > **Regra rápida:** GUI para simplicidade, standalone para Discord sem mods, plugin para quem já usa um mod.
 
 > **Status da versão 2.0.0:** a migração do plugin para a arquitetura WireGuard por aplicativo
-> começou para Windows x64. O código do plugin já está separado da GUI e do standalone, mas os
-> instaladores automáticos permanecem pausados até a validação E2E e a publicação de um pacote.
-> O standalone continua fora do escopo desta migração.
+> está em beta para Windows x64 e Linux x64, com o código separado da GUI e do standalone. Os
+> instaladores automáticos do plugin voltaram a funcionar nessa linha beta — Windows e Linux —
+> e entregam o pacote da release. O **standalone continua pausado** e só será retomado depois.
 
 ## 🌟 Versão 2.0.0: Interface Gráfica com WireGuard por aplicativo
 
@@ -67,7 +67,7 @@ O túnel cobre o processo do Discord inteiro — gateway, login, voz, vídeo e a
    - **Linux:** `GoLiveBypass-*.AppImage`
 3. Abra o arquivo que você acabou de baixar.
 
-O programa **não é assinado**. O sistema avisa na primeira vez. Na 2.0.0, a GUI é a única variante disponível; os instaladores CLI permanecem pausados.
+O programa **não é assinado**. O sistema avisa na primeira vez. Na 2.0.0, a GUI é a única variante estável; o instalador do plugin está disponível em beta e o standalone segue pausado.
 
 **Windows (SmartScreen):** **Mais informações → Executar assim mesmo**.
 
@@ -166,8 +166,9 @@ paralelos e Flatpak; Equicord/Vencord é preservado e não impede o túnel por n
 
 ## Instalação do plugin (recomendado para Equicord, Vencord e Vesktop)
 
-> A VPN do plugin está implementada para Windows x64, mas os instaladores automáticos continuam
-> pausados até a validação E2E. Para instalação manual e configuração, use
+> A VPN do plugin está em beta para Windows x64 e Linux x64, e os instaladores automáticos
+> entregam essa linha beta — no Windows e no Linux. O instalador avisa que o sistema ainda não
+> é estável e que cada bug reportado vira uma issue. Para instalação manual e configuração, use
 > [`goLiveBypass/COMO-INSTALAR.md`](goLiveBypass/COMO-INSTALAR.md).
 
 <p align="center">
@@ -271,11 +272,11 @@ Ao abrir, ele mostra o que encontrou e um menu:
 
     [1] Instalar ou atualizar o GoLiveBypass
     [2] Remover so o plugin (o mod continua)
-    [3] Restaurar tudo (remove o plugin e desfaz a injecao)
+    [3] Restaurar tudo (remove o plugin; preserva a injeção do mod)
     [0] Sair
 ```
 
-Escolhendo instalar, ele pergunta três coisas: **onde** (usar o mod que já está aí ou baixar outro), **como sair do Brasil** (proxy gratuita testada sozinha, Tor local, ou uma proxy sua) e **por quanto tempo** (permanente, ou temporário — que desfaz a injeção quando você fechar o Discord).
+Escolhendo instalar, ele pergunta duas coisas: **onde** (usar o mod que já está aí ou baixar outro) e **por quanto tempo** (permanente, ou temporário — que remove apenas o GoLiveBypass quando você fechar o Discord, preservando Vencord/Equicord). A saída para fora do Brasil não é mais escolhida aqui: a conta Proton é configurada dentro do plugin, na primeira ativação.
 
 **Pelo PowerShell:**
 
@@ -284,12 +285,12 @@ irm https://raw.githubusercontent.com/PgLESv/GoLiveBypass/main/installer/GoLiveB
 powershell -ExecutionPolicy Bypass -File .\GoLiveBypass-Installer.ps1
 ```
 
-Ele descobre onde está o seu checkout **lendo a própria injeção do Discord**: o instalador do Equicord e o do Vencord substituem o `app.asar` por um stub que faz `require` da pasta de build, e desse caminho dá para derivar a raiz do repositório. Se não achar por aí, procura nos lugares habituais.
+Ele tenta descobrir onde está o seu checkout **lendo a própria injeção do Discord**. Se o mod foi instalado a partir de um pacote sem o checkout fonte, a instalação é interrompida sem alterar `app.asar` ou `_app.asar`; nesse caso, use `-Source` apontando para o checkout original.
 
 | sua situação | o que acontece |
 |---|---|
 | Equicord ou Vencord já instalado a partir do fonte | Copia o plugin, compila e reinicia o Discord |
-| Instalado, mas o Discord não carrega desse checkout | Compila e roda o `pnpm inject` para apontar o Discord para ele |
+| checkout fonte não encontrado, mas Vencord/Equicord já está instalado | Interrompe sem alterar o Discord; use `-Source` apontando para o checkout do mod |
 | Você não tem nenhum dos dois | Mostra uma tela para escolher **Equicord** ou **Vencord**, baixa, compila e injeta |
 | Falta Git ou Node | No Windows, oferece instalar pelo winget. No Linux, mostra o comando da sua distro (o pacote do Node é `nodejs`, e costuma ser antigo demais: nesse caso use nvm, fnm ou o NodeSource). O pnpm sai do `corepack enable` nos dois |
 
@@ -303,7 +304,7 @@ Outros modos:
 .\GoLiveBypass-Installer.ps1 -Yes                             # sem perguntas, para automação
 .\GoLiveBypass-Installer.ps1 -Mode Install                    # instala direto, sem menu
 .\GoLiveBypass-Installer.ps1 -Mode Uninstall                  # remove o plugin e recompila
-.\GoLiveBypass-Installer.ps1 -Mode Restore                    # remove o plugin e desfaz a injeção
+.\GoLiveBypass-Installer.ps1 -Mode Restore                    # remove o plugin e preserva a injeção do mod
 ```
 
 ```bash
@@ -312,10 +313,13 @@ Outros modos:
 ./golivebypass-installer.sh --yes                 # sem perguntas, para automação
 ./golivebypass-installer.sh --install             # instala direto, sem menu
 ./golivebypass-installer.sh --uninstall           # remove o plugin e recompila
-./golivebypass-installer.sh --restore             # remove o plugin e desfaz a injeção
+./golivebypass-installer.sh --restore             # remove o plugin e preserva a injeção do mod
 ```
 
-O instalador **baixa o plugin direto deste repositório** em vez de carregar uma cópia embutida, então nunca instala uma versão defasada. Ele nunca mexe no `app.asar`: quem injeta é o instalador oficial do Equicord/Vencord.
+O instalador **baixa o pacote da release** (o mesmo `goLiveBypass-vencord.zip` que o updater do
+plugin usa) e confere o **SHA-256** publicado antes de extrair — não copia arquivos soltos da
+branch `main`, que pode estar atrás da tag. Ele nunca mexe no `app.asar`: quem injeta é o
+instalador oficial do Equicord/Vencord.
 
 O instalador já deixa o plugin **ativado e configurado**. Depois que ele terminar, feche o Discord pela bandeja e abra de novo: é isso.
 
@@ -923,7 +927,7 @@ It was written after Brazil's data protection authority (ANPD) [ordered Discord 
 - **Your calls stay on the region you pick.** The plugin keeps its `RTCRegionStore` preference override separate from the VPN controller and restores it on `stop()`.
 - The plugin stores its WireGuard profile, Proton session and ownership lock in `%LOCALAPPDATA%\GoLiveBypass\plugin-vpn`; it does not read GUI settings or standalone state except for the one-time compatible-file migration described above.
 - DNS/HTTPS/route probes are diagnostic-only. They are logged for troubleshooting and do not block activation, change the route during a call, or stop Discord.
-- Install: copy the `goLiveBypass` folder into `src/userplugins/` of your Equicord or Vencord clone, then `pnpm install && pnpm build && pnpm inject`, fully restart Discord, and enable **GoLiveBypass** in plugin settings. The automatic installer and the standalone remain paused/separate in this migration.
+- Install: copy the `goLiveBypass` folder into `src/userplugins/` of your Equicord or Vencord clone, then `pnpm install && pnpm build && pnpm inject`, fully restart Discord, and enable **GoLiveBypass** in plugin settings. The Windows PowerShell installer is available again for the current WireGuard beta; the Linux installer and standalone remain separate in this migration.
 - Fork maintained by **PgLESv** — [GitHub](https://github.com/PgLESv/GoLiveBypass).
 - Originally created by **bezumiya** — [GitHub](https://github.com/bezumiya/GoLiveBypass), [Twitter](https://twitter.com/obezumiya), Discord `1366453661970071633`.
 - Thanks to **[mazxxy](https://github.com/mazxxy)** for the idea that became the project's backbone: a local SOCKS5 with an embedded PAC routing only the gateway through the proxy ([#3](https://github.com/bezumiya/GoLiveBypass/pull/3), merged for authorship — the lines were later rewritten, but the design is his).

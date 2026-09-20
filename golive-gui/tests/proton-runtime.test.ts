@@ -15,7 +15,6 @@ const temporaryRoots: string[] = [];
 afterEach(() => {
   for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-
 function temporaryRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-proton-runtime-"));
   temporaryRoots.push(root);
@@ -58,11 +57,11 @@ describe("runtime Proton empacotado", () => {
     const result = await stageValidatedProtonConfgen({
       sourcePath,
       installDir: path.join(root, "data"),
-      version: "2.0.5-beta-8",
+      version: "2.0.6-beta-2",
       expectedSha256,
-      assetName: "GoLiveBypass-2.0.5-beta-8-proton-confgen-linux-x64",
+      assetName: "GoLiveBypass-2.0.6-beta-2-proton-confgen-linux-x64",
     });
-    expect(result).toContain(path.join("runtime", "2.0.5-beta-8"));
+    expect(result).toContain(path.join("runtime", "2.0.6-beta-2"));
     expect(fs.readFileSync(result, "utf8")).toBe(content);
     expect(fs.readdirSync(path.dirname(result)).some((item) => item.endsWith(".tmp"))).toBe(false);
   });
@@ -79,26 +78,26 @@ describe("runtime Proton empacotado", () => {
     await expect(stageValidatedProtonConfgen({
       sourcePath,
       installDir: path.join(root, "data"),
-      version: "2.0.5-beta-8",
+      version: "2.0.6-beta-2",
       expectedSha256: "0".repeat(64),
     })).rejects.toThrow(/SHA-256/i);
-    expect(protonRuntimeAssetUrl("2.0.5-beta-8", "GoLiveBypass-2.0.5-beta-8-proton-confgen-win-x64.exe"))
-      .toBe("https://github.com/bezumiya/GoLiveBypass/releases/download/v2.0.5-beta-8/GoLiveBypass-2.0.5-beta-8-proton-confgen-win-x64.exe");
-    expect(() => protonRuntimeAssetUrl("2.0.5-beta-8", "../proton-confgen.exe")).toThrow(/asset/i);
+    expect(protonRuntimeAssetUrl("2.0.6-beta-2", "GoLiveBypass-2.0.6-beta-2-proton-confgen-win-x64.exe"))
+      .toBe("https://github.com/PgLESv/GoLiveBypass/releases/download/v2.0.6-beta-2/GoLiveBypass-2.0.6-beta-2-proton-confgen-win-x64.exe");
+    expect(() => protonRuntimeAssetUrl("2.0.6-beta-2", "../proton-confgen.exe")).toThrow(/asset/i);
   });
 
   it("aceita somente manifesto com os dois runtimes e hashes válidos", () => {
     const root = temporaryRoot();
     const manifestPath = path.join(root, "proton-confgen-manifest.json");
     fs.writeFileSync(manifestPath, JSON.stringify({
-      version: "2.0.5-beta-8",
+      version: "2.0.6-beta-2",
       assets: {
         "win32-x64": { asset: "win.exe", sha256: "A".repeat(64) },
         "linux-x64": { asset: "linux", sha256: "B".repeat(64) },
       },
     }));
-    expect(readProtonRuntimeManifest([manifestPath])).toMatchObject({ version: "2.0.5-beta-8" });
-    fs.writeFileSync(manifestPath, JSON.stringify({ version: "2.0.5-beta-8", assets: { "win32-x64": { asset: "../x", sha256: "A".repeat(64) } } }));
+    expect(readProtonRuntimeManifest([manifestPath])).toMatchObject({ version: "2.0.6-beta-2" });
+    fs.writeFileSync(manifestPath, JSON.stringify({ version: "2.0.6-beta-2", assets: { "win32-x64": { asset: "../x", sha256: "A".repeat(64) } } }));
     expect(readProtonRuntimeManifest([manifestPath])).toBeUndefined();
   });
 });

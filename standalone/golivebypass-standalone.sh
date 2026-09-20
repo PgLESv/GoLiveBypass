@@ -247,6 +247,7 @@ fail() {
     exit 1
 }
 
+
 # =========================================================================== TUI (standalone)
 # Interface no estilo OpenCode (dark, caixas, setas/Enter), ANSI puro, POSIX.
 # Quando nao ha TTY, ou -y/--yes esta ligado, o script cai para o fluxo por flags.
@@ -547,32 +548,469 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Senha digitada numa janela (zenity/kdialog) para o sudo -S. Cacheada em arquivo
 # temporario para nao repetir a pergunta a cada operacao da injecao (mv, mkdir, cp).
 SUDO_PASS_FILE=""
+SUDO_ASKPASS_HELPER=""
+SUDO_ASKPASS_EVENT_FILE=""
+SUDO_ASKPASS_RESULT_FILE=""
 SUDO_AUTH_READY=0
 SUDO_USE_CACHED_PASS=0
+SUDO_PROMPT_FALLBACK_PKEXEC=0
+SUDO_PROMPT_OUTCOME="not_attempted"
+ELEVATION_PROVIDER="none"
+ELEVATION_RESULT="not_attempted"
+ELEVATION_INPUT_STATE="not_applicable"
+ELEVATION_POLKIT_NO_AGENT=0
+ACTIVATION_ROLLBACK_PENDING=0
+ACTIVATION_ROLLBACK_REOPEN=0
+ACTIVATION_ROLLBACK_TARGET=""
+ACTIVATION_NETNS_TOUCH_STARTED=0
+START_DISCORD_HOST_ONLY=0
+WIREGUARD_TMP_CONF=""
+# Executor escolhido uma vez por ativacao. O nome nunca vai para logs; uid/gid
+# numericos permitem usar setpriv sem interpolar identidade em um comando shell.
+RUN_USER_NAME=""
+RUN_USER_UID=""
+RUN_USER_GID=""
+RUN_USER_METHOD="none"
 
-cleanup_sudo_pass() {
-    if [ -n "$SUDO_PASS_FILE" ] && [ -f "$SUDO_PASS_FILE" ]; then
-        rm -f "$SUDO_PASS_FILE"
-    fi
-    SUDO_PASS_FILE=""
+# Eventos de elevacao sao encaminhados pela GUI junto com o stderr do standalone.
+# A whitelist evita que uma mensagem de comando, caminho ou qualquer valor externo
+# entre no diagnostico por engano. Nunca registrar senha, tamanho da senha ou stderr
+# do prompt: somente estados controlados e a presenca dele.
+elevation_event() {
+    local event="${1:-}" detail provider result input_state
+    case "$event" in
+        prompt.requested|prompt.finished|prompt.unavailable|prompt.failed|sudo.cached|sudo.validation|sudo.credential_store|pkexec.invoked|pkexec.result|authorization.requested|authorization) ;;
+        *) return 0 ;;
+    esac
+
+    case "${ELEVATION_PROVIDER:-none}" in
+        none|root|sudo|zenity|kdialog|askpass|pkexec|tty) provider="$ELEVATION_PROVIDER" ;;
+        *) provider="unknown" ;;
+    esac
+    case "${ELEVATION_RESULT:-not_attempted}" in
+        not_attempted|requested|accepted|rejected|cancelled|unavailable|failed|cached|empty|authorized) result="$ELEVATION_RESULT" ;;
+        *) result="unknown" ;
+    esac
+
+    printf '[elevation] %s provider=%s result=%s' "$event" "$provider" "$result" >&2
+    case "$event" in
+        prompt.requested|prompt.finished|prompt.unavailable|prompt.failed)
+            case "${ELEVATION_INPUT_STATE:-not_applicable}" in
+                unknown|empty|nonempty|not_applicable) input_state="$ELEVATION_INPUT_STATE" ;;
+                *) input_state="unknown" ;;
+            esac
+            printf ' input=%s' "$input_state" >&2
+            ;;
+    esac
+    shift || true
+    for detail in "$@"; do
+        case "$detail" in
+            phase=dialog|phase=polkit|phase=password|phase=tty|phase=pre_activation|reason=provider_missing|reason=temporary_file|code=0|code=1|code=2|code=126|code=127|code=other|stderr=present|stderr=empty)
+                printf ' %s' "$detail" >&2
+                ;;
+        esac
+    done
+    printf '\n' >&2
 }
 
-trap cleanup_sudo_pass EXIT INT TERM
-sudo_pass_get() {
+# O codigo de um processo e reduzido a um conjunto fixo antes de chegar ao log.
+# Assim, nem um valor externo nem uma mensagem de erro do provedor pode ser impresso.
+elevation_code_detail() {
+    case "${1:-}" in
+        0|1|2|126|127) printf 'code=%s' "$1" ;;
+        *) printf '%s' 'code=other' ;;
+    esac
+}
+
+cleanup_sudo_pass() {
+    cleanup_wireguard_temp
+    rollback_activation
     if [ -n "$SUDO_PASS_FILE" ] && [ -f "$SUDO_PASS_FILE" ]; then
+        rm -f "$SUDO_PASS_FILE" 2>/dev/null || true
+    fi
+    for askpass_file in "$SUDO_ASKPASS_HELPER" "$SUDO_ASKPASS_EVENT_FILE" "$SUDO_ASKPASS_RESULT_FILE"; do
+        if [ -n "$askpass_file" ] && [ -f "$askpass_file" ]; then
+            rm -f "$askpass_file" 2>/dev/null || true
+        fi
+    done
+    SUDO_PASS_FILE=""
+    SUDO_ASKPASS_HELPER=""
+    SUDO_ASKPASS_EVENT_FILE=""
+    SUDO_ASKPASS_RESULT_FILE=""
+}
+
+cleanup_wireguard_temp() {
+    if [ -n "${WIREGUARD_TMP_CONF:-}" ] && [ -f "$WIREGUARD_TMP_CONF" ]; then
+        rm -f "$WIREGUARD_TMP_CONF" 2>/dev/null || true
+    fi
+    WIREGUARD_TMP_CONF=""
+}
+
+# Falhas depois de stop_discord nao podem deixar o cliente fechado nem um namespace
+# incompleto. A reabertura de emergencia so ocorre depois de remover o namespace
+# parcialmente configurado; portanto o Discord nunca e iniciado dentro de uma rota
+# cuja preparacao falhou. O estado pending e limpo antes das acoes para impedir loop
+# no trap se alguma limpeza tambem falhar.
+rollback_activation() {
+    [ "${ACTIVATION_ROLLBACK_PENDING:-0}" -eq 1 ] || return 0
+    ACTIVATION_ROLLBACK_PENDING=0
+
+    if [ "${ACTIVATION_NETNS_TOUCH_STARTED:-0}" -eq 1 ] && netns_exists; then
+        warn "Rollback: removendo o namespace WireGuard incompleto."
+        teardown_wireguard_netns || true
+    fi
+
+    if [ "${ACTIVATION_ROLLBACK_REOPEN:-0}" -ne 1 ] || discord_running; then
         return 0
     fi
-    local pass=""
-    if have zenity; then
-        pass="$(zenity --password --title='GoLiveBypass - senha do sudo' 2>/dev/null)"
-    elif have kdialog; then
-        pass="$(kdialog --password 'Senha do sudo (GoLiveBypass)' 2>/dev/null)"
+    if netns_exists; then
+        warn "Rollback: o namespace WireGuard continua ativo; nao vou iniciar o Discord fora dele."
+        return 0
     fi
-    [ -n "$pass" ] || return 1
-    SUDO_PASS_FILE="$(mktemp)"
-    chmod 600 "$SUDO_PASS_FILE"
-    printf '%s\n' "$pass" > "$SUDO_PASS_FILE"
+
+    if [ -n "${ACTIVATION_ROLLBACK_TARGET:-}" ]; then
+        warn "Rollback: bypass nao ativado; reabrindo o Discord sem o namespace WireGuard."
+        START_DISCORD_HOST_ONLY=1
+        if start_discord "$ACTIVATION_ROLLBACK_TARGET" && wait_discord_started "$ACTIVATION_ROLLBACK_TARGET"; then
+            warn "Rollback: Discord reaberto sem bypass; a ativacao falhou e precisa ser repetida."
+        else
+            warn "Rollback: nao consegui reabrir o Discord automaticamente."
+        fi
+        START_DISCORD_HOST_ONLY=0
+    fi
     return 0
+}
+
+# O trap e instalado cedo para que uma falha durante a coleta da senha ainda
+# limpe o segredo temporario. `ACTIVATION_ROLLBACK_PENDING` continua em zero ate
+# depois de todas as funcoes de rollback/lancamento estarem definidas.
+trap cleanup_sudo_pass EXIT INT TERM
+sudo_prompt_provider() {
+    if have zenity; then
+        printf '%s\n' 'zenity'
+    fi
+    if have kdialog; then
+        printf '%s\n' 'kdialog'
+    fi
+    return 0
+}
+
+sudo_pass_get() {
+    if [ -n "$SUDO_PASS_FILE" ] && [ -f "$SUDO_PASS_FILE" ]; then
+        [ "${ELEVATION_PROVIDER:-none}" = "none" ] && ELEVATION_PROVIDER="sudo"
+        ELEVATION_INPUT_STATE="nonempty"
+        return 0
+    fi
+
+    local pass="" provider="" providers="" prompt_error="" prompt_exit=1
+    local prompt_stderr_state="empty" provider_seen=0 provider_failure=0
+    SUDO_PROMPT_FALLBACK_PKEXEC=0
+    SUDO_PROMPT_OUTCOME="not_attempted"
+    providers="$(sudo_prompt_provider 2>/dev/null || true)"
+    if [ -z "$providers" ]; then
+        ELEVATION_PROVIDER="none"
+        ELEVATION_RESULT="unavailable"
+        ELEVATION_INPUT_STATE="not_applicable"
+        SUDO_PROMPT_FALLBACK_PKEXEC=1
+        SUDO_PROMPT_OUTCOME="provider_unavailable"
+        elevation_event "prompt.unavailable" "reason=provider_missing"
+        return 1
+    fi
+
+    # A ordem e fixa e cada nome veio apenas da whitelist acima. Uma falha de
+    # execucao (codigo diferente de zero) libera o proximo provedor; stderr
+    # benigno com codigo 0 e entrada nao vazia continua para a validacao do sudo.
+    for provider in $providers; do
+        provider_seen=1
+        pass=""
+        prompt_exit=1
+        prompt_stderr_state="empty"
+        ELEVATION_PROVIDER="$provider"
+        ELEVATION_RESULT="not_attempted"
+        ELEVATION_INPUT_STATE="unknown"
+        elevation_event "prompt.requested" "phase=dialog"
+        if ! prompt_error="$(mktemp 2>/dev/null)"; then
+            ELEVATION_RESULT="failed"
+            ELEVATION_INPUT_STATE="not_applicable"
+            elevation_event "prompt.failed" "reason=temporary_file"
+            SUDO_PROMPT_OUTCOME="internal_failure"
+            pass=""
+            return 1
+        fi
+        if [ "$provider" = "zenity" ]; then
+            if pass="$( (unset LD_LIBRARY_PATH LD_PRELOAD; zenity --password --title='GoLiveBypass - senha do sudo') 2>"$prompt_error")"; then
+                prompt_exit=0
+            else
+                prompt_exit=$?
+            fi
+        else
+            if pass="$( (unset LD_LIBRARY_PATH LD_PRELOAD; kdialog --password 'Senha do sudo (GoLiveBypass)') 2>"$prompt_error")"; then
+                prompt_exit=0
+            else
+                prompt_exit=$?
+            fi
+        fi
+
+        [ -s "$prompt_error" ] && prompt_stderr_state="present"
+        rm -f "$prompt_error"
+
+        if [ "$prompt_exit" -ne 0 ]; then
+            if [ "$prompt_exit" -ne 1 ]; then
+                ELEVATION_RESULT="failed"
+                ELEVATION_INPUT_STATE="not_applicable"
+                elevation_event "prompt.finished" "$(elevation_code_detail "$prompt_exit")" "stderr=$prompt_stderr_state"
+                provider_failure=1
+                SUDO_PROMPT_OUTCOME="provider_failed"
+                pass=""
+                continue
+            fi
+            ELEVATION_RESULT="cancelled"
+            ELEVATION_INPUT_STATE="empty"
+            SUDO_PROMPT_OUTCOME="cancelled"
+            elevation_event "prompt.finished" "$(elevation_code_detail "$prompt_exit")" "stderr=$prompt_stderr_state"
+            pass=""
+            return 1
+        fi
+
+        if [ -z "$pass" ]; then
+            ELEVATION_RESULT="empty"
+            ELEVATION_INPUT_STATE="empty"
+            SUDO_PROMPT_OUTCOME="empty"
+            elevation_event "prompt.finished" "$(elevation_code_detail "$prompt_exit")" "stderr=$prompt_stderr_state"
+            pass=""
+            return 1
+        fi
+
+        # Texto retornado pelo dialogo e apenas entrada recebida; ainda nao e
+        # uma autorizacao. `accepted` fica reservado ao sudo -S -k -v.
+        ELEVATION_RESULT="not_attempted"
+        ELEVATION_INPUT_STATE="nonempty"
+        elevation_event "prompt.finished" "$(elevation_code_detail "$prompt_exit")" "stderr=$prompt_stderr_state"
+        if ! SUDO_PASS_FILE="$(mktemp 2>/dev/null)"; then
+            ELEVATION_RESULT="failed"
+            SUDO_PROMPT_OUTCOME="internal_failure"
+            elevation_event "sudo.credential_store" "reason=temporary_file" "phase=password"
+            pass=""
+            return 1
+        fi
+        if ! chmod 600 "$SUDO_PASS_FILE" 2>/dev/null || ! printf '%s\n' "$pass" > "$SUDO_PASS_FILE"; then
+            cleanup_sudo_pass
+            ELEVATION_RESULT="failed"
+            SUDO_PROMPT_OUTCOME="internal_failure"
+            elevation_event "sudo.credential_store" "reason=temporary_file" "phase=password"
+            pass=""
+            return 1
+        fi
+        # O valor deixa de ser necessario depois da escrita no arquivo temporario.
+        pass=""
+        SUDO_PROMPT_OUTCOME="credential_received"
+        return 0
+    done
+
+    if [ "$provider_seen" -eq 1 ] && [ "$provider_failure" -eq 1 ]; then
+        ELEVATION_PROVIDER="none"
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        SUDO_PROMPT_FALLBACK_PKEXEC=1
+        SUDO_PROMPT_OUTCOME="provider_failed"
+        return 1
+    fi
+
+    ELEVATION_PROVIDER="none"
+    ELEVATION_RESULT="unavailable"
+    ELEVATION_INPUT_STATE="not_applicable"
+    SUDO_PROMPT_FALLBACK_PKEXEC=1
+    SUDO_PROMPT_OUTCOME="provider_unavailable"
+    elevation_event "prompt.unavailable" "reason=provider_missing"
+    return 1
+}
+
+# O askpass do sudo e executavel somente pelo usuario (0700: owner-only, pois
+# o sudo precisa executar o helper). A senha continua no arquivo separado 0600.
+sudo_authenticate_askpass() {
+    local askpass_status askpass_stderr askpass_result line
+    local askpass_event_file askpass_result_file
+    ELEVATION_PROVIDER="askpass"
+    ELEVATION_RESULT="requested"
+    ELEVATION_INPUT_STATE="unknown"
+    SUDO_PASS_FILE="$(mktemp 2>/dev/null)" || {
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    }
+    if ! chmod 600 "$SUDO_PASS_FILE"; then
+        cleanup_sudo_pass
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    fi
+    SUDO_ASKPASS_HELPER="$(mktemp 2>/dev/null)" || {
+        cleanup_sudo_pass
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    }
+    SUDO_ASKPASS_EVENT_FILE="$(mktemp 2>/dev/null)" || {
+        cleanup_sudo_pass
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    }
+    SUDO_ASKPASS_RESULT_FILE="$(mktemp 2>/dev/null)" || {
+        cleanup_sudo_pass
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    }
+    if ! cat > "$SUDO_ASKPASS_HELPER" <<'ASKPASS_HELPER'
+#!/bin/sh
+event_file="${SUDO_ASKPASS_EVENT_FILE:-}"
+result_file="${SUDO_ASKPASS_RESULT_FILE:-}"
+pass_file="${SUDO_ASKPASS_PASS_FILE:-}"
+stderr_file="${SUDO_ASKPASS_HELPER}.stderr"
+provider=""
+pass=""
+prompt_exit=1
+prompt_stderr="empty"
+
+write_result() {
+    [ -n "$result_file" ] && printf '%s\n' "$1" > "$result_file"
+}
+write_event() {
+    [ -n "$event_file" ] && printf '%s\n' "$1" >> "$event_file"
+}
+
+if command -v zenity >/dev/null 2>&1; then
+    provider="zenity"
+elif command -v kdialog >/dev/null 2>&1; then
+    provider="kdialog"
+fi
+if [ -s "$result_file" ]; then
+    previous_result=""
+    IFS= read -r previous_result < "$result_file" || true
+    if [ "$previous_result" = "nonempty" ] && [ -s "$pass_file" ]; then
+        stored_pass=""
+        IFS= read -r stored_pass < "$pass_file" || true
+        printf '%s\n' "$stored_pass"
+        exit 0
+    fi
+    exit 1
+fi
+if [ -z "$provider" ]; then
+    write_result "failed"
+    write_event "[elevation] prompt.unavailable provider=askpass result=unavailable input=not_applicable reason=provider_missing"
+    exit 2
+fi
+
+write_event "[elevation] prompt.requested provider=askpass result=requested input=unknown phase=dialog"
+rm -f "$stderr_file"
+if [ "$provider" = "zenity" ]; then
+    if pass="$( (unset LD_LIBRARY_PATH LD_PRELOAD; zenity --password --title='GoLiveBypass - senha do sudo') 2>"$stderr_file")"; then
+        prompt_exit=0
+    else
+        prompt_exit=$?
+    fi
+else
+    if pass="$( (unset LD_LIBRARY_PATH LD_PRELOAD; kdialog --password 'Senha do sudo (GoLiveBypass)') 2>"$stderr_file")"; then
+        prompt_exit=0
+    else
+        prompt_exit=$?
+    fi
+fi
+[ -s "$stderr_file" ] && prompt_stderr="present"
+rm -f "$stderr_file"
+
+if [ "$prompt_exit" -ne 0 ]; then
+    if [ "$prompt_exit" -eq 1 ]; then
+        write_result "cancelled"
+        write_event "[elevation] prompt.finished provider=askpass result=cancelled input=empty code=1 stderr=$prompt_stderr"
+    else
+        write_result "failed"
+        write_event "[elevation] prompt.finished provider=askpass result=failed input=not_applicable code=2 stderr=$prompt_stderr"
+    fi
+    exit "$prompt_exit"
+fi
+if [ -z "$pass" ]; then
+    write_result "empty"
+    write_event "[elevation] prompt.finished provider=askpass result=empty input=empty code=0 stderr=$prompt_stderr"
+    exit 1
+fi
+if [ -z "$pass_file" ] || ! chmod 600 "$pass_file" || ! printf '%s\n' "$pass" > "$pass_file"; then
+    write_result "failed"
+    write_event "[elevation] prompt.finished provider=askpass result=failed input=not_applicable code=2 stderr=$prompt_stderr"
+    exit 2
+fi
+write_result "nonempty"
+write_event "[elevation] prompt.finished provider=askpass result=not_attempted input=nonempty code=0 stderr=$prompt_stderr"
+printf '%s\n' "$pass"
+exit 0
+ASKPASS_HELPER
+    then
+        cleanup_sudo_pass
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    fi
+    if ! chmod 700 "$SUDO_ASKPASS_HELPER"; then
+        cleanup_sudo_pass
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    fi
+
+    SUDO_ASKPASS_PASS_FILE="$SUDO_PASS_FILE"
+    askpass_event_file="$SUDO_ASKPASS_EVENT_FILE"
+    askpass_result_file="$SUDO_ASKPASS_RESULT_FILE"
+    export SUDO_ASKPASS_PASS_FILE SUDO_ASKPASS_EVENT_FILE SUDO_ASKPASS_RESULT_FILE SUDO_ASKPASS_HELPER
+    askpass_stderr="$(mktemp 2>/dev/null)" || {
+        unset SUDO_ASKPASS_PASS_FILE SUDO_ASKPASS_EVENT_FILE SUDO_ASKPASS_RESULT_FILE SUDO_ASKPASS_HELPER
+        cleanup_sudo_pass
+        ELEVATION_RESULT="failed"
+        ELEVATION_INPUT_STATE="not_applicable"
+        elevation_event "prompt.failed" "reason=temporary_file"
+        return 1
+    }
+    (
+        unset LD_LIBRARY_PATH LD_PRELOAD
+        SUDO_ASKPASS="$SUDO_ASKPASS_HELPER" sudo -A -k -v >/dev/null 2>"$askpass_stderr"
+    )
+    askpass_status=$?
+    unset SUDO_ASKPASS_PASS_FILE SUDO_ASKPASS_EVENT_FILE SUDO_ASKPASS_RESULT_FILE SUDO_ASKPASS_HELPER
+    rm -f "$askpass_stderr"
+    if [ -f "$askpass_event_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "$line" >&2
+        done < "$askpass_event_file"
+    fi
+    askpass_result="failed"
+    if [ -f "$askpass_result_file" ]; then
+        IFS= read -r askpass_result < "$askpass_result_file" || true
+    fi
+    case "$askpass_result" in
+        cancelled|empty) ELEVATION_RESULT="$askpass_result"; ELEVATION_INPUT_STATE="empty" ;;
+        nonempty)
+            ELEVATION_INPUT_STATE="nonempty"
+            if [ "$askpass_status" -eq 0 ] && [ -s "$SUDO_PASS_FILE" ]; then
+                ELEVATION_RESULT="accepted"
+                elevation_event "sudo.validation" "$(elevation_code_detail 0)" "phase=password"
+                SUDO_AUTH_READY=1
+                SUDO_USE_CACHED_PASS=1
+                return 0
+            fi
+            ELEVATION_RESULT="rejected"
+            ;;
+        *) ELEVATION_RESULT="failed"; ELEVATION_INPUT_STATE="not_applicable" ;;
+    esac
+    cleanup_sudo_pass
+    elevation_event "sudo.validation" "$(elevation_code_detail "$askpass_status")" "phase=password"
+    return 1
 }
 
 # Valida a senha uma unica vez na janela grafica. Algumas politicas de sudo usam
@@ -580,46 +1018,81 @@ sudo_pass_get() {
 # `sudo -n comando` ainda a exige. Nesses casos o elevate reenvia a mesma senha
 # temporaria para cada comando, sem abrir uma nova janela.
 sudo_authenticate_once() {
+    local sudo_status
     [ "$(id -u)" -eq 0 ] && return 0
     [ "$SUDO_AUTH_READY" -eq 1 ] && return 0
 
     if have sudo && sudo -n true 2>/dev/null; then
+        ELEVATION_PROVIDER="sudo"
+        ELEVATION_RESULT="cached"
+        elevation_event "sudo.cached" "phase=password"
         SUDO_AUTH_READY=1
         return 0
     fi
 
+    # Watchdog/probe e explicitamente nao-interativo: jamais cair em zenity,
+    # kdialog, pkexec ou sudo -v nesse caminho.
+    if [ "${NONINTERACTIVE:-0}" -eq 1 ]; then
+        ELEVATION_PROVIDER="sudo"
+        ELEVATION_RESULT="unavailable"
+        return 1
+    fi
+
     if have sudo && [ "${GOLIVE_GUI:-0}" = "1" ]; then
         if ! sudo_pass_get; then
-            printf '%s\n' 'Falha: nao foi possivel obter a senha do sudo. A ativacao foi cancelada sem alterar o sistema.' >&2
+            # Quando o provedor grafico falhou, elevate ainda pode tentar
+            # pkexec. Nao anuncie cancelamento antes desse segundo caminho;
+            # para cancelamento, senha vazia ou falha sem fallback, preserve a
+            # mensagem sanitizada deste fluxo.
+            if [ "${SUDO_PROMPT_FALLBACK_PKEXEC:-0}" -ne 1 ]; then
+                printf '%s\n' "Falha: nao foi possivel autorizar o sudo (resultado ${ELEVATION_RESULT}). A ativacao foi cancelada sem alterar o sistema." >&2
+            fi
             return 1
         fi
         if sudo -S -k -v < "$SUDO_PASS_FILE" >/dev/null 2>&1; then
+            ELEVATION_RESULT="accepted"
+            elevation_event "sudo.validation" "$(elevation_code_detail 0)" "phase=password"
             SUDO_AUTH_READY=1
             SUDO_USE_CACHED_PASS=1
             return 0
+        else
+            sudo_status=$?
         fi
         cleanup_sudo_pass
+        ELEVATION_RESULT="rejected"
+        elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password"
         printf '%s\n' 'Falha: a senha do sudo foi recusada. A ativacao foi cancelada sem repetir o pedido.' >&2
         return 1
     fi
 
     if have sudo && [ -t 0 ]; then
+        ELEVATION_PROVIDER="tty"
+        ELEVATION_RESULT="requested"
+        elevation_event "prompt.requested" "phase=tty"
         if sudo -v; then
+            ELEVATION_RESULT="accepted"
+            elevation_event "sudo.validation" "$(elevation_code_detail 0)" "phase=tty"
             SUDO_AUTH_READY=1
             return 0
+        else
+            sudo_status=$?
         fi
+        ELEVATION_RESULT="rejected"
+        elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=tty"
         printf '%s\n' 'Falha: nao foi possivel autenticar o sudo.' >&2
         return 1
     fi
 
+    ELEVATION_PROVIDER="sudo"
+    ELEVATION_RESULT="unavailable"
     printf '%s\n' 'Falha: este ambiente nao tem uma autorizacao sudo reutilizavel (sem TTY/agente grafico).' >&2
     return 1
 }
 
-# A GUI sem zenity/kdialog nao consegue apresentar a senha do sudo. Nesse caso,
-# quando o polkit esta disponivel, o proprio pkexec fornece o prompt grafico.
+# A GUI sem zenity/kdialog nao consegue coletar a senha do sudo. Nesse caso,
+# quando o polkit esta disponivel, o pkexec inicia seu proprio fluxo de autorizacao.
 # O teste fica separado da autenticacao para que cancelamento, recusa ou senha
-# incorreta no prompt do sudo nunca disparem um segundo prompt.
+# incorreta no prompt do sudo nunca disparem um segundo fluxo sem necessidade.
 sudo_has_gui_prompt() {
     have zenity || have kdialog
 }
@@ -637,28 +1110,271 @@ sudo_with_cached_password() {
     fi
 }
 
+pkexec_interactive() {
+    local pkexec_status pkexec_code
+    ELEVATION_PROVIDER="pkexec"
+    ELEVATION_RESULT="requested"
+    ELEVATION_INPUT_STATE="not_applicable"
+    # pkexec pode usar agente grafico, TTY ou politica preautorizada; o script
+    # registra apenas que o comando foi delegado ao polkit, nunca que uma janela apareceu.
+    elevation_event "pkexec.invoked" "phase=polkit"
+    if pkexec "$@"; then
+        ELEVATION_RESULT="authorized"
+        elevation_event "pkexec.result" "$(elevation_code_detail 0)" "phase=polkit"
+        return 0
+    else
+        pkexec_status=$?
+    fi
+    pkexec_code="$(elevation_code_detail "$pkexec_status")"
+    [ "$pkexec_status" -eq 127 ] && ELEVATION_POLKIT_NO_AGENT=1
+    ELEVATION_RESULT="failed"
+    elevation_event "pkexec.result" "$pkexec_code" "phase=polkit"
+    return "$pkexec_status"
+}
+
 elevate() {
+    local pkexec_status
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
     elif have sudo; then
-        if [ "${NONINTERACTIVE:-0}" -ne 1 ] && [ "${SUDO_AUTH_READY:-0}" -ne 1 ] && [ "${GOLIVE_GUI:-0}" = "1" ] && ! sudo -n true 2>/dev/null && ! sudo_has_gui_prompt; then
-            if have pkexec; then
-                pkexec "$@"
-                return $?
+        if ! sudo_authenticate_once; then
+            # pkexec substitui um provedor grafico que nao conseguiu iniciar
+            # (ou a ausencia dele). Cancelamento, senha vazia, senha recusada,
+            # falha interna e NONINTERACTIVE nunca entram neste fallback.
+            if [ "${SUDO_PROMPT_FALLBACK_PKEXEC:-0}" -eq 1 ] \
+                && [ "${GOLIVE_GUI:-0}" = "1" ] && [ "${NONINTERACTIVE:-0}" -ne 1 ]; then
+                if have pkexec; then
+                    pkexec_interactive "$@"
+                    pkexec_status=$?
+                    if [ "$pkexec_status" -eq 127 ]; then
+                        if sudo_authenticate_askpass; then
+                            sudo_with_cached_password "$@"
+                            return $?
+                        fi
+                    fi
+                    return "$pkexec_status"
+                fi
+                ELEVATION_POLKIT_NO_AGENT=1
+                if sudo_authenticate_askpass; then
+                    sudo_with_cached_password "$@"
+                    return $?
+                fi
             fi
+            return 1
         fi
-        sudo_authenticate_once || return 1
         if [ "$SUDO_USE_CACHED_PASS" -eq 1 ]; then
             sudo_with_cached_password "$@"
             return $?
         fi
         sudo -n "$@"
-    elif have pkexec && [ "${GOLIVE_GUI:-0}" = "1" ]; then
-        pkexec "$@"
+    elif have pkexec && [ "${GOLIVE_GUI:-0}" = "1" ] && [ "${NONINTERACTIVE:-0}" -ne 1 ]; then
+        pkexec_interactive "$@"
+        return $?
     else
         printf '%s\n' 'Falha: sudo nao esta instalado neste sistema.' >&2
         return 127
     fi
+}
+
+
+# Valida a identidade e seleciona o menor mecanismo disponivel para trocar do
+# root elevado para o usuario da sessao. O comando selecionado e sempre um dos
+# tres literais abaixo; nenhum valor vindo do ambiente entra em log ou em shell.
+# A funcao deve ser chamada antes de fechar o Discord, para que a ausencia de
+# sudo/runuser/setpriv nao deixe a sessao sem cliente aberto.
+prepare_run_user() {
+    local user="${1:-}" uid="" gid=""
+
+    RUN_USER_NAME=""
+    RUN_USER_UID=""
+    RUN_USER_GID=""
+    RUN_USER_METHOD="none"
+
+    case "$user" in
+        ''|-*|*[!A-Za-z0-9_.-]*)
+            printf '%s\n' 'Falha: usuario de execucao do Discord invalido.' >&2
+            return 127
+            ;;
+    esac
+    uid="$(id -u "$user" 2>/dev/null || true)"
+    gid="$(id -g "$user" 2>/dev/null || true)"
+    case "$uid" in ''|*[!0-9]*) printf '%s\n' 'Falha: nao consegui resolver o usuario de execucao do Discord.' >&2; return 127 ;; esac
+    case "$gid" in ''|*[!0-9]*) printf '%s\n' 'Falha: nao consegui resolver o grupo de execucao do Discord.' >&2; return 127 ;; esac
+
+    if have sudo; then
+        RUN_USER_METHOD="sudo"
+    elif have runuser; then
+        RUN_USER_METHOD="runuser"
+    elif have setpriv; then
+        RUN_USER_METHOD="setpriv"
+    else
+        printf '%s\n' 'Falha: nenhum executor seguro (sudo, runuser ou setpriv) esta disponivel para iniciar o Discord.' >&2
+        return 127
+    fi
+
+    RUN_USER_NAME="$user"
+    RUN_USER_UID="$uid"
+    RUN_USER_GID="$gid"
+    return 0
+}
+
+# Executa o comando dentro do namespace, aplicando a troca de usuario somente
+# depois que ip netns exec ja entrou no namespace. Assim o fallback nao move o
+# iproute2 para o host nem amplia o escopo do WireGuard.
+run_user_netns_command() {
+    local launch_mode="${1:-}"
+    [ "$#" -gt 0 ] || { printf '%s\n' 'Falha: executor do Discord recebeu um modo vazio.' >&2; return 127; }
+    shift
+    [ "$#" -gt 0 ] || { printf '%s\n' 'Falha: executor do Discord recebeu um comando vazio.' >&2; return 127; }
+    case "$launch_mode" in
+        detached|background|foreground) ;;
+        *) printf '%s\n' 'Falha: modo de lancamento do Discord invalido.' >&2; return 127 ;;
+    esac
+
+    case "$RUN_USER_METHOD" in
+        sudo)
+            case "$launch_mode" in
+                detached) elevate setsid -f ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- "$@" ;;
+                background) elevate ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
+                foreground) elevate ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- "$@" ;;
+            esac
+            ;;
+        runuser)
+            case "$launch_mode" in
+                detached) elevate setsid -f ip netns exec "$NETNS_NAME" runuser -u "$RUN_USER_NAME" -- "$@" ;;
+                background) elevate ip netns exec "$NETNS_NAME" runuser -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
+                foreground) elevate ip netns exec "$NETNS_NAME" runuser -u "$RUN_USER_NAME" -- "$@" ;;
+            esac
+            ;;
+        setpriv)
+            case "$launch_mode" in
+                detached) elevate setsid -f ip netns exec "$NETNS_NAME" setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- "$@" ;;
+                background) elevate ip netns exec "$NETNS_NAME" setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- "$@" & return 0 ;;
+                foreground) elevate ip netns exec "$NETNS_NAME" setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- "$@" ;;
+            esac
+            ;;
+        *)
+            printf '%s\n' 'Falha: executor seguro do Discord nao foi preparado.' >&2
+            return 127
+            ;;
+    esac
+}
+
+# systemd-run tambem inicia como root; a troca de usuario continua depois da
+# entrada no namespace e usa exatamente o mesmo metodo validado acima.
+run_user_systemd_command() {
+    local unit="${1:-}"
+    [ "$#" -gt 0 ] || { printf '%s\n' 'Falha: unidade systemd do Discord ausente.' >&2; return 127; }
+    shift
+    [ "$#" -gt 0 ] || { printf '%s\n' 'Falha: executor systemd do Discord recebeu um comando vazio.' >&2; return 127; }
+    case "$unit" in
+        discord-vpn-[0-9]*) ;;
+        *) printf '%s\n' 'Falha: unidade systemd do Discord invalida.' >&2; return 127 ;;
+    esac
+
+    case "$RUN_USER_METHOD" in
+        sudo)
+            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- env "$@"
+            # A unidade permanece em foreground; o chamador captura sua saida:
+            # sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1
+            ;;
+        runuser)
+            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" runuser -u "$RUN_USER_NAME" -- env "$@"
+            ;;
+        setpriv)
+            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- env "$@"
+            ;;
+        *)
+            printf '%s\n' 'Falha: executor seguro do Discord nao foi preparado.' >&2
+            return 127
+            ;;
+    esac
+}
+
+# Usado somente no rollback host-only, depois de o namespace incompleto ter
+# sido removido. Mesmo esse caminho nao pode cair silenciosamente no usuario
+# corrente se o processo estiver elevado.
+run_user_host_command() {
+    local launch_mode="${1:-}"
+    [ "$#" -gt 0 ] || { printf '%s\n' 'Falha: executor host do Discord recebeu um modo vazio.' >&2; return 127; }
+    shift
+    [ "$#" -gt 0 ] || { printf '%s\n' 'Falha: executor host do Discord recebeu um comando vazio.' >&2; return 127; }
+    case "$launch_mode" in
+        detached|background|foreground) ;;
+        *) printf '%s\n' 'Falha: modo de lancamento host invalido.' >&2; return 127 ;;
+    esac
+
+    # O rollback normalmente ja esta rodando como o usuario real. Nesse caso
+    # nao force um novo prompt sudo apenas para voltar a abrir o mesmo cliente;
+    # a disponibilidade do executor ja foi validada por prepare_run_user().
+    if [ "$(id -u)" -eq "$RUN_USER_UID" ]; then
+        case "$launch_mode" in
+            detached) setsid -f "$@" ;;
+            background) "$@" & return 0 ;;
+            foreground) "$@" ;;
+        esac
+        return $?
+    fi
+
+    case "$RUN_USER_METHOD" in
+        sudo)
+            case "$launch_mode" in
+                detached) setsid -f sudo -u "$RUN_USER_NAME" -- "$@" ;;
+                background) sudo -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
+                foreground) sudo -u "$RUN_USER_NAME" -- "$@" ;;
+            esac
+            ;;
+        runuser)
+            case "$launch_mode" in
+                detached) setsid -f runuser -u "$RUN_USER_NAME" -- "$@" ;;
+                background) runuser -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
+                foreground) runuser -u "$RUN_USER_NAME" -- "$@" ;;
+            esac
+            ;;
+        setpriv)
+            case "$launch_mode" in
+                detached) setsid -f setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- "$@" ;;
+                background) setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- "$@" & return 0 ;;
+                foreground) setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- "$@" ;;
+            esac
+            ;;
+        *)
+            printf '%s\n' 'Falha: executor seguro do Discord nao foi preparado.' >&2
+            return 127
+            ;;
+    esac
+}
+
+# A autorizacao acontece antes de qualquer stop_discord. Assim, um prompt ausente,
+# cancelado ou recusado nao deixa o cliente do usuario fechado sem um namespace ativo.
+authorize_install_elevation() {
+    if [ "$(id -u)" -eq 0 ]; then
+        ELEVATION_PROVIDER="root"
+        ELEVATION_RESULT="authorized"
+        elevation_event "authorization" "phase=pre_activation"
+        return 0
+    fi
+
+    ELEVATION_INPUT_STATE="not_applicable"
+    ELEVATION_RESULT="requested"
+    elevation_event "authorization.requested" "phase=pre_activation"
+    if elevate true; then
+        ELEVATION_RESULT="authorized"
+        elevation_event "authorization" "phase=pre_activation"
+        return 0
+    fi
+
+    # Preserva o diagnostico especifico produzido por sudo_pass_get/pkexec.
+    case "${ELEVATION_RESULT:-not_attempted}" in
+        accepted|cached) ELEVATION_RESULT="failed" ;;
+        rejected|cancelled|unavailable|empty|failed) ;;
+        *) ELEVATION_RESULT="failed" ;;
+    esac
+    if [ "${ELEVATION_POLKIT_NO_AGENT:-0}" -eq 1 ]; then
+        printf '%s\n' 'Falha: nao foi possivel autorizar a ativacao Linux porque nao ha agente de autenticacao polkit. Instale e inicie um agente (por exemplo, polkit-gnome ou lxqt-policykit) ou rode o standalone em um terminal com sudo.' >&2
+    fi
+    elevation_event "authorization" "phase=pre_activation"
+    return 1
 }
 
 # Variante somente-leitura para polling automatico. Diferente de elevate(),
@@ -673,6 +1389,41 @@ elevate_readonly() {
     else
         elevate "$@"
     fi
+}
+# O preflight nao carrega o modulo: ele apenas diferencia um modulo disponivel
+# no kernel de um modulo ja carregado. A ativacao interativa faz a carga depois
+# da autorizacao, mas antes de fechar o Discord ou criar o namespace.
+wireguard_module_loaded() {
+    [ -e /sys/module/wireguard ]
+}
+
+ensure_wireguard_module() {
+    if wireguard_module_loaded; then
+        return 0
+    fi
+
+    if ! have modprobe; then
+        printf '%s\n' 'Falha: o comando modprobe nao esta disponivel para carregar o modulo WireGuard.' >&2
+        return 1
+    fi
+
+    # Nunca encaminhar stderr do modprobe: caminhos do kernel e mensagens do
+    # provedor de elevacao nao pertencem ao diagnostico exibido ao usuario.
+    if ! elevate modprobe wireguard >/dev/null 2>&1; then
+        printf '%s\n' 'Falha: nao foi possivel carregar o modulo WireGuard; a ativacao foi cancelada antes de fechar o Discord.' >&2
+        return 1
+    fi
+
+    if wireguard_module_loaded; then
+        return 0
+    fi
+
+    if have modinfo && modinfo wireguard >/dev/null 2>&1; then
+        printf '%s\n' 'Falha: o modulo WireGuard existe, mas o kernel nao o ativou.' >&2
+    else
+        printf '%s\n' 'Falha: o modulo WireGuard nao esta disponivel neste kernel.' >&2
+    fi
+    return 1
 }
 
 # Ler campo a campo em vez de dar source: /etc/os-release e shell valido, e um arquivo torto
@@ -697,6 +1448,7 @@ fi
 
 confirm() {
     [ "$ASSUME_YES" -eq 1 ] && return 0
+    [ ! -t 0 ] && return 1
     local answer
     printf '  %s [s/N] ' "$1" >&2
     read -r answer || return 1
@@ -704,6 +1456,40 @@ confirm() {
         [sSyY]*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Emite uma instalação uma única vez. Pacotes Linux podem expor o mesmo diretório por
+# /usr/lib e /usr/lib64 (ou por symlinks); sem esta guarda o preflight contava duas vezes o
+# mesmo cliente e a ativação podia tentar o mesmo processo em duplicidade.
+discord_emit_dir() {
+    local resources="$1" flav="$2" detect="$3" flatpak_id="${4:-}"
+    local target target_key
+
+    if [ -e "$resources/app.asar" ]; then
+        target="$resources/app.asar"
+    elif [ -e "$resources/_app.asar" ]; then
+        target="$resources/_app.asar"
+    else
+        return 1
+    fi
+
+    # inode/device deduplica symlinks e hardlinks sem depender do texto do caminho. `stat`
+    # existe nas distribuições Linux suportadas; se faltar, o caminho ainda é uma chave segura.
+    target_key="$target"
+    if command -v stat >/dev/null 2>&1; then
+        target_key="$(stat -Lc '%d:%i' "$target" 2>/dev/null || printf '%s' "$target")"
+    fi
+    case "$DISCORD_SEEN_TARGETS" in
+        *"|$target_key|"*) return 1 ;;
+    esac
+    DISCORD_SEEN_TARGETS="${DISCORD_SEEN_TARGETS}|${target_key}|"
+
+    if [ -n "$flatpak_id" ]; then
+        printf '%s|%s|%s|%s\n' "$resources" "$flav" "$detect" "$flatpak_id"
+    else
+        printf '%s|%s|%s\n' "$resources" "$flav" "$detect"
+    fi
+    return 0
 }
 
 # Procura o app.asar de verdade em vez de confiar numa lista de caminhos.
@@ -714,6 +1500,7 @@ confirm() {
 # so olha /usr/share e /opt nao acha Discord nenhum numa instalacao atual.
 discord_dirs() {
     local raiz sub base id flav detect count=0
+    DISCORD_SEEN_TARGETS=""
 
     base="${XDG_CONFIG_HOME:-$HOME/.config}"
     detect="bootstrap"
@@ -724,8 +1511,9 @@ discord_dirs() {
     do
         [ -e "$sub/app.asar" ] || [ -e "$sub/_app.asar" ] || continue
         flav="discord"; case "$sub" in *ptb*) flav="discordptb" ;; *canary*) flav="discordcanary" ;; esac
-        printf '%s|%s|%s\n' "$sub" "$flav" "$detect"
-        count=$((count + 1))
+        if discord_emit_dir "$sub" "$flav" "$detect"; then
+            count=$((count + 1))
+        fi
     done
     warn "trace: bootstrap config varrido (achou $count)"
 
@@ -744,8 +1532,9 @@ discord_dirs() {
         for sub in "$raiz/resources" "$raiz"; do
             if [ -e "$sub/app.asar" ] || [ -e "$sub/_app.asar" ]; then
                 flav="discord"; case "$raiz" in *ptb*) flav="discordptb" ;; *canary*) flav="discordcanary" ;; esac
-                printf '%s|%s|%s\n' "$sub" "$flav" "$detect"
-                count=$((count + 1))
+                if discord_emit_dir "$sub" "$flav" "$detect"; then
+                    count=$((count + 1))
+                fi
                 break
             fi
         done
@@ -770,9 +1559,10 @@ discord_dirs() {
         for sub in "$raiz/resources" "$raiz"; do
             if [ -e "$sub/app.asar" ] || [ -e "$sub/_app.asar" ]; then
                 flav="vesktop"; case "$raiz" in *equibop*|*Equibop*) flav="equibop" ;; *legcord*|*Legcord*) flav="legcord" ;; esac
-                printf '%s|%s|%s\n' "$sub" "$flav" "$detect"
-                count=$((count + 1))
-                break
+                if discord_emit_dir "$sub" "$flav" "$detect"; then
+                    count=$((count + 1))
+                    break
+                fi
             fi
         done
     done
@@ -791,8 +1581,9 @@ discord_dirs() {
         for sub in "$raiz/resources" "$raiz"; do
             if [ -e "$sub/app.asar" ] || [ -e "$sub/_app.asar" ]; then
                 flav="discord"; case "$raiz" in *PTB*|*ptb*) flav="discordptb" ;; *Canary*|*canary*) flav="discordcanary" ;; esac
-                printf '%s|%s|%s\n' "$sub" "$flav" "$detect"
-                count=$((count + 1))
+                if discord_emit_dir "$sub" "$flav" "$detect"; then
+                    count=$((count + 1))
+                fi
                 break
             fi
         done
@@ -814,8 +1605,9 @@ discord_dirs() {
                     *legcord*) flav="legcord" ;;
                     *) flav="vesktop" ;;
                 esac
-                printf '%s|%s|%s\n' "$sub" "$flav" "paralelo"
-                count=$((count + 1))
+                if discord_emit_dir "$sub" "$flav" "paralelo"; then
+                    count=$((count + 1))
+                fi
             fi
         done
     done
@@ -834,8 +1626,9 @@ discord_dirs() {
                        "$raiz/$id"/current/active/files/bin/*/resources; do
                 if [ -e "$sub/app.asar" ] || [ -e "$sub/_app.asar" ]; then
                     flav="discord"; case "$id" in *Vesktop*) flav="vesktop" ;; *Legcord*) flav="legcord" ;; *equibop*) flav="equibop" ;; *PTB*) flav="discordptb" ;; *Canary*) flav="discordcanary" ;; esac
-                    printf '%s|%s|%s|%s\n' "$sub" "$flav" "$detect" "$id"
-                    count=$((count + 1))
+                    if discord_emit_dir "$sub" "$flav" "$detect" "$id"; then
+                        count=$((count + 1))
+                    fi
                 fi
             done
         done
@@ -848,8 +1641,9 @@ discord_dirs() {
         for sub in "$HOME/.var/app/$id"/config/discord*/app-*/resources; do
             if [ -e "$sub/app.asar" ] || [ -e "$sub/_app.asar" ]; then
                 flav="discord"; case "$id" in *Vesktop*) flav="vesktop" ;; *Legcord*) flav="legcord" ;; *equibop*) flav="equibop" ;; *PTB*) flav="discordptb" ;; *Canary*) flav="discordcanary" ;; esac
-                printf '%s|%s|%s|%s\n' "$sub" "$flav" "$detect" "$id"
-                count=$((count + 1))
+                if discord_emit_dir "$sub" "$flav" "$detect" "$id"; then
+                    count=$((count + 1))
+                fi
             fi
         done
     done
@@ -880,7 +1674,16 @@ linux_preflight_json() {
 
     if [ "$(id -u)" -eq 0 ] || have sudo || have pkexec; then elevated=true; else errors="${errors}${errors:+,}elevacao (sudo ou pkexec)"; fi
     if have ip && ip netns list >/dev/null 2>&1; then netns_ok=true; else errors="${errors}${errors:+,}ip netns"; fi
-    if [ -e /sys/module/wireguard ] || { have modinfo && modinfo wireguard >/dev/null 2>&1; }; then kernel="available"; fi
+    if wireguard_module_loaded; then
+        kernel="loaded"
+    elif have modinfo; then
+        if modinfo wireguard >/dev/null 2>&1; then
+            kernel="available"
+        else
+            kernel="missing"
+            errors="${errors}${errors:+,}modulo wireguard ausente"
+        fi
+    fi
 
     if [ -n "$missing" ]; then
         install="$(linux_dependency_install_command "$distro" "$id_like" "$missing" || true)"
@@ -1295,7 +2098,7 @@ discord_running() {
     # instalada — o running_flav casa pelo nome do flav do install.
     if [ -n "${FOUND:-}" ]; then
         if [ -n "$(printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav rest; do
-            case "$flav" in vesktop|equibop|legcord) running_flav "$flav" && printf 'achou\n' ;; esac
+            case "$flav" in vesktop|equibop|legcord) running_flav "$flav" "" "$resources" && printf 'achou\n' ;; esac
         done)" ]; then
             return 0
         fi
@@ -1311,12 +2114,28 @@ discord_running() {
 }
 
 # O cliente deste flav esta vivo? Oficiais ("discord*"): pelo NOME do processo. Paralelos
-# (vesktop|equibop|legcord): o processo costuma ser o binario generico do Electron, entao o
-# nome nao identifica nada — mas o cmdline de todos carrega o caminho do app.asar na pasta
-# do cliente (ex.: /usr/lib/equibop/app.asar). O padrao casa "/flav/app.asar" (o main) e
-# "/flav/arrpc" (o helper): nao casa o proprio script nem o shell que o invocou.
+# (vesktop|equibop|legcord): o caminho exato do app.asar da instalação é a fonte de verdade.
+parallel_pid_for_resources() {
+    local resources="$1" proc pid cmdline
+    [ -n "$resources" ] || return 1
+    for proc in /proc/[0-9]*/cmdline; do
+        [ -r "$proc" ] || continue
+        pid="${proc#/proc/}"
+        pid="${pid%/cmdline}"
+        [ "$pid" = "$$" ] && continue
+        cmdline="$(tr '\0' ' ' < "$proc" 2>/dev/null || true)"
+        case "$cmdline" in
+            *"$resources/app.asar"*|*"$resources/_app.asar"*|*"$resources/arrpc"*)
+                printf '%s\n' "$pid"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 running_flav() {
-    local flav="$1" flatpak_id="${2:-}"
+    local flav="$1" flatpak_id="${2:-}" resources="${3:-}"
     # No Bazzite/Fedora Atomic o portal pode manter o processo Electron dentro do
     # sandbox mesmo quando o nome dele não aparece no namespace de PID do host.
     # Consultar o ID exato também evita aceitar outro Discord aberto fora do túnel.
@@ -1325,7 +2144,11 @@ running_flav() {
     fi
     case "$flav" in
         vesktop|equibop|legcord)
-            pgrep -f "/$flav/app.asar" >/dev/null 2>&1 || pgrep -f "/$flav/arrpc" >/dev/null 2>&1
+            if [ -n "$resources" ]; then
+                parallel_pid_for_resources "$resources" >/dev/null
+            else
+                pgrep -f "/$flav/(app\\.asar|resources/app\\.asar|arrpc)" >/dev/null 2>&1
+            fi
             ;;
         discord|discordptb|discordcanary)
             pgrep -x Discord >/dev/null 2>&1 || pgrep -x discord >/dev/null 2>&1 \
@@ -1338,13 +2161,17 @@ running_flav() {
 # Retorna o PID do cliente deste flavour. Usado pelo status para nao confundir um
 # Discord normal (fora do namespace) com a sessao protegida pelo WireGuard.
 discord_pid_flav() {
-    local flav="$1" flatpak_id="${2:-}" pid pattern
+    local flav="$1" flatpak_id="${2:-}" resources="${3:-}" pid pattern
     if [ -n "$flatpak_id" ] && pid="$(flatpak_pid_for_id "$flatpak_id" 2>/dev/null || true)"; then
         [ -n "$pid" ] && { printf '%s\n' "$pid"; return 0; }
     fi
     case "$flav" in
         vesktop|equibop|legcord)
-            for pattern in "/$flav/app.asar" "/$flav/arrpc"; do
+            if [ -n "$resources" ]; then
+                parallel_pid_for_resources "$resources"
+                return $?
+            fi
+            for pattern in "/$flav/(app\\.asar|resources/app\\.asar|arrpc)"; do
                 pid="$(pgrep -f "$pattern" 2>/dev/null | head -n1 || true)"
                 [ -n "$pid" ] && { printf '%s\n' "$pid"; return 0; }
             done
@@ -1360,14 +2187,56 @@ discord_pid_flav() {
 }
 
 discord_pid_in_netns() {
-    local pid="$1" identified
+    local pid="$1" identified="" pid_ns="" netns_ns=""
     [ -n "$pid" ] || return 1
     identified="$(ip netns identify "$pid" 2>/dev/null || true)"
     [ "$identified" = "$NETNS_NAME" ] && return 0
-    # ip netns identify nao existe em versoes antigas do iproute2; compare os
-    # inodes como fallback, sem exigir privilegio adicional.
+    # /run/netns/$NETNS_NAME e bind mount de nsfs (nunca symlink): readlink
+    # devolve EINVAL ate como root. A comparacao correta e por device:inode.
     [ -e "/proc/$pid/ns/net" ] && [ -e "/run/netns/$NETNS_NAME" ] || return 1
-    [ "$(readlink "/proc/$pid/ns/net" 2>/dev/null)" = "$(readlink "/run/netns/$NETNS_NAME" 2>/dev/null)" ]
+    pid_ns="$(stat -L -c '%d:%i' "/proc/$pid/ns/net" 2>/dev/null || true)"
+    netns_ns="$(stat -L -c '%d:%i' "/run/netns/$NETNS_NAME" 2>/dev/null || true)"
+    [ -n "$pid_ns" ] && [ -n "$netns_ns" ] && [ "$pid_ns" = "$netns_ns" ]
+}
+
+# Confirma o PID no namespace usando a autorizacao da ativacao quando disponivel.
+# Em --status/--probe, `elevate_readonly` usa somente sudo -n e nunca abre prompt.
+discord_pid_in_netns_elevated() {
+    local pid="$1" identified="" pid_ns="" netns_ns=""
+    [ -n "$pid" ] || return 1
+
+    # Prova primaria sem privilegio: --status/--probe nao podem depender de um
+    # timestamp sudo que talvez nao exista (ip netns identify e stat -L sao
+    # legiveis pelo usuario comum; /run/netns e drwxr-xr-x e o nsfs r--r--r--).
+    if discord_pid_in_netns "$pid"; then
+        return 0
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        identified="$(ip netns identify "$pid" 2>/dev/null || true)"
+        [ "$identified" = "$NETNS_NAME" ] && return 0
+        if have stat; then
+            pid_ns="$(stat -L -c '%d:%i' "/proc/$pid/ns/net" 2>/dev/null || true)"
+            netns_ns="$(stat -L -c '%d:%i' "/run/netns/$NETNS_NAME" 2>/dev/null || true)"
+        fi
+    elif [ "${NONINTERACTIVE:-0}" -eq 1 ]; then
+        identified="$(elevate_readonly ip netns identify "$pid" 2>/dev/null || true)"
+        [ "$identified" = "$NETNS_NAME" ] && return 0
+        if have stat; then
+            pid_ns="$(elevate_readonly stat -L -c '%d:%i' "/proc/$pid/ns/net" 2>/dev/null || true)"
+            netns_ns="$(elevate_readonly stat -L -c '%d:%i' "/run/netns/$NETNS_NAME" 2>/dev/null || true)"
+        fi
+    else
+        # A ativacao ja passou por authorize_install_elevation; nao e uma nova
+        # entrada interativa, apenas a prova final do processo iniciado.
+        identified="$(elevate ip netns identify "$pid" 2>/dev/null || true)"
+        [ "$identified" = "$NETNS_NAME" ] && return 0
+        if have stat; then
+            pid_ns="$(elevate stat -L -c '%d:%i' "/proc/$pid/ns/net" 2>/dev/null || true)"
+            netns_ns="$(elevate stat -L -c '%d:%i' "/run/netns/$NETNS_NAME" 2>/dev/null || true)"
+        fi
+    fi
+    [ -n "$pid_ns" ] && [ -n "$netns_ns" ] && [ "$pid_ns" = "$netns_ns" ]
 }
 
 # Mata os clientes paralelos pelo caminho do app.asar: o nome do processo nao basta
@@ -1756,26 +2625,33 @@ ensure_wireguard_conf() {
 setup_wireguard_netns() {
     have ip || fail "Comando 'ip' nao encontrado no sistema."
     have wg || fail "Comando 'wg' (wireguard-tools) nao encontrado. Instale com seu gerenciador de pacotes."
+    wireguard_module_loaded || fail "Modulo WireGuard nao esta carregado; ativacao cancelada antes de criar o namespace."
 
     ensure_wireguard_conf
     local wg_file="$INSTALL_DIR/wireguard.conf"
 
     if ! netns_exists; then
+        ACTIVATION_NETNS_TOUCH_STARTED=1
         step "Criando namespace de rede '$NETNS_NAME'"
         elevate ip netns add "$NETNS_NAME"
     fi
 
+    # A partir daqui a interface existente tambem pode ser removida/recriada;
+    # o trap de saida deve tratar o namespace como potencialmente parcial.
+    ACTIVATION_NETNS_TOUCH_STARTED=1
     step "Configurando interface WireGuard '$WG_IF' no namespace '$NETNS_NAME'"
     elevate ip -n "$NETNS_NAME" link del dev "$WG_IF" 2>/dev/null || true
     elevate ip link del dev "$WG_IF" 2>/dev/null || true
 
     local tmp_conf
     tmp_conf="$(mktemp)"
+    WIREGUARD_TMP_CONF="$tmp_conf"
     grep -vE "^(Address|DNS)" "$wg_file" > "$tmp_conf"
 
     elevate ip link add dev "$WG_IF" type wireguard
     elevate wg setconf "$WG_IF" "$tmp_conf"
     rm -f "$tmp_conf"
+    WIREGUARD_TMP_CONF=""
 
     elevate ip link set "$WG_IF" netns "$NETNS_NAME"
 
@@ -1891,9 +2767,18 @@ wait_for_tunnel_startup() {
 teardown_wireguard_netns() {
     if netns_exists; then
         step "Removendo namespace de rede '$NETNS_NAME' e interface WireGuard"
-        elevate ip netns del "$NETNS_NAME" 2>/dev/null || true
-        elevate rm -rf "/etc/netns/$NETNS_NAME" 2>/dev/null || true
-        ok "Tunel WireGuard encerrado."
+        if ! elevate ip netns del "$NETNS_NAME" 2>/dev/null; then
+            warn "Nao consegui remover o namespace '$NETNS_NAME' (sem privilegio?). O tunel pode continuar ativo; rode: sudo ip netns del $NETNS_NAME"
+        fi
+        if ! elevate rm -rf "/etc/netns/$NETNS_NAME" 2>/dev/null; then
+            warn "Nao consegui remover /etc/netns/$NETNS_NAME."
+        fi
+        # Apenas anuncia sucesso quando o namespace realmente saiu; o retorno
+        # continua 0 para nao abortar o uninstall (set -e) antes de restaurar
+        # as injecoes do Discord.
+        if ! netns_exists; then
+            ok "Tunel WireGuard encerrado."
+        fi
     fi
 }
 
@@ -1933,6 +2818,67 @@ graphics_json() {
         "$(json_escape "${XDG_SESSION_TYPE:-}")" "$(json_escape "$portal")"
 }
 
+# Verifica se um alvo de instalacao possui executavel ou wrapper inicializavel.
+target_can_launch() {
+    local resources="$1" flav="$2" id="${3:-}"
+    if [ -z "$id" ] && [ -n "$resources" ] && have flatpak; then
+        id="$(flatpak_app_id "$resources" 2>/dev/null || true)"
+    fi
+    if [ -n "$id" ] && have flatpak; then
+        return 0
+    fi
+    case "$flav" in
+        equibop|vesktop|legcord)
+            have "$flav" && return 0
+            ;;
+    esac
+    if [ -n "$resources" ] && [ -d "$resources" ]; then
+        local dc_path
+        dc_path="$(find "$resources/.." -maxdepth 2 -type f -executable \
+            \( -iname "Discord" -o -iname "DiscordCanary" -o -iname "DiscordPTB" \) \
+            2>/dev/null | head -1 || true)"
+        [ -n "$dc_path" ] && [ -x "$dc_path" ] && return 0
+    fi
+    local exe
+    for exe in discord Discord discord-canary discordcanary DiscordCanary discordptb DiscordPTB; do
+        have "$exe" && return 0
+    done
+    return 1
+}
+
+# Escolhe qual Discord relancar apos a ativacao do namespace WireGuard:
+# 1. Se um cliente especifico ja estava em execucao, preserva a mesma instalacao.
+# 2. Se nenhum estava rodando, escolhe o primeiro que possui executavel/flatpak funcional.
+# 3. Fallback: primeira linha do FOUND, como antes.
+select_launch_target() {
+    local found="${1:-}" resources flav detect id escolhido=""
+    [ -n "$found" ] || return 0
+
+    while IFS='|' read -r resources flav detect id; do
+        [ -n "$resources" ] || continue
+        if { [ -n "$id" ] && flatpak_running_id "$id"; } || running_flav "$flav" "$id" "$resources"; then
+            escolhido="$resources|$flav|$detect|$id"
+            break
+        fi
+    done <<EOF
+$found
+EOF
+
+    if [ -z "$escolhido" ]; then
+        while IFS='|' read -r resources flav detect id; do
+            [ -n "$resources" ] || continue
+            if target_can_launch "$resources" "$flav" "$id"; then
+                escolhido="$resources|$flav|$detect|$id"
+                break
+            fi
+        done <<EOF
+$found
+EOF
+    fi
+
+    printf '%s\n' "${escolhido:-$(printf '%s\n' "$found" | head -1)}" | head -1
+}
+
 # Reabre o Discord envelopado dentro do namespace WireGuard (sem proxy).
 start_discord() {
     local linha="${1:-}"
@@ -1944,7 +2890,8 @@ start_discord() {
     resources="${linha%%\|*}"
 
     local run_user="${SUDO_USER:-$(id -un 2>/dev/null || whoami)}"
-    local run_uid="$(id -u "$run_user" 2>/dev/null || id -u)"
+    prepare_run_user "$run_user" || return 127
+    local run_uid="$RUN_USER_UID"
     local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$run_uid}"
     local discord_log_dir="$INSTALL_DIR/logs"
     local discord_log="$discord_log_dir/discord-vpn-$(date +%Y%m%d-%H%M%S).log"
@@ -1962,7 +2909,11 @@ start_discord() {
     rm -f "$_USER_HOME/.config/discordcanary/Singleton"* 2>/dev/null || true
 
     local target_cmd=""
-    if [ -n "$resources" ] && have flatpak && id="$(flatpak_app_id "$resources")"; then
+    id="$(printf '%s' "$linha" | cut -d'|' -f4)"
+    if [ -z "$id" ] && [ -n "$resources" ] && have flatpak; then
+        id="$(flatpak_app_id "$resources" 2>/dev/null || true)"
+    fi
+    if [ -n "$id" ] && have flatpak; then
         target_cmd="flatpak run $id"
     elif [ -n "$linha" ]; then
         flav="$(printf '%s' "$linha" | cut -d'|' -f2)"
@@ -1975,22 +2926,42 @@ start_discord() {
 
     if [ -z "$target_cmd" ] && [ -n "$resources" ] && [ -d "$resources" ]; then
         local dc_path
-        dc_path="$(find "$resources/.." -maxdepth 2 -name "Discord" -type f -executable 2>/dev/null | head -1 || true)"
+        dc_path="$(find "$resources/.." -maxdepth 2 -type f -executable \
+            \( -iname "Discord" -o -iname "DiscordCanary" -o -iname "DiscordPTB" \) \
+            2>/dev/null | head -1 || true)"
         if [ -n "$dc_path" ] && [ -x "$dc_path" ]; then
             target_cmd="$dc_path"
         fi
     fi
 
     if [ -z "$target_cmd" ]; then
-        for exe in discord Discord discord-canary discordptb; do
+	    for exe in discord Discord discord-canary discordcanary DiscordCanary discordptb DiscordPTB; do
             if have "$exe"; then
                 target_cmd="$exe"
                 break
             fi
         done
     fi
+    
+    if [ -z "$target_cmd" ]; then
+        printf '[%s] launch=falhou motivo=binario_nao_encontrado resources=%s\n' \
+            "$(date -Is)" "$resources" >>"$discord_log"
+	return 1
+    fi
 
-    [ -n "$target_cmd" ] || return 1
+    if [ "${START_DISCORD_HOST_ONLY:-0}" -eq 1 ]; then
+        # Rollback: depois de remover um namespace incompleto, reabra o cliente
+        # diretamente na sessao do usuario. Isto deixa claro que o bypass falhou,
+        # sem colocar um processo dentro de uma rota que nao foi validada.
+        printf '[%s] launch=host-fallback\n' "$(date -Is)" >>"$discord_log"
+        if have setsid; then
+            run_user_host_command detached env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+        else
+            run_user_host_command background env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+        fi
+        printf '  Log do Discord: %s\n' "$discord_log" >&2
+        return 0
+    fi
 
     if [ -n "$id" ]; then
         # Flatpak depende do barramento e do portal da sessão gráfica do usuário.
@@ -2000,11 +2971,9 @@ start_discord() {
         # ambiente Wayland/DBus e ainda mantém o tráfego isolado no WireGuard.
         printf '[%s] launch=flatpak-direct app=%s\n' "$(date -Is)" "$id" >>"$discord_log"
         if have setsid; then
-            elevate setsid -f ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env \
-                sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+            run_user_netns_command detached env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
         else
-            elevate ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env \
-                sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null &
+            run_user_netns_command background env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
         fi
     elif have systemd-run; then
         # O arquivo captura o stderr/stdout do cliente para diferenciar crash,
@@ -2014,8 +2983,7 @@ start_discord() {
         # background: o trap de fim do script apaga a senha temporaria, e o
         # processo destacado tentava le-la tarde demais, deixando o Discord
         # fechado apesar de o tunel estar ativo.
-        elevate systemd-run --collect --unit="discord-vpn-$(date +%s)" \
-            ip netns exec "$NETNS_NAME" sudo -u "$run_user" env \
+        run_user_systemd_command "discord-vpn-$(date +%s)" \
             "HOME=$_USER_HOME" "USER=$run_user" "LOGNAME=$run_user" "DISPLAY=${DISPLAY:-}" \
             "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" "XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority}" \
             "XDG_RUNTIME_DIR=$runtime_dir" "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus}" \
@@ -2026,21 +2994,24 @@ start_discord() {
             "ELECTRON_OZONE_PLATFORM_HINT=${ELECTRON_OZONE_PLATFORM_HINT:-auto}" \
             sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1
     else
-        elevate ip netns exec "$NETNS_NAME" sudo -u "$run_user" env $run_env \
-            sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null &
+        run_user_netns_command background env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
     fi
     printf '  Log do Discord: %s\n' "$discord_log" >&2
 }
 
 # O launcher confirma apenas que o processo foi solicitado; o Electron pode falhar
-# logo depois (DISPLAY/Wayland, atualização em andamento, bwrap ou Flatpak sem
-# override). Aguarde o processo real antes de declarar a ativação concluída.
+# logo depois (DISPLAY/Wayland, atualizacao, bwrap ou Flatpak sem override). Aguarde
+# o PID correto e confirme sua rede no namespace antes de declarar a ativacao concluida.
 wait_discord_started() {
-    local linha="${1:-}" flav="" flatpak_id="" tentativas=40
+    local linha="${1:-}" flav="" flatpak_id="" resources="" pid="" tentativas=40
+    resources="$(printf '%s' "$linha" | cut -d'|' -f1)"
     flav="$(printf '%s' "$linha" | cut -d'|' -f2)"
     flatpak_id="$(printf '%s' "$linha" | cut -d'|' -f4)"
     while [ "$tentativas" -gt 0 ]; do
-        if running_flav "$flav" "$flatpak_id"; then return 0; fi
+        pid="$(discord_pid_flav "$flav" "$flatpak_id" "$resources" 2>/dev/null || true)"
+        if [ -n "$pid" ] && discord_pid_in_netns_elevated "$pid"; then
+            return 0
+        fi
         tentativas=$((tentativas - 1))
         [ "$tentativas" -gt 0 ] && sleep 0.5
     done
@@ -2077,6 +3048,11 @@ if [ "$MODE" = "install" ] && st_tui_is_interactive; then
     # Se veio de "Ver status" ou "Desinstalar", despacha abaixo (code continua).
 fi
 
+# O menu TUI tambem pode selecionar status depois do parser de argumentos.
+case "$MODE" in
+    status|probe) NONINTERACTIVE=1 ;;
+esac
+
 case "$MODE" in
     check-update) standalone_check_update; exit 0 ;;
     update) standalone_update; exit 0 ;;
@@ -2084,6 +3060,10 @@ esac
 
 aviso_empacotado
 
+if [ "$MODE" = "probe" ]; then
+    wireguard_gateway_probe
+    exit $?
+fi
 # ---- selecao de alvos (escolher QUAL Discord patchear) --------------------
 # rotulo_flavour <flav> → nome legivel para o seletor.
 rotulo_flavour() {
@@ -2216,12 +3196,6 @@ if [ "$MODE" = "install" ]; then
     fi
 fi
 
-if [ "$MODE" = "probe" ]; then
-    if wireguard_gateway_probe; then
-        exit 0
-    fi
-    exit 1
-fi
 
 if [ "$MODE" = "refresh" ]; then
     refresh_wireguard_route
@@ -2243,9 +3217,9 @@ if [ "$MODE" = "status" ]; then
             running="nao"
             in_namespace="nao"
             discord_pid=""
-            if discord_pid="$(discord_pid_flav "$flav" "$id" 2>/dev/null)"; then
+            if discord_pid="$(discord_pid_flav "$flav" "$id" "$resources" 2>/dev/null)"; then
                 running="sim"
-                if discord_pid_in_netns "$discord_pid"; then in_namespace="sim"; fi
+                if discord_pid_in_netns_elevated "$discord_pid"; then in_namespace="sim"; fi
             fi
             printf '{"path":"%s","state":"%s","flavour":"%s","detected_by":"%s","running":"%s","inNamespace":"%s"' "$resources" "$(injection_state "$resources")" "$flav" "$detect" "$running" "$in_namespace"
             [ -n "$discord_pid" ] && printf ',"pid":"%s"' "$discord_pid"
@@ -2300,10 +3274,6 @@ if [ "$MODE" = "status" ]; then
     exit 0
 fi
 
-if [ "$CLEANUP_LEGACY" -eq 1 ]; then
-    cleanup_legacy_tor
-fi
-
 if [ "$MODE" = "uninstall" ] || [ "$MODE" = "restore" ]; then
     stop_discord
     teardown_wireguard_netns
@@ -2346,6 +3316,32 @@ fi
 # recebem o patch (um, varios ou todos).
 FOUND="$(escolher_alvos patchear)"
 printf '%s\n' "$FOUND" > "$lista"
+# A autorizacao precisa estar concluida antes de fechar qualquer cliente. Isso
+# tambem impede que uma falha no prompt deixe o usuario sem Discord aberto.
+authorize_install_elevation || fail "Nao foi possivel autorizar a ativacao Linux (resultado ${ELEVATION_RESULT}). O Discord nao foi encerrado."
+# Valide o executor do usuario antes de remover configuracoes legadas ou fechar
+# o cliente. `pkexec` autoriza a operacao privilegiada, mas nao substitui a
+# troca segura para o usuario que deve possuir a sessao grafica.
+ACTIVATION_RUN_USER="${SUDO_USER:-$(id -un 2>/dev/null || whoami)}"
+prepare_run_user "$ACTIVATION_RUN_USER" || fail "Nao foi possivel preparar a execucao segura do Discord. O Discord nao foi encerrado."
+ensure_wireguard_module || fail "Nao foi possivel preparar o modulo WireGuard. O Discord nao foi encerrado."
+# A limpeza legada apaga recursos e configuracoes antigas; so pode acontecer
+# depois de a autorizacao da ativacao ter sido concluida.
+if [ "$CLEANUP_LEGACY" -eq 1 ]; then
+    cleanup_legacy_tor
+fi
+
+# A partir do stop, qualquer falha fatal precisa remover o namespace parcial e
+# tentar devolver o Discord ao usuario. O trap ja existe para limpar segredos,
+# mas so e habilitado para rollback aqui, depois de autorizacao e limpeza legada.
+ACTIVATION_ROLLBACK_TARGET="$(select_launch_target "$FOUND")"
+if discord_running; then
+    ACTIVATION_ROLLBACK_REOPEN=1
+else
+    ACTIVATION_ROLLBACK_REOPEN=0
+fi
+ACTIVATION_NETNS_TOUCH_STARTED=0
+ACTIVATION_ROLLBACK_PENDING=1
 # O processo antigo precisa sair antes de qualquer alteracao do namespace. Isso
 # tambem impede que uma troca de rota deixe duas instancias compartilhando o host.
 stop_discord
@@ -2380,7 +3376,9 @@ while IFS='|' read -r resources flav detect id; do
         continue
     fi
 
-    setup_wireguard_netns
+    if [ "$ACTIVATION_NETNS_TOUCH_STARTED" -eq 0 ]; then
+        setup_wireguard_netns
+    fi
 
     # So desfazemos _app.asar quando a injecao la dentro e NOSSA (versao antiga, pre-WireGuard,
     # que patcheava o app.asar). Quando e outro mod (Vencord/Equicord), _app.asar e o backup
@@ -2408,8 +3406,8 @@ log_wireguard_readiness
 
 # Modo portatil: reabre o Discord ja com o bypass ativo (mesmo comportamento do app do Windows).
 # head -1 em vez de pipe para o while: nohup num subshell morreria junto com ele.
-start_discord "$(printf '%s\n' "$FOUND" | head -1)"
-if ! wait_discord_started "$(printf '%s\n' "$FOUND" | head -1)"; then
+start_discord "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND}" | head -1)"
+if ! wait_discord_started "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND}" | head -1)"; then
     warn "O WireGuard ficou pronto, mas o processo do Discord nao iniciou."
     # Se o launcher chegou a criar um sandbox, mas o reconhecimento expirou, feche-o
     # antes de remover o namespace. Assim não deixamos um Flatpak órfão usando uma
@@ -2418,6 +3416,9 @@ if ! wait_discord_started "$(printf '%s\n' "$FOUND" | head -1)"; then
     teardown_wireguard_netns
     fail "Discord nao iniciou dentro do namespace WireGuard. Verifique o log em $INSTALL_DIR/logs."
 fi
+# A sessao ja esta confirmada dentro do namespace; a partir daqui o trap deve
+# apenas limpar segredos/temporarios e nunca reabrir o cliente fora do tunel.
+ACTIVATION_ROLLBACK_PENDING=0
 printf '\n  %sDiscord aberto com o GoLiveBypass.%s\n' "$C_GREEN" "$C_OFF" >&2
 
 # O updater do Discord baixa a versao nova numa pasta app-<versao> inteiramente nova, entao a

@@ -2,8 +2,10 @@
 package config
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +72,7 @@ func Parse() (*Config, error) {
 
 	// Human verification
 	flag.StringVar(&cfg.HVToken, "hv-token", "", "Human verification token to replay after solving a CAPTCHA (see the code 9001 error)")
+	flag.BoolVar(&cfg.StdinSecrets, "stdin-secrets", false, "Read plugin authentication secrets from a private JSON object on stdin")
 
 	// Advanced configuration
 	flag.StringVar(&cfg.APIURL, "api-url", constants.DefaultAPIURL, "ProtonVPN API URL")
@@ -84,12 +87,18 @@ func Parse() (*Config, error) {
 	// Server listing mode
 	flag.BoolVar(&cfg.ListServers, "list-servers", false, "List available servers and exit (optionally filter by -countries)")
 
+	// Route catalog mode (enumerates all currently eligible public routes)
+	flag.BoolVar(&cfg.RouteCatalog, "route-catalog", false, "List all eligible Proton routes and exit")
+
 	// Renew mode
 	flag.StringVar(&cfg.RenewSerial, "renew-serial", "", "Renew a persistent configuration by SerialNumber (reuses existing key, no config file generated)")
 
-	// Automated GUI & Ping extensions
+	// Keep each flag registered exactly once: the default FlagSet panics on
+	// duplicate names before any command mode can execute.
+	flag.BoolVar(&cfg.ProgressJSON, "progress-json", false, "Emit machine-readable progress events as JSON on stderr")
 	flag.BoolVar(&cfg.SpeedTest, "speed-test", false, "Ping all regional routes, validate twelve, then measure download/upload on up to six healthy finalists (up to 30 MiB, about 3m)")
-	flag.BoolVar(&cfg.ProgressJSON, "progress-json", false, "Emit speed-test progress events as JSON on stderr")
+	flag.BoolVar(&cfg.RequireDiscord, "require-discord", false, "Require Discord HTTPS reachability for every speed-test candidate")
+	flag.BoolVar(&cfg.ManualProbe, "manual-probe", false, "Validate and generate one explicitly selected server without speed test")
 	flag.BoolVar(&cfg.SpeedTestTrace, "speed-test-trace", false, "Print the four speed-test stages in the terminal (ping, shortlist, tunnel, speed)")
 	flag.StringVar(&cfg.TwoFactorCode, "2fa", "", "2FA TOTP code for non-interactive authentication")
 	flag.StringVar(&cfg.SessionFile, "session-file", "", "Custom path for session cache file")
@@ -101,6 +110,7 @@ func Parse() (*Config, error) {
 	flag.BoolVar(&cfg.CheckPlan, "check-plan", false, "Check the cached account plan and exit (does not prompt for a password)")
 	flag.BoolVar(&cfg.LoginOnly, "login-only", false, "Authenticate, save session, and exit")
 	flag.BoolVar(&loginAlias, "login", false, "Alias for -login-only")
+	flag.BoolVar(&cfg.SessionUsername, "session-username", false, "Print the username stored in the cached session and exit")
 	flag.BoolVar(&cfg.RoutePool, "route-pool", false, "Generate a local pool of ping-validated routes")
 	flag.IntVar(&cfg.RoutePoolSize, "route-pool-size", 2, "Number of profiles to generate in route-pool mode")
 	flag.StringVar(&cfg.RoutePoolOutputDir, "route-pool-output-dir", "", "Directory for route-pool profiles")
@@ -163,8 +173,8 @@ func Parse() (*Config, error) {
 		return cfg, nil
 	}
 
-	// -list-servers does not need a country filter either.
-	if cfg.ListServers {
+	// -list-servers and -route-catalog do not need a country filter either.
+	if cfg.ListServers || cfg.RouteCatalog {
 		cfg.Username = validation.CleanUsername(cfg.Username)
 		return cfg, nil
 	}
@@ -190,6 +200,13 @@ func Parse() (*Config, error) {
 
 	// -login-only does not need country filter or server.
 	if cfg.LoginOnly {
+		cfg.Username = validation.CleanUsername(cfg.Username)
+		return cfg, nil
+	}
+
+	// -session-username only reads the local cache and does not need any
+	// authentication or route-selection flags.
+	if cfg.SessionUsername {
 		cfg.Username = validation.CleanUsername(cfg.Username)
 		return cfg, nil
 	}
@@ -226,9 +243,59 @@ func Parse() (*Config, error) {
 	return cfg, nil
 }
 
+type stdinSecrets struct {
+	Password               string `json:"password"`
+	TwoFactorCode          string `json:"twoFactorCode"`
+	HumanVerificationToken string `json:"humanVerificationToken"`
+}
+
+// ReadStdinSecrets consumes the private credential envelope used by the Discord
+// plugin. Secrets are intentionally never accepted in diagnostics or printed.
+func ReadStdinSecrets(cfg *Config) error {
+	if !cfg.StdinSecrets {
+		return nil
+	}
+	return readStdinSecrets(os.Stdin, cfg)
+}
+
+func readStdinSecrets(reader io.Reader, cfg *Config) error {
+	data, err := io.ReadAll(io.LimitReader(reader, 32*1024))
+	if err != nil {
+		return fmt.Errorf("failed to read private authentication input: %w", err)
+	}
+	var input stdinSecrets
+	if err := json.Unmarshal(data, &input); err != nil {
+		return fmt.Errorf("private authentication input is invalid")
+	}
+	if cfg.Password == "" {
+		cfg.Password = input.Password
+	}
+	if cfg.TwoFactorCode == "" {
+		cfg.TwoFactorCode = input.TwoFactorCode
+	}
+	if cfg.HVToken == "" {
+		cfg.HVToken = input.HumanVerificationToken
+	}
+	if cfg.Password == "" {
+		return fmt.Errorf("private authentication input does not contain a password")
+	}
+	return nil
+}
+
 func validateFeatureFlags(cfg *Config) error {
 	if cfg.PortForwarding && cfg.ModerateNAT {
 		return fmt.Errorf("port-forwarding and moderate-nat cannot be enabled together")
+	}
+	if cfg.ManualProbe {
+		if strings.TrimSpace(cfg.ServerName) == "" {
+			return fmt.Errorf("manual-probe requires -server")
+		}
+		if cfg.SpeedTest {
+			return fmt.Errorf("manual-probe cannot be used with -speed-test")
+		}
+	}
+	if cfg.RequireDiscord && !cfg.SpeedTest {
+		return fmt.Errorf("require-discord can only be used with -speed-test")
 	}
 	return validateDuration(cfg)
 }

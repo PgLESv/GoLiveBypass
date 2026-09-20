@@ -1,19 +1,27 @@
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+import { execFile, execFileSync } from "child_process";
+import crypto from "crypto";
+import { promises as dns } from "dns";
 import fs from "fs";
+import https from "https";
 import os from "os";
 import path from "path";
-import crypto from "crypto";
-import https from "https";
-import { promises as dns } from "dns";
-import { execFile, execFileSync } from "child_process";
 
 import {
-    VPN_SERVICE_NAMES,
     formatAllowedApps,
     safeDiagnosticDetail,
     sanitizeWireGuardConfig,
     validateWireGuardConfig,
+    VPN_SERVICE_NAMES,
     type WireGuardConfigValidation,
 } from "./vpn-types";
+import { parseWireSockSnapshot, type WireSockSnapshot } from "./vpn-snapshot";
+import { runWireSockSnapshotOutsideMainThread } from "./vpn-snapshot-worker";
 
 export const WIRESOCK_VERSION = "3.4.8.1";
 const WIRESOCK_DOWNLOAD = "https://wiresock.net/_api/download-release.php?product=wiresock-secure-connect-sdk&platform=x64&version=3.4.8.1&channel=winget";
@@ -34,10 +42,27 @@ export interface WireSockCandidate {
 export interface WireSockInspection {
     active: boolean;
     owned: boolean;
+    reliable: boolean;
     services: string[];
     processIds: number[];
     reason: string | null;
+    /** Origem agregada dos recursos ativos: só faz sentido com `reliable && active`. */
+    origin: WireSockOrigin;
+    /** Serviços ativos cuja config aponta para o GoLiveBypass (plugin ou GUI). */
+    managedServices: string[];
+    /** PIDs ativos cuja config aponta para o GoLiveBypass (plugin ou GUI). */
+    managedProcessIds: number[];
 }
+
+/**
+ * Origem agregada dos recursos WireSock ativos. `managed` cobre apenas configs
+ * comprovadamente do GoLiveBypass (plugin ou GUI); `mixed` mistura gerenciado com
+ * externo/desconhecido e nunca autoriza encerrar nada; `unknown` é leitura
+ * inconclusiva.
+ */
+export type WireSockOrigin = "plugin" | "gui" | "managed" | "external" | "mixed" | "unknown";
+
+const UNKNOWN_WIRESOCK_STATE = "Não foi possível confirmar o estado do WireSock; estado desconhecido.";
 
 export interface WireSockCleanupResult {
     stopped: boolean;
@@ -84,6 +109,58 @@ function containsConfig(commandLine: string | null, configPath: string): boolean
     return normalizedPath(commandLine).includes(normalizedPath(configPath));
 }
 
+/**
+ * Separa uma linha de comando do Windows preservando argumentos entre aspas. Os caminhos
+ * gerados pelo GoLiveBypass não contêm aspas literais; por isso basta tratar `"` como
+ * delimitador e espaços fora delas como separadores.
+ */
+function commandTokens(commandLine: string): string[] {
+    const tokens: string[] = [];
+    let token = "";
+    let quoted = false;
+    for (const character of commandLine.trim()) {
+        if (character === '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (/\s/.test(character) && !quoted) {
+            if (token) {
+                tokens.push(token);
+                token = "";
+            }
+            continue;
+        }
+        token += character;
+    }
+    if (token) tokens.push(token);
+    return tokens;
+}
+
+/**
+ * Extrai o argumento do flag `-config`/`--config` da linha de comando. Comparar por flag
+ * (e não por substring da linha inteira) impede que `-allowed-apps`, caminhos de log ou
+ * `wiresock-discord.conf.bak` sejam confundidos com a config aplicada.
+ */
+function configArgument(commandLine: string | null): string | null {
+    if (!commandLine) return null;
+    const tokens = commandTokens(commandLine);
+    for (let index = 0; index < tokens.length - 1; index++) {
+        const flag = tokens[index].toLowerCase();
+        if (flag === "-config" || flag === "--config") return normalizedPath(tokens[index + 1]);
+    }
+    return null;
+}
+
+/**
+ * Compara o argumento de config normalizado por igualdade, não por substring de
+ * diretório: `wiresock-discord.conf.bak` ou um perfil do usuário colocado dentro da
+ * pasta GoLiveBypass não podem ser confundidos com a config aplicada.
+ */
+function configArgumentEquals(commandLine: string | null, configPath: string): boolean {
+    const argument = configArgument(commandLine);
+    return argument !== null && argument === normalizedPath(configPath);
+}
+
 function serviceExists(name: string): boolean {
     if (!isWindows()) return false;
     try {
@@ -95,16 +172,41 @@ function serviceExists(name: string): boolean {
     }
 }
 
-function serviceRunning(name: string): boolean {
-    if (!isWindows()) return false;
+function serviceRunningFromCim(name: string): boolean | null {
+    try {
+        const script = `$s=Get-CimInstance Win32_Service -Filter "Name='${name.replace(/'/g, "''")}'"; if($s){$s.State}`;
+        const output = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+            encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: 5000,
+        });
+        const value = output.trim();
+        if (!value) return null;
+        if (/^Running$/i.test(value)) return true;
+        if (/^Stopped$/i.test(value)) return false;
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+function serviceRunningFromSc(name: string): boolean | null {
     try {
         const output = execFileSync("sc.exe", ["query", name], {
             encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: 5000,
         });
-        return /STATE\s*:\s*\d+\s+RUNNING/i.test(output);
-    } catch {
-        return false;
+        if (/STATE\s*:\s*\d+\s+RUNNING/i.test(output)) return true;
+        if (/STATE\s*:\s*\d+\s+STOPPED/i.test(output)) return false;
+        if (/STATE\s*:\s*\d+\s+(?:START_PENDING|STOP_PENDING|PAUSED|PAUSE_PENDING|CONTINUE_PENDING)/i.test(output)) return null;
+        return null;
+    } catch (error) {
+        return Number((error as { status?: unknown })?.status) === 1060 ? false : null;
     }
+}
+
+function serviceRunning(name: string): boolean | null {
+    if (!isWindows()) return false;
+    const cimState = serviceRunningFromCim(name);
+    if (cimState !== null) return cimState;
+    return serviceRunningFromSc(name);
 }
 
 function serviceCommand(name: string): string | null {
@@ -119,62 +221,225 @@ function serviceCommand(name: string): string | null {
     }
 }
 
-function assertPluginServiceSlot(configPath: string): void {
-    const name = VPN_SERVICE_NAMES[0];
-    if (!serviceExists(name)) return;
-    const command = serviceCommand(name);
-    if (!command || !containsConfig(command, configPath))
-        throw new Error("O serviço WireSock já está registrado com outro perfil (possivelmente pela GUI ou por outro plugin). Desative-o antes de usar a VPN do plugin.");
+// A inspeção completa custava ~1,6s NA THREAD PRINCIPAL do Discord (medido na VM: sete
+// spawns de PowerShell, seis deles Get-CimInstance, ~220ms só para criar cada processo), e o
+// watchdog repete isso a cada 15s -- e até seis vezes seguidas quando confirma uma leitura
+// transitória. Com a janela do Discord chegando a não responder por mais de 1s nas amostras
+// de recon4, uma única sessão do PowerShell passou a responder tudo o que a inspeção precisa
+// (estado, PathName e ProcessId dos serviços do WireSock + a lista de processos próprios).
+// A checagem de slot e a limpeza seguem com os helpers baratos (sc.exe).
+function wireSockSnapshotScript(names: readonly string[]): string {
+    const list = names.map(name => quotePowerShell(name)).join(",");
+    return `$names=@(${list})
+$svc=@()
+foreach($n in $names){
+  $s=Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+  if($s){ $svc += [PSCustomObject]@{ name=$s.Name; state=$s.State; command=$s.PathName; processId=[int]$s.ProcessId } }
+  else { $svc += [PSCustomObject]@{ name=$n; state='Missing'; command=$null; processId=0 } }
+}
+$procs=@(Get-CimInstance Win32_Process -Filter "Name='wiresock-client.exe'" -ErrorAction SilentlyContinue | ForEach-Object { [PSCustomObject]@{ pid=[int]$_.ProcessId; commandLine=$_.CommandLine } })
+[PSCustomObject]@{ services=$svc; processes=$procs } | ConvertTo-Json -Compress -Depth 4`;
 }
 
-function runningWireSockProcesses(): Array<{ pid: number; commandLine: string | null }> {
-    if (!isWindows()) return [];
+function readWireSockSnapshot(names: readonly string[]): WireSockSnapshot | null {
+    const script = wireSockSnapshotScript(names);
     try {
-        const script = "$p=Get-CimInstance Win32_Process -Filter \"Name='wiresock-client.exe'\" | ForEach-Object { [PSCustomObject]@{pid=[int]$_.ProcessId; commandLine=$_.CommandLine} }; $p | ConvertTo-Json -Compress";
         const output = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-            encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: 5000,
+            encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: 8000,
         }).trim();
-        if (!output) return [];
-        const parsed = JSON.parse(output) as unknown;
-        const rows = Array.isArray(parsed) ? parsed : [parsed];
-        return rows.flatMap(row => {
-            if (row === null || typeof row !== "object") return [];
-            const value = row as { pid?: unknown; commandLine?: unknown };
-            const pid = Number(value.pid);
-            if (!Number.isInteger(pid) || pid <= 0) return [];
-            return [{ pid, commandLine: typeof value.commandLine === "string" ? value.commandLine : null }];
-        });
+        if (!output) return null;
+        return parseWireSockSnapshot(output, names);
     } catch {
-        return [];
+        return null;
     }
 }
 
-export function inspectWireSock(configPath?: string): WireSockInspection {
-    if (!isWindows()) return { active: false, owned: false, services: [], processIds: [], reason: null };
-    const services = VPN_SERVICE_NAMES.filter(serviceRunning);
-    const processes = runningWireSockProcesses();
-    const processIds = processes.map(process => process.pid);
-    const active = services.length > 0 || processes.length > 0;
-    if (!active) return { active: false, owned: false, services: [], processIds: [], reason: null };
-    if (!configPath) return { active, owned: false, services, processIds, reason: "WireSock já está ativo fora do perfil do plugin." };
-
-    const ownService = services.filter(name => containsConfig(serviceCommand(name), configPath));
-    const ownProcess = processes.filter(process => containsConfig(process.commandLine, configPath));
-    const allServicesOwned = services.every(name => containsConfig(serviceCommand(name), configPath));
-    const allProcessesOwned = processes.every(process => containsConfig(process.commandLine, configPath));
-    if ((ownService.length > 0 || ownProcess.length > 0) && allServicesOwned && allProcessesOwned)
-        return { active, owned: true, services, processIds, reason: null };
-    return {
-        active,
-        owned: false,
-        services,
-        processIds,
-        reason: ownService.length > 0 || ownProcess.length > 0
-            ? "WireSock próprio e externo foram detectados ao mesmo tempo; a operação foi bloqueada."
-            : "WireSock já está ativo por outro perfil, pela GUI ou por outro plugin.",
-    };
+function readWireSockSnapshotInProcessAsync(script: string, names: readonly string[]): Promise<WireSockSnapshot | null> {
+    const { promise, resolve } = Promise.withResolvers<WireSockSnapshot | null>();
+    try {
+        execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+            encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: 8000,
+        }, (error, stdout) => {
+            if (error || !stdout) {
+                resolve(null);
+                return;
+            }
+            try {
+                const output = String(stdout).trim();
+                resolve(output ? parseWireSockSnapshot(output, names) : null);
+            } catch {
+                resolve(null);
+            }
+        });
+    } catch {
+        resolve(null);
+    }
+    return promise;
+}
+function assertPluginServiceSlot(configPath: string): void {
+    const name = VPN_SERVICE_NAMES[0];
+    if (!serviceExists(name)) return;
+    // Um registro parado não controla tráfego e pode ser retargeteado pelo
+    // script de inicialização abaixo; o bloqueio continua valendo para um
+    // serviço realmente ativo fora do perfil do plugin.
+    const running = serviceRunning(name);
+    if (running === null) throw new Error("Não foi possível confirmar o estado do serviço WireSock; operação interrompida por segurança.");
+    if (!running) return;
+    const command = serviceCommand(name);
+    if (!command || !configArgumentEquals(command, configPath))
+        throw new Error("O serviço WireSock já está registrado com outro perfil (possivelmente pela GUI ou por outro plugin). Desative-o antes de usar a VPN do plugin.");
 }
 
+export function inspectWireSock(configPath?: string, guiConfigPath?: string, snapshotOverride?: WireSockSnapshot | null): WireSockInspection {
+    if (!isWindows())
+        return { active: false, owned: false, reliable: true, services: [], processIds: [], reason: null, origin: "unknown", managedServices: [], managedProcessIds: [] };
+    const snapshot = snapshotOverride === undefined ? readWireSockSnapshot(VPN_SERVICE_NAMES) : snapshotOverride;
+    if (!snapshot) {
+        // Sem o snapshot a leitura já é desconhecida de qualquer forma: os processos não têm
+        // fonte barata. O sc.exe (~9ms, sem PowerShell) ainda diz quais serviços estão de pé,
+        // o que é tudo o que a mensagem de estado desconhecido reporta.
+        return {
+            // Uma leitura incompleta não prova nem presença nem ausência. Não
+            // a exponha como ativa, pois isso faria o controller classificá-la
+            // incorretamente como um WireSock externo.
+            active: false,
+            owned: false,
+            reliable: false,
+            services: VPN_SERVICE_NAMES.filter(name => serviceRunningFromSc(name) === true),
+            processIds: [],
+            reason: UNKNOWN_WIRESOCK_STATE,
+            origin: "unknown",
+            managedServices: [],
+            managedProcessIds: [],
+        };
+    }
+    const serviceStates = snapshot.services.map(service => ({ name: service.name, running: service.running }));
+    const services = serviceStates.filter(service => service.running === true).map(service => service.name);
+    const processes = snapshot.processes;
+    const processIds = processes.map(process => process.pid);
+    // A lista de processos veio do mesmo snapshot: se ela não existisse, `readWireSockSnapshot`
+    // teria devolvido null. Sobra saber se cada nome de serviço respondeu um estado definitivo.
+    const reliable = serviceStates.every(service => service.running !== null);
+    if (!reliable) {
+        return {
+            active: false,
+            owned: false,
+            reliable: false,
+            services,
+            processIds,
+            reason: UNKNOWN_WIRESOCK_STATE,
+            origin: "unknown",
+            managedServices: [],
+            managedProcessIds: [],
+        };
+    }
+    const active = services.length > 0 || processes.length > 0;
+    if (!active)
+        return { active: false, owned: false, reliable: true, services: [], processIds: [], reason: null, origin: "unknown", managedServices: [], managedProcessIds: [] };
+    if (!configPath)
+        return { active, owned: false, reliable: true, services, processIds, reason: "WireSock já está ativo fora do perfil do plugin.", origin: "unknown", managedServices: [], managedProcessIds: [] };
+
+    const commandOf = (name: string) => snapshot.services.find(service => service.name === name)?.command ?? null;
+    if (services.some(name => commandOf(name) === null)) {
+        return {
+            active: false,
+            owned: false,
+            reliable: false,
+            services,
+            processIds,
+            reason: "Não foi possível confirmar o perfil do serviço WireSock; estado desconhecido.",
+            origin: "unknown",
+            managedServices: [],
+            managedProcessIds: [],
+        };
+    }
+    // Cada recurso ativo recebe uma origem comprovada pelo argumento de config. Um processo
+    // sem linha de comando só herda a origem do serviço cujo ProcessId coincide com o PID;
+    // fora disso a leitura inteira é desconhecida (nada pode ser encerrado com segurança).
+    // O pool de rotas da GUI vive dentro da pasta dela e também é instância gerenciada.
+    const guiPoolPrefix = guiConfigPath
+        ? `${normalizedPath(path.win32.join(path.win32.dirname(guiConfigPath), "proton-route-pool"))}\\`
+        : null;
+    const isGuiConfig = (argument: string | null): boolean => {
+        if (!argument || !guiConfigPath) return false;
+        return argument === normalizedPath(guiConfigPath) || (guiPoolPrefix !== null && argument.startsWith(guiPoolPrefix));
+    };
+    const classify = (commandLine: string | null): "plugin" | "gui" | "external" | null => {
+        const argument = configArgument(commandLine);
+        if (argument !== null && argument === normalizedPath(configPath)) return "plugin";
+        if (isGuiConfig(argument)) return "gui";
+        if (commandLine && commandLine.trim().length > 0) return "external";
+        return null;
+    };
+    const serviceOrigin = new Map<string, "plugin" | "gui" | "external">();
+    for (const name of services) serviceOrigin.set(name, classify(commandOf(name)) ?? "external");
+    const servicePidsOf = (origin: "plugin" | "gui") => new Set(snapshot.services
+        .filter(service => service.running === true && serviceOrigin.get(service.name) === origin)
+        .map(service => service.processId)
+        .filter((pid): pid is number => pid !== null));
+    const pluginServicePids = servicePidsOf("plugin");
+    const guiServicePids = servicePidsOf("gui");
+    const processOrigin = processes.map(process => {
+        const direct = classify(process.commandLine);
+        if (direct) return direct;
+        if (pluginServicePids.has(process.pid)) return "plugin" as const;
+        if (guiServicePids.has(process.pid)) return "gui" as const;
+        return null;
+    });
+    if (processOrigin.some(origin => origin === null)) {
+        return {
+            active: false,
+            owned: false,
+            reliable: false,
+            services,
+            processIds,
+            reason: "Não foi possível confirmar o perfil do processo WireSock; estado desconhecido.",
+            origin: "unknown",
+            managedServices: [],
+            managedProcessIds: [],
+        };
+    }
+    const ownServices = services.filter(name => serviceOrigin.get(name) === "plugin");
+    const ownProcesses = processes.filter((_, index) => processOrigin[index] === "plugin");
+    const managedServices = services.filter(name => serviceOrigin.get(name) === "gui");
+    const managedProcesses = processes.filter((_, index) => processOrigin[index] === "gui");
+    const managedProcessIds = managedProcesses.map(process => process.pid);
+    const externalCount = (services.length - ownServices.length - managedServices.length)
+        + (processes.length - ownProcesses.length - managedProcesses.length);
+    const hasManaged = managedServices.length + managedProcessIds.length > 0;
+    const hasOwn = ownServices.length + ownProcesses.length > 0;
+    if (hasOwn && !hasManaged && externalCount === 0)
+        return { active, owned: true, reliable: true, services, processIds, reason: null, origin: "plugin", managedServices: [], managedProcessIds: [] };
+
+    let origin: WireSockOrigin;
+    let reason: string;
+    if (externalCount > 0 && (hasManaged || hasOwn)) {
+        origin = "mixed";
+        reason = hasOwn && !hasManaged
+            ? "WireSock próprio e externo foram detectados ao mesmo tempo; a operação foi bloqueada."
+            : "WireSock externo e uma instância GoLiveBypass estão ativos ao mesmo tempo; a operação foi bloqueada.";
+    } else if (externalCount > 0) {
+        origin = "external";
+        reason = "WireSock externo já está ativo fora do GoLiveBypass.";
+    } else if (hasOwn) {
+        origin = "managed";
+        reason = "WireSock próprio e da GUI GoLiveBypass estão ativos ao mesmo tempo.";
+    } else {
+        origin = "gui";
+        reason = "Outra superfície do GoLiveBypass (GUI) está com o WireSock ativo.";
+    }
+    return { active, owned: false, reliable: true, services, processIds, reason, origin, managedServices, managedProcessIds };
+}
+export async function inspectWireSockAsync(configPath?: string, guiConfigPath?: string): Promise<WireSockInspection> {
+    if (!isWindows()) return inspectWireSock(configPath, guiConfigPath);
+    const names = VPN_SERVICE_NAMES;
+    const run = await runWireSockSnapshotOutsideMainThread(wireSockSnapshotScript(names), 8000);
+    if (run.ran) {
+        const snapshot = run.stdout ? parseWireSockSnapshot(run.stdout, names) : null;
+        return inspectWireSock(configPath, guiConfigPath, snapshot);
+    }
+    return inspectWireSock(configPath, guiConfigPath, await readWireSockSnapshotInProcessAsync(wireSockSnapshotScript(names), names));
+}
 export function wireSockSearchRoots(env: NodeJS.ProcessEnv = process.env): string[] {
     const programFiles = [env.ProgramW6432, env.ProgramFiles, env["ProgramFiles(x86)"], "C:\\Program Files"]
         .filter((value): value is string => Boolean(value));
@@ -416,6 +681,7 @@ export async function startWireSockService(
     if (!validation.valid) throw new Error(validation.error);
 
     const current = inspectWireSock(configPath);
+    if (!current.reliable) throw new Error(current.reason || UNKNOWN_WIRESOCK_STATE);
     if (current.active && !current.owned) throw new Error(current.reason || "WireSock externo já está ativo.");
     assertPluginServiceSlot(configPath);
     const executable = await ensureWireSockInstalled(log);
@@ -437,6 +703,10 @@ export async function startWireSockService(
     }
 
     const inspection = inspectWireSock(target);
+    if (!inspection.reliable) {
+        log("error", "WireSock não confirmou o perfil próprio após a ativação", { motivo: inspection.reason || UNKNOWN_WIRESOCK_STATE });
+        throw new Error("O serviço WireSock não confirmou o perfil do plugin após a ativação.");
+    }
     if (!inspection.active || !inspection.owned) {
         log("error", "WireSock não confirmou o perfil próprio após a ativação", { motivo: inspection.reason || "serviço ausente" });
         throw new Error("O serviço WireSock não confirmou o perfil do plugin após a ativação.");
@@ -482,18 +752,38 @@ export function clearWireSockDns(log: WireSockLogger): boolean {
     }
 }
 
-function killOwnProcesses(processIds: number[], log: WireSockLogger): void {
+function killProcesses(processIds: number[], label: string, log: WireSockLogger): void {
     for (const pid of processIds) {
         if (!runAsAdministrator("taskkill.exe", ["/F", "/T", "/PID", String(pid)], log))
-            log("warn", "não consegui encerrar processo WireSock próprio", { pid });
+            log("warn", `não consegui encerrar processo WireSock ${label}`, { pid });
     }
 }
 
+function killOwnProcesses(processIds: number[], log: WireSockLogger): void {
+    killProcesses(processIds, "próprio", log);
+}
+
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+const WIRESOCK_INSPECTION_RETRIES = 6;
+
+async function inspectWireSockUntilReliable(configPath: string, guiConfigPath?: string): Promise<WireSockInspection> {
+    let inspection = inspectWireSock(configPath, guiConfigPath);
+    for (let attempt = 1; !inspection.reliable && attempt < WIRESOCK_INSPECTION_RETRIES; attempt++) {
+        await wait(500);
+        inspection = inspectWireSock(configPath, guiConfigPath);
+    }
+    return inspection;
+}
+
 
 export async function stopOwnedWireSock(configPath: string, log: WireSockLogger): Promise<WireSockCleanupResult> {
     if (!isWindows()) return { stopped: true, servicesResidual: [], processResidual: [], networkLockReset: false, dnsCleared: false, dnsFlushed: false };
     const initial = inspectWireSock(configPath);
+    if (!initial.reliable) {
+        const error = initial.reason || UNKNOWN_WIRESOCK_STATE;
+        log("warn", "limpeza adiada porque o estado do WireSock é desconhecido", { motivo: error });
+        return { stopped: false, servicesResidual: initial.services, processResidual: initial.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+    }
     if (initial.active && !initial.owned) {
         const error = initial.reason || "WireSock externo detectado";
         log("warn", "limpeza recusada para preservar WireSock externo", { motivo: error });
@@ -508,7 +798,12 @@ export async function stopOwnedWireSock(configPath: string, log: WireSockLogger)
     }
     for (let attempt = 0; attempt < 2; attempt++) {
         await wait(500);
-        const current = inspectWireSock(configPath);
+        const current = await inspectWireSockUntilReliable(configPath);
+        if (!current.reliable) {
+            const error = current.reason || UNKNOWN_WIRESOCK_STATE;
+            log("error", "limpeza interrompida porque o estado do WireSock ficou desconhecido", { motivo: error });
+            return { stopped: false, servicesResidual: current.services, processResidual: current.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+        }
         if (!current.active) break;
         if (!current.owned) {
             const error = current.reason || "WireSock externo apareceu durante a limpeza";
@@ -530,11 +825,24 @@ export async function stopOwnedWireSock(configPath: string, log: WireSockLogger)
     } catch (error) {
         log("warn", "flushdns falhou", { erro: logError(error) });
     }
-    const residual = inspectWireSock(configPath);
-    const stopped = !residual.active && networkLockReset;
-    if (stopped) log("info", "WireSock próprio, lock e processo verificados como parados");
-    else if (residual.active) log("error", "limpeza deixou resíduo WireSock próprio", { services: residual.services, pids: residual.processIds });
-    else log("error", "processo WireSock parou, mas o network-lock não foi confirmado como restaurado");
+    const residual = await inspectWireSockUntilReliable(configPath);
+    // O veredito e' o mesmo da GUI (electron/wiresock.ts: `!isWireSockActive() && residual.length === 0`)
+    // e o mesmo que o README promete: o tunel acabou quando servico E processos proprios
+    // sumiram, com leitura confiavel. `active` cobre exatamente esses dois (services/processIds);
+    // o network-lock nao entra.
+    //
+    // O reset do network-lock continua sendo TENTADO logo acima e reportado no resultado, mas
+    // nao decide mais nada: ele exige elevacao (UAC) e a config do plugin instala o servico com
+    // "-network-lock disabled" (vpn-windows.ts:469/477, confirmado por
+    // tests/test-distribution-parity.cjs), entao a nossa sessao nunca engata esse lock. Exigi-lo
+    // fazia a limpeza falhar em maquina onde o UAC nao era aceito no momento da saida -- com o
+    // tunel ja derrubado e a rede restaurada --, o que virava recovery_required, mantinha o
+    // lock do plugin e (antes da correcao do before-quit) deixava o Discord preso sem janela.
+    const stopped = residual.reliable && !residual.active;
+    if (!stopped && !residual.reliable) log("error", "limpeza não confirmou o estado final do WireSock", { motivo: residual.reason || UNKNOWN_WIRESOCK_STATE });
+    else if (!stopped) log("error", "limpeza deixou resíduo WireSock próprio", { services: residual.services, pids: residual.processIds });
+    else if (networkLockReset) log("info", "WireSock próprio, lock e processo verificados como parados");
+    else log("warn", "WireSock próprio parado (serviço e processos); o reset do network-lock não foi confirmado -- exige elevação e o plugin não habilita esse lock", { networkLockReset });
     return {
         stopped,
         servicesResidual: residual.services,
@@ -542,8 +850,85 @@ export async function stopOwnedWireSock(configPath: string, log: WireSockLogger)
         networkLockReset,
         dnsCleared,
         dnsFlushed,
-        ...(stopped ? {} : { error: residual.active ? "O WireSock próprio ainda permanece ativo." : "Não foi possível confirmar a restauração do network-lock do WireSock." }),
+        // So ha erro quando o veredito falhou. O reset do network-lock nao entra aqui: virou
+        // aviso, porque nao diz nada sobre o tunel ter parado.
+        ...(stopped ? {} : {
+            error: !residual.reliable
+                ? residual.reason || UNKNOWN_WIRESOCK_STATE
+                : "O WireSock próprio ainda permanece ativo.",
+        }),
     };
+}
+
+/**
+ * Retomada gerenciada: encerra somente serviços e processos cuja config foi comprovada
+ * como instância do GoLiveBypass (GUI ou pool de rotas dela) e libera o slot para o plugin.
+ * Nunca toca em WireSock externo, em leitura desconhecida ou em mistura dos dois. Chamada
+ * apenas pela ativação explícita do usuário, depois de o controller reservar o owner.lock.
+ */
+export async function stopManagedWireSock(configPath: string, guiConfigPath: string, log: WireSockLogger): Promise<WireSockCleanupResult> {
+    if (!isWindows()) return { stopped: true, servicesResidual: [], processResidual: [], networkLockReset: false, dnsCleared: false, dnsFlushed: false };
+    const initial = await inspectWireSockUntilReliable(configPath, guiConfigPath);
+    if (!initial.reliable) {
+        const error = initial.reason || UNKNOWN_WIRESOCK_STATE;
+        log("warn", "retomada adiada porque o estado do WireSock é desconhecido", { motivo: error });
+        return { stopped: false, servicesResidual: initial.services, processResidual: initial.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+    }
+    if (!initial.active) return { stopped: true, servicesResidual: [], processResidual: [], networkLockReset: false, dnsCleared: false, dnsFlushed: false };
+    if (initial.origin !== "gui" && initial.origin !== "managed") {
+        const error = initial.reason || "WireSock externo detectado";
+        log("warn", "retomada recusada para preservar WireSock não gerenciado", { motivo: error, origem: initial.origin });
+        return { stopped: false, servicesResidual: initial.services, processResidual: initial.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+    }
+
+    // Somente serviços comprovadamente gerenciados: no veredito "gui"/"managed" não existe
+    // recurso externo, então a lista ativa é exatamente o conjunto encerrável.
+    for (const name of initial.services) {
+        if (!runAsAdministrator("sc.exe", ["stop", name], log)) {
+            log("warn", "o Windows não autorizou parar o serviço WireSock gerenciado", { servico: name });
+            return { stopped: false, servicesResidual: initial.services, processResidual: initial.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error: "O Windows não autorizou encerrar a instância anterior do GoLiveBypass." };
+        }
+    }
+    let stopped = false;
+    for (let attempt = 0; attempt < 2 && !stopped; attempt++) {
+        await wait(500);
+        const current = await inspectWireSockUntilReliable(configPath, guiConfigPath);
+        if (!current.reliable) {
+            const error = current.reason || UNKNOWN_WIRESOCK_STATE;
+            log("error", "retomada interrompida porque o estado do WireSock ficou desconhecido", { motivo: error });
+            return { stopped: false, servicesResidual: current.services, processResidual: current.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+        }
+        if (!current.active) { stopped = true; break; }
+        if (current.origin !== "gui" && current.origin !== "managed") {
+            const error = current.reason || "WireSock externo apareceu durante a retomada";
+            log("error", "retomada interrompida ao detectar WireSock não gerenciado", { motivo: error, origem: current.origin });
+            return { stopped: false, servicesResidual: current.services, processResidual: current.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+        }
+        killProcesses(current.processIds, "gerenciado", log);
+    }
+    if (!stopped) {
+        const residual = await inspectWireSockUntilReliable(configPath, guiConfigPath);
+        const error = residual.reliable && residual.active
+            ? "A instância anterior do GoLiveBypass não encerrou; tente novamente."
+            : residual.reason || UNKNOWN_WIRESOCK_STATE;
+        log("error", "retomada não confirmou o encerramento da instância gerenciada", { services: residual.services, pids: residual.processIds });
+        return { stopped: false, servicesResidual: residual.services, processResidual: residual.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+    }
+
+    // Tudo que foi encerrado era GoLiveBypass comprovado: o lock e o DNS do adaptador
+    // pertenciam à sessão morta, não a uma VPN externa viva.
+    const executable = findWireSockCandidate()?.executable;
+    const networkLockReset = executable ? resetNetworkLock(executable, log) : false;
+    const dnsCleared = clearWireSockDns(log);
+    let dnsFlushed = false;
+    try {
+        execFileSync("ipconfig.exe", ["/flushdns"], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
+        dnsFlushed = true;
+    } catch (error) {
+        log("warn", "flushdns falhou", { erro: logError(error) });
+    }
+    log("info", "WireSock da GUI GoLiveBypass encerrado; plugin assumiu o serviço", { networkLockReset });
+    return { stopped: true, servicesResidual: [], processResidual: [], networkLockReset, dnsCleared, dnsFlushed };
 }
 
 function httpsCheck(url: string): Promise<boolean> {
@@ -571,6 +956,119 @@ export async function diagnoseWindowsNetwork(log: WireSockLogger): Promise<Windo
     return result;
 }
 
+const ROUTE_PROBE_BASENAME = /^\.golive-route-probe-\d+-\d+\.exe$/i;
+const ROUTE_PROBE_REMOVE_RETRIES = 3;
+const ROUTE_PROBE_REMOVE_RETRY_DELAY_MS = 200;
+const ROUTE_PROBE_GRACE_MS = 60_000;
+
+export type RouteProbeRemoval = "removed" | "missing" | "invalid" | "busy";
+
+export interface RouteProbeCleanupResult {
+    scanned: number;
+    removed: number;
+    protected: number;
+    recent: number;
+    invalid: number;
+    busy: number;
+}
+
+function probePathKey(value: string): string {
+    const resolved = path.resolve(value);
+    return isWindows() ? resolved.toLowerCase() : resolved;
+}
+
+function probeErrorCode(error: unknown): string | undefined {
+    if (!error || typeof error !== "object") return undefined;
+    const { code } = (error as { code?: unknown });
+    return typeof code === "string" ? code : undefined;
+}
+
+export function isManagedRouteProbePath(directory: string, candidate: string): boolean {
+    const root = path.resolve(directory);
+    const target = path.resolve(candidate);
+    const relative = path.relative(root, target);
+    if (!relative || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) return false;
+    if (path.dirname(relative) !== ".") return false;
+    return ROUTE_PROBE_BASENAME.test(path.basename(target));
+}
+
+export async function removeRouteProbe(directory: string, target: string): Promise<RouteProbeRemoval> {
+    if (!isManagedRouteProbePath(directory, target)) return "invalid";
+    try {
+        const stat = fs.lstatSync(target);
+        if (!stat.isFile() || stat.isSymbolicLink()) return "invalid";
+    } catch (error) {
+        return probeErrorCode(error) === "ENOENT" ? "missing" : "busy";
+    }
+
+    for (let attempt = 0; attempt < ROUTE_PROBE_REMOVE_RETRIES; attempt++) {
+        try {
+            // maxRetries/retryDelay only apply to recursive removal in Node.
+            // Use explicit bounded attempts so an in-use Windows executable is
+            // retried without ever enabling recursive deletion.
+            fs.rmSync(target, { force: true });
+            if (!fs.existsSync(target)) return "removed";
+        } catch (error) {
+            if (probeErrorCode(error) === "ENOENT") return "missing";
+        }
+        if (attempt + 1 < ROUTE_PROBE_REMOVE_RETRIES)
+            await new Promise<void>(resolve => setTimeout(resolve, ROUTE_PROBE_REMOVE_RETRY_DELAY_MS));
+    }
+    return "busy";
+}
+
+export async function cleanupRouteProbes(
+    directory: string,
+    protectedPaths: readonly string[] = [],
+    now = Date.now(),
+    graceMs = ROUTE_PROBE_GRACE_MS,
+): Promise<RouteProbeCleanupResult> {
+    const result: RouteProbeCleanupResult = { scanned: 0, removed: 0, protected: 0, recent: 0, invalid: 0, busy: 0 };
+    const protectedSet = new Set(
+        protectedPaths.filter(candidate => isManagedRouteProbePath(directory, candidate)).map(probePathKey),
+    );
+    let entries: string[];
+    try {
+        entries = fs.readdirSync(directory);
+    } catch {
+        return result;
+    }
+
+    for (const name of entries) {
+        if (!ROUTE_PROBE_BASENAME.test(name)) continue;
+        result.scanned++;
+        const target = path.join(directory, name);
+        if (protectedSet.has(probePathKey(target))) {
+            result.protected++;
+            continue;
+        }
+
+        let stat: fs.Stats;
+        try {
+            stat = fs.lstatSync(target);
+        } catch {
+            result.busy++;
+            continue;
+        }
+        if (!stat.isFile() || stat.isSymbolicLink()) {
+            result.invalid++;
+            continue;
+        }
+        if (now - stat.mtimeMs < graceMs) {
+            result.recent++;
+            continue;
+        }
+
+        switch (await removeRouteProbe(directory, target)) {
+            case "removed": result.removed++; break;
+            case "missing": break;
+            case "invalid": result.invalid++; break;
+            case "busy": result.busy++; break;
+        }
+    }
+    return result;
+}
+
 export function routeProbeExecutablePath(directory: string): string {
     return path.join(directory, `.golive-route-probe-${process.pid}-${Date.now()}.exe`);
 }
@@ -580,11 +1078,14 @@ export function copyRouteProbe(source: string, target: string): void {
     fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
 }
 
-export function removeRouteProbe(target: string): void {
-    try { fs.rmSync(target, { force: true }); } catch {}
-}
-
 export function runRouteProbe(executable: string): Promise<Record<string, unknown> | null> {
+    try {
+        const stat = fs.lstatSync(executable);
+        if (!stat.isFile() || stat.isSymbolicLink() || !isManagedRouteProbePath(path.dirname(executable), executable))
+            return Promise.resolve(null);
+    } catch {
+        return Promise.resolve(null);
+    }
     return new Promise(resolve => {
         execFile(executable, ["-route-probe"], { windowsHide: true, timeout: 12_000, encoding: "utf8" }, (_error, stdout) => {
             try {

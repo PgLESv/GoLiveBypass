@@ -35,18 +35,7 @@ func main() {
 			}
 		}
 		if isJSON {
-			response := map[string]any{
-				"success": false,
-				"error":   err.Error(),
-			}
-			var hvErr auth.HumanVerificationError
-			if errors.As(err, &hvErr) {
-				response["code"] = hvErr.Code
-				response["retryable"] = hvErr.Retryable
-				if hvErr.CaptchaURL != "" {
-					response["captchaUrl"] = hvErr.CaptchaURL
-				}
-			}
+			response := jsonErrorResponse(err)
 			data, _ := json.Marshal(response)
 			fmt.Println(string(data))
 		} else {
@@ -54,6 +43,47 @@ func main() {
 		}
 		os.Exit(1)
 	}
+}
+
+func jsonErrorResponse(err error) map[string]any {
+	response := map[string]any{
+		"success": false,
+		"error":   err.Error(),
+	}
+	var hvErr auth.HumanVerificationError
+	if errors.As(err, &hvErr) {
+		response["code"] = hvErr.Code
+		response["retryable"] = hvErr.Retryable
+		if hvErr.CaptchaURL != "" {
+			response["captchaUrl"] = hvErr.CaptchaURL
+		}
+		return response
+	}
+	if errors.Is(err, auth.ErrTwoFactorRequired) {
+		response["code"] = "TWO_FACTOR_REQUIRED"
+		response["retryable"] = false
+		return response
+	}
+	if auth.IsTwoFactorError(err) {
+		response["code"] = "TWO_FACTOR_INVALID"
+		response["retryable"] = false
+		return response
+	}
+	if auth.IsInvalidCredentials(err) {
+		response["code"] = "INVALID_CREDENTIALS"
+		response["retryable"] = false
+		return response
+	}
+	if auth.IsSessionPersistenceError(err) {
+		response["code"] = "SESSION_PERSISTENCE"
+		response["retryable"] = true
+		return response
+	}
+	if auth.IsTemporarySessionError(err) {
+		response["code"] = "NETWORK_ERROR"
+		response["retryable"] = true
+	}
+	return response
 }
 
 func run() error {
@@ -69,22 +99,52 @@ func run() error {
 		config.PrintUsage()
 		return err
 	}
+	if err := config.ReadStdinSecrets(cfg); err != nil {
+		return err
+	}
 
 	authClient := auth.NewClient(cfg)
+
+	if cfg.SessionUsername {
+		username, usernameErr := authClient.SessionUsername()
+		if cfg.JSONOutput {
+			data, _ := json.Marshal(map[string]any{
+				"success":  usernameErr == nil,
+				"username": username,
+				"error": func() string {
+					if usernameErr != nil {
+						return "Não foi possível ler a sessão Proton."
+					}
+					return ""
+				}(),
+			})
+			fmt.Println(string(data))
+			return nil
+		}
+		if usernameErr != nil {
+			return fmt.Errorf("failed to read cached session username: %w", usernameErr)
+		}
+		fmt.Println(username)
+		return nil
+	}
 
 	if cfg.CheckSession {
 		session, timeUntilExpiry, err := authClient.CheckSession()
 		if err != nil || session == nil {
+			errorMessage := "Sessão expirada ou não encontrada"
+			if auth.IsTemporarySessionError(err) {
+				errorMessage = "Não foi possível verificar a sessão Proton temporariamente"
+			}
 			if cfg.JSONOutput {
 				data, _ := json.Marshal(map[string]any{
 					"success": false,
 					"valid":   false,
-					"error":   "Sessão expirada ou não encontrada",
+					"error":   errorMessage,
 				})
 				fmt.Println(string(data))
 				return nil
 			}
-			return fmt.Errorf("sessão expirada ou não encontrada")
+			return errors.New(errorMessage)
 		}
 		vpnClient := vpn.NewClient(cfg, session)
 		tier := 0
@@ -120,16 +180,20 @@ func run() error {
 	if cfg.CheckPlan {
 		session, _, sessionErr := authClient.CheckSession()
 		if sessionErr != nil || session == nil {
+			errorMessage := "Sessão Proton expirada ou não encontrada."
+			if auth.IsTemporarySessionError(sessionErr) {
+				errorMessage = "Não foi possível verificar a sessão Proton temporariamente."
+			}
 			if cfg.JSONOutput {
 				data, _ := json.Marshal(map[string]any{
 					"success": false,
 					"status":  "unknown",
-					"error":   "Sessão Proton expirada ou não encontrada.",
+					"error":   errorMessage,
 				})
 				fmt.Println(string(data))
 				return nil
 			}
-			return fmt.Errorf("sessão Proton expirada ou não encontrada")
+			return errors.New(errorMessage)
 		}
 
 		plan, planErr := vpn.NewClient(cfg, session).GetAccountPlan()
@@ -207,6 +271,8 @@ func run() error {
 	switch {
 	case cfg.ListConfigs:
 		return listConfigs(vpnClient)
+	case cfg.RouteCatalog:
+		return catalogServers(cfg, vpnClient)
 	case cfg.ListServers:
 		return listServers(cfg, vpnClient)
 	case cfg.RenewSerial != "":
@@ -250,7 +316,55 @@ func generateConfig(cfg *config.Config, vpnClient *vpn.Client) error {
 	var server *api.LogicalServer
 	var pingMs int
 	var measured *speedtest.Result
-	if cfg.SpeedTest {
+	if cfg.ManualProbe {
+		progress := speedtest.ProgressFunc(nil)
+		if cfg.ProgressJSON || cfg.SpeedTestTrace {
+			progress = func(event speedtest.ProgressEvent) {
+				if cfg.ProgressJSON {
+					data, _ := json.Marshal(event)
+					fmt.Fprintf(os.Stderr, "GOLIVE_PROGRESS %s\n", data)
+				}
+				if cfg.SpeedTestTrace {
+					printSpeedTrace(event)
+				}
+			}
+			progress(speedtest.ProgressEvent{Phase: "ping", Total: 0, Tested: 0, Succeeded: 0})
+		}
+
+		server, pingMs, err = selector.SelectManualWithPing(servers)
+		if err != nil {
+			return err
+		}
+		if progress != nil {
+			progress(speedtest.ProgressEvent{
+				Phase: "ping", Total: 1, Tested: 1, Succeeded: 1,
+				Server: server.Name, PingMs: pingMs, Status: "success",
+			})
+			progress(speedtest.ProgressEvent{
+				Phase: "preparing", Total: 1, Tested: 0, Succeeded: 0,
+				Server: server.Name, Status: "testing",
+			})
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		probeErr := speedtest.ProbeCandidate(ctx, cfg.ClientPrivateKey, *server)
+		cancel()
+		if progress != nil {
+			status := "success"
+			succeeded := 1
+			if probeErr != nil {
+				status = "failed"
+				succeeded = 0
+			}
+			progress(speedtest.ProgressEvent{
+				Phase: "preparing", Total: 1, Tested: 1, Succeeded: succeeded,
+				Server: server.Name, Status: status,
+			})
+		}
+		if probeErr != nil {
+			return fmt.Errorf("manual route preflight failed: %w", probeErr)
+		}
+	} else if cfg.SpeedTest {
 		const (
 			pingTriageLimit       = 12
 			speedMeasurementLimit = 6
@@ -315,7 +429,13 @@ func generateConfig(cfg *config.Config, vpnClient *vpn.Client) error {
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-		healthyCandidates, probeErr := speedtest.FilterReachableCandidatesConcurrent(ctx, cfg.ClientPrivateKey, candidates, pingTriageLimit, preflightConcurrency, progress)
+		var healthyCandidates []api.LogicalServer
+		var probeErr error
+		if cfg.RequireDiscord {
+			healthyCandidates, probeErr = speedtest.FilterDiscordReachableCandidatesConcurrent(ctx, cfg.ClientPrivateKey, candidates, pingTriageLimit, preflightConcurrency, progress)
+		} else {
+			healthyCandidates, probeErr = speedtest.FilterReachableCandidatesConcurrent(ctx, cfg.ClientPrivateKey, candidates, pingTriageLimit, preflightConcurrency, progress)
+		}
 		if probeErr != nil {
 			cancel()
 			return probeErr
@@ -382,6 +502,10 @@ func generateConfig(cfg *config.Config, vpnClient *vpn.Client) error {
 			"confFile":  cfg.OutputFile,
 			"expiresAt": vpnInfo.ExpirationTime,
 		}
+		if cfg.ManualProbe {
+			resp["manual"] = true
+			resp["preflight"] = "success"
+		}
 		if measured != nil {
 			resp["downloadMbps"] = measured.DownloadMbps
 			resp["uploadMbps"] = measured.UploadMbps
@@ -447,7 +571,32 @@ func generateRoutePool(cfg *config.Config, vpnClient *vpn.Client) error {
 		}
 	}
 	selector := vpn.NewServerSelector(cfg)
-	candidates, pings, err := selector.SpeedCandidatesWithProgressExcluding(servers, cfg.RoutePoolSize, excluded, nil)
+	var pingProgress vpn.PingProgressFunc
+	if cfg.ProgressJSON || cfg.SpeedTestTrace {
+		emitProgress := func(event speedtest.ProgressEvent) {
+			if cfg.ProgressJSON {
+				data, _ := json.Marshal(event)
+				fmt.Fprintf(os.Stderr, "GOLIVE_PROGRESS %s\n", data)
+			}
+			if cfg.SpeedTestTrace {
+				printSpeedTrace(event)
+			}
+		}
+		emitProgress(speedtest.ProgressEvent{Phase: "ping", Total: 0, Tested: 0, Succeeded: 0})
+		pingProgress = func(event vpn.PingProgressEvent) {
+			emitProgress(speedtest.ProgressEvent{
+				Phase:     "ping",
+				Total:     event.Total,
+				Tested:    event.Tested,
+				Succeeded: event.Succeeded,
+				Server:    event.Server,
+				PingMs:    event.PingMs,
+				ElapsedMs: event.ElapsedMs,
+				Status:    event.Status,
+			})
+		}
+	}
+	candidates, pings, err := selector.SpeedCandidatesWithProgressExcluding(servers, cfg.RoutePoolSize, excluded, pingProgress)
 	if err != nil {
 		return err
 	}
@@ -681,6 +830,244 @@ func listServers(cfg *config.Config, vpnClient *vpn.Client) error {
 	}
 	fmt.Printf("\n%d servers found across %d countries.\n", len(filtered), len(seen))
 	return nil
+}
+
+type routeCatalogEntry struct {
+	Server  string  `json:"server"`
+	Country string  `json:"country"`
+	City    string  `json:"city"`
+	Tier    string  `json:"tier"`
+	Load    int     `json:"load"`
+	Score   float64 `json:"score"`
+	PingMs  int     `json:"pingMs,omitempty"`
+}
+
+type routeCatalogResult struct {
+	Success bool                `json:"success"`
+	Routes  []routeCatalogEntry `json:"routes"`
+}
+
+func eligibleRouteServers(cfg *config.Config, servers []api.LogicalServer) []api.LogicalServer {
+	filtered := vpn.EligibleServers(cfg, servers)
+	filtered = slices.DeleteFunc(filtered, func(server api.LogicalServer) bool {
+		return slices.Contains(cfg.ExcludedServers, server.Name)
+	})
+	slices.SortFunc(filtered, func(a, b api.LogicalServer) int {
+		if c := cmp.Compare(a.ExitCountry, b.ExitCountry); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.City, b.City); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Score, b.Score); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Load, b.Load); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+	return filtered
+}
+
+func routeCatalogEntries(servers []api.LogicalServer) []routeCatalogEntry {
+	entries := make([]routeCatalogEntry, len(servers))
+	for i := range servers {
+		entries[i] = routeCatalogEntry{
+			Server:  servers[i].Name,
+			Country: servers[i].ExitCountry,
+			City:    servers[i].City,
+			Tier:    api.GetTierName(servers[i].Tier),
+			Load:    servers[i].Load,
+			Score:   servers[i].Score,
+		}
+	}
+	return entries
+}
+
+func eligibleRouteCatalog(cfg *config.Config, servers []api.LogicalServer) []routeCatalogEntry {
+	return routeCatalogEntries(eligibleRouteServers(cfg, servers))
+}
+
+func attachRouteCatalogPings(entries []routeCatalogEntry, pings map[string]int) {
+	for i := range entries {
+		ping := pings[entries[i].Server]
+		if ping > 0 && ping < 999 {
+			entries[i].PingMs = ping
+		}
+	}
+}
+
+// catalogHeader announces the size of the catalog before any route row.
+type catalogHeader struct {
+	Phase     string `json:"phase"`
+	Total     int    `json:"total"`
+	Tested    int    `json:"tested"`
+	Succeeded int    `json:"succeeded"`
+}
+
+// catalogRow is one catalogued route. Unlike speedtest.ProgressEvent it always
+// serializes load and score, including zero, so a consumer never drops a route
+// whose load or score is exactly 0. A measurement update reuses the announced
+// server name and metadata and only adds pingMs when the probe produced a valid
+// latency.
+type catalogRow struct {
+	Phase     string  `json:"phase"`
+	Total     int     `json:"total"`
+	Tested    int     `json:"tested"`
+	Succeeded int     `json:"succeeded"`
+	Server    string  `json:"server"`
+	Country   string  `json:"country,omitempty"`
+	City      string  `json:"city,omitempty"`
+	Tier      string  `json:"tier,omitempty"`
+	Load      int     `json:"load"`
+	Score     float64 `json:"score"`
+	PingMs    int     `json:"pingMs,omitempty"`
+	Status    string  `json:"status,omitempty"`
+}
+
+// catalogProgress publishes the progressive -route-catalog stream consumed by
+// the GUI and the plugin. The complete row set is announced before the first
+// probe and every completed measurement then updates its own row by exact
+// server name. It stays inert when no progress sink is configured.
+type catalogProgress struct {
+	emit      func(any)
+	index     map[string]routeCatalogEntry
+	total     int
+	tested    int
+	succeeded int
+}
+
+func newCatalogProgress(entries []routeCatalogEntry, emit func(any)) *catalogProgress {
+	if emit == nil {
+		return nil
+	}
+	index := make(map[string]routeCatalogEntry, len(entries))
+	for _, entry := range entries {
+		index[entry.Server] = entry
+	}
+	return &catalogProgress{emit: emit, index: index, total: len(entries)}
+}
+
+// announce reports the catalog header plus one metadata event per route as soon
+// as the service list is filtered, before any ping measurement starts, so a
+// consumer renders every row while the probes are still pending. The announced
+// fields are exactly the public metadata the final JSON carries.
+func (p *catalogProgress) announce(entries []routeCatalogEntry) {
+	if p == nil {
+		return
+	}
+	p.emit(catalogHeader{Phase: "catalog", Total: p.total})
+	for _, entry := range entries {
+		p.emit(catalogRow{
+			Phase:   "catalog",
+			Total:   p.total,
+			Server:  entry.Server,
+			Country: entry.Country,
+			City:    entry.City,
+			Tier:    entry.Tier,
+			Load:    entry.Load,
+			Score:   entry.Score,
+			Status:  "success",
+		})
+	}
+}
+
+// record reports one finished probe for the row it belongs to. Only a finite
+// measurement between 1 ms and 998 ms becomes a ping: a missing or failed probe
+// is published without a latency, keeping the announced metadata, and never
+// aborts the catalog. Probed servers outside the catalog stay silent.
+func (p *catalogProgress) record(event vpn.PingProgressEvent) {
+	if p == nil {
+		return
+	}
+	entry, catalogued := p.index[event.Server]
+	if !catalogued {
+		return
+	}
+	p.tested++
+	update := catalogRow{
+		Phase:   "catalog",
+		Total:   p.total,
+		Tested:  p.tested,
+		Server:  entry.Server,
+		Country: entry.Country,
+		City:    entry.City,
+		Tier:    entry.Tier,
+		Load:    entry.Load,
+		Score:   entry.Score,
+		Status:  "failed",
+	}
+	if event.PingMs > 0 && event.PingMs < 999 {
+		p.succeeded++
+		update.PingMs = event.PingMs
+		update.Status = "success"
+	}
+	update.Succeeded = p.succeeded
+	p.emit(update)
+}
+
+func catalogServers(cfg *config.Config, vpnClient *vpn.Client) error {
+	servers, err := vpnClient.GetServers()
+	if err != nil {
+		return fmt.Errorf("failed to get servers: %w", err)
+	}
+
+	eligible := eligibleRouteServers(cfg, servers)
+	entries := routeCatalogEntries(eligible)
+	if len(entries) == 0 {
+		if len(cfg.Countries) > 0 {
+			return fmt.Errorf("no online servers found for countries: %v", cfg.Countries)
+		}
+		return fmt.Errorf("no online servers found")
+	}
+
+	// The catalog uses its own event shape so load and score are always present,
+	// even when they are exactly zero.
+	var emit func(any)
+	if cfg.ProgressJSON {
+		emit = func(event any) {
+			data, _ := json.Marshal(event)
+			fmt.Fprintf(os.Stderr, "GOLIVE_PROGRESS %s\n", data)
+		}
+	}
+	progress := newCatalogProgress(entries, emit)
+	// The catalog is complete as soon as the service list is filtered, so every
+	// row is published before the first probe instead of after the whole batch.
+	progress.announce(entries)
+
+	if cfg.AutoPing {
+		// The regional ping keeps its existing bounded concurrency, deadline and
+		// candidate set; each finished probe updates its own row, so an individual
+		// failure never aborts the catalog.
+		_, pings, _ := vpn.NewServerSelector(cfg).SpeedCandidatesWithProgress(eligible, len(eligible), progress.record)
+		attachRouteCatalogPings(entries, pings)
+	}
+
+	if cfg.JSONOutput {
+		data, _ := json.Marshal(routeCatalogResult{Success: true, Routes: entries})
+		fmt.Println(string(data))
+		return nil
+	}
+
+	fmt.Printf("%-7s  %-14s  %-18s  %5s  %6s  %-10s\n",
+		"Country", "Server", "City", "Load", "Score", "Tier")
+	fmt.Println(strings.Repeat("-", 86))
+	for i := range entries {
+		entry := &entries[i]
+		fmt.Printf("%-7s  %-14s  %-18s  %3d%%  %6.2f  %-10s\n",
+			entry.Country, entry.Server, entry.City, entry.Load, entry.Score, entry.Tier)
+	}
+	fmt.Printf("\n%d routes found across %d countries.\n", len(entries), countCatalogCountries(entries))
+	return nil
+}
+
+func countCatalogCountries(entries []routeCatalogEntry) int {
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		seen[entry.Country] = struct{}{}
+	}
+	return len(seen)
 }
 
 func renewSerial(cfg *config.Config, vpnClient *vpn.Client) error {

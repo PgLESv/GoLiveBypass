@@ -257,12 +257,7 @@
 
               <div class="proton-step-label">2 <span>Escolha sua rota</span></div>
               <div class="proton-controls-row">
-                <select id="protonCountrySelect" class="proton-select">
-                  <option value="">Automático · menor ping, prioriza América do Sul</option>
-                  <option value="US">Estados Unidos · recomendado</option>
-                  <option value="NL">Holanda</option>
-                  <option value="JP">Japão</option>
-                </select>
+                <div id="protonCountrySelect" class="proton-route-select" aria-label="Escolha uma rota Proton"></div>
                 <button type="button" id="protonOptimizeBtn" class="proton-btn proton-btn--action" title="Com o bypass ativo, o Discord fecha durante a medição e reabre após iniciar a nova rota." aria-label="Otimizar rota. Com o bypass ativo, o Discord fecha durante a medição e reabre após iniciar a nova rota.">
                   <svg class="icon-refresh" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <polyline points="23 4 23 10 17 10"/>
@@ -273,16 +268,6 @@
                 </button>
               </div>
 
-              <div id="protonServerBadge" class="proton-server-badge">
-                <span class="proton-server-caption">Rota selecionada</span>
-                <span class="proton-server-route">
-                  <span class="proton-country-flag proton-server-flag" id="protonServerFlag" aria-hidden="true"></span>
-                  <span class="proton-server-name" id="protonServerName">Servidor otimizado</span>
-                </span>
-                <span class="proton-ping-pill" id="protonServerPing">— ms</span>
-                <span class="proton-load-pill" id="protonServerLoad">—% carga</span>
-                <span class="proton-speed-pill" hidden>Velocidade não medida</span>
-              </div>
             </div>
             <div class="proton-feedback" id="protonFeedback" hidden></div>
           </div>
@@ -435,7 +420,28 @@
             </div>
 
             <div class="settings-section settings-section--behavior">
-              <span class="settings-group__label">Comportamento</span>
+              <span class="settings-group__label" id="protonRoutePreferenceLabel">Otimização de rota</span>
+              <div class="theme-opts settings-route-preference__options" role="radiogroup" aria-labelledby="protonRoutePreferenceLabel">
+                <button type="button" id="protonRoutePreferenceAuto" class="theme-opt settings-route-option theme-opt--active" data-route-pref="auto" role="radio" aria-checked="true" tabindex="0">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 12a8 8 0 0 1 13.7-5.7L20 8.5" />
+                    <path d="M20 4v4.5h-4.5" />
+                    <path d="M20 12a8 8 0 0 1-13.7 5.7L4 15.5" />
+                    <path d="M4 20v-4.5h4.5" />
+                  </svg>
+                  <span>Automática</span>
+                </button>
+                <button type="button" id="protonRoutePreferenceManual" class="theme-opt settings-route-option" data-route-pref="manual" role="radio" aria-checked="false" tabindex="-1">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 12h12" />
+                    <path d="m12 8 4 4-4 4" />
+                    <path d="M4 5h16" />
+                    <path d="M4 19h16" />
+                  </svg>
+                  <span>Manual</span>
+                </button>
+              </div>
+              <p id="protonRoutePreferenceFeedback" class="settings-route-preference__feedback" role="status" aria-live="polite" hidden></p>
 
               <label class="settings-switch" id="autoUpdateRow">
                 <span class="settings-switch__icon" aria-hidden="true">

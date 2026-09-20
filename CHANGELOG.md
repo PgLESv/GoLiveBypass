@@ -197,6 +197,460 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - Adiciona um toast interno na GUI quando uma atualização é baixada e fica pronta para reiniciar.
 - Reativa o cliente SSE na beta publicada e mantém a consulta de releases como fallback.
 
+## [2.0.6] - 2026-09-18
+
+### Devlog da release estável
+
+- **Login Proton destravado:** a sessão Proton passa a ser migrada para DPAPI com substituição atômica e nova tentativa quando o arquivo está somente-leitura ou bloqueado por outro processo no Windows. Falha persistente de armazenamento deixa de ser exibida como senha incorreta e a sessão anterior é preservada para nova tentativa (#280, #302, #308, #310).
+- **Discord encontrado fora de `%LOCALAPPDATA%` (Windows):** a varredura passa a cobrir `%ProgramFiles%`, `%ProgramFiles(x86)%` e `%ProgramW6432%`, o processo em execução (`ExecutablePath`), `App Paths`, handlers de URL, entradas de desinstalação e atalhos conhecidos. Restore, desativação e troca de rota reutilizam o snapshot capturado antes de fechar o Discord (#300).
+- **Ativação Linux confiável:** a ativação só conclui depois de confirmar o PID correto dentro de `discord-vpn`; o botão acompanha o watchdog mesmo sem clique, `--status`/`--probe` não travam com stdin herdado e a autorização no Wayland aceita respostas válidas do diálogo, recorrendo ao `sudo askpass` quando não há agente polkit (#278).
+- **Rotas Proton:** catálogo manual com ping progressivo e destaque da melhor candidata; cada candidato precisa alcançar o gateway do Discord pelo próprio túnel antes de ser escolhido; opção de otimizar ao abrir ou somente ao clicar em **Otimizar rota**.
+- **Instaladores:** canal stable/beta no Windows e Linux (stable é o padrão), injeção verificada por alvo em vez do exit code, preservação do Vencord/Equicord existente, recuperação de locks órfãos e log de instalação local em JSONL com redaction (#289, #293).
+- **Updater:** o portable Windows troca o executável por helper externo depois que o processo antigo sai, com identidade, tamanho, SHA-256 e rollback; o canal estável não recebe beta nem downgrade.
+- **Observabilidade:** GUI, plugin e instaladores mantêm registro local limitado e redigido; o `/golivebypass` continua sendo um relatório manual, sem telemetria automática.
+
+### Detalhes por área
+
+### Plugin Linux: preflight do módulo e elevação única
+
+- A ativação verifica o módulo WireGuard do kernel antes de abrir o prompt administrativo. Em kernel atualizado sem os módulos correspondentes, o plugin informa o release em execução e orienta reiniciar no kernel instalado, sem pedir senha.
+- A criação do namespace, interface, configuração, rotas e DNS agora usa uma única chamada privilegiada com rollback próprio, evitando uma senha por comando e preservando o isolamento por aplicativo.
+
+### Instalador Linux: recuperação de locks órfãos
+
+- Antes de reabrir o Discord nativo, o instalador remove links `Singleton*` deixados por crash ou encerramento forçado somente quando nenhum processo Discord nativo está ativo; uma instância paralela não impede essa recuperação. Locks nativos de uma instância viva são preservados.
+- A regressão cobre remoção segura de locks órfãos, preservação durante uma execução ativa e coexistência com cliente paralelo.
+
+### Instalador Linux: identidade do mod e clientes paralelos
+
+- A guarda que preserva o mod existente agora considera somente injeções no Discord oficial. Equibop, Vesktop e Legcord são clientes paralelos e não bloqueiam um checkout compatível escolhido para a instalação; conflitos reais no Discord oficial continuam recusados.
+- A regressão cobre Equibop paralelo permitido e mod diferente no Discord oficial bloqueado.
+
+### Instaladores: canais stable/beta do plugin
+
+- Windows (`-Channel stable|beta`) e Linux (`--channel stable|beta`) usam stable por padrão. Em modo interativo, stable é a opção recomendada, com o canal mais previsível e somente releases estáveis; beta é opt-in: um canal de testes em que você ajuda a comunidade ao testar, encontrar e corrigir erros antes da versão estável. Nenhum canal promete estabilidade.
+- A preferência é persistida separadamente em `plugins.GoLiveBypass.updateChannel` no `settings.json` do Equicord/Vencord, preservando `autoUpdate` e as demais chaves; as configurações da GUI e do standalone não são tocadas.
+- Checagens e instalações escolhem a maior versão SemVer válida do canal, exigem release publicada com ZIP e SHA-256, rejeitam metadata inconsistente e nunca fazem downgrade. `--check-update`/`-Mode CheckUpdate` consultam a API sem baixar o ZIP, mas podem persistir a preferência de canal após uma operação válida.
+- Como o canal selecionado exige um ZIP e seu SHA-256 da mesma release, uma release sem esses assets agora falha de forma explícita e não cai silenciosamente em `RepoRaw`; use `--plugin-source`/`-PluginSource` somente quando quiser uma fonte local explícita.
+- O menu principal agora oferece `Mudar canal de atualizacoes` com submenu Stable/Beta/Cancelar. A troca salva imediatamente e retorna ao menu sem instalar, atualizar, compilar, injetar ou reiniciar; sem checkout, mostra como preparar um mod primeiro e não grava configuração ambígua. No fallback textual, `uninstall`/`restore` passam de `[4]`/`[5]` para `[5]`/`[6]`.
+
+
+### Instalador Windows: injeção e fonte ausente
+
+- A injeção oficial verifica o stub de cada alvo selecionado, em vez de confiar no exit code do `pnpm`; a chamada não passa o separador extra e limita detalhes de falha.
+- Sem checkout fonte válido, detectar Vencord ou Equicord no Discord não bloqueia mais a escolha/download explícito de um mod. Nenhuma fonte ambígua ou distribuição instalada é aceita como checkout.
+
+### Observabilidade local/manual do plugin e dos instaladores
+
+- O plugin Vencord/Equicord passa a manter eventos JSONL locais com correlação por operação/tentativa, view textual compatível em `getLog()`, redaction recursiva, retenção limitada, dedupe de watchdog/progresso e métricas do helper sem stdout/stderr bruto. O `/golivebypass` continua sendo um relatório manual e limitado.
+- Os instaladores Windows/Linux registram `installer.log` local em JSONL, com timestamp UTC em milissegundos, rotação por bytes sem linhas parciais, redaction de credenciais/URLs/caminhos e tolerância a falha de escrita.
+- A #293 fica distinguível por evento `MOD_INSTALLED_WITHOUT_CHECKOUT`: o gate preserva `app.asar`/`_app.asar` quando Vencord/Equicord é detectado sem checkout comprovado. A causa específica do checkout ausente continua hipótese sem evidência adicional.
+- Não há telemetria nem envio automático de bug report. Downloads normais do GitHub para instalar/atualizar o plugin continuam no fluxo existente; nenhuma decisão de roteamento, WireGuard/WireSock, ownership, relaunch ou rollback foi alterada.
+- Cobertura segura: `test-installer-log.sh` valida redaction, timestamp, rotação, falha de escrita, ausência de POST e #293; os testes de logger/helper do plugin cobrem JSONL, correlação, dedupe, restore, limites e dados sintéticos sem credenciais reais.
+
+### Instalador Linux: seleção direta do cliente Discord
+
+- No menu com vários clientes detectados, as setas destacam o destino e **Enter** agora seleciona esse cliente imediatamente quando ainda não há marcações. **Espaço** e `a` continuam disponíveis para instalar em vários clientes; **Esc** continua cancelando.
+
+### Instalador Linux: pergunta de qual cliente vem antes de mexer no checkout
+
+- Relato: com vários clientes e TUI, a pergunta "Quais Discords recebem o plugin?" só aparecia depois de instalar dependências, baixar/compilar o plugin — ou seja, depois de `ensure_toolchain`, `install_plugin_source` e `build_mod`. Quem queria apenas escolher o cliente esperava a build inteira, e um **Esc** no menu chegava tarde demais.
+- **Correção:** `do_install` agora chama `selecionar_alvos_inject` logo após `select_target` definir o checkout e **antes** de `ensure_toolchain`, `install_plugin_source` e `build_mod`. A lista escolhida é reaproveitada em `alvos_ja_injetados`/`injetar_alvos`, então o seletor roda uma única vez. Com vários clientes e TTY, a pergunta aparece primeiro e **Esc cancela sem instalar dependências, sem compilar o plugin e sem tocar em nenhum Discord**. Um único alvo e `--yes`/não-interativo continuam idênticos (sem pergunta).
+- `tests/test-installer-client-selector-full-flow.sh` ganhou duas verificações de comportamento: a ordem real (`seletor` antes de `ensure_toolchain`/`install_plugin_source`/`build_mod`, chamado exatamente uma vez) e o cancelamento (`Esc` derruba o `do_install` sem executar nenhuma etapa de mutação). O contador de vereditos do teste foi corrigido — o `ok` do próprio instalador sombreava o do teste, então o resumo sempre dizia "0 OK".
+- Evidência: `sh tests/test-installer-client-selector-full-flow.sh` → 14 OK, 0 falhas; `tests/test-inject-selector.sh` 18/18 e `tests/test-selector.sh` 19/19 sem regressão; smoke PTY real (TUI de verdade, HOME falso, nenhuma etapa toca Discord) mostrou o menu antes das mutações e o `Esc` cancelando sem efeitos.
+
+### Teste: regressão end-to-end do seletor de clientes do instalador Linux
+
+- `tests/test-installer-client-selector-full-flow.sh` dirige o fluxo completo (`main_menu` → `do_install` → `select_target` → `selecionar_alvos_inject` → `escolher_alvos_inject` → `tui_menu_multi`) com HOME/XDG temporários e clientes falsos (oficial + Vesktop + Legcord + Canary + flatpak), sem PTY e sem tocar Discord real. Garante que o seletor aparece com todos os clientes detectados, que o caminho pós-criação do checkout também oferece o menu, e que `--yes`/`ASSUME_YES` mantém o comportamento não-interativo (sem seletor, oficiais vão direto para injeção).
+
+### GUI Linux: confirmação de processo no namespace (#278)
+
+- Causa confirmada no caminho reportado: `wait_discord_started` aceitava qualquer processo `Discord` encontrado por `pgrep`, sem provar que o PID correto tinha entrado em `discord-vpn`; o watchdog/status também podiam concluir `INACTIVE` porque a inspeção do namespace era feita sem elevação.
+- Correção: a ativação só conclui após confirmar, pelo caminho elevado já autorizado na própria ativação, o PID do cliente no namespace. Falha nessa confirmação fecha o processo observado, remove o namespace e propaga uma causa sanitizada; status, probe e watchdog usam apenas consultas readonly não interativas (`sudo -n`) e permanecem log-only.
+- A guarda serial existente continua tratando uma ativação concorrente/duplicada como no-op quando o estado confirmado é `ACTIVE`, sem encerrar uma sessão recém-confirmada. `portal=ausente`, updater 404 e falhas de handshake/HTTP/IP continuam diagnósticos, não bloqueios.
+- Hipótese restante: um encerramento espontâneo posterior do Electron (por Wayland/Flatpak/portal ou atualização) não pode ser atribuído à confirmação de namespace sem log de crash correspondente. Limitação: não houve ativação real, `sudo`/`pkexec`, encerramento do Discord ou alteração de rede/namespace neste host.
+
+### GUI Windows: descoberta de instalações Discord fora de `%LOCALAPPDATA%` (#300)
+
+- A GUI Windows passa a procurar as raízes conhecidas `%ProgramFiles%`, `%ProgramFiles(x86)%` e `%ProgramW6432%` além de `%LOCALAPPDATA%`, nos layouts `<raiz>\<cliente>` e `<raiz>\Programs\<cliente>`, sem depender só das raízes fixas antigas.
+- Instalações em execução são reconhecidas pelo `ExecutablePath` do processo; instalações paradas, por `App Paths`, handlers de URL (`discord`/`discordptb`/`discordcanary`/`vesktop`/`equibop`/`legcord`), entradas `Uninstall` limitadas e atalhos conhecidos (Start Menu do usuário e comum, Desktop do usuário e público). Não há varredura de disco, enumeração recursiva de volume nem inventário irrestrito da máquina.
+- Restore, desativação, troca de rota (manual/Proton) e rollback capturam o snapshot de instalações **antes** de encerrar o Discord e reutilizam a mesma lista ao relançar, sem depender de um novo scan depois que o processo terminou.
+- Falhas parciais (timeout, CIM/registro indisponível, truncamento de enumeração) ficam restritas ao diagnóstico (`scan.fonte`) e não apagam candidatos de outras fontes nem transformam indisponibilidade em ausência comprovada.
+- `windowsAllowedAppPaths()`/`AllowedApps` permanecem sem alteração; Linux, macOS, plugin e standalone não mudam.
+- `scan.inicio`, `scan.raiz` e `scan.install` agora sanitizam o caminho antes de registrar: raízes conhecidas viram placeholders (`%LOCALAPPDATA%`, `%PROGRAMFILES%`, `<usuario>`), trechos fora do layout conhecido viram hash curto e o valor passa por clipping — sem expor usuário nem caminhos customizados.
+- Limitação: uma instalação portable sem registro, atalho ou processo em execução continua invisível; MSIX/MS Store não tem inventário AppX completo nesta versão (só é detectada quando processo, registro consultado ou atalho fornecem o executável exato).
+
+### GUI Windows: migração segura da sessão Proton (#288, #290)
+
+- O helper fecha a sessão legada antes de migrá-la para DPAPI e mantém a substituição atômica. Em arquivo readonly ou bloqueio transitório de compartilhamento, remove somente o atributo readonly e tenta novamente por janela limitada; em falha persistente preserva o cache anterior e devolve `SESSION_PERSISTENCE`, sem acusar senha incorreta ou aceitar fallback em texto claro.
+- A GUI passa a obter apenas a identidade pelo contrato bloqueado `-session-username` do helper, compatível com cache DPAPI, e informa que a senha não foi verificada quando a persistência falha.
+- Coberto por sessão sintética no Windows: arquivo readonly, handle sem share-delete, falha persistente que preserva o arquivo e estresse concorrente. Não inclui login Proton nem Discord reais.
+
+### Instalador Windows: injeção verificável por alvo (#289)
+
+- A chamada oficial usa `pnpm run inject --location <raiz>` sem o separador extra; stdout/stderr e exceções são limitados no diagnóstico.
+- O exit code deixou de ser a autoridade: cada `resources` oficial só é aprovado quando seu stub aponta para o checkout selecionado. Código não-zero ou exceção com pós-condição confirmada fica como aviso; código zero sem pós-condição falha.
+- Testes seguros cobrem argumentos, saída limitada, exceção, código não-zero e dois alvos independentes; não executam Discord real.
+
+### Plugin Windows: retomada segura do WireSock da GUI
+
+- Ao clicar em **Ativar agora**, o plugin reconhece pelo argumento `-config` uma instância WireSock pertencente à GUI GoLiveBypass ou ao pool de rotas dela, encerra somente os serviços e PIDs comprovadamente gerenciados e assume o serviço com a configuração privada `plugin-vpn\wiresock-discord.conf`. A ativação automática do boot e o watchdog continuam sem encerrar processos.
+- Perfis WireSock externos, mistos ou com origem desconhecida continuam bloqueados e preservados. A comparação exige o caminho exato do argumento de configuração, aceita caminhos Windows entre aspas e não confunde sufixos como `.bak`.
+- Verificado no Equicord da VM Windows x64: o painel inicialmente identificou a configuração da GUI, manteve **Ativar agora** disponível, registrou a retomada, relançou o Discord e confirmou serviço/PID próprios, HTTPS do Discord e isolamento por `AllowedApps`. Linux, standalone e o transporte legado não foram alterados.
+
+## [2.0.6-beta-12] - 2026-09-12
+
+### Plugin Vencord/Equicord
+
+- O plugin sai da linha de testes: tem transporte WireGuard/WireSock próprio (Windows x64 e Linux x64), seleção manual de rota Proton, updater com canal stable/beta, relato de bug pelo Discord e não depende da GUI nem do standalone.
+- No Windows, a ativação explícita retoma com segurança uma instância WireSock que pertença à GUI ou ao pool de rotas dela; perfis externos continuam preservados. No Linux, a ativação verifica o módulo WireGuard do kernel, pede elevação uma única vez por ativação e mantém o isolamento por aplicativo.
+
+### Limitação conhecida: macOS
+
+- Esta versão não inclui suporte a macOS: os auxiliares específicos da plataforma não fazem parte da árvore e o updater do app permanece desligado nessa plataforma. Não há validação de release em macOS neste ciclo.
+
+### Agradecimentos
+
+- Obrigado a @bezu, criador do projeto.
+- Obrigado a todos os beta testers que rodaram as betas 2.0.6-beta-1 a 2.0.6-beta-22 e relataram problemas com log.
+
+## [2.0.6-beta-22] - 2026-09-17
+
+### GUI: correção do empacotamento da animação Proton
+
+- A dependência GSAP usada pelo carregamento do botão **Otimizar rota** volta a ser declarada no `package.json` e no lockfile, garantindo que a compilação da GUI inclua o módulo usado pelo renderer.
+
+
+## [2.0.6-beta-21] - 2026-09-17
+
+### GUI Linux: autorização sudo no Wayland
+
+- Respostas válidas do `zenity` e do `kdialog` com aviso benigno no `stderr` agora seguem para a validação real do `sudo`. Quando o `pkexec` falha por falta de agente polkit, a GUI tenta o `sudo askpass` com arquivos temporários protegidos e informa como instalar/iniciar um agente quando essa alternativa também não está disponível.
+- O ambiente dos prompts remove `LD_LIBRARY_PATH`/`LD_PRELOAD`, e senha, logs e arquivos temporários continuam sem exposição. Sem `sudo` configurado, prompt disponível ou credencial válida, a ativação continua sendo recusada de forma segura.
+
+### GUI Linux: estado real do botão após a ativação
+
+- A janela agora acompanha as mudanças de estado observadas pelo watchdog de saúde Linux, inclusive quando o namespace é perdido ou o Discord é encerrado sem um clique. Estados repetidos não geram atualizações redundantes.
+- A confirmação do processo no namespace tenta primeiro a leitura sem privilégio e só usa a autorização elevada já existente quando a leitura é inconclusiva; probes e status continuam não interativos.
+
+### GUI Linux: `--status`/`--probe` sem bloqueio de stdin
+
+- O spawn da GUI ignora o stdin herdado do Electron, e o modo `--probe` despacha diretamente o diagnóstico JSON. Isso impede que o relatório leia um socket aberto esperando EOF e bloqueie o watchdog.
+
+### Relatórios de erro com orçamento limitado
+
+- O envio por `curl` e `wget` agora tem timeouts explícitos de conexão e execução. A cobertura do cenário de serviço que não responde usa um orçamento curto e limitado, sem aguardar indefinidamente.
+
+### Limitação conhecida: macOS
+
+- Os auxiliares `writeError`, `macPermissionDenied`, `openAppManagementSettings`, `enclosingApp` e o deep-link `x-apple.systempreferences` não estão presentes na árvore desta beta e não são referenciados pelo renderer, IPC ou preload. O canal beta não publica macOS; não há alteração de comportamento a validar nessa plataforma.
+
+## [2.0.6-beta-19] - 2026-09-14
+
+### Instaladores: correção da injeção Windows/Linux
+
+- Corrige o shim Windows do `pnpm`: `Invoke-Pnpm` resolve um executável/entrypoint real, captura o código de saída de forma determinística (incluindo `exit=-1` quando o shim lança exceção) e é usado em `Test-Pnpm`, `Build-Mod` e `Remove-PluginSource`.
+- A pós-condição agora é verificada por Discord escolhido, com evento canônico `installer.inject`; `exit=-1` com a injeção confirmada vira apenas warning, enquanto ausência da pós-condição bloqueia o fluxo.
+- Os caminhos Linux deixam de passar o separador `--` extra ao `pnpm`; os detalhes da injeção continuam limitados e redigidos.
+- Auditoria do beta-19 confirmou que o ZIP público contém `stability.ts`, `vpn-types.ts` e os demais módulos exigidos; a causa provável do relato é o launcher `.bat` ter reutilizado um `GoLiveBypass-Installer.ps1` antigo/cacheado quando já existia no diretório. O launcher agora sempre baixa para arquivo temporário e só substitui atomicamente após sucesso; uma fonte local/checkout parcial também falha explicitamente (sem módulo stale ou fallback vazio) antes de `pnpm build`. Limitação: a reprodução original com `pnpm 11.22.0` e o checkout Windows do usuário não está disponível neste host Linux.
+
+## [2.0.6-beta-18] - 2026-09-14
+
+### Incidente do archive beta-17: correção de distribuição
+
+- Causa confirmada do beta-17: a tag da linhagem GUI omitiu `bug-report.ts` e `vpn-snapshot-worker.ts`; por isso usuários beta-16 encontravam `archive do plugin não contém bug-report.ts` ao atualizar.
+- A validação do updater beta-16 permanece **fail-closed**: archive sem qualquer arquivo obrigatório é rejeitado e a instalação existente é preservada; o beta-17 público não foi corrigido por esta mudança.
+- O job `release-assets` agora executa a guarda de archive/required files antes do `zip` e do upload, exigindo também os módulos de compatibilidade beta-16 e bloqueando uma árvore incompatível antes da publicação.
+- O beta-18 corrige a árvore e os metadados versionados do plugin, incluindo os três arquivos observados (`bug-report.ts`, `vpn-snapshot-worker.ts` e `plugin-log.ts`); a publicação é mantida como prerelease do canal beta, nunca `latest`.
+
+## [2.0.6-beta-15] - 2026-09-13
+
+### Plugin: relato manual de bug pelo Discord
+
+- O painel VPN agora oferece **Reportar bug**, com resumo, detalhes, logs sanitizados e cópia do diagnóstico; o envio só ocorre após o clique do usuário.
+- A distribuição inclui `bug-report.ts` nos arquivos obrigatórios e nos dois instaladores.
+- Evidência: `node tests/test-plugin-bug-report.mjs` 14/14, `tests/test-redaction-parity.mjs` 2/2 e `tests/test-distribution-parity.cjs` sem regressão.
+
+### Plugin: correção real das engasgadas da interface
+
+- A primeira tentativa com `execFile` foi neutra na VM (8,4 s contra 8,6 s de janela bloqueada); a correção real moveu a criação do PowerShell para uma worker thread persistente, preservando script, parser e vereditos.
+- Na mesma VM Windows 11, a janela bloqueada caiu para 2,35 s em 75 s, contra 8,4–8,6 s antes; picos acima de 300 ms caíram de 16–17 para 4.
+- Evidência: `golive-gui/tests/plugin-inspection-async.test.ts` cobre delegação, reuso e fallback; a medição de fluidez é específica da VM Windows com o painel aberto.
+
+## [2.0.6-beta-16] - 2026-09-14
+
+### Instaladores: preservação de Vencord e Equicord
+
+- Os instaladores Linux e Windows preservam um Discord já patchado por Vencord/Equicord quando a origem não pode ser resolvida, recusando o alvo em vez de substituir `app.asar` ou `_app.asar`.
+- Os modos temporário e **Restaurar tudo** removem e recompilam somente `goLiveBypass`; não executam `pnpm uninject` nem desfazem o patch do mod.
+- Evidência: `tests/test-vencord-preserve.sh` e `tests/test-vencord-preserve.ps1`, com validação de BOM/AST no PS1.
+
+## [2.0.6-beta-8] - 2026-09-11
+
+### Plugin: login Proton parava em máquinas sem armazenamento seguro
+
+- Relato: em algumas máquinas o login da conta Proton não funcionava no plugin, mesmo com as credenciais corretas.
+- **Causa, reproduzida com Electron real:** o caminho Linux da sessão exigia `safeStorage.isEncryptionAvailable()`. Em uma máquina onde o Electron não consegue abrir o Secret Service/libsecret — keyring ausente, bloqueado, ou backend não selecionado — o plugin **recusava o login antes de tentar autenticar**, com a mensagem "O armazenamento seguro do sistema (Secret Service / libsecret) não está disponível para proteger a sessão Proton". Sonda no host (Electron 43.4.1, gnome-keyring presente, `GET`/auth reais): `isEncryptionAvailable()=false`, `getSelectedStorageBackend()=unknown` e `loginProton` devolvendo `SESSION_PERSISTENCE` sem sequer executar o helper. É a mesma família de máquinas que roda Discord modado sem keyring destravado ou sob Flatpak sem acesso ao serviço `org.freedesktop.secrets`.
+- **Segunda ponta do mesmo sintoma:** no assistente, se a checagem da sessão guardada devolvesse qualquer código diferente de `INVALID_SESSION` (armazenamento, helper ausente, rede), o botão "Continuar para rota real" **retornava sem tentar o login** — beco sem saída: o usuário digitava usuário e senha e a tela repetia o erro anterior.
+- **Correção:** a sessão passa a poder viver **na memória do processo** quando o armazenamento seguro não está disponível. O login autentica normalmente, nada em texto claro vai para o disco (o helper recebe uma cópia 0600 por operação, removida em `finally`), e a UI avisa que a sessão vale só enquanto o Discord estiver aberto. O contrato do envelope cifrado continua igual quando o armazenamento seguro existe; um envelope que não abre nesta execução é reportado como tal e **substituído pelo próximo login**, nunca mais bloqueia. No assistente, com senha informada o login é sempre tentado — o motivo da sessão guardada não servir entra na mensagem, sem chamá-la de expirada. Falha de escrita no disco também cai na memória, em vez de perder o login que acabou de ser concluído.
+- Novos campos: `persisted` no resultado do login e `sessionStorage` (`safe-storage` | `file` | `memory-only`) no status do plugin, ambos consumidos pela UI (aviso no assistente e no painel, toast honesto ao entrar).
+- Evidência: sonda com Electron real e o helper Linux embutido — antes `SESSION_PERSISTENCE` sem executar o helper, depois o login chega ao Proton e recebe o desafio de CAPTCHA real; `tests/test-plugin-proton-edge.mjs` 22/22 no Linux, incluindo dois casos novos (sem armazenamento seguro: login ok, `persisted:false`, pasta privada vazia, checagem de sessão pela memória e logout esquecendo; com armazenamento seguro: envelope `electron-safe-storage` no disco sem texto claro e releitura da sessão); `tests/test-plugin-proton-audit.mjs` 8/8 — os dois arquivos **falhavam em qualquer host Linux** antes desta correção, por ambiente, e o harness que importava `vpn-types` por linha literal foi tornado tolerante. `golive-gui` 459/459 e os outros 19 testes de plugin seguem verdes.
+- GUI e standalone avaliados: nenhum dos dois usa o armazenamento seguro (`golive-gui/electron/proton.ts` entrega a sessão direto ao helper; o standalone está pausado e não tem o portão), então o defeito era exclusivo do plugin e não há comportamento a portar.
+- E2E na VM Windows com o Discord logado e a sessão Proton real (`luannrhiston2003@gmail.com`, expira em 538h): `protonSessionStorageMode()` = `file` (correto no Windows), `savedSessionUsername()` leu o usuário da sessão real, `checkProtonSession()` devolveu `valid: true` contra a API Proton, e `loginProton` com senha errada alcançou a API e classificou `INVALID_CREDENTIALS` em 3,2s — sessão válida intacta (SHA-256 igual antes/depois) e zero temporários `.protonvpn-session-*` deixados na pasta. O assistente abriu direto na etapa 2 (skip da conta pela sessão salva), a otimização concluiu com servidor real e o botão final "Ativar VPN e reiniciar o Discord" subiu o túnel com o filtro por aplicativo e **reiniciou o Discord** (`app.relaunch`): PIDs do cliente trocaram de `8076@15:47` para `9420@15:54`, o serviço ficou `Running`, o owner foi adotado com `restarting:false` e o log registrou `sessão WireSock própria adotada após inicialização | generation=1` → `sessao aberta | VPN active | ativa true | ownership true`.
+- Limite: o caminho alterado desta correção (máquina **sem** armazenamento seguro) não existe no Windows — lá o armazenamento sempre esteve disponível, e foi por isso que o defeito só apareceu em Linux. A reprodução do bloqueio e a prova do modo `memory-only` continuam sendo as do host Linux com Electron real; na VM o que se provou foi que a mudança não regride o caminho compartilhado (`save`/`check`/`login` real, ritual de ativação e relaunch).
+
+### Onboarding do plugin ativa a VPN e reinicia o Discord ao concluir
+
+- Relato: instalar o plugin, configurar e concluir não deixava o Discord roteado — a página final dizia que a ativação era "uma ação separada no painel" e o aviso da otimização dizia que "nenhuma reinicialização do Discord foi solicitada". O pedido é sair do assistente com o túnel de pé e o cliente já reiniciado.
+- Duas causas, medidas na VM:
+  1. **Concluir nunca ativava.** `complete()` só marcava `onboardingCompleted` e fechava o modal.
+  2. **E o clique seguinte podia não fazer nada.** `startInternal` tinha um early-return para túnel já ativo e próprio que devolvia sucesso **sem relançar**. O caso é o normal logo após a otimização: ela derruba o túnel para medir e o restaura sem relaunch (`restorePreviousRoute` → `startInternal(false)`; log da VM: `serviço WireSock ativo com filtro por aplicativo` às 17:38:44, antes do clique). O "Ativar agora" achava o túnel de pé, retornava sucesso e nada mudava no cliente — sem toast, sem linha de erro e sem reinício.
+- Correções: `complete()` ativa de verdade (`Native.enable()`, que sobe o túnel e reinicia o Discord) e reporta falha em toast; o early-return relança quando o pedido é explícito (`enable()`) e continua sendo adoção pura no caminho automático (`enableAutomatic`, que não pode reiniciar); os textos do assistente e o aviso da otimização agora descrevem o que acontece; e a página de credenciais é pulada quando a sessão Proton salva já é válida — "Voltar" continua reabrindo a conta para trocar de usuário.
+- Evidência: `tsc`/build da VM com exit 0; harness com o `PluginVpnController` real e shim do Electron observando `app.relaunch`/`app.exit` — com o túnel parado o relaunch é pedido nas duas versões, e com o túnel ativo o código anterior devolvia `{success:true,state:"active"}` em silêncio enquanto o atual chama `app.relaunch()`; na VM, o botão final aparece como "Ativar VPN e reiniciar o Discord" e o assistente abriu direto na etapa 2 com a sessão salva.
+- Limite: o E2E no Discord real deste build não foi reexercitado — a sessão do Discord na VM foi invalidada durante os testes (o túnel trocou o IP de saída) e passou a pedir senha, que não está disponível na sessão de teste. O relaunch ficou verificado no controller, sob o contrato do Electron; a pendência é repetir o fluxo de instalação em um cliente logado.
+- Testes: `tests/test-plugin-onboarding.mjs` prende as duas regras novas (concluir ativa; sessão salva pula a conta); em `golive-gui/tests/plugin-v2-regression.test.ts`, duas asserções que fixavam **nomes de função** do refactor de inspeção (PID do serviço e o fallback CIM→`sc.exe`) viraram testes de comportamento sobre `inspectWireSock` com o SO mockado; e `golive-gui/tests/plugin-update-ui.test.ts` deixou de exigir `Native.enable()` no start do renderer (contrato que a correção do ciclo de autostart já tinha mudado).
+
+### Inspeção periódica do WireSock faz uma consulta em vez de sete
+
+- A inspeção que o watchdog roda a cada 15s custava **~1,6s de thread principal do Discord por ciclo** — medido na VM (`recon4`): sete spawns de `powershell.exe`, seis deles `Get-CimInstance`, com ~220ms só para criar cada processo; a sequência completa deu 1441–1907ms. Numa VM de 2 vCPU, a janela do Discord chegou a não responder por ~1s em 2 de 30 amostras. É o mesmo caminho que decide se o túnel é do plugin, então ele roda também em toda ativação, limpeza e restauração.
+- Agora `readWireSockSnapshot` responde tudo numa única sessão do PowerShell (estado, `PathName` e `ProcessId` dos serviços + processos do WireSock) e `inspectWireSock` consome esse snapshot. Custo medido na VM: **285ms contra 1596ms** do caminho antigo — mesma leitura, um spawn em vez de sete. O parser saiu para `goLiveBypass/vpn-snapshot.ts` porque é a parte que decide o veredito e é testável sem Windows.
+- O parsing aceita o que o `ConvertTo-Json` do PowerShell 5.1 realmente produz: lista de um item podendo virar objeto, `null` em `PathName`, `Missing` para serviço inexistente e estado transicional (`Start Pending`) que **não** pode virar "parado". Resposta que não cobre exatamente os serviços pedidos continua sendo leitura desconhecida — nunca ausência.
+- `tests/test-plugin-windows-snapshot.mjs` cobre essas formas e `tests/test-plugin-windows-inspection.mjs` ganhou a regra de uma consulta por ciclo (contra o código anterior ela falha). `assertPluginServiceSlot` e a limpeza seguem com os helpers baratos (`sc.exe`, ~9ms), que não mudaram.
+
+### Plugin Windows: a ativação automática do boot parou de reiniciar o Discord
+
+- Relato: depois de injetar e ativar, fechar o Discord não o encerrava (só pelo gerenciador de tarefas) e a interface não voltava. É o **mesmo** sintoma já descrito acima ("Discord travava aberto e a interface não voltava"), com outra causa — as correções de `before-quit`/ownership não bastaram porque o processo nem chegava a fechar: ele era **relançado** antes.
+- **Cadeia medida na VM, com o log do plugin:** 87 boots, um `stop → start → relaunch` a cada ~31s, por horas. Todo boot chamava `Native.enable()` — inclusive o start do renderer (`index.tsx`), que **não** consultava a suspensão de autostart. `enable()` limpa `automaticBootSuppressed` e chama `startInternal(true)`, que relança o Discord; com o túnel inativo no momento do boot (a saída anterior o derruba), o ciclo se refechava sozinho: cada processo novo lançava outro. Efeitos colaterais observados: processos de Discord acumulados (8–10 vivos), instalação `app-1.0.9257` com `app.asar` de 1 byte (update interrompido pelo ciclo) e o X parecendo "não fechar".
+- **Ativação automática virou adotar, não ativar.** Novo `controller.enableAutomatic()`: respeita `automaticBootSuppressed`, nunca relança e só adota um túnel que já esteja ativo e próprio. O processo principal (boot) e o start do renderer usam esse caminho; o relaunch continua sendo da ativação **explícita** do painel (`Native.enable`). Se o túnel não está ativo no boot, a VPN fica inativa e o painel ativa — em vez de reiniciar o Discord em silêncio. Bridge antiga sem `enableAutomatic` simplesmente não ativa sozinha.
+- **A falha de ativação parou de derrubar o túnel alheio.** O `catch` do `startInternal` chamava `stopOwnedWireSock` para qualquer WireSock ativo — inclusive o de **outra instância viva** cujo lock tinha acabado de recusar a ativação. Matar essa VPN alimentava o ciclo (o boot seguinte via a rede caída e tentava ativar de novo, com relaunch). Agora só derruba o túnel que a própria tentativa criou (`sameOwnership(this.ownershipToken, this.readOwner())`).
+- Verificado na VM com o plugin compilado e injetado: **0 boots em 150s** com o Discord aberto (antes: ~5 no mesmo intervalo), `VPN não foi ativada automaticamente porque o túnel não está ativo; ative pelo painel` no log, Discord abre em 3s e reabre em 3s. `tests/test-plugin-autostart-loop.mjs` prende as três regras (sem relaunch, sem limpar a suspensão, só adota túnel ativo) e a regra do túnel alheio; `tests/test-plugin-lifecycle.mjs` e `tests/test-plugin-onboarding.mjs` deixaram de exigir a chamada antiga no renderer.
+- Limite: o fechamento pela janela principal não foi reexercitado neste build com o túnel ativo — as duas tentativas desta sessão (com `WM_CLOSE`) acertaram a janela do **Discord Updater**, não a principal (`Amigos - Discord`), então o processo vivo ali não diz nada sobre o `before-quit`. O roteiro que exercita o caminho completo (bandeja desligada + janela principal) é o da correção anterior deste mesmo changelog, que mediu a saída do Discord em 13s. O "Configurações > Aplicativos não abre" não reproduziu: abriu em ~3s em três passagens, duas com o plugin ativo e o túnel de pé.
+- GUI e standalone avaliados sem mudança: a ativação da GUI é conduzida pelo usuário (não há `enable()` no boot) e o standalone segue pausado.
+
+### Limpeza do WireSock no plugin não depende mais do reset do network-lock
+
+- **A limpeza exigia o reset do network-lock para se declarar concluída.** `stopped` era `residual.reliable && !residual.active && networkLockReset`, mas o reset exige elevação (UAC) — verificado na VM sem elevação: `reset-network-lock` sai com código 1 e `Failed to reset network lock. Error code: 0x0000001f / Make sure you are running with administrator privileges`. Numa saída em que o UAC não fosse aceito, a limpeza seria dada como falha **com o túnel já derrubado e a rede restaurada**, virando `recovery_required` e mantendo o lock do plugin. O veredito agora é `residual.reliable && !residual.active` — o mesmo da GUI (`!isWireSockActive() && residual.length === 0`) e o que o README promete. `active` cobre serviço e processos próprios, então nada foi enfraquecido: a config instala o serviço com `-network-lock disabled` (o próprio `test-distribution-parity.cjs` garante isso), logo a sessão do plugin nunca engata esse lock. O reset continua sendo tentado e reportado; quando falha agora é `warn`, não erro.
+- `tests/test-plugin-windows-inspection.mjs` ganhou a regressão do veredito. O teste que já mirava essa linha usava regex solta (`const stopped = residual.reliable && !residual.active`) e **passava com o bug** — foi endurecido; contra o código anterior a suíte falha (3 passam, 2 falham) e com a correção fica 5/5.
+
+### Plugin Windows: Discord travava aberto e a interface não voltava
+
+- Relato: depois de injetar e ativar, fechar o Discord não o encerrava (só pelo gerenciador de tarefas) e a interface não voltava mais. Reproduzido na VM: 8 processos vivos por 90s com `comJanela=0`, ou seja, processos sem nenhuma janela — o "não fecha e não abre" do relato.
+- **O quit era cancelado e depois abandonado.** O `before-quit` do plugin chama `event.preventDefault()` para restaurar a rede, mas quando a restauração não confirmava ele fazia `quitting = false` e desistia: as janelas já tinham sido destruídas, então o app ficava vivo sem interface, não fechava e ainda segurava o lugar da instância. Agora a saída acontece de qualquer forma (`shutdown(false)` → log → `finally app.exit(0)`), espelhando o `before-quit` da GUI. O que não confirmou fica no log e o boot seguinte adota `owner.lock` + WireSock.
+- **O lock da VPN era dado como perdido quando outra instância o assumia.** Cadeia exata, do log do plugin na VM:
+  ```
+  18:24:07 [info]  abrindo plugin VPN              <- a instância nova do relaunch sobe
+  18:24:08 [info]  probe ... stage=adoption        <- ela adota o WireSock e grava o próprio pid
+  18:24:14 [info]  WireSock próprio, lock e processo verificados como parados
+  18:24:14 [error] fechamento aguardou porque a restauração da VPN não foi confirmada
+                   erro=A rede foi restaurada, mas o lock da VPN ficou pendente
+  18:24:19 [error] Outra instância do GoLiveBypass já controla a VPN   <- a VPN nunca mais ativava
+  ```
+  O processo que saía tentava liberar um lock que a instância nova já tinha assumido; `releaseOwnership` devolvia falso, o estado virava `recovery_required` e a VPN ficava inutilizável até limpeza manual. Agora `ownershipTakenOver` distingue "não consegui liberar" (falha real, segue reportando) de "o lock passou para outra instância" (nada a liberar — quem manda no túnel agora é ela). Vale nos três caminhos de parada: rede ativa, rede já inativa e o caminho Linux.
+- `tests/test-plugin-lifecycle.mjs` ganhou as duas regressões. Contra o código anterior a suíte falha (4 passam, 2 falham); com as correções, 6/6. A asserção de `shutdown` que exigia o literal `shutdown(false)` estava obsoleta desde que o argumento virou `process.platform === "linux"` — falhava sem que o comportamento tivesse mudado.
+- Limite: o X do Discord com `minimizeToTray` apenas esconde a janela e o `before-quit` não roda nesse caso (comportamento do próprio Discord, não do plugin). Para o caminho de quit ser exercido, o teste desliga a bandeja. E o log registra `Discord HTTPS inacessivel pela rota` de forma repetida no watchdog — é diagnóstico log-only, fora do escopo desta correção.
+
+### Seletor de alvo do instalador Linux não oferecia escolha
+
+- Relato: quem tem Equibop, Vesktop e Legcord não recebia a opção de escolher em qual instalar o plugin. Eram quatro defeitos somados, e o primeiro sozinho já bastava:
+  1. **A escolha vinha depois da decisão de pular.** `do_install` perguntava apenas "este checkout já está injetado em algum lugar?" — e com um único cliente já apontando para ele (o caso de quem tinha o Equibop injetado a partir de `~/Equicord`) pulava a injeção inteira, onde o seletor morava. O `inject_mod` foi dividido em `selecionar_alvos_inject` + `injetar_alvos`, e o `do_install` agora escolhe **antes**: só pula quando todos os alvos escolhidos já estão prontos (`alvos_ja_injetados`). É o espelho do `$oficialPendente`/`Select-InjectionTargets` do instalador PowerShell, que já fazia certo.
+  2. **O seletor devolvia o rótulo da tela, não o alvo.** `escolher_alvos_inject` guardava os rótulos em `$@` e os imprimia como resultado: quem escolhia recebia `P|Equibop (flatpak)` em vez do caminho, e a injeção morria em "Cliente paralelo desconhecido". Agora a lista de rótulos (tela) e a de alvos (resultado) são separadas, com `alvos_por_indice` fazendo o mapeamento.
+  3. **Nenhum cliente paralelo de flatpak era encontrado.** O glob era `files/*/resources`, e Vesktop/Equibop/Legcord põem o app em `files/bin/<cliente>/resources`. O segundo nível passou a ser listado.
+  4. **Vesktop caía como Discord oficial.** `is_parallel_install` casava só o fim do caminho, então `~/.local/share/vesktop/resources` (termina em `/resources`) passava por Discord puro e ia para o `pnpm inject`, que só sabe dizer "Invalid Discord install". O casamento agora é por componente, o que cobre tanto a raiz quanto o deploy de flatpak.
+- Junto disso: `/usr/lib/equibop` e `/usr/lib64/equibop` apareciam como duas instalações (lib64 é symlink de lib); `discord_resources` agora deduplica por caminho canônico. Os rótulos ganharam o local curto (`Equibop (flatpak)`, `Equibop (/usr/lib/equibop)`) para distinguir o mesmo cliente em dois lugares, e dizem quando o checkout atual não atende o alvo (`Legcord -- Legcord nao usa build do mod`, `Vesktop -- precisa de um checkout Vencord`) em vez de oferecer uma escolha que só pode falhar.
+- O rodapé da TUI prometia `[Enter] confirmar`, mas Enter sem nada marcado não fazia nada e não dizia nada. Agora avisa que é preciso marcar um alvo.
+- A caixa da TUI era fixa em 62 colunas e cortava justamente o aviso nas entradas de caminho longo; a largura agora acompanha o terminal (piso de 62, teto de 96) e o rótulo é truncado no limite da caixa.
+- `tests/test-inject-selector.sh` cobre o seletor dirigindo a TUI de verdade (troca só o leitor de tecla): alvo devolvido, multi-seleção, cancelamento, rótulos e a ordem escolha→decisão no `do_install`. A condição de entrada do ramo interativo passou a usar `tui_is_interactive` em vez de repetir `[ ! -t 0 ]` — a duplicata deixava o caminho inalcançável por qualquer coisa que não fosse um terminal de verdade, inclusive os testes.
+
+### Modo temporário do instalador Windows voltava a ser permanente
+
+- Escolhendo **Temporário** no instalador PowerShell, a injeção não era desfeita ao fechar o Discord: o instalador avisava "O Discord ja estava injetado antes de eu rodar, entao nao vou desfazer isso" e o mod continuava ativo. `$weInjected` era lido no fim de `Invoke-Install` e **nunca atribuído** — a atribuição (`$weInjected = -not (Test-InjectedFromCheckout $root)`) sumiu quando o bloco de multi-seleção de alvos entrou no lugar dela. Nulo é falso em PowerShell, então o ramo do aviso era sempre o escolhido e `Wait-DiscordExit` nunca rodava. A gravação foi restaurada com a semântica atual (`$oficialPendente -or $paralelos.Count -gt 0`): só quem injetou é que espera para desfazer. Uma varredura do arquivo confirma que era a única variável lida e nunca atribuída.
+- No instalador Linux a variável equivalente estava **invertida** (`permanent=1` quando a escolha era temporária). O comportamento sempre esteve certo por dupla negação, mas era a mesma armadilha do defeito acima; a leitura agora é positiva (`permanente`) e o caso temporário continua chamando `wait_discord_exit`.
+- `tests/test-installer-persistence.sh` cobre o caminho: exercita `do_install` de verdade com os efeitos colaterais em stubs (temporário desfaz, permanente não) e confere no `.ps1` que `$weInjected` é gravado antes de lido — o CI Linux não tem `pwsh`. Contra o código anterior o teste falha nos dois pontos do Windows; contra o corrigido, passa.
+
+### Seletor de saída removido do instalador do plugin
+
+- Os dois instaladores (`installer/golivebypass-installer.sh` e `installer/GoLiveBypass-Installer.ps1`) param de perguntar "como o bypass vai sair para fora do Brasil". A saída agora é a conta Proton, configurada dentro do plugin na primeira ativação: nenhum arquivo de `goLiveBypass/` lê a chave `proxy` do `settings.json`, e a pergunta só existia para o transporte SOCKS/PAC legado.
+- Saiu junto o que só servia a essa escolha: `select_proxy`/`Select-Proxy`, o Tor embutido dos instaladores (`ensure_tor`/`ensure_tor_bundle`/`tor_ready`/`Install-Tor`/`Set-RunKey` e as constantes do bundle), `hide_proxy_secret`/`Hide-ProxySecret`, `tui_input`/`Tui-Input` (sem outro chamador) e os filtros de relatório automático para as mensagens do seletor. A constante `TOR_SERVICE` do instalador Linux ficou: é o que a limpeza usa.
+- `set_plugin_settings`/`Set-PluginSettings` não escrevem mais `proxy`. Uma chave legada de instalação anterior — inclusive a que guardava a porta do Tor — é preservada em vez de reescrita vazia pelo instalador; `enabled` e `excludedCountries` continuam sendo gravados.
+- O Tor que sobra nos instaladores é limpeza: `remove_tor`/`Remove-Tor` continuam removendo o serviço do usuário e a Run key/`GoLiveBypassTor.vbs` registrados pelas versões anteriores. O binário permanece (a GUI usa o mesmo). O standalone, pausado, mantém o Tor dele sem alteração.
+- `tests/test-run-key.ps1` passa a exercitar só o standalone: o instalador não tem mais `Set-RunKey`.
+
+### Instalador do plugin liberado com aviso de beta
+
+- O instalador Linux (`installer/golivebypass-installer.sh`) saía com código 1 antes de qualquer coisa: "Plugin e standalone CLI estao temporariamente fora do ar". A linha beta do plugin já é instalável, então o bloqueio saiu e virou aviso; o **standalone continua pausado**, com o bloqueio próprio em `standalone/golivebypass-standalone.sh` e `GoLiveBypass-Standalone.ps1`, que este instalador não toca.
+- Os dois instaladores passam a dizer, no cabeçalho, que a linha é beta, que o sistema ainda não é estável e que ele chega lá com relatos: cada bug vira uma issue e o relatório automático (ou o link das issues) encurta o caminho. No Linux o aviso sai em stderr, para não sujar o contrato de saída de `--check-update`/`--update`.
+- A fonte do plugin na instalação passou a ser o **zip da release** (`goLiveBypass-vencord.zip`, o mesmo artefato do updater do plugin), com **SHA-256 publicado** conferido antes de extrair. As fontes uma a uma da branch `main` ficaram como reserva: `main` pode estar atrás da tag da linha beta — foi o caso da `vpn-linux.ts`, que só existia no zip — e a lista fixa de arquivos pedia um arquivo que o `main` não tinha. `--plugin-source` e um checkout do repositório ao lado do script continuam preferidos, para quem testa uma mudança antes de publicar.
+- A lista de fontes do instalador Linux (`PLUGIN_FILES`) tinha 4 arquivos: sem `vpn-controller.ts`, `vpn-proton.ts`, `vpn-types.ts`, `vpn-linux.ts` e `update-*.ts`, o `pnpm build` do checkout nem começava — `native.ts` importa todos eles. A lista agora é a completa, e um teste compara com o que `requiredFilesForPlatform` exige em `native.ts`, para não divergir de novo.
+- Windows: o helper Proton continua sendo baixado da beta mais recente com validação de SHA-256 contra o manifesto publicado (garantia do #260), inclusive quando o plugin vem do zip.
+
+### Validação da árvore do plugin no Linux
+
+- O plugin recusava a própria árvore em Linux: `requiredFilesForPlatform` exigia `bin/linux-x64/proton-confgen` e `bin/linux-x64/netns-launcher`, arquivos que o zip do release não carrega justamente porque vão comprimidos no `vpn-proton.ts` e são materializados em runtime. A árvore instalada e o update preparado nunca passavam da validação, e o updater do plugin falhava no Linux com "archive do plugin não contém bin/linux-x64/proton-confgen". A exigência desses dois arquivos saiu (o helper do Windows, que não tem equivalente embutido, continua exigido); `validatePluginSourceTree` segue rejeitando fonte ausente, manifest inválido e entrada especial.
+
+### Fila de issues de produção (2026-09-10)
+
+- Linux: o `stripAnsiCodes` da GUI confundia o `[` de um texto comum com o início de uma sequência ANSI. Ele removia `[*]`, `[OK]` e `[X]` das mensagens do script, então o erro mostrado ao usuário chegava truncado (`K] Tunel WireGuard encerrado.`, `] Discord nao iniciou...`) — a impressão digital visível no relato da #263. Agora só remove sequências realmente introduzidas por `ESC`, `U+009B` ou o `U+FFFD` corrompido, preservando os prefixos do script.
+- Linux: a mensagem de falha da ativação mostrava as linhas informativas do teardown (`[*] Removendo namespace de rede`, `[OK] Tunel WireGuard encerrado`) no lugar da causa. Elas passam a ser filtradas antes do corte das últimas linhas.
+- Linux: a GUI iniciava um alvo de `$FOUND` que não tem executável (a pasta de bootstrap de `~/.config/discord/app-*/resources`), sem considerar o `flatpak_id` que o próprio scanner já havia detectado. Em Bazzite, onde o Discord é Flatpak, a abertura não tinha comando, a espera esgotava e a ativação terminava em "Discord nao iniciou dentro do namespace WireGuard" com o namespace já removido (#263). A escolha do alvo agora é explícita: preserva o cliente que já estava rodando; se nenhum estava, escolhe o primeiro com executável nativo, wrapper paralelo ou Flatpak executável; e mantém a primeira linha como fallback. O `setup_wireguard_netns` deixa de ser repetido para cada Discord detectado.
+- Linux: o watchdog de saúde e o de estatísticas do WireGuard continuavam rodando durante o `--uninstall`; o script mata o Discord como parte da desativação e o monitor registrava "Discord não está dentro do namespace WireGuard" como se fosse uma falha real (#258). Eles agora são parados antes do script de desinstalação.
+- Proton: quando o helper falhava ao gerar a rota ótima, a GUI registrava apenas `codigo_saida=1 resposta_json=true` — o motivo já existia e era descartado, então o relato chegava sem causa (#261). O log passa a incluir código estruturado, validade da medição e a mensagem do helper, normalizada e limitada.
+- Instalador do plugin: o helper Proton só era procurado em `$PluginSource\bin\win32-x64\proton-confgen.exe`. Um pacote de release extraído o coloca em `goLiveBypass\bin\win32-x64\` e um checkout o produz em `tools\proton-confgen\build\`; nenhum dos dois era reconhecido, e o erro resultante (#260) só dizia para usar um pacote de release. O instalador agora resolve esses layouts (além do helper baixado avulso ao lado do próprio script), valida o SHA-256 quando há manifesto ou `.sha256` disponível e cai no download autenticado da release quando não há. A busca não varre `Downloads`: copiar um binário arbitrário de lá para dentro do userplugin seria pior do que falhar com o hash publicado.
+- Instalador do plugin: o download da beta passa a preferir `proton-confgen-manifest.json` para obter o nome canônico e o hash do helper, mantendo o padrão de nome e o `.sha256` como fallback; o cabeçalho `Accept` de API não é mais enviado no download direto do asset.
+- Release: o job `release-assets` compilava o helper sem `-buildid=`, divergindo do `build-proton.mjs` que gera o manifesto. Na `v2.0.6-beta-7` isso produziu dois binários diferentes para a mesma versão: o helper dentro de `goLiveBypass-vencord.zip` (`ced12d2d…`) e o asset declarado no manifesto (`84c88bbb…`). As flags foram alinhadas; a paridade byte a byte do próximo release ainda precisa ser conferida no artefato publicado.
+
+Investigação, evidência e limites por issue: [triagem das issues de produção](docs/testing/2026-09-10-production-issue-triage.md).
+
+### Ciclo de desativação no Linux não deixava resíduo silencioso
+
+- O `teardown_wireguard_netns` do standalone mascarava falha de elevação com `|| true` e anunciava "Tunel WireGuard encerrado" mesmo quando o `ip netns del` não tinha privilégio para executar; o namespace `discord-vpn` (com o túnel WireGuard vivo e tráfego real do Discord) sobrevivia ao `--uninstall` sem nenhum aviso. Agora o script avisa explicitamente quando não consegue remover o namespace e só declara sucesso quando ele realmente saiu; o retorno continua neutro para não abortar a restauração das injeções do Discord.
+- A amostragem do failover automático Proton na GUI Linux podia registrar `Cannot read properties of null (reading 'observe')` quando a desativação zerava o rastreador de saúde enquanto a amostra esperava `linuxStatus`/`linuxWgStats`. A coleta agora captura a referência localmente e o teste de geração impede que uma amostra velha dispare failover após a parada do monitor.
+
+### Recuperação manual após falha de otimização Proton
+
+- Se a otimização falhar, for cancelada ou lançar uma exceção sem deixar nenhuma candidata manual selecionável, o fechamento do diálogo inicia uma nova varredura somente de ping em segundo plano. A operação reutiliza a triagem regional do helper, não gera certificado, chave, túnel nem perfil, e só libera no dropdown as rotas que responderem com ping válido.
+- Quando a otimização já deixou uma candidata selecionável, a GUI não repete a sondagem de ping; a descoberta normal de metadados continua podendo abastecer outras alternativas sem inventar latência.
+- Remove a seção de fallback, recomendação, contador e retry do diálogo de otimização, restaurando a janela enxuta com progresso, lista e ações originais. A seleção manual permanece exclusivamente no dropdown principal e revalida a rota antes de aplicar.
+
+### Sessão Proton rejeitada por catálogo de servidores grande
+
+- A verificação de sessão do helper Proton (`-check-session`) limitava a leitura da resposta de `/vpn/v1/logicals` a 256 KB; o catálogo de servidores da API cresceu além disso e toda verificação passou a rejeitar uma sessão válida como "expirada ou não encontrada". O login em si funcionava, mas a GUI voltava ao login e novas tentativas recebiam falha embrulhada como erro de autenticação.
+- O helper agora decodifica o envelope em streaming e para no campo `Code`, sem baixar o catálogo inteiro nem tratar catálogo grande como erro de protocolo. Corpo vazio, rejeição 401/403, indisponibilidade temporária e JSON truncado preservam a classificação anterior. Vale para GUI, standalone e plugin, que usam builds do mesmo helper.
+- A GUI passa a honrar os códigos estruturados do JSON do helper (`INVALID_CREDENTIALS`, `NETWORK_ERROR`, `TWO_FACTOR_REQUIRED`, `TWO_FACTOR_INVALID`) e o texto genérico `authentication failed` não é mais classificado como senha incorreta; sem código estruturado, o erro cai em mensagem genérica acionável em vez de culpar a credencial.
+
+### Correção do login Proton no helper
+
+- Remove o registro duplicado da flag `-progress-json`, que fazia o `proton-confgen` abortar com `flag redefined` antes de autenticar ou verificar a sessão.
+- O login e os modos `-check-session`/`-check-plan` voltam a iniciar normalmente; a correção vale para o helper usado pela GUI e pelos demais empacotamentos.
+
+### Filtro de rotas Proton sem ping
+
+- O seletor persistente e o dropdown principal mostram somente rotas com ping válido; servidores sem medição deixam de ocupar espaço com `—`.
+
+### Fallback manual de rotas Proton na GUI
+
+- Mantém a seleção automática e, quando a medição é cancelada ou falha, carrega progressivamente em segundo plano o catálogo completo de rotas elegíveis da conta, respeitando país, plano, status online e exclusão da rota atual.
+- Exibe país, cidade, tier e carga no dropdown principal; somente rotas com ping medido aparecem como opções manuais, enquanto a seleção preserva as validações de ping, peer WireGuard e preflight antes de aplicar.
+- A seleção manual preserva preflight, geração de perfil, promoção atômica e rollback. O catálogo não gera certificado, chave, túnel ou perfil temporário.
+- A troca manual continua isolada por aplicativo no WireGuard; ela não altera o standalone, o plugin nem promete uma prova geográfica de saída.
+
+### Atualizações do plugin Vencord/Equicord
+
+- Mantém o canal estável padrão, com beta opt-in e atualização automática
+  controlada pelo usuário.
+- Reativa o instalador PowerShell do plugin no canal beta: ele deixa claro que a
+  instalação é experimental, distribui todas as fontes WireGuard e valida o
+  `proton-confgen.exe` x64 por SHA-256 antes de copiar o helper.
+- Usa validação SHA-256, origem e compatibilidade antes de preparar a troca;
+  a aplicação exige reload manual e permanece separada da GUI e do standalone.
+
+### Regressão do updater portable e caminhos Windows
+
+- Assets auxiliares Proton deixam o prefixo `GoLiveBypass-`: versões antigas que selecionam o primeiro `GoLiveBypass-*.exe` não podem confundir o confgen com a GUI nas próximas releases. O manifesto continua informando o nome exato do helper.
+- O updater Windows valida nome, origem/tag, tamanho, SHA-256 e estrutura PE GUI/NSIS antes de preparar, restaurar ou aplicar um update. Pendências antigas sem identidade completa são descartadas em vez de executadas.
+- Preserva o `.old` até a nova GUI iniciar e restaura a ordenação numérica de `beta-10` acima de `beta-9`.
+- Scripts de ativação WireSock preservam caminhos Unicode no Windows PowerShell 5.1 usando BOM; a captura não perde letras `s` e falhas SCM preservam seus códigos sem serem mascaradas pela tentativa direta incompatível.
+- A confirmação do modo direto não espera o processo persistente encerrar; preserva o handle para obter códigos de saída reais e limita o fallback a incompatibilidade explícita de `run`, não de outra opção/comando.
+- Estas mudanças de execução são específicas da GUI Windows. Linux continua com electron-updater; o plugin não recebe automaticamente o updater portable nem os scripts de ativação da GUI. Nomes novos de assets são resolvidos pelo manifesto nas duas plataformas.
+
+## [2.0.6-beta-7] - 2026-09-10
+
+### Seleção manual e recuperação de rotas Proton na GUI
+
+- O dropdown principal passa a oferecer rotas medidas da conta Proton: o catálogo completo é carregado em segundo plano, sem gerar certificado, chave, perfil ou túnel, e só entram opções com ping válido.
+- Quando a otimização falha, é cancelada ou termina sem candidata selecionável, uma nova varredura somente de ping abastece o dropdown; o diálogo de otimização volta ao layout enxuto, sem fallback, recomendação, contador ou retry próprios.
+- A sessão Proton grande volta a ser aceita: o helper decodifica `/vpn/v1/logicals` em streaming e para no campo `Code`, em vez de tratar catálogo acima de 256 KB como sessão expirada. A GUI passa a honrar os códigos estruturados do helper.
+
+### Backend Linux do plugin Vencord/Equicord
+
+- O plugin ganha transporte WireGuard autônomo no Linux x64 com namespace de rede por instância e relançamento pelo helper C `netns-launcher`; o manifesto passa a declarar `win32` e `linux` e o pacote carrega os dois helpers.
+- No Linux a sessão Proton fica no armazenamento seguro do Electron, nunca em JSON plaintext; o helper recebe uma cópia temporária `0600`. A ativação do namespace ainda depende do `pkexec` e não foi concluída em produto real.
+
+### Desativação Linux e sincronização do helper
+
+- O standalone deixa de mascarar falha de elevação na remoção do namespace `discord-vpn` e avisa quando o namespace sobrevive.
+- A amostragem de failover Proton da GUI Linux não dispara mais `Cannot read properties of null` ao ser coletada durante a desativação.
+
+## [2.0.6-beta-6] - 2026-09-09
+
+### Correção do updater portable e ativação Windows
+
+- Impede que o updater confunda a GUI com o `proton-confgen` de aproximadamente 14 MB; a identidade do executável agora é validada por nome, origem, tamanho, SHA-256 e estrutura PE/NSIS antes do download e da aplicação.
+- Preserva a versão anterior até a nova GUI iniciar e corrige a ordenação numérica das betas, incluindo a transição de `beta-9` para `beta-10`.
+- Corrige a ativação WireSock no Windows em caminhos Unicode e evita fallback indevido para o serviço global quando o modo oficial por aplicativo falha por outro motivo.
+- Adiciona regressões de updater, empacotamento, WireSock e contratos Windows ao workflow antes da publicação.
+
+
+### Correção da ativação Linux e diagnóstico de elevação
+
+- Corrige o caso da issue #258 em que o Discord era encerrado antes de o script conseguir obter ou validar a senha do `sudo`; a autorização e o executor do usuário agora são validados antes de qualquer encerramento ou limpeza legada.
+- Registra no diagnóstico da GUI, sem senha, tamanho de segredo, token ou stderr bruto, se o provedor gráfico foi solicitado, recebeu entrada, foi validado pelo `sudo` ou falhou; `pkexec` é identificado como delegação ao polkit, sem afirmar que uma janela foi exibida.
+- Mantém `--status`, preflight, watchdogs e probes não interativos; prompts gráficos têm fallback seguro entre provedores e o cancelamento/recusa não dispara pedidos repetidos.
+- Em falhas após o fechamento, o namespace parcial é removido quando possível e o Discord é reaberto fora do bypass somente após confirmar que não há namespace ativo.
+
+### Correções de ativação Windows e runtime Proton
+
+- O helper Proton agora é validado por SHA-256, copiado atomicamente para a pasta de dados e reparado automaticamente a partir de assets autenticados da mesma release quando a extração da GUI estiver incompleta.
+- A ativação WireSock no Windows usa primeiro o modo oficial por aplicativo (`run`), preservando a correção que removeu a dependência do serviço global. O serviço só é considerado para incompatibilidade explícita do comando `run`; `DIRECT_EXITED`, UAC, driver, perfil e timeout não ativam fallback cego.
+- A rotina elevada devolve um resultado próprio em arquivo temporário, captura stdout/stderr do processo direto e confirma o PID pertencente à operação; mensagens CLIXML ou um serviço residual não são mais confundidos com uma rota válida.
+- Falhas comuns do Windows passaram a orientar o usuário sobre permissão, reinicialização, timeout do serviço ou perfil WireGuard, enquanto o rollback da rota continua obrigatório.
+- Logs de ativação, preflight e Proton agora têm `operation_id`/`attempt_id`, fase, duração, PID, códigos do SCM, fingerprint do perfil e fontes de diagnóstico; saídas são limitadas e segredos são redigidos.
+
+### Atualizações do plugin Vencord/Equicord
+
+- O plugin agora documenta o canal estável padrão, o beta opt-in e a atualização automática
+  com validação SHA-256; a troca preparada exige reload manual e permanece separada da GUI e
+  do standalone.
+- O plugin agora inclui um assistente sequencial dentro do Discord para validar a sessão
+  Proton e preparar a rota WireGuard, com estados reais de progresso, cancelamento e
+  conclusão sem ativação ou reinício automático.
+- O status do updater passou a aparecer em um cartão contextual dentro do Discord, com
+  estados de download/preparação e reload manual, sem roubar foco nem reiniciar o cliente.
+
+### Restauração do bypass no autostart do Windows
+
+- A GUI agora persiste se o bypass estava ativo. No boot oculto iniciado pelo Windows,
+  a rota Proton é otimizada antes de ativar WireSock e iniciar o Discord; se a medição
+  falhar, a última rota salva ou a seleção rápida existente é usada como fallback.
+- Desativação explícita e “Restaurar internet” desligam a preferência persistida; o
+  encerramento normal apenas desmonta o túnel e preserva a intenção para o próximo login.
+- A operação roda no processo principal, mantém o isolamento por aplicativo e evita uma
+  segunda otimização quando a janela é aberta durante o boot. Standalone e plugin legado
+  não participam desse fluxo.
+
+## [2.0.6-beta-5] - 2026-09-08
+
+### Correções de ativação Windows e diagnóstico
+
+- Reforça a ativação WireSock por aplicativo: a GUI confirma o processo direto que recebeu
+  o perfil e não transforma uma saída prematura em sucesso nem em fallback para serviço.
+- Registra uma trilha detalhada por operação e tentativa, incluindo fase, duração, PID,
+  códigos do SCM, fingerprint do perfil e saída limitada dos processos, com redação de
+  segredos para facilitar a investigação de novas issues.
+- Mantém o reparo autenticado do helper Proton e os assets de runtime da mesma release,
+  permitindo recuperar instalações incompletas sem aceitar executáveis não verificados.
+
+## [2.0.6-beta-4] - 2026-09-08
+
+- Corrige o caso da issue #256 no Windows em que o serviço WireSock aparecia como ativo, mas o filtro não capturava o Discord e a rota continuava brasileira. A GUI agora prioriza o modo oficial por aplicativo (`wiresock-client run`), confirma o processo que leu o perfil e mantém o serviço global apenas como fallback.
+
+## [2.0.6-beta-3] - 2026-09-08
+
+- Corrige definitivamente a ativação Windows que terminava em `WIRESOCK_SERVICE`: a GUI preserva um serviço já confirmado e usa o modo `run` oficial por aplicativo quando o serviço global não pode ser reconfigurado.
+- Scripts temporários elevados agora usam explicitamente `ExecutionPolicy Bypass`; políticas locais que bloqueavam o `.ps1` antes da primeira linha não impedem mais a ativação. O erro real também é transportado fora do stderr CLIXML, evitando classificação por nomes como `activate-service.ps1` e removendo a orientação incorreta de reinstalar o GoLiveBypass.
+
+## [2.0.6-beta-2] - 2026-09-08
+
+- Beta de correção para usuários Windows com erro de componente Proton ausente ou falha genérica ao iniciar o WireSock, incluindo o caso `spawnSync ENAMETOOLONG` que impedia o Windows de executar a rotina de serviço.
+- Inclui manifesto, hashes e assets de reparo dos helpers Proton para Windows/Linux; a release é exclusiva do canal beta e não substitui a estável `v2.0.5`.
+
+## [2.0.6-beta-1] - 2026-09-08
+
+- Beta de produção com o assistente Proton e o cartão de atualização do plugin dentro do Discord.
+- A GUI mantém a restauração do bypass no autostart do Windows e o updater portable aguarda o
+  encerramento do executável antigo antes da troca.
+- A detecção Linux cobre Discord, Vesktop, Equibop e Legcord em instalações nativas e Flatpak,
+  deduplicando o mesmo `app.asar` e associando o processo ao caminho exato instalado.
+
 ## [2.0.6-beta.2] - 2026-09-07
 
 ### Correção do pipeline beta

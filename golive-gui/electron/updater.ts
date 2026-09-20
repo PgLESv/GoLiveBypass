@@ -17,7 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { createHash } from "crypto";
+import { validWindowsIdentity, verifyWindowsAsset, type WindowsAssetIdentity } from "./updater-identity";
 import { rm } from "fs/promises";
 import { tmpdir } from "os";
 import { basename, join, resolve, sep } from "path";
@@ -47,7 +47,7 @@ const CHECK_INTERVAL_MS = 60 * 60 * 1000; // fallback de seguranca: uma vez por 
 const CHECK_MIN_INTERVAL_MS = 60_000;
 const PUSH_RETRY_DELAYS_MS = [30_000, 120_000] as const;
 
-type PendingWindowsUpdate = {
+type PendingWindowsUpdate = WindowsAssetIdentity & {
   current: string;
   downloaded: string;
   tag: string;
@@ -151,6 +151,8 @@ function githubReleases(): Promise<ReleaseCandidata[]> {
                 url: asset.browser_download_url,
                 digest: typeof asset.digest === "string" ? asset.digest : null,
                 prerelease: item.prerelease === true,
+                assetName: asset.name,
+                size: asset.size,
               });
             }
             console.log(`[updater] releases com executavel encontradas: ${releases.length}`);
@@ -231,30 +233,6 @@ function downloadFile(url: string, dest: string, hops = MAX_REDIRECTS): Promise<
   });
 }
 
-// A API do GitHub devolve o digest do anexo na mesma resposta autenticada por TLS de onde sai a
-// URL. Conferir aqui deixa o Windows no mesmo nivel de Linux e macOS, que ganham a checagem de
-// graca pelo electron-updater.
-function digestMatches(file: string, digest: string | null): boolean {
-  if (digest === null) {
-    console.warn("[updater] anexo sem digest na API; nao vou instalar sem conferir.");
-    return false;
-  }
-
-  const [algo, esperado] = digest.split(":", 2);
-  if (algo !== "sha256" || esperado === undefined || !/^[0-9a-f]{64}$/i.test(esperado)) return false;
-
-  try {
-    const obtido = createHash(algo).update(readFileSync(file)).digest("hex");
-    if (obtido === esperado) return true;
-
-    console.error(`[updater] ${algo} nao confere: esperado ${esperado}, obtido ${obtido}`);
-    return false;
-  } catch (error) {
-    console.error("[updater] falhei ao conferir o digest:", error);
-    return false;
-  }
-}
-
 // ------------------------------------------------------------------ Windows portable
 
 function portableExePath(): string | null {
@@ -327,6 +305,7 @@ function parsePendingWindowsUpdate(value: unknown): PendingWindowsUpdate | null 
   if (!/^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(item.tag)) return null;
   if (!/^sha256:[0-9a-f]{64}$/i.test(item.digest) || !isSafePendingDownload(item.downloaded)) return null;
   if (item.version !== item.tag.replace(/^v/, "") || item.prerelease !== item.tag.includes("-")) return null;
+  if (!validWindowsIdentity(item.tag, item)) return null;
   return {
     current: item.current,
     downloaded: item.downloaded,
@@ -334,6 +313,9 @@ function parsePendingWindowsUpdate(value: unknown): PendingWindowsUpdate | null 
     version: item.version,
     digest: item.digest,
     prerelease: item.prerelease,
+    assetName: item.assetName,
+    url: item.url,
+    size: item.size,
   };
 }
 
@@ -353,7 +335,7 @@ function loadPendingWindowsUpdate(canal: Canal): void {
     pending !== null &&
     pending.current === current &&
     existsSync(pending.downloaded) &&
-    digestMatches(pending.downloaded, pending.digest) &&
+    verifyWindowsAsset(pending.downloaded, pending.tag, pending) &&
     compararVersoes(pending.version, app.getVersion()) > 0 &&
     (canal === "beta" || !pending.prerelease);
 
@@ -382,8 +364,8 @@ async function downloadWindowsPortable(
   candidate: ReleaseCandidata,
   current: string,
 ): Promise<PendingWindowsUpdate | null> {
-  if (!candidate.url || !candidate.digest) {
-    console.error("[updater] candidata sem URL ou digest; nao vou preparar o update");
+  if (!validWindowsIdentity(candidate.tag, candidate)) {
+    console.error("[updater] candidata sem identidade valida (nome, URL, tamanho ou digest); nao vou preparar o update");
     return null;
   }
 
@@ -403,10 +385,8 @@ async function downloadWindowsPortable(
     return null;
   }
 
-  // Conferido antes de encostar no exe em uso: o helper so recebe um arquivo que bate
-  // com o digest publicado; um arquivo invalido e apagado e a versao atual continua.
-  if (!digestMatches(partial, candidate.digest)) {
-    console.error("[updater] digest do executavel baixado nao confere");
+  if (!verifyWindowsAsset(partial, candidate.tag, candidate)) {
+    console.error("[updater] executavel recusado: identidade, tamanho, PE GUI/NSIS ou digest invalido");
     await rm(downloaded, { force: true }).catch(() => {});
     await rm(partial, { force: true }).catch(() => {});
     return null;
@@ -427,6 +407,9 @@ async function downloadWindowsPortable(
     version: candidate.tag.replace(/^v/, ""),
     digest: candidate.digest,
     prerelease: candidate.prerelease,
+    assetName: candidate.assetName,
+    url: candidate.url,
+    size: candidate.size,
   };
   if (!persistPendingWindowsUpdate(pending)) {
     await rm(downloaded, { force: true }).catch(() => {});
@@ -461,7 +444,9 @@ async function installPendingWindowsUpdate(): Promise<boolean> {
     !current ||
     current !== pending.current ||
     !existsSync(pending.downloaded) ||
-    !digestMatches(pending.downloaded, pending.digest)
+    !isSafePendingDownload(pending.downloaded) ||
+    !verifyWindowsAsset(pending.downloaded, pending.tag, pending) ||
+    compararVersoes(pending.version, app.getVersion()) <= 0
   ) {
     await discardPendingWindowsUpdate();
     console.error("[updater] update pendente foi alterado ou ficou invalido");

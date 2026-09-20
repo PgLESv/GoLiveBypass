@@ -62,17 +62,189 @@ describe("controles Proton", () => {
     expect(source).toContain("Sem resposta ao ping");
   });
 
-  it("exibe o servidor no formato país#servidor sem alterar o identificador interno", () => {
+  it("exibe a rota selecionada no dropdown sem alterar o identificador interno", () => {
     const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
-    expect(html).toContain('id="protonServerFlag"');
-    expect(html).toContain('class="proton-country-flag proton-server-flag"');
+    expect(html).toContain('id="protonCountrySelect"');
+    expect(html).not.toContain('id="protonServerBadge"');
+    expect(html).not.toContain('id="protonServerFlag"');
     const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
     expect(source).toContain("function formatProtonServerName");
     expect(source).toContain("formatProtonServerName(event.server)");
-    expect(source).toContain("formatProtonServerName(s.lastServer.server)");
+    expect(source).toContain("protonSelectedRoute = rememberedServer");
     expect(source).toContain("const selectedServerName = formatProtonServerName(res.server)");
     expect(source).toContain("renderProtonCountryFlag");
     expect(source).toContain("protonMeasurementRows.get(event.server)");
+  });
+
+  it("mantém o diálogo de otimização enxuto e deixa a seleção no dropdown", () => {
+    const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    expect(html).not.toContain('id="protonManualFallback"');
+    expect(html).not.toContain('id="protonManualRecommendationBtn"');
+    expect(html).toContain('id="protonMeasurementActions"');
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("reduceManualRouteEvent");
+    expect(source).toContain("sortManualRouteCandidates");
+    expect(source).toContain("recommendManualRoute");
+    expect(source).toContain("const orderedCandidates = recommendedServer");
+    expect(source).toContain("const routes: ProtonRouteOption[] = orderedCandidates.map");
+    expect(source).toContain("isManualRouteActionable");
+    expect(source).toContain(".filter(isManualRouteSelectable)");
+    expect(source).not.toContain("renderManualRouteChoices");
+    expect(source).not.toContain("protonManualFallback");
+    expect(source).toContain("needsManualPingRecovery");
+    expect(source).toContain("measurePing = false");
+    expect(source).toContain("...(measurePing ? { measurePing: true } : {})");
+    expect(source).toContain("window.api.selectProtonRoute({ measurementId: protonManualMeasurementId, server })");
+    expect(source).toContain("toggleBtn.disabled = busy || protonOptimizationInFlight");
+    expect(source).toContain("protonCloseMeasurementBtn.disabled = busy");
+    expect(source).toContain("if (protonOptimizationInFlight || protonManualSelectionInFlight) return;");
+  });
+  it("exibe skeleton, catálogo progressivo e preserva a rota manual salva", () => {
+    const renderer = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    const preload = fs.readFileSync(path.resolve(process.cwd(), "electron/preload.ts"), "utf8");
+    const electron = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const routePool = fs.readFileSync(path.resolve(process.cwd(), "../tools/proton-confgen/cmd/protonvpn-wg/main.go"), "utf8");
+    const select = fs.readFileSync(path.resolve(process.cwd(), "src/proton-route-select.ts"), "utf8");
+    const styles = fs.readFileSync(path.resolve(process.cwd(), "src/style.css"), "utf8");
+    expect(renderer).toContain("window.api.discoverProtonRoutes({");
+    expect(renderer).toContain("protonCountrySelect?.setLoading(true)");
+    expect(renderer).toContain("protonManualMeasurementId = result.measurementId");
+    expect(renderer).toContain("shouldMeasurePingForCurrentProtonRoutes");
+    expect(renderer).toContain("void discoverProtonRoutesInBackground(shouldMeasurePingForCurrentProtonRoutes())");
+    expect(renderer).toContain("let protonRouteCatalogCandidates = new Map");
+    expect(renderer).toContain("function mergedProtonManualCandidates()");
+    expect(renderer).toContain("function updateProtonRouteDiscoveryProgress");
+    expect(renderer).toContain("event.phase !== 'catalog'");
+    expect(renderer).not.toContain("PROTON_ROUTE_POOL_SIZE");
+    expect(renderer).not.toContain("protonRouteDiscoveryPreviewCandidates");
+    expect(renderer).not.toContain("slice(0, 3)");
+    expect(renderer).toContain("sortManualRouteCandidates(mergedProtonManualCandidates().values())");
+    expect(renderer).toContain("protonRouteCatalogCandidates = candidates");
+    expect(renderer).not.toContain("protonManualCandidates = new Map(candidates)");
+    expect(renderer).toContain("function flushProtonRouteDiscovery()");
+    expect(renderer).toContain("function queueProtonRouteDiscoveryAfterOptimization");
+    expect(renderer).toContain("queueProtonRouteDiscoveryAfterOptimization(needsManualPingRecovery)");
+    expect(renderer).toContain("Rota manual salva · execute uma nova medição para trocar");
+    expect(renderer).toContain("shouldShowProtonRoutePingFallbackFeedback");
+    expect(renderer).toContain("PROTON_ROUTE_PING_FALLBACK_FEEDBACK");
+    expect(renderer).toContain("protonRoutePingFallbackFeedbackShown = true");
+    expect(renderer).toContain("protonOptimizeBtn.disabled = protonManualSelectionInFlight || protonOptimizationInFlight");
+    expect(renderer).toContain("protonRouteDiscoveryRetryPending");
+    expect(renderer).toContain("rota de boot ainda está sendo restaurada");
+    expect(renderer).not.toContain("protonManualCatalogRetryBtn");
+    expect(preload).toContain("ipcRenderer.invoke('discover-proton-routes', options)");
+    expect(preload).toContain("proton-route-discovery-progress");
+    expect(electron).toContain('ipcMain.handle("discover-proton-routes"');
+    expect(electron).toContain("generateProtonRouteCatalog");
+    expect(electron).toContain("excludeServers: previousServer ? [previousServer] : []");
+    expect(electron).toContain("onProgress: sendDiscoveryProgress");
+    expect(routePool).toContain("SpeedCandidatesWithProgressExcluding(servers, cfg.RoutePoolSize, excluded, pingProgress)");
+    expect(select).toContain("proton-route-select__loading");
+    expect(select).toContain("this.measuredRoutes.forEach((option) => this.menu.appendChild(this.createOption(option)))");
+    expect(select).toContain("const selectableRouteCount = this.measuredRoutes.filter((option) => !option.disabled).length");
+    expect(select).toContain("ROUTE_LOADING_PLACEHOLDERS");
+    expect(select).toContain("this.loadingState ? []");
+    expect(select).toContain("Rotas Proton disponíveis");
+    expect(select).toContain("proton-route-select__option-description-row");
+    expect(select).toContain("recommendedBadge = document.createElement('span')");
+    expect(select).toContain("button.appendChild(recommendedBadge)");
+    expect(select).not.toContain("descriptionRow.appendChild(badge)");
+    expect(select).not.toContain("label: 'Automático'");
+    expect(select).not.toContain("proton-route-select__group");
+    expect(styles).toContain("max-height: 111px;");
+    expect(styles).toContain("min-height: 48px;");
+    expect(styles).toContain("grid-template-rows: minmax(0, 1fr) auto;");
+    expect(styles).toContain("overflow-y: auto;");
+    expect(styles).toContain("scrollbar-width: thin;");
+    expect(styles).toContain(".proton-route-select__menu::-webkit-scrollbar");
+    expect(styles).toContain(".proton-route-select__menu::-webkit-scrollbar-thumb");
+    expect(styles).not.toContain(".proton-manual-fallback");
+    expect(styles).toContain("width: 5px;");
+    expect(styles).toContain(".vpn-config-card:has(.proton-route-select.is-open)");
+    expect(styles).toContain("grid-template-columns: auto minmax(0, 1fr);");
+  });
+
+
+  it("oferece a preferência horizontal no mesmo padrão do seletor de tema", () => {
+    const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    expect(html).toContain('class="theme-opts settings-route-preference__options"');
+    expect(html).toContain('id="protonRoutePreferenceAuto"');
+    expect(html).toContain('id="protonRoutePreferenceManual"');
+    expect(html).toContain('data-route-pref="auto" role="radio" aria-checked="true"');
+    expect(html).toContain('data-route-pref="manual" role="radio" aria-checked="false"');
+    expect(html).toContain(">Automática</span>");
+    expect(html).toContain(">Manual</span>");
+    expect(html).not.toContain("settings-route-option__indicator");
+    expect(html).not.toContain("settings-route-preference__hint");
+    expect(html).not.toContain("Uma rota automática por sessão");
+    expect(html).not.toContain("Meça usando o botão quando quiser");
+    const styles = fs.readFileSync(path.resolve(process.cwd(), "src/style.css"), "utf8");
+    expect(styles).not.toContain(".settings-route-preference__options {");
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("document.getElementById('protonRoutePreferenceAuto')");
+    expect(source).toContain("document.getElementById('protonRoutePreferenceManual')");
+    expect(source).toContain(".theme-opt[data-theme-opt]");
+    expect(source).not.toContain("querySelectorAll<HTMLButtonElement>('.theme-opt').forEach");
+    expect(source).toContain("void refreshProtonRoutePreference();");
+    expect(source).toContain("window.api.setProtonSettings({ routePreference: next })");
+    expect(source).toContain("A escolha anterior foi mantida.");
+    expect(source).toContain("syncProtonRoutePreferenceUi(previous);");
+    expect(source).toContain("option.tabIndex = active ? 0 : -1;");
+    expect(source).toContain("event.key === 'ArrowRight'");
+    expect(source).toContain("event.key === 'Home'");
+  });
+  it("marca a seleção imediatamente e exibe check integrado, revertendo no erro", () => {
+    const html = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
+    const styles = fs.readFileSync(path.resolve(process.cwd(), "src/style.css"), "utf8");
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(html).toContain('class="theme-opt settings-route-option theme-opt--active" data-route-pref="auto"');
+    expect(styles).toContain(".settings-route-option.theme-opt--active::after");
+    expect(styles).toContain("content: '✓';");
+    const optimistic = source.indexOf("syncProtonRoutePreferenceUi(next);");
+    const persist = source.indexOf("window.api.setProtonSettings({ routePreference: next })");
+    expect(optimistic).toBeGreaterThanOrEqual(0);
+    expect(persist).toBeGreaterThan(optimistic);
+    expect(source).toContain("syncProtonRoutePreferenceUi(previous);");
+    expect(styles).toContain(".settings-route-option:active:not(:disabled)");
+  });
+
+
+  it("mantém o botão manual nos dois modos e desliga os gatilhos automáticos no modo manual", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("return protonRoutePreference === 'auto';");
+    expect(source).toContain("protonOptimizeBtn?.addEventListener('click', () => void optimizeProtonRoute());");
+    expect(source).toContain("if (onStartup) {");
+    expect(source).toContain("syncProtonRoutePreferenceUi(protonRoutePreference);");
+    expect(source).toContain("shouldDiscoverProtonRoutesAfterPreferenceChange(next, isProtonAuthenticated)");
+    expect(source).toContain("void discoverProtonRoutesInBackground(shouldMeasurePingForCurrentProtonRoutes())");
+  });
+
+  it("anima apenas o ícone durante a medição e respeita reduced-motion", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(source).toContain("const protonOptimizeMotion = gsap.matchMedia();");
+    expect(source).toContain("protonOptimizeMotion.add");
+    expect(source).toContain("reduceMotion: '(prefers-reduced-motion: reduce)'");
+    expect(source).toContain("gsap.to(protonOptimizeIcon");
+    expect(source).toContain("stopProtonOptimizeAnimation();");
+    expect(source).toContain("protonOptimizeMotion.revert();");
+    expect(source).not.toContain("gsap.to(protonOptimizeBtn");
+  });
+
+
+  it("mantém a escolha automática ou manual entre sessões", () => {
+    const renderer = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    const electron = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    expect(renderer).not.toContain("renderManualRouteChoices('cancelled')");
+    expect(renderer).toContain("protonRoutePreference = manualPreference ? 'manual' : 'auto';");
+    expect(renderer).toContain("protonRememberedManualRoute = manualPreference && rememberedServer");
+    expect(renderer).toContain("Rota manual salva · execute uma nova medição para trocar");
+    expect(renderer).toContain("protonSelectedRoute = rememberedServer");
+    expect(renderer).toContain("country: ''");
+    expect(renderer).not.toContain("protonCountryFilter");
+    expect(renderer).toContain("currentVpnMode === 'proton' && isProtonAuthenticated && shouldOptimizeProtonAutomatically()");
+    expect(electron).toContain('protonRoutePreference: "manual"');
+    expect(electron).toContain('protonRoutePreference: "auto"');
+    expect(electron).toContain('if (sessions && ("deferred" in result && result.deferred))');
   });
 
   it("distingue a prova funcional da telemetria auxiliar", () => {

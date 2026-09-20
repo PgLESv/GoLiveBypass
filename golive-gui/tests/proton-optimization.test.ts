@@ -24,6 +24,40 @@ function handlerSource(): string {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
 }
+function discoveryHandlerSource(): string {
+  let body: ts.Block | undefined;
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && node.expression.getText(mainFile) === "ipcMain.handle" &&
+        node.arguments[0]?.getText(mainFile) === '"discover-proton-routes"') {
+      const callback = node.arguments[1];
+      if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) && callback.body && ts.isBlock(callback.body)) body = callback.body;
+    }
+    if (!body) ts.forEachChild(node, visit);
+  };
+  visit(mainFile);
+  if (!body) throw new Error("handler discover-proton-routes não encontrado");
+  return ts.transpileModule(`async function discover(event, options) ${body.getText(mainFile)}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText;
+}
+
+
+function manualHandlerSource(): string {
+  let body: ts.Block | undefined;
+  const visit = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && node.expression.getText(mainFile) === "ipcMain.handle" &&
+        node.arguments[0]?.getText(mainFile) === '"select-proton-route"') {
+      const callback = node.arguments[1];
+      if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) && callback.body && ts.isBlock(callback.body)) body = callback.body;
+    }
+    if (!body) ts.forEachChild(node, visit);
+  };
+  visit(mainFile);
+  if (!body) throw new Error("handler select-proton-route não encontrado");
+  return ts.transpileModule(`async function select(event, options) ${body.getText(mainFile)}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText;
+}
 
 type Harness = {
   run: (options?: Record<string, unknown>) => Promise<any>;
@@ -31,13 +65,102 @@ type Harness = {
   events: any[];
   calls: Record<string, number>;
   coordinator: ProtonOptimizationCoordinator;
+  sessions: Map<number, unknown>;
   resolveGeneration?: () => void;
 };
+
+type ManualHarness = {
+  selectManual: (options?: Record<string, unknown>, ownerId?: number) => Promise<any>;
+  settings: Record<string, any>;
+  calls: Record<string, any>;
+  order: string[];
+  sessions: Map<number, any>;
+  inFlight: Set<string>;
+};
+type DiscoveryHarness = {
+  run: (options?: Record<string, unknown>) => Promise<any>;
+  settings: Record<string, any>;
+  calls: { catalog?: Record<string, any> };
+  events: any[];
+  sessions: Map<number, any>;
+};
+
+function makeDiscoveryHarness(overrides: Record<string, any> = {}): DiscoveryHarness {
+  const settings: Record<string, any> = {
+    protonUsername: "user@example.test",
+    protonCountry: "",
+    protonLastServer: { server: "US#8", pingMs: 144 },
+  };
+  const calls: { catalog?: Record<string, any> } = {};
+  const events: any[] = [];
+  const sessions = new Map<number, any>();
+  const sender = {
+    id: 41,
+    isDestroyed: () => false,
+    send: (channel: string, payload: any) => events.push({ channel, payload }),
+    once: () => {},
+    removeListener: () => {},
+  };
+  const event = { sender };
+  const coordinator = new ProtonOptimizationCoordinator();
+  const ctx: any = new Proxy({
+    isMac: false,
+    startupRestoreInFlight: false,
+    quitting: false,
+    settingsDir: () => "/tmp/test-settings",
+    readSharedSettings: () => settings,
+    resolveProtonPlan: async () => ({ success: true, status: "free", maxTier: 0 }),
+    withWireSockLifecycle: async (_name: string, task: () => Promise<any>) => task(),
+    proton: {
+      generateProtonRouteCatalog: async (_dir: string, options: Record<string, any>) => {
+        calls.catalog = options;
+        options.onProgress?.({
+          phase: "catalog",
+          total: 3,
+          tested: 1,
+          succeeded: 1,
+          server: "NL#2",
+          country: "NL",
+          city: "Amsterdam",
+          tier: "Free",
+          load: 21,
+          score: 2,
+          ...(options.measurePing ? { pingMs: 81 } : {}),
+          status: "success",
+        });
+        return {
+          success: true,
+          routes: [
+            { server: "US#8", country: "US", city: "New York", tier: "Free", load: 12, score: 1, ...(options.measurePing ? { pingMs: 80 } : {}) },
+            { server: "NL#2", country: "NL", city: "Amsterdam", tier: "Free", load: 21, score: 2, ...(options.measurePing ? { pingMs: 81 } : {}) },
+            { server: "DE#4", country: "DE", city: "Berlin", tier: "Free", load: 19, score: 3, ...(options.measurePing ? { pingMs: 92 } : {}) },
+          ],
+        };
+      },
+    },
+    protonOptimizations: coordinator,
+    manualMeasurementSessions: sessions,
+    fs, Date, Error, String, Number, Boolean, Object, Promise, Math, Map, console,
+  }, { has: () => true, get: (target, property) => property in target ? target[property as any] : undefined });
+  Object.assign(ctx, overrides);
+  const compiled = discoveryHandlerSource();
+  const factory = new Function("ctx", `with (ctx) { ${compiled}; return discover; }`);
+  const fn = factory(ctx);
+  return {
+    run: (options = {}) => fn(event, options),
+    settings,
+    calls,
+    events,
+    sessions,
+  };
+}
+
 
 function makeHarness(overrides: Record<string, any> = {}): Harness {
   const settings: Record<string, any> = { protonUsername: "user@example.test" };
   const events: any[] = [];
   const calls: Record<string, number> = {};
+  const sessions = new Map<number, unknown>();
   const sender = {
     id: 41,
     isDestroyed: () => false,
@@ -81,13 +204,207 @@ function makeHarness(overrides: Record<string, any> = {}): Harness {
     event,
     Date, Error, String, Number, Boolean, Object, Promise, Math, console, AbortController,
     protonOptimizations: coordinator,
+    manualMeasurementSessions: sessions,
   }, { has: () => true, get: (target, property) => property in target ? target[property as any] : undefined });
   Object.assign(ctx, overrides);
   const compiled = handlerSource();
   const factory = new Function("ctx", `with (ctx) { ${compiled}; return optimize; }`);
   const fn = factory(ctx);
-  return { run: (options = {}) => fn(event, options), settings, events, calls, coordinator };
+  return { run: (options = {}) => fn(event, options), settings, events, calls, coordinator, sessions };
 }
+
+function makeManualHarness(overrides: Record<string, any> = {}): ManualHarness {
+  const settings: Record<string, any> = {
+    protonUsername: "user@example.test",
+    protonCountry: "US",
+    protonAutoPing: true,
+  };
+  const calls: Record<string, any> = {};
+  const order: string[] = [];
+  const sessions = new Map<number, any>([[41, {
+    measurementId: "measurement-1",
+    ownerId: 41,
+    username: "user@example.test",
+    country: "US",
+    freeOnly: true,
+    autoPing: true,
+    candidates: new Map([
+      ["US#8", {
+        server: "US#8", pingMs: 188, pingStatus: "success",
+        preflightStatus: "not-tested", speedStatus: "not-tested",
+      }],
+      ["NL#2", {
+        server: "NL#2", pingStatus: "not-tested",
+        preflightStatus: "not-tested", speedStatus: "not-tested",
+      }],
+      ["US#72", {
+        server: "US#72", pingMs: 205, pingStatus: "failed",
+        preflightStatus: "not-tested", speedStatus: "not-tested",
+      }],
+      ["US#99", {
+        server: "US#99", pingMs: 210, pingStatus: "success",
+        preflightStatus: "failed", speedStatus: "not-tested",
+      }],
+    ]),
+    expiresAt: Date.now() + 10 * 60_000,
+  }]]);
+  const inFlight = new Set<string>();
+  const sender = {
+    id: 41,
+    isDestroyed: () => false,
+    send: () => {},
+  };
+  const event = { sender };
+  const defaultProton = {
+    generateManualProtonConfig: async (_dir: string, options: any) => {
+      order.push("generate-manual");
+      calls.generateManualOptions = options;
+      return {
+        success: true,
+        manual: true,
+        server: options.server,
+        pingMs: 188,
+        endpoint: "198.51.100.8:51820",
+        confFile: ".manual-proton-route.test.tmp",
+        staged: true,
+      };
+    },
+    promoteStagedProtonConfig: () => order.push("promote"),
+    removeStagedProtonConfig: vi.fn(),
+    protonIdentityMatches: (left: string, right: string) => left.trim().toLowerCase() === right.trim().toLowerCase(),
+  };
+  const defaultApply = async (generated: any, context: any) => {
+    order.push("apply");
+    calls.applyContext = context;
+    return { ...generated, success: true, manual: true };
+  };
+  const ctx: any = new Proxy({
+    isMac: false, IS_LINUX: false, IS_WINDOWS: false, quitting: false,
+    settingsDir: () => "/tmp/test-settings",
+    readSharedSettings: () => settings,
+    updateSharedSettings: (patch: any) => { Object.assign(settings, patch); return true; },
+    getStatus: () => "INACTIVE",
+    linuxStatus: async () => "INACTIVE",
+    withWireSockLifecycle: async (_name: string, task: () => Promise<any>) => task(),
+    refreshWindowStatus: () => {}, refreshTray: async () => {},
+    windowsAllowedAppPaths: () => [], getDiscordInstalls: () => [],
+    killDiscord: async () => calls.killDiscord = (calls.killDiscord || 0) + 1,
+    recoverWireSockNetwork: async () => ({ ok: true, residual: [] }),
+    startWireSockService: async () => calls.startWireSock = (calls.startWireSock || 0) + 1,
+    startDiscordAndConfirm: async () => { calls.startDiscord = (calls.startDiscord || 0) + 1; return true; },
+    waitForWindowsRouteSettle: async () => {},
+    beginWindowsRouteOperation: () => 1, assertWindowsRouteGeneration: () => {},
+    stopWindowsRouteWatchdog: () => {}, pararWgStatsWatchdog: () => {},
+    startWindowsRouteWatchdog: () => {}, iniciarWgStatsWatchdog: () => {},
+    linuxDeactivate: async () => {}, linuxActivate: async () => {}, linuxPreflight: async () => ({ ok: true }),
+    linuxPreflightRepairable: () => true, linuxPreflightMessage: () => "preflight",
+    runScript: async () => ({ code: 0 }),
+    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    resolveProtonPlan: async () => ({ success: true, status: "free", maxTier: 0 }),
+    backupProtonConfig: () => { order.push("backup"); return "backup-file"; },
+    restoreProtonConfigBackup: () => { order.push("restore"); },
+    removeProtonConfigBackup: () => { order.push("backup-remove"); },
+    applyProtonRouteResult: defaultApply,
+    randomUUID: () => "manual-id",
+    manualMeasurementSessions: sessions,
+    manualRouteSelectionsInFlight: inFlight,
+    proton: defaultProton,
+    event,
+    Date, Error, String, Number, Boolean, Object, Promise, Math, console, AbortController,
+  }, { has: () => true, get: (target, property) => property in target ? target[property as any] : undefined });
+  Object.assign(ctx, overrides);
+  const compiled = manualHandlerSource();
+  const factory = new Function("ctx", `with (ctx) { ${compiled}; return select; }`);
+  const fn = factory(ctx);
+  return {
+    selectManual: (options = {}, ownerId = 41) => fn({ sender: { ...sender, id: ownerId } }, options),
+    settings,
+    calls,
+    order,
+    sessions,
+    inFlight,
+  };
+}
+
+describe("handler real de descoberta Proton", () => {
+  it("carrega todas as rotas catalogadas sem alterar a rota manual ativa", async () => {
+    const h = makeDiscoveryHarness();
+    const result = await h.run({ requestId: "discover-me" });
+
+    expect(result).toMatchObject({
+      success: true,
+      measurementId: "discover-me",
+      routes: [
+        { server: "NL#2", country: "NL", city: "Amsterdam", tier: "Free", load: 21, score: 2 },
+        { server: "DE#4", country: "DE", city: "Berlin", tier: "Free", load: 19, score: 3 },
+      ],
+    });
+    expect(h.calls.catalog).toMatchObject({
+      freeOnly: true,
+      excludeServers: ["US#8"],
+    });
+    expect(h.calls.catalog).not.toHaveProperty("size");
+    expect(h.calls.catalog).not.toHaveProperty("autoPing");
+    expect(h.settings.protonLastServer).toMatchObject({ server: "US#8" });
+    expect(h.sessions.get(41)).toMatchObject({
+      measurementId: "discover-me",
+      username: "user@example.test",
+      freeOnly: true,
+    });
+    expect([...h.sessions.get(41).candidates.keys()]).toEqual(["NL#2", "DE#4"]);
+    expect(h.sessions.get(41).candidates.get("NL#2")).toMatchObject({
+      server: "NL#2",
+      pingStatus: "not-tested",
+      preflightStatus: "not-tested",
+      speedStatus: "not-tested",
+    });
+    expect(h.sessions.get(41).candidates.get("NL#2")).not.toHaveProperty("pingMs");
+  });
+  it("carrega ping medido e disponibiliza as rotas na sessão manual", async () => {
+    const h = makeDiscoveryHarness();
+    const result = await h.run({ requestId: "discover-ping", measurePing: true });
+
+    expect(h.calls.catalog).toMatchObject({
+      measurePing: true,
+    });
+    expect(result.routes).toEqual([
+      { server: "NL#2", country: "NL", city: "Amsterdam", tier: "Free", load: 21, score: 2, pingMs: 81 },
+      { server: "DE#4", country: "DE", city: "Berlin", tier: "Free", load: 19, score: 3, pingMs: 92 },
+    ]);
+    expect(h.sessions.get(41).candidates.get("NL#2")).toMatchObject({
+      pingMs: 81,
+      pingStatus: "success",
+    });
+  });
+
+  it("encaminha progresso de catálogo com requestId e metadados públicos", async () => {
+    const h = makeDiscoveryHarness();
+    await h.run({ requestId: "discover-progress" });
+
+    expect(h.events).toContainEqual({
+      channel: "proton-route-discovery-progress",
+      payload: expect.objectContaining({
+        requestId: "discover-progress",
+        phase: "catalog",
+        server: "NL#2",
+        country: "NL",
+        city: "Amsterdam",
+        load: 21,
+        score: 2,
+        status: "success",
+      }),
+    });
+  });
+
+  it("libera a filtragem de servidores para conta Premium", async () => {
+    const h = makeDiscoveryHarness({
+      resolveProtonPlan: async () => ({ success: true, status: "premium", maxTier: 2 }),
+    });
+    await h.run({ requestId: "discover-premium" });
+    expect(h.calls.catalog).toMatchObject({ freeOnly: false });
+    expect(h.sessions.get(41)).toMatchObject({ freeOnly: false });
+  });
+});
 
 describe("handler real de otimização Proton", () => {
   it("reutiliza cache compatível sem medir", async () => {
@@ -115,13 +432,14 @@ describe("handler real de otimização Proton", () => {
     expect(generated).toBe(1);
   });
 
-  it("mede na seleção inicial e persiste a métrica de velocidade", async () => {
+  it("mede na seleção inicial, persiste velocidade e conserva candidatas", async () => {
     const h = makeHarness();
     const result = await h.run({ speedTest: true });
     expect(result).toMatchObject({ success: true, downloadMbps: 100, uploadMbps: 20 });
     expect(h.calls.generate).toBe(1);
     expect(h.settings.protonLastServer).toMatchObject({ measurementVersion: "test-v2", measurementUsername: "user@example.test" });
     expect(h.events.at(-1)).toMatchObject({ phase: "completed", requestId: expect.any(String) });
+    expect(h.sessions.has(41)).toBe(true);
   });
 
   it("adianta quando o túnel está ativo e há reutilização solicitada", async () => {
@@ -176,7 +494,7 @@ describe("handler real de otimização Proton", () => {
     expect(h.settings.protonLastServer).toBeUndefined();
   });
 
-  it("cancelamento por requestId aborta a geração e não grava perfil", async () => {
+  it("cancelamento por requestId aborta a geração e conserva candidatas para seleção manual", async () => {
     let release!: () => void;
     const pending = new Promise<void>((resolve) => { release = resolve; });
     const h = makeHarness({ proton: { MEASUREMENT_CRITERION_VERSION: "test-v2", canReuseMeasuredProfile: () => false,
@@ -190,6 +508,14 @@ describe("handler real de otimização Proton", () => {
     release();
     await expect(run).resolves.toMatchObject({ success: false, cancelled: true });
     expect(h.settings.protonLastServer).toBeUndefined();
+    expect(h.sessions.has(41)).toBe(true);
+    expect(h.sessions.get(41)).toMatchObject({ measurementId: "cancel-me" });
+  });
+
+  it("persiste preferência automática ao concluir uma nova medição", async () => {
+    const h = makeHarness();
+    await expect(h.run({ speedTest: true })).resolves.toMatchObject({ success: true });
+    expect(h.settings.protonRoutePreference).toBe("auto");
   });
 
   it("coordenador rejeita concorrência e protege cancelamento por owner", () => {
@@ -212,6 +538,86 @@ describe("handler real de otimização Proton", () => {
     const first = h.run({ speedTest: true, requestId: "first" });
     await Promise.resolve();
     await expect(h.run({ speedTest: true, requestId: "second" })).resolves.toEqual({ success: false, error: "Já existe uma seleção de rota em andamento." });
+    release();
+    await expect(first).resolves.toMatchObject({ success: true });
+  });
+
+  it("rejeita seleção manual fora da sessão e não chama o helper", async () => {
+    const h = makeManualHarness();
+    const result = await h.selectManual({ measurementId: "old", server: "US#8" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("medição");
+    expect(h.calls.generateManualOptions).toBeUndefined();
+  });
+
+  it("rejeita proprietário diferente, servidor ausente e ping inválido", async () => {
+    const h = makeManualHarness();
+    await expect(h.selectManual({ measurementId: "measurement-1", server: "US#8" }, 42))
+      .resolves.toMatchObject({ success: false });
+    await expect(h.selectManual({ measurementId: "measurement-1", server: "DE#1" }))
+      .resolves.toMatchObject({ success: false });
+    await expect(h.selectManual({ measurementId: "measurement-1", server: "US#72" }))
+      .resolves.toMatchObject({ success: false });
+    expect(h.calls.generateManualOptions).toBeUndefined();
+  });
+
+  it("rejeita rota explicitamente reprovada no preflight", async () => {
+    const h = makeManualHarness();
+    const result = await h.selectManual({ measurementId: "measurement-1", server: "US#99" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("preflight");
+    expect(h.calls.generateManualOptions).toBeUndefined();
+  });
+  it("valida sob demanda uma rota catalogada sem ping armazenado", async () => {
+    const h = makeManualHarness();
+    const result = await h.selectManual({ measurementId: "measurement-1", server: "NL#2" });
+
+    expect(h.calls.generateManualOptions).toMatchObject({ server: "NL#2" });
+    expect(result).toMatchObject({ success: true, manual: true, server: "NL#2" });
+  });
+
+  it("seleciona servidor exato e conserva sessão para outra escolha", async () => {
+    const h = makeManualHarness();
+    const result = await h.selectManual({ measurementId: "measurement-1", server: "US#8" });
+
+    expect(h.calls.generateManualOptions).toMatchObject({ server: "US#8" });
+    expect(h.order).toEqual(["generate-manual", "backup", "promote", "apply", "backup-remove"]);
+    expect(result).toMatchObject({ success: true, manual: true, server: "US#8" });
+    expect(h.calls.startDiscord).toBeUndefined();
+    expect(h.sessions.has(41)).toBe(true);
+  });
+
+  it("preserva o perfil anterior e a sessão quando a aplicação manual falha", async () => {
+    const h = makeManualHarness({
+      applyProtonRouteResult: async () => {
+        h?.order.push("apply");
+        return { success: false, manual: true, error: "rota indisponível" };
+      },
+    });
+    const result = await h.selectManual({ measurementId: "measurement-1", server: "US#8" });
+
+    expect(result).toMatchObject({ success: false });
+    expect(h.order).toContain("restore");
+    expect(h.order).toContain("backup-remove");
+    expect(h.sessions.has(41)).toBe(true);
+  });
+
+  it("recusa a segunda seleção enquanto a primeira está aplicando", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const h = makeManualHarness({
+      applyProtonRouteResult: async (generated: any) => {
+        h?.order.push("apply");
+        await pending;
+        return { ...generated, success: true, manual: true };
+      },
+    });
+    const first = h.selectManual({ measurementId: "measurement-1", server: "US#8" });
+    await Promise.resolve();
+    await expect(h.selectManual({ measurementId: "measurement-1", server: "US#8" }))
+      .resolves.toMatchObject({ success: false, error: expect.stringContaining("andamento") });
     release();
     await expect(first).resolves.toMatchObject({ success: true });
   });

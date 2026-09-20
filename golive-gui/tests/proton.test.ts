@@ -20,6 +20,14 @@ import {
 } from "../electron/proton";
 
 describe("ProtonVPN Integration & Sidecar", () => {
+  it("registra as fases do helper sem expor sessão ou credenciais", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "electron/proton.ts"), "utf8");
+    expect(source).toContain("ensureProtonConfgen");
+    expect(source).toContain("logEvent");
+    expect(source).toContain("safeConfgenArgs");
+    expect(source).not.toContain("logger.info('proton', 'sessão");
+  });
+
   it("gera perfis Proton com IPv6 para impedir saida direta fora do AllowedIPs", () => {
     const source = fs.readFileSync(path.resolve(process.cwd(), "electron/proton.ts"), "utf8");
     const generation = source.slice(source.indexOf("export async function generateOptimalProtonConfig"));
@@ -46,14 +54,14 @@ describe("ProtonVPN Integration & Sidecar", () => {
     expect(sessionFile).toBe(path.join(tmpDir, "proton-session.json"));
   });
 
-  it("recupera somente o usuario da sessao persistida", () => {
+  it("recupera somente o usuario da sessao pelo contrato do helper", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
       fs.writeFileSync(path.join(tmpDir, "proton-session.json"), JSON.stringify({
         username: "conta@example.com",
-        session: { AccessToken: "nao deve ser retornado" },
+        session: { AccessToken: "nao deve ser retornado", UID: "synthetic-uid" },
       }));
-      expect(getSavedSessionUsername(tmpDir)).toBe("conta@example.com");
+      await expect(getSavedSessionUsername(tmpDir)).resolves.toBe("conta@example.com");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -100,7 +108,18 @@ describe("ProtonVPN Integration & Sidecar", () => {
     expect(classifyProtonError("CAPTCHA_INVALID").code).toBe("CAPTCHA_INVALID");
     expect(classifyProtonError("invalid password").code).toBe("INVALID_CREDENTIALS");
     expect(classifyProtonError("Tempo limite excedido").code).toBe("TIMEOUT");
-    expect(classifyProtonError("spawn proton-confgen ENOENT").code).toBe("MISSING_EXECUTABLE");
+    // O prefixo genérico do helper cobre falha de transporte/protocolo também;
+    // sem texto explícito de credencial, não pode acusar senha errada.
+    const wrappedProtocol = classifyProtonError("authentication failed: Proton session verification returned an invalid HTTP status (200)");
+    expect(wrappedProtocol.code).toBe("UNKNOWN");
+    expect(wrappedProtocol.retryable).toBe(true);
+    const missing = classifyProtonError("spawn proton-confgen ENOENT");
+    expect(missing.code).toBe("MISSING_EXECUTABLE");
+    expect(missing.retryable).toBe(true);
+    expect(missing.message).not.toContain("Reinstale o GoLiveBypass");
+    const persistence = classifyProtonError("failed to migrate session file: failed to commit session file: access denied");
+    expect(persistence).toMatchObject({ code: "SESSION_PERSISTENCE", retryable: true });
+    expect(persistence.message).toContain("senha não foi verificada");
   });
 
   it("classifica o plano somente quando MaxTier e valido", () => {
@@ -131,10 +150,11 @@ describe("ProtonVPN Integration & Sidecar", () => {
     }
   });
 
-  it("executa proton-confgen e processa JSON retornado", async () => {
+  it("inicia proton-confgen sem duplicar flags globais", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
       const sessionFile = path.join(tmpDir, "dummy-session.json");
+      // Regra de regressão: uma flag repetida aborta o helper antes de autenticar.
       const res = await runConfgen({
         args: [
           "-username", "teste_golive",
@@ -145,6 +165,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
         timeoutMs: 5000,
       });
 
+      expect(res.code).toBe(0);
       expect(res.json).toBeDefined();
       expect(res.json.valid).toBe(false);
       expect(typeof res.json.error).toBe("string");

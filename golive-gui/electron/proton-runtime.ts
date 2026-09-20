@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import https from "node:https";
 
-const RUNTIME_REPO = "bezumiya/GoLiveBypass";
+const RUNTIME_REPO = "PgLESv/GoLiveBypass";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const HASH_RE = /^[a-f0-9]{64}$/i;
@@ -137,19 +138,8 @@ export function readProtonRuntimeManifest(paths: readonly string[]): ProtonRunti
   for (const manifestPath of paths) {
     try {
       const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Partial<ProtonRuntimeManifest>;
-      const win = parsed.assets?.["win32-x64"];
-      const linux = parsed.assets?.["linux-x64"];
-      if (!parsed.version || !VERSION_RE.test(parsed.version) || !win || !linux) continue;
-      const entries = [win, linux];
-      if (entries.some((entry) => typeof entry.asset !== "string" || typeof entry.sha256 !== "string" ||
-        !HASH_RE.test(entry.sha256) || !/^[A-Za-z0-9._-]+$/.test(entry.asset) || entry.asset.includes(".."))) continue;
-      return {
-        version: parsed.version,
-        assets: {
-          "win32-x64": { asset: win.asset, sha256: win.sha256.toLowerCase() },
-          "linux-x64": { asset: linux.asset, sha256: linux.sha256.toLowerCase() },
-        },
-      };
+      const normalized = normalizeProtonRuntimeManifest(parsed);
+      if (normalized) return normalized;
     } catch {
       // O próximo layout pode conter o manifesto válido; não vazar conteúdo do arquivo para a UI.
     }
@@ -157,6 +147,23 @@ export function readProtonRuntimeManifest(paths: readonly string[]): ProtonRunti
   return undefined;
 }
 
+function normalizeProtonRuntimeManifest(value: unknown): ProtonRuntimeManifest | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const parsed = value as Partial<ProtonRuntimeManifest>;
+  const win = parsed.assets?.["win32-x64"];
+  const linux = parsed.assets?.["linux-x64"];
+  if (!parsed.version || !VERSION_RE.test(parsed.version) || !win || !linux) return undefined;
+  const entries = [win, linux];
+  if (entries.some((entry) => typeof entry.asset !== "string" || typeof entry.sha256 !== "string" ||
+    !HASH_RE.test(entry.sha256) || !/^[A-Za-z0-9._-]+$/.test(entry.asset) || entry.asset.includes(".."))) return undefined;
+  return {
+    version: parsed.version,
+    assets: {
+      "win32-x64": { asset: win.asset, sha256: win.sha256.toLowerCase() },
+      "linux-x64": { asset: linux.asset, sha256: linux.sha256.toLowerCase() },
+    },
+  };
+}
 export function protonRuntimeAssetUrl(version: string, asset: string): string {
   const safeVersion = validatedVersion(version);
   const safeAsset = validatedAssetName(asset);
@@ -240,6 +247,41 @@ async function downloadVerified(url: string, target: string, expectedSha256: str
   });
 }
 
+async function fetchReleaseManifest(versionOrUrl: string, redirects = 0): Promise<ProtonRuntimeManifest | undefined> {
+  if (redirects > MAX_REDIRECTS) return undefined;
+  const url = /^https:\/\//i.test(versionOrUrl)
+    ? versionOrUrl
+    : protonRuntimeAssetUrl(versionOrUrl, "proton-confgen-manifest.json");
+  const parsed = new URL(url);
+  return new Promise((resolve) => {
+    if (parsed.protocol !== "https:" || !allowedDownloadHost(parsed.hostname)) { resolve(undefined); return; }
+    const request = https.get(parsed, {
+      headers: { "User-Agent": "GoLiveBypass-ProtonRuntime", Accept: "application/json" },
+    }, (response) => {
+      const status = response.statusCode ?? 0;
+      if (status >= 300 && status < 400 && response.headers.location) {
+        response.resume();
+        void fetchReleaseManifest(new URL(response.headers.location, parsed).toString(), redirects + 1).then(resolve);
+        return;
+      }
+      if (status !== 200) { response.resume(); resolve(undefined); return; }
+      let body = "";
+      let tooLarge = false;
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => {
+        body += chunk;
+        if (body.length > MAX_MANIFEST_BYTES) tooLarge = true;
+      });
+      response.on("error", () => resolve(undefined));
+      response.on("end", () => {
+        if (tooLarge) { resolve(undefined); return; }
+        try { resolve(normalizeProtonRuntimeManifest(JSON.parse(body))); } catch { resolve(undefined); }
+      });
+    });
+    request.setTimeout(15_000, () => request.destroy());
+    request.on("error", () => resolve(undefined));
+  });
+}
 export async function stageValidatedProtonConfgen(options: StageValidatedProtonConfgenOptions): Promise<string> {
   const version = validatedVersion(options.version);
   const expected = options.expectedSha256 ? validatedHash(options.expectedSha256) : undefined;
@@ -276,7 +318,11 @@ async function ensureProtonConfgenOnce(options: EnsureProtonConfgenOptions): Pro
   const version = validatedVersion(options.version);
   const key = runtimeKey(options.context);
   if (!key) throw new Error(`Arquitetura ${options.context.platform ?? process.platform}/${options.context.arch ?? process.arch} não suportada pelo runtime Proton.`);
-  const manifest = readProtonRuntimeManifest(protonRuntimeManifestCandidates(options.context));
+  const localManifest = readProtonRuntimeManifest(protonRuntimeManifestCandidates(options.context));
+  // A release asset is the repair path for installations where an antivirus,
+  // an incomplete extraction or a bad portable copy removed extraResources.
+  // It is only trusted after the strict schema validation above.
+  const manifest = localManifest || await fetchReleaseManifest(version);
   const entry = manifest?.assets[key];
   if (manifest && manifest.version !== version) {
     throw new Error("O manifesto do runtime Proton pertence a outra versão da GUI.");

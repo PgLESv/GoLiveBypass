@@ -25,9 +25,8 @@ const targets = [
   { key: 'linux-x64', output: 'build/proton-confgen', env: { GOOS: 'linux', GOARCH: 'amd64', CGO_ENABLED: '0' } },
   { key: 'win32-x64', output: 'build/proton-confgen.exe', env: { GOOS: 'windows', GOARCH: 'amd64', CGO_ENABLED: '0' } },
 ];
-// Nunca deixe o estado do checkout alterar os bytes do helper. O workflow cria
-// arquivos no checkout antes de compilar o segundo target, o que ativaria
-// vcs.modified=true sem esta flag e quebraria o hash do manifesto.
+// O estado VCS do checkout não pode alterar os bytes do helper entre a GUI e o
+// asset de reparo publicado. Isso também torna o manifesto reproduzível no CI.
 const buildArgs = ['build', '-buildvcs=false', '-trimpath', '-ldflags=-s -w -buildid=', '-o'];
 
 // Explicit env objects work with cmd.exe, PowerShell and POSIX shells alike.
@@ -42,8 +41,10 @@ for (const target of targets) {
 }
 
 const assetNames = {
-  'linux-x64': `GoLiveBypass-${version}-proton-confgen-linux-x64`,
-  'win32-x64': `GoLiveBypass-${version}-proton-confgen-win-x64.exe`,
+  // Older portable updaters accept GoLiveBypass-*.exe, including helpers.
+  // Keep auxiliary assets outside that namespace so those clients can migrate.
+  'linux-x64': `proton-confgen-${version}-linux-x64`,
+  'win32-x64': `proton-confgen-${version}-win-x64.exe`,
 };
 const assets = {};
 for (const target of targets) {
