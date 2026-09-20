@@ -4,6 +4,26 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.7] - 2026-09-20
+
+### Sincronização Upstream (GoLiveBypass 2.0.9 Estável)
+- **Resiliência de Sessão Proton (GUI):**
+  - Erros temporários de rede ou oscilação na verificação da sessão Proton (`NETWORK_ERROR`, timeout) não deslogam mais a conta nem bloqueiam o botão "Ativar Bypass" (#312, #316, #317).
+  - O painel adota veredito (`authenticated` | `unverified` | `logged-out`) com tentativas automáticas em segundo plano e preserva o perfil e a rota local previamente preparados.
+- **Plugin Linux & Launcher Netns Confiável:**
+  - O utilitário `netns-launcher.c` grava confirmação de entrada no namespace e renúncia de privilégios antes que o processo atual encerre o Discord, prevenindo fechamentos indevidos quando diálogos polkit são cancelados ou atrasam (#313).
+  - Resolução do módulo WireGuard no Linux através de caminhos absolutos no sistema (`modprobe`, `modinfo`, `ip`), eliminando dependência do `PATH` do aplicativo.
+- **Recuperação de Clientes Paralelos nos Instaladores:**
+  - Novos comandos `-Mode RestoreClient` e `-Mode ClientStatus` (e equivalentes `--restore-client` e `--client-status` no instalador POSIX) para inspecionar a posse de injeções e restaurar backups originais (`_app.asar`) de clientes paralelos (Equibop, Vesktop) que deixaram de abrir.
+  - O instalador Windows sobrevive a travas de arquivos em `app.asar`, fechando `Update.exe` e repetindo tentativas de injeção de forma segura.
+- **Painel do Plugin & Desacoplamento de Threads na GUI:**
+  - Exibição em tempo real da rota em uso e do estado detalhado do túnel WireGuard diretamente nas configurações do plugin.
+  - Isolamento de tarefas de status, watchdog e ícone da bandeja fora da thread principal do Electron.
+- **Recursos Exclusivos do Fork PgLESv Preservados:**
+  - Preservada a identidade e releases de `PgLESv/GoLiveBypass`.
+  - Suporte completo a planos ProtonVPN (Free e Plus/Paid) com extração de `tier`, `planTitle` e `isPaid`.
+  - Diagnóstico estritamente local e ausência de telemetria externa em favor de privacidade.
+
 ## [2.1.6] - 2026-09-19
 
 ### Sincronização Upstream (GoLiveBypass 2.0.6 Estável)

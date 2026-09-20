@@ -38,8 +38,8 @@ export interface ReleaseCatalog {
 
 const owner = 'PgLESv'
 const repo = 'GoLiveBypass'
-const fallbackTag = 'v2.1.6'
-const fallbackVersion = '2.1.6'
+const fallbackTag = 'v2.1.7'
+const fallbackVersion = '2.1.7'
 const repositoryUrl = `https://github.com/${owner}/${repo}`
 
 export const release = {
