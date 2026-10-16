@@ -4,6 +4,17 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.9] - 2026-10-16
+
+### Modificado
+- **Build & Versionamento no GitHub Actions:**
+  - O workflow `build-gui.yml` agora sincroniza dinamicamente a versão de `golive-gui/package.json` a partir da tag disparada (`inputs.tag`), garantindo que o executável e o instalador gerados pelo `electron-builder` reflitam exatamente a versão da release.
+- **Interface Gráfica (GUI):**
+  - Removido o botão flutuante com link para o servidor de suporte do Discord.
+  - Removido o seletor de canal beta das configurações da GUI.
+- **Canal Beta:**
+  - Eliminado o canal beta da GUI e do workflow do GitHub Actions (`build-gui.yml`), mantendo o fork focado exclusivamente no canal estável padrão.
+
 ## [2.1.8] - 2026-09-20
 
 ### Corrigido

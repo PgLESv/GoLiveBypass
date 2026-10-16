@@ -470,17 +470,6 @@ html[data-theme='dark'] .page-ambient::before {
   transform: none;
 }
 
-/* Discord: so o SVG oficial, sem texto */
-.discord-btn {
-  color: var(--discord);
-}
-
-.discord-btn svg {
-  width: 18px;
-  height: 18px;
-  fill: currentColor;
-}
-
 /* Botao de configuracoes (canto superior): herda o visual do .icon-btn. */
 
 
@@ -2241,11 +2230,7 @@ html[data-theme='dark'] .settings-switch input:checked + .switch-track .switch-t
   width: 15px;
   height: 15px;
 }
-.settings-switch__icon--beta {
-  color: var(--warn-ink);
-  border-color: var(--warn-line);
-  background: var(--warn-bg);
-}
+
 .settings-switch__copy {
   display: flex;
   min-width: 0;

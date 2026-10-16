@@ -285,8 +285,6 @@ const appVersionEl = document.getElementById('appVersion');
 const startupToggle = document.getElementById('startupToggle') as HTMLInputElement;
 const autoUpdateToggle = document.getElementById('autoUpdateToggle') as HTMLInputElement | null;
 const autoFailoverToggle = document.getElementById('autoFailoverToggle') as HTMLInputElement | null;
-const updateChannelRow = document.getElementById('updateChannelRow') as HTMLElement | null;
-const updateChannelToggle = document.getElementById('updateChannelToggle') as HTMLInputElement | null;
 const settingsBtn = document.getElementById('settingsBtn') as HTMLButtonElement | null;
 const settingsDialog = document.getElementById('settingsDialog') as HTMLElement | null;
 const settingsBackdrop = document.getElementById('settingsBackdrop') as HTMLElement | null;
@@ -719,14 +717,6 @@ async function refreshAutoUpdate() {
   try {
     if (autoUpdateToggle) {
       autoUpdateToggle.checked = await window.api.getAutoUpdate();
-    }
-    // O canal beta so existe onde ha updater que o suporta (updater proprio no
-    // Windows, allowPrerelease no Linux); no macOS nao existe updater nenhum.
-    if (updateChannelRow) {
-      updateChannelRow.hidden = window.api.platform === 'darwin';
-    }
-    if (updateChannelToggle) {
-      updateChannelToggle.checked = (await window.api.getUpdateChannel()) === 'beta';
     }
   } catch (err) {
     console.error(err);
@@ -2372,22 +2362,6 @@ autoFailoverToggle?.addEventListener('change', async () => {
   }
 });
 
-// Canal de atualizacao: opt-in dos testadores para receber prereleases (beta).
-updateChannelToggle?.addEventListener('change', async () => {
-  if (!updateChannelToggle) return;
-  const betaAtivado = updateChannelToggle.checked;
-  updateChannelToggle.disabled = true;
-  try {
-    // O processo principal consulta e baixa a beta imediatamente. O await mantém o
-    // toggle ocupado até o diálogo de reinício ser apresentado/encerrado.
-    await window.api.setUpdateChannel(betaAtivado ? 'beta' : 'stable');
-  } catch (error) {
-    console.error('[updater] não consegui alterar o canal:', error);
-    updateChannelToggle.checked = !betaAtivado;
-  } finally {
-    updateChannelToggle.disabled = false;
-  }
-});
 
 window.api.onRefreshAutoUpdate?.(refreshAutoUpdate);
 window.api.onUpdateAvailable?.(showUpdateCard);

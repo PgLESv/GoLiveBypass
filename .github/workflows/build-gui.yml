@@ -43,6 +43,24 @@ jobs:
         with:
           go-version-file: tools/proton-confgen/go.mod
           cache-dependency-path: tools/proton-confgen/go.sum
+      - name: Sincronizar versão do package.json com a tag da release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const tag = (process.env.RELEASE_TAG || "").replace(/^v/, "").trim();
+            if (!tag) {
+              console.error("Tag de release ausente ou inválida");
+              process.exit(1);
+            }
+            const pkgPath = "golive-gui/package.json";
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            pkg.version = tag;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+            console.log(`[build-gui] Versão em ${pkgPath} atualizada para ${tag}`);
+          '
       - run: npm ci
         working-directory: golive-gui
       - name: Regressões do updater portable antes de publicar
@@ -78,6 +96,24 @@ jobs:
         with:
           go-version-file: tools/proton-confgen/go.mod
           cache-dependency-path: tools/proton-confgen/go.sum
+      - name: Sincronizar versão do package.json com a tag da release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const tag = (process.env.RELEASE_TAG || "").replace(/^v/, "").trim();
+            if (!tag) {
+              console.error("Tag de release ausente ou inválida");
+              process.exit(1);
+            }
+            const pkgPath = "golive-gui/package.json";
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            pkg.version = tag;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+            console.log(`[build-gui] Versão em ${pkgPath} atualizada para ${tag}`);
+          '
       - run: npm ci
         working-directory: golive-gui
       # No canal beta publica AppImage + beta.yml. O channel precisa ser explicito:
@@ -180,6 +216,24 @@ jobs:
         with:
           go-version-file: tools/proton-confgen/go.mod
           cache-dependency-path: tools/proton-confgen/go.sum
+      - name: Sincronizar versão do package.json com a tag da release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const tag = (process.env.RELEASE_TAG || "").replace(/^v/, "").trim();
+            if (!tag) {
+              console.error("Tag de release ausente ou inválida");
+              process.exit(1);
+            }
+            const pkgPath = "golive-gui/package.json";
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            pkg.version = tag;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+            console.log(`[build-gui] Versão em ${pkgPath} atualizada para ${tag}`);
+          '
       - run: npm ci
         working-directory: golive-gui
       # Com CSC_LINK/CSC_KEY_PASSWORD o electron-builder assina o app; sem eles, builda
@@ -192,7 +246,6 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-
 
   release-assets:
     # Sobe os assets de update que NAO dependem do electron-builder: o zip do
