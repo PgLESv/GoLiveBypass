@@ -52,7 +52,12 @@ function makeActivationPreflight() {
 }
 
 function makeLinuxPreflight() {
-  const fn = findFunction("linuxActivate");
+  let fn: ts.FunctionDeclaration;
+  try {
+    fn = findFunction("linuxActivateInner");
+  } catch {
+    fn = findFunction("linuxActivate");
+  }
   if (!fn.body || !ts.isBlock(fn.body)) throw new Error("linuxActivate sem corpo");
   const statements = [...fn.body.statements];
   const end = statements.findIndex((s) => s.getText(file).includes("if (!preflight.ok)"));
@@ -63,6 +68,8 @@ function makeLinuxPreflight() {
   }).outputText;
   return new Function(`return async function(ctx) {
     const { linuxPreflight, runScript, onChunk, linuxPreflightMessage, linuxPreflightRepairable, tailErroScript } = ctx;
+    const forwardLinuxChunk = ctx.forwardLinuxChunk || onChunk;
+    const elevated = ctx.elevated || { run: async (args, chunk) => runScript(args, chunk) };
     ${body}
     return preflight;
   }`)();

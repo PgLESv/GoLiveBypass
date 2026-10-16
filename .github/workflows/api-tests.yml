@@ -1,0 +1,41 @@
+name: api-tests
+
+# A API não tinha CI: o catálogo de releases (api/internal/releases) só era
+# exercitado por teste local, e foi justamente aí que o build do DMG reprovou —
+# o hash do proton-confgen não sobrevivia ao afterPack. Um workflow para a API
+# pega essa classe de erro no pull request.
+on:
+  pull_request:
+    paths:
+      - 'api/**'
+      - '.github/workflows/api-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - '.github/workflows/api-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+      # gofmt cobre o repositório inteiro: ratelimit.go já entra pendente no
+      # histórico e não é motivo para o gate passar por cima dele.
+      - name: Formatação, vet e testes
+        run: |
+          test -z "$(gofmt -l .)" || { echo "gofmt pendente em:"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./... -race

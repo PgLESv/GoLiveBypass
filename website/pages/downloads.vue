@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import type { Platform } from '~/components/PlatformTabs.vue'
+import { macDmgAssetName, macRelease } from '~/data/release'
 
 const { catalog, status, downloadUrl, asset } = useRelease()
+
+// Só para o texto de fallback: quando a API não responde, a página mostra o
+// nome do último artefato publicado em vez de um arquivo que não existe.
+const macAssetName = macDmgAssetName
+const macVersion = macRelease.version
 
 const releaseStateLabel = computed(() => {
   if (status.value === 'stale') return 'cache anterior'
@@ -82,17 +88,15 @@ onMounted(() => {
           icon="apple"
           kicker="MACOS"
           title="Aplicativo para macOS"
-          description="Baixe o pacote DMG da release estável. O ZIP alternativo fica disponível no segundo botão."
-          :meta="`${asset('mac-dmg')?.name ?? 'GoLiveBypass.dmg'} · canal ${catalog.channel}`"
+          description="Aplicativo dedicado ao macOS: só o tráfego do Discord passa pelo túnel, o resto do computador continua na rede normal."
+          :meta="`${asset('mac-dmg')?.name ?? macAssetName} · cliente macOS ${catalog.macos?.version ?? macVersion}`"
           primary-label="Baixar DMG"
           :primary-href="asset('mac-dmg') ? downloadUrl('mac-dmg') : undefined"
-          secondary-label="Baixar ZIP"
-          :secondary-href="asset('mac-zip') ? downloadUrl('mac-zip') : undefined"
           tone="success"
         />
         <div class="platform-note">
           <BaseIcon name="lock" :size="17" />
-          <p>Se o pacote não estiver no catálogo da release atual, a própria página mostra o botão indisponível em vez de apontar para um arquivo antigo.</p>
+          <p>O cliente macOS tem release própria (<code>macos-vX.Y.Z</code>) e nunca vira a release mais recente do repositório, então o canal da GUI não é afetado. Se o pacote não estiver publicado, a página mostra o botão indisponível em vez de apontar para um arquivo antigo.</p>
         </div>
       </div>
 

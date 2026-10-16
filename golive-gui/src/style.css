@@ -1840,6 +1840,178 @@ body.logs-window {
   text-decoration-color: currentColor;
 }
 
+.bug-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+/* ------------------------------------------------------------
+   Dialog de report de bug — overlay + painel
+   ------------------------------------------------------------ */
+.bug-dialog[hidden] { display: none !important; }
+.bug-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+.bug-dialog__backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--overlay-bg);
+  backdrop-filter: blur(2px);
+}
+.bug-dialog__panel {
+  position: relative;
+  width: 100%;
+  max-width: 380px;
+  max-height: 92vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 16px 40px rgba(0,0,0,0.22);
+  padding: 18px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.bug-dialog__title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink-strong);
+}
+.bug-dialog__hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.route-prompt__option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  padding: 11px 13px;
+  text-align: left;
+  font-family: inherit;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: background var(--t-med) var(--ease), border-color var(--t-med) var(--ease);
+}
+.route-prompt__option:hover { background: var(--surface-muted); }
+.route-prompt__option:focus-visible { outline: 2px solid var(--ink-strong); outline-offset: 2px; }
+.route-prompt__name { font-size: 13.5px; font-weight: 600; color: var(--ink-strong); }
+.route-prompt__badge { margin-left: 4px; font-size: 10.5px; font-weight: 500; color: var(--muted); }
+.route-prompt__desc { font-size: 12px; line-height: 1.4; color: var(--muted); }
+.bug-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink);
+}
+.bug-field span { font-weight: 600; font-size: 11px; letter-spacing: 0.02em; color: var(--muted); }
+.bug-field input,
+.bug-field textarea {
+  width: 100%;
+  background: var(--canvas);
+  border: 1px solid var(--line-strong);
+  color: var(--ink);
+  border-radius: var(--r-sm);
+  padding: 9px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  resize: vertical;
+  transition: border-color 150ms var(--ease), box-shadow 150ms var(--ease);
+}
+.bug-field input:focus,
+.bug-field textarea:focus {
+  border-color: var(--ink-strong);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink-strong) 12%, transparent);
+}
+.bug-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.bug-check input { accent-color: var(--ink-strong); }
+.bug-status {
+  min-height: 16px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.bug-status--ok { color: var(--ok-ink); }
+.bug-status--err { color: var(--err-ink); }
+.bug-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+/* Estado de sucesso: botao unico centralizado sob a mensagem de agradecimento */
+.bug-dialog--success .bug-dialog__actions {
+  justify-content: center;
+  margin-top: 10px;
+}
+.bug-btn {
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-strong);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 150ms var(--ease), border-color 150ms var(--ease), opacity 150ms var(--ease);
+}
+.bug-btn--ghost {
+  background: var(--surface);
+  color: var(--ink);
+}
+.bug-btn--ghost:hover { background: var(--surface-muted); }
+.bug-btn--primary {
+  background: var(--ink-strong);
+  color: var(--canvas);
+  border-color: var(--ink-strong);
+}
+.bug-btn--primary:hover { filter: brightness(1.08); }
+.bug-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.bug-btn__spinner {
+  display: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: bug-spin 0.6s linear infinite;
+}
+.bug-btn--loading .bug-btn__text { opacity: 0.85; }
+.bug-btn--loading .bug-btn__spinner { display: inline-block; }
+.bug-btn--primary.bug-btn--loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+@keyframes bug-spin { to { transform: rotate(360deg); } }
 
 /* ------------------------------------------------------------
    Dialog de configurações — painel compacto, inspirado nos cards do site.
@@ -3012,4 +3184,166 @@ html[data-theme='dark'] .settings-switch input:checked + .switch-track .switch-t
   .proton-panel-copy {
     font-size: 10px;
   }
+}
+
+/* ------------------------------------------------------------
+   Fallback de alvo manual (Linux): botao que substitui a mensagem
+   "Discord nao encontrado", linha do alvo registrado e o dialog que
+   lista os programas abertos.
+   ------------------------------------------------------------ */
+.manual-target-btn {
+  align-self: flex-start;
+  margin-top: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 150ms var(--ease), background-color 150ms var(--ease);
+}
+
+.manual-target-btn:hover {
+  background: color-mix(in srgb, var(--ok-ink) 12%, var(--surface));
+  border-color: var(--ok-ink);
+}
+
+.manual-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.manual-target-row__name {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.manual-target-row__action {
+  padding: 3px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.manual-target-row__action:hover {
+  border-color: var(--ok-ink);
+  color: var(--ok-ink);
+}
+
+.manual-target-dialog {
+  width: min(92vw, 470px);
+  max-height: min(82vh, 620px);
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-sm), 0 24px 70px rgba(6, 6, 12, 0.42);
+}
+
+.manual-target-dialog:not([open]) { display: none; }
+
+.manual-target-dialog::backdrop {
+  background: var(--overlay-bg);
+  backdrop-filter: blur(4px);
+}
+
+.manual-target-dialog__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(min(82vh, 620px) - 2px);
+  overflow-y: auto;
+  padding: 20px;
+}
+
+.manual-target-dialog__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.manual-target-dialog__kicker {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.manual-target-dialog__heading h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.manual-target-dialog__close {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.manual-target-dialog__hint {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.manual-target-dialog__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.manual-target-dialog__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.manual-target-dialog__item:hover,
+.manual-target-dialog__item:focus-visible {
+  background: color-mix(in srgb, var(--ok-ink) 10%, var(--surface));
+  border-color: var(--ok-ink);
+}
+
+.manual-target-dialog__item-kind {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.manual-target-dialog__feedback {
+  font-size: 12.5px;
+  color: var(--muted);
 }

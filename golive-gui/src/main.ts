@@ -1,4 +1,10 @@
 import { gsap } from 'gsap';
+import {
+  manualTargetHeadline,
+  manualTargetKindLabel,
+  shouldOfferManualTarget,
+  type ManualTargetKind,
+} from './manual-target-selection';
 import { protonMeasurementText } from './proton-measurement';
 import { decideProtonSession, type ProtonSessionVerdict } from './proton-session';
 import { renderProtonCountryFlag } from './proton-flags';
@@ -51,10 +57,26 @@ declare global {
         repairable?: boolean;
         elevation: { available: boolean; method: string };
         netns: { available: boolean };
-        discord: { found: boolean; count: number; firstPath: string };
+        discord: {
+          found: boolean;
+          count: number;
+          firstPath: string;
+          manual?: { present: boolean; valid: boolean };
+        };
+        // Fallback de alvo manual (Linux): sem instalacao reconhecida a UI oferece a escolha.
+        discordMissing?: boolean;
+        manualTarget?: { name: string; kind: ManualTargetKind; valid: boolean } | null;
         errors: string[];
         installCommand: string;
       } | null>;
+      listLinuxRunningApps: () => Promise<{
+        ok: boolean;
+        apps: Array<{ key: string; name: string; icon?: string; kind: string; pid: number }>;
+        truncated: boolean;
+        error?: string;
+      }>;
+      setLinuxManualTarget: (key: string) => Promise<{ ok: boolean; error?: string }>;
+      clearLinuxManualTarget: () => Promise<{ ok: boolean; error?: string }>;
       getVersion: () => Promise<string>;
       getPlatform: () => Promise<string>;
       getStartup: () => Promise<boolean>;
@@ -165,6 +187,7 @@ declare global {
         routePreference?: 'auto' | 'manual';
         /** Perfil Proton ja gerado no disco (username + wireguard.conf). */
         profileReady?: boolean;
+        routePreferencePrompt?: boolean;
         lastServer?: any;
       }>;
       getProtonPlan: (options?: { force?: boolean }) => Promise<{
@@ -281,6 +304,104 @@ const vpnDropFeedback = document.getElementById('vpnDropFeedback') as HTMLElemen
 
 let currentState = 'INACTIVE';
 let linuxPreflight: Awaited<ReturnType<Window['api']['getLinuxPreflight']>> = null;
+
+// ---------------------------------------------------------------------------
+// Fallback de alvo manual (Linux): quando a varredura nao reconhece a instalacao,
+// o cartao de status troca a mensagem de "Discord nao encontrado" por um botao que
+// lista os programas abertos. A escolha so registra o alvo — quem aplica o tunel
+// continua sendo o botao de ativacao.
+// ---------------------------------------------------------------------------
+const manualTargetButton = document.getElementById('manualTargetButton') as HTMLButtonElement | null;
+const manualTargetRow = document.getElementById('manualTargetRow') as HTMLElement | null;
+const manualTargetName = document.getElementById('manualTargetName') as HTMLElement | null;
+const manualTargetChange = document.getElementById('manualTargetChange') as HTMLButtonElement | null;
+const manualTargetRemove = document.getElementById('manualTargetRemove') as HTMLButtonElement | null;
+const manualTargetDialog = document.getElementById('manualTargetDialog') as HTMLDialogElement | null;
+const manualTargetList = document.getElementById('manualTargetList') as HTMLElement | null;
+const manualTargetFeedback = document.getElementById('manualTargetFeedback') as HTMLElement | null;
+
+function syncManualTargetUi() {
+  const state = {
+    isLinux,
+    discordMissing: linuxPreflight?.discordMissing === true,
+    manualTarget: linuxPreflight?.manualTarget ?? null,
+  };
+  const oferece = shouldOfferManualTarget(state);
+  const headline = manualTargetHeadline(state);
+
+  if (manualTargetButton) {
+    manualTargetButton.hidden = !oferece;
+    // O botao ocupa o lugar da mensagem de Discord nao encontrado.
+    if (oferece) statusText.innerText = '';
+  }
+  if (manualTargetRow) manualTargetRow.hidden = headline === null;
+  if (manualTargetName) manualTargetName.innerText = headline ?? '';
+}
+
+function showManualTargetFeedback(message: string) {
+  if (!manualTargetFeedback) return;
+  manualTargetFeedback.innerText = message;
+  manualTargetFeedback.hidden = !message;
+}
+
+async function openManualTargetDialog() {
+  showManualTargetFeedback('');
+  if (manualTargetList) manualTargetList.replaceChildren();
+  manualTargetDialog?.showModal();
+  const resultado = await window.api.listLinuxRunningApps();
+  if (!manualTargetList) return;
+  if (!resultado.ok) {
+    showManualTargetFeedback(resultado.error || 'Não foi possível listar os programas abertos.');
+    return;
+  }
+  const apps = resultado.apps.filter((app) => app.name.trim().length > 0);
+  if (apps.length === 0) {
+    showManualTargetFeedback('Nenhum programa aberto foi encontrado. Abra o Discord e tente de novo.');
+    return;
+  }
+  manualTargetList.replaceChildren(
+    ...apps.map((app) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'manual-target-dialog__item';
+      item.setAttribute('role', 'option');
+      item.dataset.targetKey = app.key;
+      const nome = document.createElement('span');
+      nome.className = 'manual-target-dialog__item-name';
+      nome.innerText = app.name;
+      const detalhe = document.createElement('span');
+      detalhe.className = 'manual-target-dialog__item-kind';
+      detalhe.innerText = manualTargetKindLabel(app.kind);
+      item.replaceChildren(nome, detalhe);
+      item.addEventListener('click', () => {
+        void chooseManualTarget(app.key);
+      });
+      return item;
+    }),
+  );
+  if (resultado.truncated) {
+    showManualTargetFeedback('A lista foi limitada aos primeiros programas; se o seu não aparecer, feche outros apps.');
+  }
+}
+
+async function chooseManualTarget(key: string) {
+  const resultado = await window.api.setLinuxManualTarget(key);
+  if (!resultado.ok) {
+    showManualTargetFeedback(resultado.error || 'Não foi possível registrar o programa escolhido.');
+    return;
+  }
+  manualTargetDialog?.close();
+  await updateStatus();
+}
+
+async function removeManualTarget() {
+  const resultado = await window.api.clearLinuxManualTarget();
+  if (!resultado.ok) {
+    showManualTargetFeedback(resultado.error || 'Não foi possível remover o alvo registrado.');
+    return;
+  }
+  await updateStatus();
+}
 
 // ---------------------------------------------------------------------------
 // Configurações: o botão de canto abre o dialog com tema + notificações de
@@ -491,9 +612,24 @@ async function updateStatus() {
     toggleBtn.disabled = true;
     toggleBtn.title = protonOptimizationInFlight ? 'Otimização de rota em andamento' : 'Aplicando a rota escolhida';
   }
+  // O botao de alvo manual ocupa o lugar da mensagem de "Discord nao encontrado" no Linux.
+  syncManualTargetUi();
   // Depois de mudar o estado, ajusta a janela ao novo tamanho do conteudo.
   fitWindowToContent();
 }
+
+manualTargetButton?.addEventListener('click', () => {
+  void openManualTargetDialog();
+});
+manualTargetChange?.addEventListener('click', () => {
+  void openManualTargetDialog();
+});
+manualTargetRemove?.addEventListener('click', () => {
+  void removeManualTarget();
+});
+document.getElementById('manualTargetClose')?.addEventListener('click', () => {
+  manualTargetDialog?.close();
+});
 
 toggleBtn.addEventListener('click', async () => {
   if (protonOptimizationInFlight || protonManualSelectionInFlight) return;
@@ -1385,6 +1521,56 @@ async function handleProtonRoutePreferenceChange(next: ProtonRoutePreference): P
   }
 }
 
+// Pergunta unica na primeira abertura (modo Proton, sem preferencia nem rota lembradas). O
+// main decide quando perguntar; aqui so exibimos e gravamos a resposta. "Decidir depois" e
+// Esc tambem contam como respondida, para a pergunta nao voltar a cada abertura.
+const routePromptDialog = document.getElementById('routePromptDialog') as HTMLElement | null;
+const routePromptAuto = document.getElementById('routePromptAuto') as HTMLButtonElement | null;
+const routePromptManual = document.getElementById('routePromptManual') as HTMLButtonElement | null;
+const routePromptLater = document.getElementById('routePromptLater') as HTMLButtonElement | null;
+let routePromptShown = false;
+// Enquanto a pergunta esta aberta, a otimizacao automatica de abertura fica em espera: o padrao
+// sem preferencia e "auto", e ela ja teria medido a rede antes de o usuario escolher "Manual".
+let routePromptPending = false;
+
+function openProtonRoutePrompt(): void {
+  if (!routePromptDialog || routePromptShown) return;
+  routePromptShown = true;
+  routePromptPending = true;
+  routePromptDialog.hidden = false;
+  routePromptAuto?.focus();
+}
+
+async function answerProtonRoutePrompt(choice: ProtonRoutePreference | null): Promise<void> {
+  if (!routePromptDialog || routePromptDialog.hidden) return;
+  routePromptDialog.hidden = true;
+  routePromptPending = false;
+  try {
+    if (choice === null) {
+      await window.api.setProtonSettings({ routePreferencePrompted: true });
+    } else if (choice === protonRoutePreference) {
+      // O handler ignora escolha igual a atual (o padrao e "auto"), mas aqui ela precisa ser gravada.
+      await window.api.setProtonSettings({ routePreference: choice });
+    } else {
+      await handleProtonRoutePreferenceChange(choice);
+    }
+  } catch (err) {
+    console.error('Falha ao salvar a resposta da pergunta de rota:', err);
+  }
+  // Retoma o que a abertura adiou. Em "Manual" o handler acima ja descobre as rotas; em
+  // "Automatica" e "Decidir depois" (que fica no padrao automatico) a otimizacao comeca agora.
+  if (choice !== 'manual' && currentVpnMode === 'proton' && isProtonAuthenticated && shouldOptimizeProtonAutomatically()) {
+    void optimizeProtonRoute(true);
+  }
+}
+
+routePromptAuto?.addEventListener('click', () => void answerProtonRoutePrompt('auto'));
+routePromptManual?.addEventListener('click', () => void answerProtonRoutePrompt('manual'));
+routePromptLater?.addEventListener('click', () => void answerProtonRoutePrompt(null));
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && routePromptDialog && !routePromptDialog.hidden) void answerProtonRoutePrompt(null);
+});
+
 function routePreferenceFromOption(option: HTMLButtonElement): ProtonRoutePreference | undefined {
   return option.dataset.routePref === 'manual' ? 'manual'
     : option.dataset.routePref === 'auto' ? 'auto'
@@ -1442,6 +1628,7 @@ async function refreshProtonState(forcePlan = false) {
       || (s.routePreference !== 'auto' && s.lastServer?.manual === true);
     protonRoutePreference = manualPreference ? 'manual' : 'auto';
     syncProtonRoutePreferenceUi(protonRoutePreference);
+    if (s.routePreferencePrompt === true) openProtonRoutePrompt();
     protonRememberedManualRoute = manualPreference && rememberedServer
       ? { server: rememberedServer, pingMs: Number.isFinite(rememberedPing) && rememberedPing > 0 ? rememberedPing : undefined }
       : null;
@@ -2012,7 +2199,9 @@ async function initVpnSection() {
     }
     await refreshProtonState();
     await atualizarStatusWgConf();
-    if (currentVpnMode === 'proton' && isProtonAuthenticated && shouldOptimizeProtonAutomatically()) {
+    if (routePromptPending) {
+      // Aguarda a resposta da pergunta de rota; answerProtonRoutePrompt retoma a abertura.
+    } else if (currentVpnMode === 'proton' && isProtonAuthenticated && shouldOptimizeProtonAutomatically()) {
       void optimizeProtonRoute(true);
     } else if (currentVpnMode === 'proton' && isProtonAuthenticated) {
       void discoverProtonRoutesInBackground(shouldMeasurePingForCurrentProtonRoutes());

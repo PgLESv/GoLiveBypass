@@ -24,11 +24,17 @@ A saída estática fica em `.output/public`.
 
 ## Downloads dinâmicos
 
-O site consulta no navegador `GET https://api.skyplaceia.com/bugs/v1/releases/latest`.
+O site consulta no navegador `GET https://golivebypass.dev/bugs/v1/releases/latest`.
 O catálogo Go consulta o GitHub, rejeita prereleases e mantém cache por cinco
 minutos. Os botões usam os aliases `/v1/releases/latest/download/windows`,
-`linux`, `mac-dmg`, `mac-zip`, `plugin` e `standalone`, então uma nova release
+`linux`, `mac-dmg`, `plugin` e `standalone`, então uma nova release
 estável não exige edição ou rebuild do site.
+
+O cliente macOS é a exceção: ele tem release própria (`macos-vX.Y.Z`,
+`make_latest=false`) e o catálogo expõe o ponto em `macos`. O alias `mac-dmg`
+aponta para o DMG universal dessa release — o `GoLiveBypass.dmg` que a GUI
+publicava na estável era build sem assinatura e com auto-update desligado no
+código, então não é mais oferecido.
 
 `data/release.ts` contém somente o contrato e o fallback de emergência. Para
 desenvolvimento local, sobrescreva a API com:

@@ -2,7 +2,6 @@ export type ReleaseAlias =
   | 'windows'
   | 'linux'
   | 'mac-dmg'
-  | 'mac-zip'
   | 'plugin'
   | 'plugin-sha'
   | 'standalone'
@@ -11,7 +10,6 @@ export type ReleaseAlias =
 export type ReleaseAssetKey =
   | 'windowsGui'
   | 'macDmg'
-  | 'macZip'
   | 'linuxGui'
   | 'plugin'
   | 'pluginSha'
@@ -25,6 +23,13 @@ export interface ReleaseAsset {
   url: string
 }
 
+export interface MacOSRelease {
+  tag: string
+  version: string
+  publishedAt: string
+  pageUrl: string
+}
+
 export interface ReleaseCatalog {
   tag: string
   version: string
@@ -34,12 +39,19 @@ export interface ReleaseCatalog {
   pageUrl: string
   stale: boolean
   assets: Partial<Record<ReleaseAlias, ReleaseAsset>>
+  macos?: MacOSRelease
 }
 
 const owner = 'PgLESv'
 const repo = 'GoLiveBypass'
 const fallbackTag = 'v2.1.8'
 const fallbackVersion = '2.1.8'
+// O cliente macOS é outra aplicação, com release própria (macos-vX.Y.Z) e
+// make_latest=false: ele não aparece na estável da GUI. O fallback do site
+// precisa apontar para essa tag, senão oferece um arquivo que não existe.
+const macReleaseTag = 'macos-v0.6.0'
+const macReleaseVersion = '0.6.0'
+const macDmgAssetName = `GoLiveBypass-macos-${macReleaseVersion}-universal.dmg`
 const repositoryUrl = `https://github.com/${owner}/${repo}`
 
 export const release = {
@@ -50,8 +62,7 @@ export const release = {
   channel: 'stable',
   assets: {
     windowsGui: `GoLiveBypass-${fallbackVersion}.exe`,
-    macDmg: '',
-    macZip: '',
+    macDmg: macDmgAssetName,
     linuxGui: `GoLiveBypass-${fallbackVersion}.AppImage`,
     plugin: 'goLiveBypass-vencord.zip',
     pluginSha: 'goLiveBypass-vencord.zip.sha256',
@@ -60,12 +71,20 @@ export const release = {
   } satisfies Record<ReleaseAssetKey, string>,
 } as const
 
+export const macRelease = {
+  tag: macReleaseTag,
+  version: macReleaseVersion,
+  pageUrl: `${repositoryUrl}/releases/tag/${macReleaseTag}`,
+} as const
+
 export const githubRepositoryUrl = repositoryUrl
 export const githubReleasePageUrl = `${repositoryUrl}/releases/tag/${release.tag}`
 
-export function githubReleaseAssetUrl(asset: string, tag = release.tag) {
+export function githubReleaseAssetUrl(asset: string, tag: string = release.tag) {
   return `${repositoryUrl}/releases/download/${tag}/${encodeURIComponent(asset)}`
 }
+
+export { macDmgAssetName, macReleaseTag, macReleaseVersion }
 
 export function githubRawUrl(path: string) {
   const encodedPath = path
@@ -87,8 +106,7 @@ export function releaseApiDownloadUrl(apiBaseUrl: string, alias: ReleaseAlias) {
 const fallbackAssets: Record<ReleaseAlias, ReleaseAsset> = {
   windows: { name: release.assets.windowsGui, url: githubReleaseAssetUrl(release.assets.windowsGui) },
   linux: { name: release.assets.linuxGui, url: githubReleaseAssetUrl(release.assets.linuxGui) },
-  'mac-dmg': { name: release.assets.macDmg, url: githubReleaseAssetUrl(release.assets.macDmg) },
-  'mac-zip': { name: release.assets.macZip, url: githubReleaseAssetUrl(release.assets.macZip) },
+  'mac-dmg': { name: macDmgAssetName, url: githubReleaseAssetUrl(macDmgAssetName, macReleaseTag) },
   plugin: { name: release.assets.plugin, url: githubReleaseAssetUrl(release.assets.plugin) },
   'plugin-sha': { name: release.assets.pluginSha, url: githubReleaseAssetUrl(release.assets.pluginSha) },
   standalone: { name: release.assets.standaloneJs, url: githubReleaseAssetUrl(release.assets.standaloneJs) },
@@ -103,13 +121,18 @@ export const fallbackReleaseCatalog: ReleaseCatalog = {
   publishedAt: '',
   pageUrl: githubReleasePageUrl,
   stale: false,
+  macos: {
+    tag: macRelease.tag,
+    version: macRelease.version,
+    publishedAt: '',
+    pageUrl: macRelease.pageUrl,
+  },
   assets: fallbackAssets,
 }
 
 export const downloads = {
   windowsGui: fallbackAssets.windows.url,
   macDmg: fallbackAssets['mac-dmg'].url,
-  macZip: fallbackAssets['mac-zip'].url,
   linuxGui: fallbackAssets.linux.url,
   plugin: fallbackAssets.plugin.url,
   pluginSha: fallbackAssets['plugin-sha'].url,
@@ -123,7 +146,7 @@ export const downloads = {
 }
 
 const semver = /^\d+\.\d+\.\d+$/
-const aliases: ReleaseAlias[] = ['windows', 'linux', 'mac-dmg', 'mac-zip', 'plugin', 'plugin-sha', 'standalone', 'standalone-sha']
+const aliases: ReleaseAlias[] = ['windows', 'linux', 'mac-dmg', 'plugin', 'plugin-sha', 'standalone', 'standalone-sha']
 
 export function parseReleaseCatalog(input: unknown): ReleaseCatalog | null {
   if (!input || typeof input !== 'object') return null
@@ -146,6 +169,18 @@ export function parseReleaseCatalog(input: unknown): ReleaseCatalog | null {
     }
   }
 
+  const rawMacOS = data.macos
+  let macOS: MacOSRelease | undefined
+  if (rawMacOS && typeof rawMacOS === 'object') {
+    const m = rawMacOS as Record<string, unknown>
+    if (typeof m.tag === 'string' && /^macos-v?\d+\.\d+\.\d+$/.test(m.tag)
+      && typeof m.version === 'string' && semver.test(m.version)
+      && typeof m.published_at === 'string'
+      && typeof m.page_url === 'string' && isHttpsUrl(m.page_url)) {
+      macOS = { tag: m.tag, version: m.version, publishedAt: m.published_at, pageUrl: m.page_url }
+    }
+  }
+
   return {
     tag: data.tag,
     version: data.version,
@@ -155,6 +190,7 @@ export function parseReleaseCatalog(input: unknown): ReleaseCatalog | null {
     pageUrl: data.page_url,
     stale: data.stale === true,
     assets: parsedAssets,
+    macos: macOS,
   }
 }
 

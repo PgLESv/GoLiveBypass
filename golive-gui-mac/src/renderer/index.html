@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="styles.css" />
+  <title>GoLiveBypass</title>
+</head>
+<body>
+  <!-- Área de arrasto da titlebar oculta -->
+  <div class="drag-region"></div>
+
+  <!-- Banner de atualização (oculto por padrão) -->
+  <div id="update-banner" hidden>
+    <span id="update-msg">Nova versão disponível!</span>
+    <button id="update-btn" class="pill-btn">Atualizar</button>
+  </div>
+
+  <main>
+    <!-- Botão de ativar/desativar com spinner -->
+    <div class="power-wrap">
+      <button id="toggle" class="power" disabled aria-label="Ativar">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 3v8" />
+          <path d="M6.3 6.8a8 8 0 1 0 11.4 0" />
+        </svg>
+      </button>
+    </div>
+
+    <p id="state-label" class="state-label">Verificando…</p>
+    <p id="exit-label" class="exit-label" hidden>
+      <span id="exit-flag" class="exit-flag"></span>
+      <span id="exit-country" class="exit-country"></span>
+    </p>
+    <p id="ip-label" class="ip-label"></p>
+
+    <!-- Permissão de Gerenciamento de Apps (Vencord) -->
+    <section class="card perm-card" id="perm-card" hidden>
+      <h2 class="card-title">Permissão necessária</h2>
+      <p class="perm-text">Para colocar o Vencord com FakeNitro no Discord, o macOS precisa que você libere o GoLiveBypass para modificar apps.</p>
+      <ol class="perm-steps">
+        <li>Clique em <strong>Abrir Ajustes</strong>.</li>
+        <li>Em <strong>Gerenciamento de Apps</strong>, ligue a chave do <strong>GoLiveBypass</strong>.<br><span class="hint">Não aparece? Clique em <strong>+</strong> e escolha o GoLiveBypass em Aplicativos.</span></li>
+        <li>Volte para cá: o app continua sozinho.</li>
+      </ol>
+      <div class="btn-row">
+        <button id="perm-open" class="pill-btn">Abrir Ajustes</button>
+        <button id="perm-retry" class="pill-btn ghost">Já liberei</button>
+      </div>
+      <p id="perm-status" class="hint"></p>
+    </section>
+
+    <!-- Seção ProtonVPN -->
+    <section class="card" id="proton-section">
+      <h2 class="card-title">Configuração ProtonVPN</h2>
+      <div id="account-row" class="account-row" hidden>
+        <span class="account-dot" aria-hidden="true"></span>
+        <span id="account-label" class="account-label"></span>
+        <button id="logout-btn" class="link-btn">Sair da conta</button>
+      </div>
+      <div class="field-row">
+        <input id="proton-user" type="text"    placeholder="Usuário" autocomplete="off" spellcheck="false" />
+        <input id="proton-pass" type="password" placeholder="Senha" />
+      </div>
+      <div class="btn-row">
+        <button id="fetch-btn" class="pill-btn">Buscar melhor servidor</button>
+        <button id="import-btn" class="pill-btn ghost">Importar .conf</button>
+      </div>
+      <p id="proton-status" class="hint"></p>
+      <p id="captcha-hint" class="hint warn" hidden>
+        Verificação humana necessária. Resolva o CAPTCHA no navegador e tente novamente.
+        <a id="captcha-link" href="#" class="pill-btn mini">Abrir CAPTCHA</a>
+      </p>
+    </section>
+
+    <!-- Extras opcionais -->
+    <section class="card" id="extras-section">
+      <h2 class="card-title">Extras</h2>
+      <label class="toggle-row">
+        <input id="vencord-optin" type="checkbox" />
+        <span>Instalar o Vencord com o plugin FakeNitro ao ativar</span>
+      </label>
+      <p class="hint">Opcional e desligado por padrão: modifica o app do Discord e não faz parte do bypass. Se você desligar o FakeNitro no Vencord, o GoLiveBypass não liga de novo.</p>
+    </section>
+
+    <!-- Log -->
+    <pre id="log" class="log"></pre>
+  </main>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

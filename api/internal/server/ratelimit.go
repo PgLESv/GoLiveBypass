@@ -23,7 +23,7 @@ const janelaRateLimit = time.Minute
 type blockStore struct {
 	mu        sync.Mutex
 	cfg       *config.Config
-	bloqueios map[string]time.Time // ip -> quando o bloqueio expira
+	bloqueios map[string]time.Time   // ip -> quando o bloqueio expira
 	janela    map[string][]time.Time // ip -> timestamps dos requests na janela
 }
 

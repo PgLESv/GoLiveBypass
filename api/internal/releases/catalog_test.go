@@ -12,12 +12,18 @@ import (
 type fakeSource struct {
 	release gh.Release
 	err     error
+	list    []gh.Release
+	listErr error
 	calls   int
 }
 
 func (f *fakeSource) LatestStableRelease(context.Context) (gh.Release, error) {
 	f.calls++
 	return f.release, f.err
+}
+
+func (f *fakeSource) ListReleases(context.Context) ([]gh.Release, error) {
+	return f.list, f.listErr
 }
 
 func validRelease() gh.Release {
@@ -40,35 +46,102 @@ func validRelease() gh.Release {
 }
 
 func TestBuildCatalogStableAliases(t *testing.T) {
-	catalog, err := buildCatalog(validRelease())
+	catalog, err := buildCatalog(validRelease(), nil)
 	if err != nil {
 		t.Fatalf("buildCatalog() error = %v", err)
 	}
 	if catalog.Version != "2.0.4" || catalog.Channel != "stable" || catalog.Stale {
 		t.Fatalf("catalog = %+v", catalog)
 	}
-	for _, alias := range []string{"windows", "linux", "mac-dmg", "mac-zip", "plugin", "plugin-sha", "standalone", "standalone-sha"} {
+	for _, alias := range []string{"windows", "linux", "plugin", "plugin-sha", "standalone", "standalone-sha"} {
 		if catalog.Assets[alias].URL == "" {
 			t.Errorf("asset %q ausente", alias)
 		}
 	}
 }
 
+// O DMG do macOS sai da release própria do cliente (macos-vX.Y.Z), nunca dos
+// assets da release estável da GUI: o GoLiveBypass.dmg de lá é build da GUI sem
+// assinatura e com auto-update desligado no código.
+func TestBuildCatalogMacOSAssetsComeFromMacOSRelease(t *testing.T) {
+	gui := validRelease()
+	mac := gh.Release{
+		TagName:     "macos-v0.6.0",
+		Name:        "GoLiveBypass macOS 0.6.0",
+		PublishedAt: "2026-10-11T03:25:00Z",
+		HTMLURL:     "https://github.com/owner/repo/releases/tag/macos-v0.6.0",
+		Assets: []gh.ReleaseAsset{
+			{Name: "GoLiveBypass-macos-0.6.0-universal.dmg", BrowserDownloadURL: "https://github.com/owner/repo/releases/download/macos-v0.6.0/GoLiveBypass-macos-0.6.0-universal.dmg"},
+			{Name: "GoLiveBypass-macos-0.6.0-universal.dmg.sha256", BrowserDownloadURL: "https://github.com/owner/repo/releases/download/macos-v0.6.0/GoLiveBypass-macos-0.6.0-universal.dmg.sha256"},
+		},
+	}
+	catalog, err := buildCatalog(gui, &mac)
+	if err != nil {
+		t.Fatalf("buildCatalog() error = %v", err)
+	}
+	asset, ok := catalog.Assets["mac-dmg"]
+	if !ok {
+		t.Fatal("alias mac-dmg ausente")
+	}
+	if asset.Name != "GoLiveBypass-macos-0.6.0-universal.dmg" {
+		t.Fatalf("mac-dmg = %q, devia ser o DMG universal da release própria", asset.Name)
+	}
+	if catalog.MacOS == nil || catalog.MacOS.Version != "0.6.0" || catalog.MacOS.Tag != "macos-v0.6.0" {
+		t.Fatalf("MacOS = %+v", catalog.MacOS)
+	}
+	// O ZIP deixou de existir no cliente novo; o alias não pode ser servido.
+	if _, ok := catalog.Assets["mac-zip"]; ok {
+		t.Fatal("mac-zip nao existe mais no cliente macOS e nao devia ser exposto")
+	}
+}
+
+// Sem release própria, o botão do macOS fica indisponível em vez de apontar para
+// um arquivo antigo.
+func TestBuildCatalogWithoutMacOSReleaseHidesAlias(t *testing.T) {
+	gui := validRelease()
+	catalog, err := buildCatalog(gui, nil)
+	if err != nil {
+		t.Fatalf("buildCatalog() error = %v", err)
+	}
+	if _, ok := catalog.Assets["mac-dmg"]; ok {
+		t.Fatal("sem release própria o alias mac-dmg nao devia existir")
+	}
+	if catalog.MacOS != nil {
+		t.Fatalf("MacOS devia ser nulo, veio %+v", catalog.MacOS)
+	}
+}
+
 func TestBuildCatalogRejectsPrereleaseAndUnsafeURLs(t *testing.T) {
 	release := validRelease()
 	release.Prerelease = true
-	if _, err := buildCatalog(release); !errors.Is(err, ErrNoStableRelease) {
+	if _, err := buildCatalog(release, nil); !errors.Is(err, ErrNoStableRelease) {
 		t.Fatalf("prerelease err = %v", err)
 	}
 
 	release = validRelease()
 	release.Assets[0].BrowserDownloadURL = "http://github.com/owner/repo/download.exe"
-	catalog, err := buildCatalog(release)
+	catalog, err := buildCatalog(release, nil)
 	if err != nil {
 		t.Fatalf("URL insegura nao deveria invalidar catalogo inteiro: %v", err)
 	}
 	if _, ok := catalog.Assets["windows"]; ok {
 		t.Fatal("asset HTTP nao deveria ser exposto")
+	}
+}
+
+// A lista de releases é opcional: se falhar, o catálogo serve o resto sem o macOS.
+func TestCatalogCacheToleratesListReleasesFailure(t *testing.T) {
+	source := &fakeSource{release: validRelease(), listErr: errors.New("github fora do ar")}
+	cache := NewCatalogCache(source, time.Minute)
+	catalog, err := cache.Latest(context.Background())
+	if err != nil {
+		t.Fatalf("Latest() error = %v", err)
+	}
+	if _, ok := catalog.Assets["mac-dmg"]; ok {
+		t.Fatal("com a lista indisponivel o alias mac-dmg nao devia aparecer")
+	}
+	if catalog.Assets["windows"].URL == "" {
+		t.Fatal("o resto do catálogo devia continuar servindo")
 	}
 }
 

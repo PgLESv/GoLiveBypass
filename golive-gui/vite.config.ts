@@ -10,6 +10,7 @@ export default defineConfig({
       input: {
         main: path.resolve(import.meta.dirname, 'index.html'),
         logs: path.resolve(import.meta.dirname, 'logs.html'),
+        'sudo-password': path.resolve(import.meta.dirname, 'sudo-password.html'),
       },
     },
   },

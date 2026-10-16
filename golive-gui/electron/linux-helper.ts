@@ -29,7 +29,7 @@ export interface ScriptResult {
 }
 
 // Roda o script e resolve com a saida completa (para acoes que terminam rapido: status).
-export function runScript(args: string[], onChunk?: (chunk: string) => void): Promise<ScriptResult> {
+export function runScript(args: string[], onChunk?: (chunk: string) => void, extraEnv?: Record<string, string>): Promise<ScriptResult> {
   return new Promise((resolve, reject) => {
     let stdout = '', stderr = '';
     let child;
@@ -37,7 +37,7 @@ export function runScript(args: string[], onChunk?: (chunk: string) => void): Pr
       child = spawn('sh', [findStandaloneScript(), ...args], {
         // O standalone publico esta temporariamente bloqueado durante a portabilidade.
         // Somente a GUI, que e a variante mantida, pode usar o motor interno por esta marca.
-        env: { ...process.env, GOLIVE_GUI: '1' },
+        env: { ...process.env, GOLIVE_GUI: '1', ...extraEnv },
         // Nunca herdar o socket stdin do Electron: status/probe/report nao podem
         // ficar bloqueados aguardando EOF de um processo pai vivo.
         stdio: ['ignore', 'pipe', 'pipe'],

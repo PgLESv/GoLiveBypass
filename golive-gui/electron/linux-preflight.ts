@@ -13,6 +13,17 @@ export type LinuxPreflight = {
   netns: { available: boolean };
   kernel: { wireguard: "available" | "loaded" | "missing" | "unknown" | string };
   discord: { found: boolean; count: number; firstPath: string };
+  discord: {
+    found: boolean;
+    count: number;
+    firstPath: string;
+    /**
+     * Alvo manual (fallback) registrado em `manual-target.conf`. `valid` e a resposta do
+     * script: o app ainda pode ser lancado agora. Script antigo nao manda o campo, e ausente
+     * nunca significa "existe um alvo".
+     */
+    manual: { present: boolean; valid: boolean };
+  };
   errors: string[];
   installCommand: string;
 }
@@ -51,6 +62,11 @@ export function parseLinuxPreflight(raw: string): LinuxPreflight {
   const count = typeof discord.count === "number" && Number.isFinite(discord.count)
     ? Math.max(0, Math.floor(discord.count))
     : 0;
+  // Script antigo nao manda `discord.manual`, e qualquer valor que nao seja literalmente
+  // `true` conta como ausente: a GUI nunca anuncia um alvo que o script nao confirmou.
+  const manualBruto = discord.manual;
+  const manualPresent = typeof manualBruto === "object" && manualBruto !== null && "present" in manualBruto && manualBruto.present === true;
+  const manualValid = typeof manualBruto === "object" && manualBruto !== null && "valid" in manualBruto && manualBruto.valid === true;
   return {
     ok: data.ok === true,
     platform: "linux",
@@ -72,6 +88,7 @@ export function parseLinuxPreflight(raw: string): LinuxPreflight {
       found: discord.found === true || count > 0,
       count,
       firstPath: typeof discord.firstPath === "string" ? discord.firstPath : "",
+      manual: { present: manualPresent, valid: manualValid },
     },
     errors: strings(data.errors),
     installCommand: typeof data.installCommand === "string" ? data.installCommand : "",

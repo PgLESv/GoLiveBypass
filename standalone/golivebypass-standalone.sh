@@ -581,6 +581,10 @@ SUDO_ASKPASS_RESULT_FILE=""
 SUDO_AUTH_READY=0
 SUDO_USE_CACHED_PASS=0
 SUDO_PROMPT_FALLBACK_PKEXEC=0
+# Tentativas de senha incorreta antes de desistir. A politica padrao do sudo
+# tambem insiste tres vezes; aqui o limite vale para a janela da GUI.
+GOLIVE_SUDO_PASSWORD_ATTEMPTS="${GOLIVE_SUDO_PASSWORD_ATTEMPTS:-3}"
+case "${GOLIVE_SUDO_PASSWORD_ATTEMPTS:-}" in ''|*[!0-9]*|0) GOLIVE_SUDO_PASSWORD_ATTEMPTS=3 ;; esac
 SUDO_PROMPT_OUTCOME="not_attempted"
 ELEVATION_PROVIDER="none"
 ELEVATION_RESULT="not_attempted"
@@ -611,7 +615,7 @@ elevation_event() {
     esac
 
     case "${ELEVATION_PROVIDER:-none}" in
-        none|root|sudo|zenity|kdialog|askpass|pkexec|tty) provider="$ELEVATION_PROVIDER" ;;
+        none|root|sudo|zenity|kdialog|askpass|pkexec|tty|gui) provider="$ELEVATION_PROVIDER" ;;
         *) provider="unknown" ;;
     esac
     case "${ELEVATION_RESULT:-not_attempted}" in
@@ -632,7 +636,7 @@ elevation_event() {
     shift || true
     for detail in "$@"; do
         case "$detail" in
-            phase=dialog|phase=polkit|phase=password|phase=tty|phase=pre_activation|reason=provider_missing|reason=temporary_file|code=0|code=1|code=2|code=126|code=127|code=other|stderr=present|stderr=empty)
+            phase=dialog|phase=polkit|phase=password|phase=tty|phase=pre_activation|reason=provider_missing|reason=temporary_file|reason=incorrect_password|reason=not_in_sudoers|reason=tty_required|reason=account_blocked|reason=pam_error|reason=other|code=0|code=1|code=2|code=126|code=127|code=other|stderr=present|stderr=empty)
                 printf ' %s' "$detail" >&2
                 ;;
         esac
@@ -652,10 +656,13 @@ elevation_code_detail() {
 cleanup_sudo_pass() {
     cleanup_wireguard_temp
     rollback_activation
-    if [ -n "$SUDO_PASS_FILE" ] && [ -f "$SUDO_PASS_FILE" ]; then
-        rm -f "$SUDO_PASS_FILE" 2>/dev/null || true
+    # `${VAR:-}` em vez de `$VAR`: o askpass faz `unset` dessas variaveis e esta
+    # limpeza roda no trap de saida; sob `set -eu` a referencia direta quebraria
+    # o script no exato momento de encerrar.
+    if [ -n "${SUDO_PASS_FILE:-}" ] && [ -f "${SUDO_PASS_FILE:-}" ]; then
+        rm -f "${SUDO_PASS_FILE:-}" 2>/dev/null || true
     fi
-    for askpass_file in "$SUDO_ASKPASS_HELPER" "$SUDO_ASKPASS_EVENT_FILE" "$SUDO_ASKPASS_RESULT_FILE"; do
+    for askpass_file in "${SUDO_ASKPASS_HELPER:-}" "${SUDO_ASKPASS_EVENT_FILE:-}" "${SUDO_ASKPASS_RESULT_FILE:-}"; do
         if [ -n "$askpass_file" ] && [ -f "$askpass_file" ]; then
             rm -f "$askpass_file" 2>/dev/null || true
         fi
@@ -733,6 +740,23 @@ sudo_pass_get() {
     local prompt_stderr_state="empty" provider_seen=0 provider_failure=0
     SUDO_PROMPT_FALLBACK_PKEXEC=0
     SUDO_PROMPT_OUTCOME="not_attempted"
+    # Senha vinda da janela da propria GUI (GOLIVE_SUDO_PASS_FILE aponta um
+    # arquivo 0600 com a senha + newline). Ultimo recurso quando o sistema nao
+    # tem zenity/kdialog nem agente polkit alcancavel: a GUI decide quando
+    # oferecer, nunca o script por conta propria. Vazio/ilegivel cai no fluxo
+    # normal; o trap de saida apaga o arquivo como qualquer senha temporaria.
+    if [ "${GOLIVE_GUI:-0}" = "1" ] && [ -n "${GOLIVE_SUDO_PASS_FILE:-}" ] \
+        && [ -f "$GOLIVE_SUDO_PASS_FILE" ] && [ -r "$GOLIVE_SUDO_PASS_FILE" ] \
+        && [ -s "$GOLIVE_SUDO_PASS_FILE" ]; then
+        SUDO_PASS_FILE="$GOLIVE_SUDO_PASS_FILE"
+        ELEVATION_PROVIDER="gui"
+        ELEVATION_RESULT="not_attempted"
+        ELEVATION_INPUT_STATE="nonempty"
+        elevation_event "prompt.requested" "phase=dialog"
+        elevation_event "prompt.finished" "$(elevation_code_detail 0)" "stderr=empty"
+        SUDO_PROMPT_OUTCOME="credential_received"
+        return 0
+    fi
     providers="$(sudo_prompt_provider 2>/dev/null || true)"
     if [ -z "$providers" ]; then
         ELEVATION_PROVIDER="none"
@@ -855,7 +879,7 @@ sudo_pass_get() {
 # O askpass do sudo e executavel somente pelo usuario (0700: owner-only, pois
 # o sudo precisa executar o helper). A senha continua no arquivo separado 0600.
 sudo_authenticate_askpass() {
-    local askpass_status askpass_stderr askpass_result line
+    local askpass_status askpass_stderr askpass_result askpass_reason line
     local askpass_event_file askpass_result_file
     ELEVATION_PROVIDER="askpass"
     ELEVATION_RESULT="requested"
@@ -1004,13 +1028,23 @@ ASKPASS_HELPER
         elevation_event "prompt.failed" "reason=temporary_file"
         return 1
     }
+    # `askpass_status` precisa de valor inicial: sob `set -eu`, a atribuicao
+    # `askpass_status=$?` depois de um subshell que falha derrubaria o shell.
+    askpass_status=0
     (
         unset LD_LIBRARY_PATH LD_PRELOAD
         SUDO_ASKPASS="$SUDO_ASKPASS_HELPER" sudo -A -k -v >/dev/null 2>"$askpass_stderr"
-    )
-    askpass_status=$?
+    ) || askpass_status=$?
+    # A primeira linha do stderr do sudo so serve para classificar a causa; ela
+    # nunca volta para o log nem para a interface.
+    askpass_reason="other"
+    if [ -f "$askpass_stderr" ] && [ -s "$askpass_stderr" ]; then
+        IFS= read -r askpass_reason < "$askpass_stderr" || true
+        askpass_reason="$(sudo_classify_failure "$askpass_reason")"
+    fi
     unset SUDO_ASKPASS_PASS_FILE SUDO_ASKPASS_EVENT_FILE SUDO_ASKPASS_RESULT_FILE SUDO_ASKPASS_HELPER
     rm -f "$askpass_stderr"
+    askpass_stderr=""
     if [ -f "$askpass_event_file" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             printf '%s\n' "$line" >&2
@@ -1036,8 +1070,78 @@ ASKPASS_HELPER
         *) ELEVATION_RESULT="failed"; ELEVATION_INPUT_STATE="not_applicable" ;;
     esac
     cleanup_sudo_pass
+    # O motivo identificado no askpass segue a mesma whitelist do caminho -S: sem
+    # isso a falha de PAM apareceria como "senha recusada" e o usuario redigitaria
+    # a senha correta sem sucesso (relato no NixOS). O askpass e o ultimo recurso
+    # da cadeia (sem pkexec e sem janela do zenity/kdialog): classificar e informar
+    # o motivo basta, repetir o prompt aqui so alongaria uma sessao ja degradada.
+    # Dialogo cancelado, vazio ou com falha tecnica nao tem motivo de sudo para
+    # classificar: a linha e a mensagem anteriores se mantêm.
+    if [ "$askpass_result" = "nonempty" ]; then
+        elevation_event "sudo.validation" "$(elevation_code_detail "$askpass_status")" "phase=password" "reason=$askpass_reason"
+        case "$askpass_reason" in
+            incorrect_password)
+                printf '%s\n' "Falha: a senha do sudo foi recusada. A ativacao foi cancelada sem repetir o pedido." >&2
+                ;;
+            not_in_sudoers)
+                printf '%s\n' "Falha: o usuario $(id -un) nao tem permissao de sudo nesta maquina. Adicione o usuario ao grupo wheel (ou ao sudoers) e tente de novo; a ativacao foi cancelada." >&2
+                ;;
+            tty_required)
+                printf '%s\n' 'Falha: a politica de sudo desta maquina exige um terminal (Defaults requiretty), que a interface grafica nao tem. Remova o requiretty do sudoers ou execute a ativacao por um terminal; a ativacao foi cancelada.' >&2
+                ;;
+            account_blocked)
+                printf '%s\n' 'Falha: o sudo recusou a autenticacao desta conta (senha expirada, conta bloqueada ou troca de senha obrigatoria). Resolva o acesso com sudo -v em um terminal e tente de novo; a ativacao foi cancelada.' >&2
+                ;;
+            pam_error)
+                printf '%s\n' 'Falha: o sudo nao conseguiu autenticar esta conta pelo PAM do sistema (senha expirada, conta sem senha definida ou configuracao de PAM ausente — comum em instalacoes NixOS/enxutas). Rode "sudo -v" em um terminal para ver o motivo exato e corrija-o antes de ativar.' >&2
+                ;;
+            *)
+                printf '%s\n' 'Falha: o sudo recusou a autorizacao por um motivo nao identificado. A ativacao foi cancelada sem repetir o pedido; rode "sudo -v" em um terminal para ver o motivo real exibido pelo sudo.' >&2
+                ;;
+        esac
+        return 1
+    fi
     elevation_event "sudo.validation" "$(elevation_code_detail "$askpass_status")" "phase=password"
     return 1
+}
+
+
+# A mensagem do sudo e lida somente para classificar a causa da recusa; ela nunca
+# volta para o log nem para a interface. O retorno e sempre um motivo conhecido da
+# whitelist abaixo. Os padroes reproduzem as saidas reais do sudo 1.9, conferidas
+# em container (pt_BR e en, porque o texto segue o locale da maquina):
+#   sem permissao .... "Sorry, user X may not run sudo on HOST." /
+#                       "X is not in the sudoers file." /
+#                       "Sinto muito, usuário X não pode executar sudo em HOST." /
+#                       "X não está no arquivo sudoers."
+#   falta de tty ..... "sorry, you must have a tty to run sudo" / "no tty present" /
+#                       "sinto mesmo, você deve ter um tty" / "nenhum tty"
+#   conta/senha ...... "Account or password is expired, reset your password" /
+#                       "your account has expired" / "Conta ou senha expirou"
+#   senha incorreta .. "Sorry, try again." / "N incorrect password attempt(s)" /
+#                       "Authentication failure" / "Sinto mesmo, tente novamente." /
+#                       "N tentativa de senha incorreta" / "falha de autenticação"
+#   PAM .............. "PAM account management error", "a password is required",
+#                       "no password was provided" (e equivalentes em pt) — e o
+#                       que sobra quando /etc/pam.d/sudo nao consegue autenticar,
+#                       como no NixOS enxuto; a senha digitada nunca chega a ser testada.
+# A ordem importa: "PAM: Authentication failure" e senha incorreta, nao falha de
+# configuracao do PAM. Os padroes evitam os caracteres acentuados das mensagens
+# (cada idioma/localidade acentua de um jeito) e prendem o nucleo ASCII da frase.
+sudo_classify_failure() {
+    case "${1:-}" in
+        *"may not run sudo"*|*"executar sudo"*|*"is not in the sudoers file"*|*"not in the sudoers file"*|*"no arquivo sudoers"*|*sudoers*)
+            printf '%s\n' 'not_in_sudoers' ;;
+        *"you must have a tty"*|*"deve ter um tty"*|*"no tty present"*|*"no tty"*|*"terminal is required"*)
+            printf '%s\n' 'tty_required' ;;
+        *expir*|*"redefina sua senha"*|*"reset your password"*|*"altera"*"senha"*|*"troca de senha"*)
+            printf '%s\n' 'account_blocked' ;;
+        *"try again"*|*"tente novamente"*|*incorrect*|*incorret*|*"Authentication failure"*|*"falha de autentica"*)
+            printf '%s\n' 'incorrect_password' ;;
+        *"PAM account"*|*"gerenciamento de conta PAM"*|*"a password is required"*|*"uma senha"*"necess"*|*"no password was provided"*|*"nenhuma senha foi fornecida"*|*"unable to read password"*|*"nao foi possivel ler a senha"*|*"cannot retrieve authentication info"*|*"recuperar as informacoes de autenticacao"*|*"recuperar as informa"*)
+            printf '%s\n' 'pam_error' ;;
+        *) printf '%s\n' 'other' ;;
+    esac
 }
 
 # Valida a senha uma unica vez na janela grafica. Algumas politicas de sudo usam
@@ -1045,7 +1149,7 @@ ASKPASS_HELPER
 # `sudo -n comando` ainda a exige. Nesses casos o elevate reenvia a mesma senha
 # temporaria para cada comando, sem abrir uma nova janela.
 sudo_authenticate_once() {
-    local sudo_status
+    local sudo_status sudo_reason sudo_stderr password_attempt
     [ "$(id -u)" -eq 0 ] && return 0
     [ "$SUDO_AUTH_READY" -eq 1 ] && return 0
 
@@ -1066,30 +1170,88 @@ sudo_authenticate_once() {
     fi
 
     if have sudo && [ "${GOLIVE_GUI:-0}" = "1" ]; then
-        if ! sudo_pass_get; then
-            # Quando o provedor grafico falhou, elevate ainda pode tentar
-            # pkexec. Nao anuncie cancelamento antes desse segundo caminho;
-            # para cancelamento, senha vazia ou falha sem fallback, preserve a
-            # mensagem sanitizada deste fluxo.
-            if [ "${SUDO_PROMPT_FALLBACK_PKEXEC:-0}" -ne 1 ]; then
-                printf '%s\n' "Falha: nao foi possivel autorizar o sudo (resultado ${ELEVATION_RESULT}). A ativacao foi cancelada sem alterar o sistema." >&2
+        # Senha incorreta merece nova tentativa (erro de digitacao e a causa mais
+        # comum); falta de permissao, conta bloqueada ou politica de tty nao mudam
+        # com outra tentativa e param na primeira recusa.
+        password_attempt=0
+        while :; do
+            if ! sudo_pass_get; then
+                # Quando o provedor grafico falhou, elevate ainda pode tentar
+                # pkexec. Nao anuncie cancelamento antes desse segundo caminho;
+                # para cancelamento, senha vazia ou falha sem fallback, preserve a
+                # mensagem sanitizada deste fluxo.
+                if [ "${SUDO_PROMPT_FALLBACK_PKEXEC:-0}" -ne 1 ]; then
+                    printf '%s\n' "Falha: nao foi possivel autorizar o sudo (resultado ${ELEVATION_RESULT}). A ativacao foi cancelada sem alterar o sistema." >&2
+                fi
+                return 1
             fi
-            return 1
-        fi
-        if sudo -S -k -v < "$SUDO_PASS_FILE" >/dev/null 2>&1; then
-            ELEVATION_RESULT="accepted"
-            elevation_event "sudo.validation" "$(elevation_code_detail 0)" "phase=password"
-            SUDO_AUTH_READY=1
-            SUDO_USE_CACHED_PASS=1
-            return 0
-        else
+            sudo_stderr="$(sudo -S -k -v < "$SUDO_PASS_FILE" 2>&1 >/dev/null)"
             sudo_status=$?
-        fi
-        cleanup_sudo_pass
-        ELEVATION_RESULT="rejected"
-        elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password"
-        printf '%s\n' 'Falha: a senha do sudo foi recusada. A ativacao foi cancelada sem repetir o pedido.' >&2
-        return 1
+            if [ "$sudo_status" -eq 0 ]; then
+                sudo_stderr=""
+                ELEVATION_RESULT="accepted"
+                elevation_event "sudo.validation" "$(elevation_code_detail 0)" "phase=password"
+                SUDO_AUTH_READY=1
+                SUDO_USE_CACHED_PASS=1
+                return 0
+            fi
+            sudo_reason="$(sudo_classify_failure "$sudo_stderr")"
+            sudo_stderr=""
+            cleanup_sudo_pass
+            case "$sudo_reason" in
+                incorrect_password)
+                    ELEVATION_RESULT="rejected"
+                    elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=incorrect_password"
+                    # Senha da GUI: repetir aqui so revalidaria o mesmo arquivo.
+                    # Quem re-pergunta e a janela, com a mensagem de erro.
+                    if [ "${ELEVATION_PROVIDER:-}" = "gui" ]; then
+                        printf '%s\n' "Falha: senha do sudo incorreta. Informe a senha novamente na janela." >&2
+                        return 1
+                    fi
+                    password_attempt=$((password_attempt + 1))
+                    if [ "$password_attempt" -lt "$GOLIVE_SUDO_PASSWORD_ATTEMPTS" ]; then
+                        printf '%s\n' "Falha: senha do sudo incorreta. Informe a senha novamente (tentativa ${password_attempt} de ${GOLIVE_SUDO_PASSWORD_ATTEMPTS})." >&2
+                        continue
+                    fi
+                    printf '%s\n' "Falha: a senha do sudo foi recusada em ${GOLIVE_SUDO_PASSWORD_ATTEMPTS} tentativas. A ativacao foi cancelada sem repetir o pedido." >&2
+                    return 1
+                    ;;
+                not_in_sudoers)
+                    ELEVATION_RESULT="unavailable"
+                    elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=not_in_sudoers"
+                    printf '%s\n' "Falha: o usuario $(id -un) nao tem permissao de sudo nesta maquina. Adicione o usuario ao grupo wheel (ou ao sudoers) e tente de novo; a ativacao foi cancelada." >&2
+                    return 1
+                    ;;
+                tty_required)
+                    ELEVATION_RESULT="unavailable"
+                    elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=tty_required"
+                    printf '%s\n' 'Falha: a politica de sudo desta maquina exige um terminal (Defaults requiretty), que a interface grafica nao tem. Remova o requiretty do sudoers ou execute a ativacao por um terminal; a ativacao foi cancelada.' >&2
+                    return 1
+                    ;;
+                account_blocked)
+                    ELEVATION_RESULT="unavailable"
+                    elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=account_blocked"
+                    printf '%s\n' 'Falha: o sudo recusou a autenticacao desta conta (senha expirada, conta bloqueada ou troca de senha obrigatoria). Resolva o acesso com sudo -v em um terminal e tente de novo; a ativacao foi cancelada.' >&2
+                    return 1
+                    ;;
+                pam_error)
+                    # Caminho comum em NixOS enxuto: o PAM do sistema nao resolve a
+                    # conta (modulo/servico incompleto) e o sudo recusa antes de
+                    # comparar a senha. A mensagem precisa dizer que a senha nao
+                    # estava em questao, senao o usuario a redigita sem sucesso.
+                    ELEVATION_RESULT="unavailable"
+                    elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=pam_error"
+                    printf '%s\n' 'Falha: o sudo nao conseguiu autenticar esta conta pelo PAM do sistema (senha expirada, conta sem senha definida ou configuracao de PAM ausente — comum em instalacoes NixOS/enxutas). Rode "sudo -v" em um terminal para ver o motivo exato e corrija-o antes de ativar.' >&2
+                    return 1
+                    ;;
+                *)
+                    ELEVATION_RESULT="rejected"
+                    elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=other"
+                    printf '%s\n' 'Falha: o sudo recusou a autorizacao por um motivo nao identificado. A ativacao foi cancelada sem repetir o pedido; rode "sudo -v" em um terminal para ver o motivo real exibido pelo sudo.' >&2
+                    return 1
+                    ;;
+            esac
+        done
     fi
 
     if have sudo && [ -t 0 ]; then
@@ -1679,6 +1841,118 @@ discord_dirs() {
     return 0
 }
 
+# Fallback de alvo manual: quando a varredura nao reconhece a instalacao do cliente, a GUI
+# grava em manual-target.conf o programa que o usuario escolheu entre os que estao abertos.
+# O arquivo e gravavel pelo usuario, entao TODO argumento de lancamento e revalidado aqui
+# antes de virar linha de alvo: nada dele chega ao shell como comando.
+MANUAL_TARGET_FILE="${MANUAL_TARGET_FILE:-${INSTALL_DIR}/manual-target.conf}"
+
+# Le o registro para MANUAL_SCHEMA/KIND/KEY/LABEL/RESOURCES e para os argumentos numerados
+# (MANUAL_ARGCOUNT/ARG1..ARG4). Nao valida — quem valida e manual_target_validate, para que o
+# preflight possa distinguir "nao existe" de "existe e nao serve".
+manual_target_read() {
+    MANUAL_PRESENT=0
+    MANUAL_SCHEMA=""; MANUAL_KIND=""; MANUAL_KEY=""; MANUAL_LABEL=""; MANUAL_RESOURCES=""
+    MANUAL_ARGCOUNT=0; MANUAL_ARG1=""; MANUAL_ARG2=""; MANUAL_ARG3=""; MANUAL_ARG4=""
+    [ -f "$MANUAL_TARGET_FILE" ] || return 0
+    MANUAL_PRESENT=1
+    local linha
+    while IFS= read -r linha || [ -n "$linha" ]; do
+        case "$linha" in
+            schema=*) MANUAL_SCHEMA="${linha#schema=}" ;;
+            kind=*) MANUAL_KIND="${linha#kind=}" ;;
+            key=*) MANUAL_KEY="${linha#key=}" ;;
+            label=*) MANUAL_LABEL="${linha#label=}" ;;
+            resources=*) MANUAL_RESOURCES="${linha#resources=}" ;;
+            arg=*)
+                MANUAL_ARGCOUNT=$((MANUAL_ARGCOUNT + 1))
+                case "$MANUAL_ARGCOUNT" in
+                    1) MANUAL_ARG1="${linha#arg=}" ;;
+                    2) MANUAL_ARG2="${linha#arg=}" ;;
+                    3) MANUAL_ARG3="${linha#arg=}" ;;
+                    4) MANUAL_ARG4="${linha#arg=}" ;;
+                esac
+                ;;
+        esac
+    done < "$MANUAL_TARGET_FILE"
+    return 0
+}
+
+# Valida o registro lido. Cada kind tem uma forma de lancamento permitida e qualquer outra e
+# recusada em silencio (o preflight reporta valid=false e a ativacao segue sem o alvo).
+manual_target_validate() {
+    [ "$MANUAL_SCHEMA" = "1" ] || return 1
+    local tab campo
+    tab="$(printf '\t')"
+    for campo in "$MANUAL_KEY" "$MANUAL_LABEL" "$MANUAL_RESOURCES"; do
+        case "$campo" in *"$tab"*) return 1 ;; esac
+    done
+    case "$MANUAL_RESOURCES" in ""|/*) ;; *) return 1 ;; esac
+    case "$MANUAL_KIND" in
+        flatpak)
+            [ "$MANUAL_ARGCOUNT" = 3 ] || return 1
+            [ "$MANUAL_ARG1" = "flatpak" ] || return 1
+            [ "$MANUAL_ARG2" = "run" ] || return 1
+            [ "$MANUAL_ARG3" = "$MANUAL_KEY" ] || return 1
+            case "$MANUAL_KEY" in
+                ""|*[!A-Za-z0-9_.-]*) return 1 ;;
+            esac
+            ;;
+        snap)
+            [ "$MANUAL_ARGCOUNT" = 3 ] || return 1
+            [ "$MANUAL_ARG1" = "snap" ] || return 1
+            [ "$MANUAL_ARG2" = "run" ] || return 1
+            [ "$MANUAL_ARG3" = "$MANUAL_KEY" ] || return 1
+            case "$MANUAL_KEY" in
+                ""|*[!A-Za-z0-9-]*) return 1 ;;
+            esac
+            ;;
+        appimage|exec)
+            [ "$MANUAL_ARGCOUNT" = 1 ] || return 1
+            [ "$MANUAL_ARG1" = "$MANUAL_KEY" ] || return 1
+            case "$MANUAL_KEY" in /*) ;; *) return 1 ;; esac
+            [ -f "$MANUAL_KEY" ] || return 1
+            [ -x "$MANUAL_KEY" ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Linha de alvo no formato que o resto do script ja consome:
+# resources|flav|detect[|flatpak_id]. Sai vazia quando nao ha registro valido.
+manual_target_line() {
+    manual_target_read
+    [ "$MANUAL_PRESENT" = 1 ] || return 0
+    if ! manual_target_validate; then
+        warn "O programa escolhido como alvo manual nao esta mais disponivel; escolha de novo na GUI."
+        return 0
+    fi
+    # O alvo manual nao passa por discord_emit_dir: ela exige app.asar (ou um diretorio de
+    # resources) e recusaria justamente o caso deste fallback. A dedupe continua valendo
+    # quando existe um caminho para comparar.
+    if [ -n "$MANUAL_RESOURCES" ]; then
+        local chave
+        chave="|$(stat -Lc '%d:%i' "$MANUAL_RESOURCES" 2>/dev/null || printf 'sem-alvo')|"
+        case "${DISCORD_SEEN_TARGETS:-}" in *"$chave"*) return 0 ;; esac
+    fi
+    local app_id=""
+    [ "$MANUAL_KIND" = "flatpak" ] && app_id="$MANUAL_KEY"
+    printf '%s|manual|manual|%s\n' "$MANUAL_RESOURCES" "$app_id"
+    return 0
+}
+
+# Fragmento do preflight: "present" e o arquivo existir, "valid" e ele poder ser lancado
+# agora. A GUI nunca inventa validade — ela le esta resposta.
+manual_target_manual_json() {
+    manual_target_read
+    local valid=false
+    if [ "$MANUAL_PRESENT" = 1 ] && manual_target_validate; then valid=true; fi
+    local present=false
+    [ "$MANUAL_PRESENT" = 1 ] && present=true
+    printf ',"manual":{"present":%s,"valid":%s}' "$present" "$valid"
+}
+
 # Preflight somente leitura para a GUI. Ele existe para que uma dependencia ausente
 # (em especial wireguard-tools no Arch) vire uma mensagem acionavel, em vez de um
 # loop de tentativas de ativacao. Nao instala pacotes nem pede senha.
@@ -1741,11 +2015,11 @@ linux_preflight_json() {
     [ "$elevated" = true ] || ok=false
     [ "$netns_ok" = true ] || ok=false
     [ "$found_count" -gt 0 ] || ok=false
-    printf '{"ok":%s,"platform":"linux","distro":"%s","archLike":%s,"dependencies":{"missing":[%s],"required":["wg","ip","curl"]},"elevation":{"available":%s,"method":"%s"},"netns":{"available":%s},"kernel":{"wireguard":"%s"},"discord":{"found":%s,"count":%s,"firstPath":"%s"},"errors":[%s],"installCommand":"%s"}\n' \
+    printf '{"ok":%s,"platform":"linux","distro":"%s","archLike":%s,"dependencies":{"missing":[%s],"required":["wg","ip","curl"]},"elevation":{"available":%s,"method":"%s"},"netns":{"available":%s},"kernel":{"wireguard":"%s"},"discord":{"found":%s,"count":%s,"firstPath":"%s"%s},"errors":[%s],"installCommand":"%s"}\n' \
         "$ok" "$(json_escape "${distro:-Linux}")" \
         "$(case "$distro $id_like" in *arch*) printf true ;; *) printf false ;; esac)" \
         "$missing_json" "$elevated" "$(if [ "$(id -u)" -eq 0 ]; then printf root; elif have sudo; then printf sudo; elif have pkexec; then printf pkexec; else printf none; fi)" \
-        "$netns_ok" "$kernel" "$( [ "$found_count" -gt 0 ] && printf true || printf false )" "$found_count" "$(json_escape "$first_path")" "$error_json" "$(json_escape "$install")"
+        "$netns_ok" "$kernel" "$( [ "$found_count" -gt 0 ] && printf true || printf false )" "$found_count" "$(json_escape "$first_path")" "$(manual_target_manual_json)" "$error_json" "$(json_escape "$install")"
 }
 
 # Instala somente os comandos indispensaveis que faltam para o tunel WireGuard.
@@ -2137,6 +2411,12 @@ discord_running() {
         rodando="$(flatpak ps --columns=application 2>/dev/null || true)"
         case "$rodando" in *com.discordapp.*|*dev.vencord.*|*app.legcord.*|*org.equicord.*) return 0 ;; esac
     fi
+    # Alvo manual (fallback): nao usa nenhum dos nomes acima nem vem da varredura — a
+    # identidade esta no registro, e sem isso o cliente ficaria aberto dentro de um
+    # namespace prestes a ser destruido.
+    if [ -n "$(manual_pid_for_target 2>/dev/null || true)" ]; then
+        return 0
+    fi
     return 1
 }
 
@@ -2185,10 +2465,41 @@ running_flav() {
     esac
 }
 
+# PID do processo do alvo manual, ou vazio. A identidade nao pode vir de um nome conhecido:
+# e o proprio registro que diz o que procurar (escopo do cgroup, variavel do ambiente ou o
+# executavel resolvido em /proc/<pid>/exe).
+manual_pid_for_target() {
+    manual_target_read
+    manual_target_validate || return 1
+    local pid exe
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        case "$MANUAL_KIND" in
+            flatpak)
+                grep -qs -- "app-flatpak-${MANUAL_KEY}-" "/proc/$pid/cgroup" 2>/dev/null && { printf '%s\n' "$pid"; return 0; }
+                ;;
+            snap)
+                grep -qszF -x "SNAP_INSTANCE_NAME=${MANUAL_KEY}" "/proc/$pid/environ" 2>/dev/null && { printf '%s\n' "$pid"; return 0; }
+                grep -qszF -x "SNAP_NAME=${MANUAL_KEY}" "/proc/$pid/environ" 2>/dev/null && { printf '%s\n' "$pid"; return 0; }
+                ;;
+            appimage)
+                grep -qszF -x "APPIMAGE=${MANUAL_KEY}" "/proc/$pid/environ" 2>/dev/null && { printf '%s\n' "$pid"; return 0; }
+                ;;
+            *)
+                exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+                [ -n "$exe" ] && [ "$exe" = "$MANUAL_KEY" ] && { printf '%s\n' "$pid"; return 0; }
+                ;;
+        esac
+    done
+    return 1
+}
 # Retorna o PID do cliente deste flavour. Usado pelo status para nao confundir um
 # Discord normal (fora do namespace) com a sessao protegida pelo WireGuard.
 discord_pid_flav() {
     local flav="$1" flatpak_id="${2:-}" resources="${3:-}" pid pattern
+    if [ "$flav" = "manual" ]; then
+        manual_pid_for_target
+        return $?
+    fi
     if [ -n "$flatpak_id" ] && pid="$(flatpak_pid_for_id "$flatpak_id" 2>/dev/null || true)"; then
         [ -n "$pid" ] && { printf '%s\n' "$pid"; return 0; }
     fi
@@ -2300,6 +2611,13 @@ stop_discord() {
     rm -f "$_USER_HOME/.config/discordptb/Singleton"* 2>/dev/null || true
     rm -f "$_USER_HOME/.config/discordcanary/Singleton"* 2>/dev/null || true
     kill_parallel_by_path
+    # Alvo manual (fallback): encerra pelo PID confirmado, que pode nao casar com nenhum dos
+    # nomes conhecidos. Sem isto o cliente ficaria aberto dentro do namespace que vai sumir.
+    local manual_pid
+    manual_pid="$(manual_pid_for_target 2>/dev/null || true)"
+    if [ -n "$manual_pid" ]; then
+        kill "$manual_pid" 2>/dev/null || true
+    fi
     if have flatpak; then
         local id
         for id in $FLATPAK_IDS; do
@@ -2322,6 +2640,10 @@ stop_discord() {
     pkill -9 -x discord-canary 2>/dev/null || true
     pkill -9 -x discordptb 2>/dev/null || true
     kill_parallel_by_path -9
+    manual_pid="$(manual_pid_for_target 2>/dev/null || true)"
+    if [ -n "$manual_pid" ]; then
+        kill -9 "$manual_pid" 2>/dev/null || true
+    fi
     for i in $(seq 1 20); do
         sleep 0.25
         discord_running || return 0
@@ -2880,6 +3202,16 @@ target_can_launch() {
 select_launch_target() {
     local found="${1:-}" resources flav detect id escolhido=""
     [ -n "$found" ] || return 0
+    # Alvo manual (fallback): a escolha explicita do usuario vence a heuristica, inclusive
+    # quando ela nao tem resources para comparar (flatpak, snap e AppImage ficam sem esse
+    # caminho). A linha continua no FOUND para o status e a parada a cobrirem.
+    local manual
+    manual="$(printf '%s\n' "$found" | grep -m1 '|manual|' || true)"
+    if [ -n "$manual" ]; then
+        printf '%s\n' "$manual" | head -1
+        return 0
+    fi
+
 
     while IFS='|' read -r resources flav detect id; do
         [ -n "$resources" ] || continue
@@ -2936,6 +3268,32 @@ start_discord() {
     rm -f "$_USER_HOME/.config/discordcanary/Singleton"* 2>/dev/null || true
 
     local target_cmd=""
+    # Fallback de alvo manual: o comando veio validado da GUI e e refeito aqui como parametros
+    # posicionais — um caminho com espaco nao pode virar duas palavras.
+    if [ "$(printf '%s' "$linha" | cut -d'|' -f3)" = "manual" ]; then
+        manual_target_read
+        if ! manual_target_validate; then
+            printf '[%s] launch=falhou motivo=alvo_manual_invalido\n' "$(date -Is)" >>"$discord_log"
+            warn "O alvo manual nao esta mais disponivel. Escolha o programa de novo na GUI."
+            return 1
+        fi
+        case "$MANUAL_KIND" in
+            flatpak) set -- flatpak run "$MANUAL_KEY" ;;
+            snap) set -- snap run "$MANUAL_KEY" ;;
+            *) set -- "$MANUAL_KEY" ;;
+        esac
+        printf '[%s] launch=manual kind=%s key=%s\n' "$(date -Is)" "$MANUAL_KIND" "$MANUAL_KEY" >>"$discord_log"
+        if [ "${START_DISCORD_HOST_ONLY:-0}" -eq 1 ]; then
+            printf '[%s] launch=host-fallback\n' "$(date -Is)" >>"$discord_log"
+            run_user_host_command detached env $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
+        elif have setsid; then
+            run_user_netns_command detached env $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
+        else
+            run_user_netns_command background env $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
+        fi
+        printf '  Log do Discord: %s\n' "$discord_log" >&2
+        return 0
+    fi
     id="$(printf '%s' "$linha" | cut -d'|' -f4)"
     if [ -z "$id" ] && [ -n "$resources" ] && have flatpak; then
         id="$(flatpak_app_id "$resources" 2>/dev/null || true)"
@@ -3200,7 +3558,7 @@ EOF
     linux_ensure_dependencies
     exit 0
 }
-FOUND="$(discord_dirs)"
+FOUND="$(discord_dirs; manual_target_line)"
 [ "$MODE" = "preflight" ] && {
     if [ "$JSON" -eq 1 ]; then
         linux_preflight_json

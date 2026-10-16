@@ -167,15 +167,62 @@ describe("persistencia dos eventos de elevacao Linux", () => {
     expect(JSON.stringify(sink.calls)).not.toContain("benign-provider-warning");
   });
 
+  it("persiste o motivo da recusa do sudo e segue descartando motivo desconhecido", () => {
+    const sink = makeSink();
+    const { consumeLinuxElevationEvents } = loadElevationConsumer(sink.logger);
+    const state = { pending: "" };
+    consumeLinuxElevationEvents([
+      "[elevation] sudo.validation provider=zenity result=rejected code=1 phase=password reason=incorrect_password",
+      "[elevation] sudo.validation provider=zenity result=unavailable code=1 phase=password reason=not_in_sudoers",
+      "[elevation] sudo.validation provider=zenity result=rejected code=1 phase=password reason=nao-whitelistado",
+      "[elevation] sudo.validation provider=zenity result=rejected code=1 phase=password reason=account_blocked reason=incorrect_password",
+      // O relato do NixOS (#345): a senha digitada e correta, mas o PAM do
+      // sistema nao resolve a conta e o sudo recusa. Precisa chegar ao log com
+      // um motivo proprio, senao o diagnostico acusa senha errada.
+      "[elevation] sudo.validation provider=zenity result=unavailable code=1 phase=password reason=pam_error",
+    ].join("\n") + "\n", state);
+    expect(sink.calls).toHaveLength(3);
+    expect(sink.calls[0]).toEqual([
+      "info",
+      "linux",
+      "elevation.sudo.validation",
+      { source: "standalone", provider: "zenity", result: "rejected", code: "1", phase: "password", reason: "incorrect_password" },
+    ]);
+    expect(sink.calls[1][3]).toMatchObject({ reason: "not_in_sudoers", result: "unavailable" });
+    expect(sink.calls[2][3]).toMatchObject({ reason: "pam_error", result: "unavailable" });
+  });
+
+  it("persiste eventos do provedor gui e sinaliza falta de providers e recusa", () => {
+    const sink = makeSink();
+    const { consumeLinuxElevationEvents } = loadElevationConsumer(sink.logger);
+    const state = { pending: "", providerMissing: false, guiPasswordRejected: false };
+    consumeLinuxElevationEvents([
+      "[elevation] prompt.unavailable provider=none result=unavailable input=not_applicable reason=provider_missing",
+      "[elevation] prompt.requested provider=gui result=not_attempted input=unknown phase=dialog",
+      "[elevation] prompt.finished provider=gui result=not_attempted input=nonempty code=0 stderr=empty",
+      "[elevation] sudo.validation provider=gui result=rejected code=1 phase=password reason=incorrect_password",
+    ].join("\n") + "\n", state);
+    expect(sink.calls.map((call) => call[2])).toEqual([
+      "elevation.prompt.unavailable",
+      "elevation.prompt.requested",
+      "elevation.prompt.finished",
+      "elevation.sudo.validation",
+    ]);
+    expect(state.providerMissing).toBe(true);
+    expect(state.guiPasswordRejected).toBe(true);
+    expect(JSON.stringify(sink.calls)).not.toContain("124151");
+  });
+
   it("liga o consumidor ao callback da ativacao sem mudar o canal publico", () => {
     const activationStart = mainSource.indexOf("async function linuxActivate");
     const activationEnd = mainSource.indexOf("async function linuxDeactivate", activationStart);
     const activation = mainSource.slice(activationStart, activationEnd);
 
-    expect(activation).toContain("const elevationParserState: LinuxElevationParserState = { pending: \"\" };");
+    expect(activation).toContain("const elevationParserState: LinuxElevationParserState = { pending: \"\", providerMissing: false, guiPasswordRejected: false };");
     expect(activation).toContain("consumeLinuxElevationEvents(chunk, elevationParserState);");
     expect(activation).toContain("onChunk(chunk);");
-    expect(activation).toContain('runScript(["--yes", "--cleanup-legacy"], forwardLinuxChunk)');
+    expect(activation).toContain('elevated.run(["--yes", "--cleanup-legacy"], forwardLinuxChunk)');
+    expect(activation).toContain("createLinuxPasswordFallback(elevationParserState, forwardLinuxChunk)");
     expect(mainSource).toContain('logger.logEvent("info", "linux", LINUX_ELEVATION_LOG_EVENTS[record.event], data);');
   });
 });

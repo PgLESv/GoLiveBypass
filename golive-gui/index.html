@@ -106,6 +106,17 @@
               <code id="linuxPreflightCommand" class="linux-preflight-command" hidden></code>
             </div>
 
+            <button id="manualTargetButton" class="manual-target-btn" type="button" hidden>
+              Escolher programa…
+            </button>
+
+            <div class="manual-target-row" id="manualTargetRow" hidden>
+              <span class="manual-target-row__label">Túnel aplicado em</span>
+              <span class="manual-target-row__name" id="manualTargetName"></span>
+              <button id="manualTargetChange" class="manual-target-row__action" type="button">Trocar</button>
+              <button id="manualTargetRemove" class="manual-target-row__action" type="button">Remover</button>
+            </div>
+
             <button id="toggleBtn" class="toggle-btn" disabled>
           <svg
             class="btn-icon icon-play"
@@ -346,6 +357,31 @@
           </section>
         </dialog>
 
+        <dialog
+          id="manualTargetDialog"
+          class="manual-target-dialog"
+          aria-modal="true"
+          aria-labelledby="manualTargetTitle"
+          aria-describedby="manualTargetHint"
+        >
+          <section class="manual-target-dialog__panel">
+            <div class="manual-target-dialog__heading">
+              <div>
+                <span class="manual-target-dialog__kicker">Aplicar o túnel a um programa</span>
+                <h2 id="manualTargetTitle">Qual programa deve usar a VPN?</h2>
+              </div>
+              <button type="button" id="manualTargetClose" class="manual-target-dialog__close">Fechar</button>
+            </div>
+            <p id="manualTargetHint" class="manual-target-dialog__hint">
+              Escolha o Discord que a varredura não reconheceu. Na ativação ele será fechado e reaberto
+              dentro do túnel.
+            </p>
+            <div id="manualTargetList" class="manual-target-dialog__list" role="listbox" aria-label="Programas abertos"></div>
+            <div id="manualTargetFeedback" class="manual-target-dialog__feedback" hidden></div>
+          </section>
+        </dialog>
+
+
         <label class="switch-row" id="devModeRow">
           <input type="checkbox" id="devModeToggle" />
           <span class="switch-track" aria-hidden="true">
@@ -486,8 +522,24 @@
               </label>
             </div>
           </div>
+        <div id="routePromptDialog" class="bug-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="routePromptTitle" aria-describedby="routePromptHint">
+          <div class="bug-dialog__backdrop" id="routePromptBackdrop"></div>
+          <div class="bug-dialog__panel" role="document">
+            <h2 id="routePromptTitle" class="bug-dialog__title">Como você quer escolher a rota?</h2>
+            <p id="routePromptHint" class="bug-dialog__hint">Você pode mudar isso depois em Configurações.</p>
+            <button type="button" id="routePromptAuto" class="route-prompt__option">
+              <span class="route-prompt__name">Automática <span class="route-prompt__badge">recomendado</span></span>
+              <span class="route-prompt__desc">O app procura e otimiza a rota para você.</span>
+            </button>
+            <button type="button" id="routePromptManual" class="route-prompt__option">
+              <span class="route-prompt__name">Manual</span>
+              <span class="route-prompt__desc">Você escolhe a rota e ela é mantida.</span>
+            </button>
+            <div class="bug-dialog__actions">
+              <button type="button" id="routePromptLater" class="bug-btn bug-btn--ghost">Decidir depois</button>
+            </div>
+          </div>
         </div>
-
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

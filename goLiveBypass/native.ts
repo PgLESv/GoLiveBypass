@@ -321,7 +321,6 @@ type PluginUpdateFlight<T> = {
 };
 
 type PluginUpdateLock = {
-    fd: number;
     token: string;
     depth: number;
 };
@@ -504,6 +503,7 @@ async function requestRelaunch(namespace: string | null): Promise<boolean> {
     const safeEnvKeys = [
         "WAYLAND_DISPLAY",
         "DISPLAY",
+        "XAUTHORITY",
         "XDG_BACKEND",
         "XDG_SESSION_TYPE",
         "GDK_BACKEND",
@@ -1554,7 +1554,7 @@ function acquirePluginUpdateLock(): PluginUpdateLock {
         try {
             fd = openSync(path, "wx", 0o600);
             created = true;
-            const lock: PluginUpdateLock = { fd, token: randomUUID(), depth: 1 };
+            const lock: PluginUpdateLock = { token: randomUUID(), depth: 1 };
             writeFileSync(fd, `${JSON.stringify({ pid: process.pid, token: lock.token, startedAt: Date.now() })}\n`, "utf8");
             // O lock é consultado por outro processo. Garanta que o owner foi
             // escrito antes de liberar o descritor, especialmente no Windows.
@@ -1603,7 +1603,8 @@ function releasePluginUpdateLock(lock: PluginUpdateLock | null | undefined): voi
     let ownsFile = false;
     const owner = readUpdateLockOwner(updateLockPath());
     ownsFile = owner?.pid === process.pid && owner.token === lock.token;
-    try { closeSync(lock.fd); } catch { /* o descritor pode já estar fechado */ }
+    // O descritor foi fechado na aquisição e seu número pode pertencer agora
+    // ao SQLite, logger ou Wayland do Discord. A liberação só remove nosso lock.
     if (ownsFile) {
         try { rmSync(updateLockPath(), { force: true }); }
         catch (error) { log("warn", "não consegui liberar o lock do updater", { erro: error }); }

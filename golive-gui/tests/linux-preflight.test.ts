@@ -9,6 +9,66 @@ const tempRoots: string[] = [];
 afterEach(() => { for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("preflight Linux", () => {
+  it.skipIf(process.platform === "win32")("reporta o alvo manual no JSON do preflight real", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-manual-preflight-"));
+    tempRoots.push(root);
+    const app = path.join(root, "discord");
+    fs.writeFileSync(app, "#!/bin/sh\n");
+    fs.chmodSync(app, 0o755);
+    const arquivo = path.join(root, "manual-target.conf");
+    const script = path.resolve(process.cwd(), "../standalone/golivebypass-standalone.sh");
+
+    const rodar = (): { manual: { present: boolean; valid: boolean }; count: number } => {
+      const run = spawnSync("/bin/bash", [script, "--preflight", "--json"], {
+        env: { ...process.env, GOLIVE_GUI: "1", MANUAL_TARGET_FILE: arquivo },
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(run.status, run.stderr).toBe(0);
+      const json = JSON.parse(run.stdout.trim().split("\n").pop() as string);
+      return { manual: json.discord.manual, count: json.discord.count };
+    };
+
+    // Sem arquivo: presente e valido sao falsos, e a varredura segue sendo a unica fonte.
+    expect(rodar().manual).toEqual({ present: false, valid: false });
+
+    fs.writeFileSync(arquivo, ["schema=1", "kind=exec", `key=${app}`, "label=Discord", "resources=", `arg=${app}`, ""].join("\n"));
+    const comAlvo = rodar();
+    expect(comAlvo.manual).toEqual({ present: true, valid: true });
+    // O alvo manual entra em $FOUND: sem instalacao reconhecida ele ainda conta como um alvo.
+    expect(comAlvo.count).toBeGreaterThanOrEqual(1);
+
+    // Registro que existe e nao serve (schema desconhecido) nao vira alvo.
+    fs.writeFileSync(arquivo, ["schema=2", "kind=exec", `key=${app}`, "label=Discord", "resources=", `arg=${app}`, ""].join("\n"));
+    expect(rodar().manual).toEqual({ present: true, valid: false });
+
+    // Alvo obsoleto: o caminho deixou de existir desde a escolha.
+    fs.rmSync(app);
+    fs.writeFileSync(arquivo, ["schema=1", "kind=exec", `key=${app}`, "label=Discord", "resources=", `arg=${app}`, ""].join("\n"));
+    expect(rodar().manual).toEqual({ present: true, valid: false });
+  });
+
+  it("le o bloco do alvo manual e assume ausente quando o script nao manda o campo", () => {
+    const comManual = parseLinuxPreflight(JSON.stringify({
+      ok: true, platform: "linux", distro: "Arch Linux",
+      dependencies: { missing: [], required: ["wg", "ip", "curl"] },
+      elevation: { available: true, method: "sudo" }, netns: { available: true },
+      kernel: { wireguard: "loaded" },
+      discord: { found: true, count: 1, firstPath: "/home/u/Discord/resources", manual: { present: true, valid: true } },
+      errors: [], installCommand: "",
+    }));
+
+    expect(comManual.discord.manual).toEqual({ present: true, valid: true });
+
+    const alvoMorto = parseLinuxPreflight(JSON.stringify({ discord: { found: false, count: 0, manual: { present: true, valid: false } } }));
+    expect(alvoMorto.discord.manual).toEqual({ present: true, valid: false });
+
+    // Script antigo (sem o campo) e valores de tipo errado nao podem virar "alvo existente".
+    expect(parseLinuxPreflight(JSON.stringify({ discord: { found: true, count: 1 } })).discord.manual).toEqual({ present: false, valid: false });
+    expect(parseLinuxPreflight(JSON.stringify({ discord: { manual: { present: "sim", valid: 1 } } })).discord.manual).toEqual({ present: false, valid: false });
+    expect(parseLinuxPreflight(JSON.stringify({ discord: { manual: null } })).discord.manual).toEqual({ present: false, valid: false });
+  });
+
   it("mapeia dependencias ausentes do Arch para um comando pacman copiavel", () => {
     const result = parseLinuxPreflight(JSON.stringify({
       ok: false,
@@ -196,7 +256,9 @@ describe("preflight Linux", () => {
     const source = fs.readFileSync(path.resolve(process.cwd(), "../standalone/golivebypass-standalone.sh"), "utf8");
     const ensureStart = source.indexOf('[ "$MODE" = "ensure-dependencies" ] && {');
     const preflightStart = source.indexOf('[ "$MODE" = "preflight" ] && {');
-    const foundStart = source.indexOf('FOUND="$(discord_dirs)"');
+    // Ancora pelo prefixo: a linha ganhou o ramo do alvo manual e a assercao aqui e a ORDEM
+    // dos blocos, nao o texto exato do FOUND.
+    const foundStart = source.indexOf('FOUND="$(discord_dirs');
     const preflightEnd = source.indexOf('[ -n "$FOUND" ] || fail', preflightStart);
     const statusStart = source.indexOf('if [ "$MODE" = "status" ]');
     const statusEnd = source.indexOf('if [ "$MODE" = "uninstall" ] || [ "$MODE" = "restore" ]', statusStart);

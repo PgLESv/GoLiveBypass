@@ -43,7 +43,7 @@ export default defineNuxtConfig({
   },
   runtimeConfig: {
     public: {
-      releaseApiBaseUrl: process.env.NUXT_PUBLIC_RELEASE_API_BASE_URL || 'https://api.skyplaceia.com/bugs',
+      releaseApiBaseUrl: process.env.NUXT_PUBLIC_RELEASE_API_BASE_URL || 'https://golivebypass.dev/bugs',
     },
   },
 })

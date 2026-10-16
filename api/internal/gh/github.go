@@ -82,6 +82,37 @@ func (c *Client) LatestStableRelease(ctx context.Context) (Release, error) {
 	return release, nil
 }
 
+// ListReleases devolve as releases do repo (drafts incluídos: o cliente macOS
+// nasce como rascunho e só a guarda o publica). Uma página de 100 basta para
+// achar a maior tag macos-v* — acima disso a release sai do catálogo, não da
+// lista.
+func (c *Client) ListReleases(ctx context.Context) ([]Release, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/repos/"+c.repo+"/releases?per_page=100", nil)
+	if err != nil {
+		return nil, fmt.Errorf("montando requisicao de releases: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", apiAccept)
+	req.Header.Set("X-GitHub-Api-Version", apiVersion)
+	req.Header.Set("User-Agent", "GoLiveBypass-release-catalog")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("consultando releases no GitHub: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub respondeu %s ao listar releases: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var releases []Release
+	if err := json.Unmarshal(body, &releases); err != nil {
+		return nil, fmt.Errorf("decodificando releases (%s): %w", resp.Status, err)
+	}
+	return releases, nil
+}
+
 // VerifyLabels confere no boot que cada label de ISSUE_LABELS existe no repo alvo.
 // Sem isso, o primeiro report real devolveria 422 do GitHub e o usuario acharia
 // que a API quebrou. Erro de auth/rede tambem falha: melhor abortar o boot do que

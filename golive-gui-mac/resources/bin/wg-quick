@@ -1,0 +1,231 @@
+#!/bin/sh
+# wg-quick minimal para macOS com wireguard-go (userspace)
+# POSIX sh — compatível com bash 3.2 do sistema macOS
+# Substitui o wg-quick upstream que requer bash 4+
+set -eu
+
+PROGRAM="${0##*/}"
+BINDIR="$(cd "${0%/*}" 2>/dev/null && pwd -P)"
+export PATH="${BINDIR}:/usr/bin:/bin:/usr/sbin:/sbin"
+
+WG_CONFIG=""
+INTERFACE=""
+CONFIG_FILE=""
+ADDRESSES=""
+DNS_SERVERS=""
+MTU_VAL=""
+REAL_INTERFACE=""
+
+die()  { echo "$PROGRAM: $*" >&2; exit 1; }
+cmd()  { echo "[#] $*" >&2; "$@"; }
+info() { echo "[+] $*" >&2; }
+
+# ── Eleva para root se necessário ──────────────────────────────────────────
+auto_su() {
+    [ "$(id -u)" = "0" ] || exec sudo -- "$BINDIR/$PROGRAM" "$@"
+}
+
+# ── Parse do .conf ─────────────────────────────────────────────────────────
+parse_options() {
+    CONFIG_FILE="$1"
+    [ -f "$CONFIG_FILE" ] || die "'$CONFIG_FILE' não existe"
+    base="${CONFIG_FILE##*/}"
+    INTERFACE="${base%.conf}"
+
+    in_iface=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        stripped="${line%%#*}"
+        raw_key="${stripped%%=*}"
+        raw_val="${stripped#*=}"
+        # trim espaços
+        key="$(printf '%s' "$raw_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        val="$(printf '%s' "$raw_val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+        case "$key" in
+            \[Interface\]) in_iface=1; continue ;;
+            \[*)
+                in_iface=0
+                # Preservar cabeçalho da secção ([Peer], etc.) no WG_CONFIG
+                WG_CONFIG="${WG_CONFIG}${line}
+"
+                continue
+                ;;
+        esac
+
+        if [ "$in_iface" = "1" ]; then
+            case "$key" in
+                Address) ADDRESSES="$ADDRESSES $val" ;;
+                DNS)     DNS_SERVERS="$DNS_SERVERS $val" ;;
+                MTU)     MTU_VAL="$val" ;;
+                # PrivateKey e outros campos da secção Interface passam para o wg
+                *)       WG_CONFIG="${WG_CONFIG}${line}
+" ;;
+            esac
+        else
+            WG_CONFIG="${WG_CONFIG}${line}
+"
+        fi
+    done < "$CONFIG_FILE"
+}
+
+# ── Rede padrão e endpoints ────────────────────────────────────────────────
+default_route_field() { route -n get default 2>/dev/null | awk -v f="$1:" '$1==f{print $2; exit}'; }
+
+# IPs IPv4 dos Endpoint do conf (hostnames e IPv6 ficam de fora)
+endpoint_ips() {
+    printf '%s\n' "$WG_CONFIG" | awk -F= '
+        { k=$1; gsub(/[ \t]/,"",k) }
+        tolower(k)=="endpoint" { v=$2; gsub(/[ \t]/,"",v); sub(/:[0-9]+$/,"",v); print v }
+    ' | grep -E '^[0-9]+(\.[0-9]+){3}$' || true
+}
+
+# Remove rotas de host para os endpoints, inclusive sobras de uma rede anterior
+delete_endpoint_routes() {
+    for ep_ip in $(endpoint_ips); do
+        route -q -n delete -inet -host "$ep_ip" >/dev/null 2>&1 || true
+    done
+}
+
+# ── Interface real (utun*) ──────────────────────────────────────────────────
+get_real_interface() {
+    name_file="/var/run/wireguard/${INTERFACE}.name"
+    [ -f "$name_file" ] || return 1
+    REAL_INTERFACE="$(cat "$name_file")"
+    [ -n "$REAL_INTERFACE" ] && [ -S "/var/run/wireguard/${REAL_INTERFACE}.sock" ] || return 1
+    return 0
+}
+
+# ── Subir o túnel ─────────────────────────────────────────────────────────
+cmd_up() {
+    auto_su up "$CONFIG_FILE"
+
+    get_real_interface && die "'$INTERFACE' já existe como '$REAL_INTERFACE'"
+
+    mkdir -p /var/run/wireguard
+
+    export WG_TUN_NAME_FILE="/var/run/wireguard/${INTERFACE}.name"
+    cmd "${WG_QUICK_USERSPACE_IMPLEMENTATION:-wireguard-go}" utun
+
+    get_real_interface || die "Não foi possível obter a interface real"
+    # Permitir que o processo do app (usuário não-root) leia o arquivo .name
+    chmod 644 "/var/run/wireguard/${INTERFACE}.name" 2>/dev/null || true
+    chmod 755 /var/run/wireguard 2>/dev/null || true
+    info "Interface para $INTERFACE é $REAL_INTERFACE"
+
+    # Configurar WireGuard (PrivateKey, Peer, etc.) pelo stdin: a chave privada
+    # nunca passa por um arquivo em disco
+    printf '[Interface]\n%s\n' "$WG_CONFIG" | cmd wg setconf "$REAL_INTERFACE" /dev/stdin
+
+    # MTU automático se não especificado
+    if [ -n "$MTU_VAL" ]; then
+        cmd ifconfig "$REAL_INTERFACE" mtu "$MTU_VAL"
+    else
+        default_if="$(default_route_field interface)"
+        default_mtu=""
+        [ -n "$default_if" ] && default_mtu="$(ifconfig "$default_if" 2>/dev/null | awk '/mtu/{print $NF; exit}')"
+        if [ -n "$default_mtu" ] && [ "$default_mtu" -gt 80 ] 2>/dev/null; then
+            cmd ifconfig "$REAL_INTERFACE" mtu $(( default_mtu - 80 ))
+        fi
+    fi
+
+    # Endereços IP
+    for addr in $ADDRESSES; do
+        case "$addr" in
+            *:*) cmd ifconfig "$REAL_INTERFACE" inet6 "$addr" alias ;;
+            *)   cmd ifconfig "$REAL_INTERFACE" inet "$addr" "${addr%%/*}" alias ;;
+        esac
+    done
+
+    # Ligar interface
+    cmd ifconfig "$REAL_INTERFACE" up
+
+    # Rotas para AllowedIPs de todos os peers
+    wg show "$REAL_INTERFACE" allowed-ips 2>/dev/null | while read -r _ ips; do
+        for ip in $ips; do
+            case "$ip" in
+                *:*)
+                    case "$ip" in
+                        ::/0|*/0) # rota default IPv6
+                            cmd route -q -n add -inet6 ::/1    -interface "$REAL_INTERFACE" 2>/dev/null || true
+                            cmd route -q -n add -inet6 8000::/1 -interface "$REAL_INTERFACE" 2>/dev/null || true
+                            ;;
+                        *) cmd route -q -n add -inet6 "$ip" -interface "$REAL_INTERFACE" 2>/dev/null || true ;;
+                    esac
+                    ;;
+                */0|0.0.0.0/0) # rota default IPv4 — dividir em dois /1
+                    cmd route -q -n add -inet 0.0.0.0/1   -interface "$REAL_INTERFACE" 2>/dev/null || true
+                    cmd route -q -n add -inet 128.0.0.0/1 -interface "$REAL_INTERFACE" 2>/dev/null || true
+                    ;;
+                [0-9]*) cmd route -q -n add -inet "$ip" -interface "$REAL_INTERFACE" 2>/dev/null || true ;;
+            esac
+        done
+    done
+
+    # Rota direta para os endpoints pelo gateway atual (evitar loop de roteamento).
+    # Apaga antes qualquer rota antiga: de outra rede, ela levaria a um gateway morto.
+    gw4="$(default_route_field gateway)"
+    delete_endpoint_routes
+    if [ -n "$gw4" ]; then
+        for ep_ip in $(endpoint_ips); do
+            cmd route -q -n add -inet -host "$ep_ip" "$gw4" >/dev/null 2>&1 || true
+        done
+    fi
+
+    # DNS via networksetup (opcional — falha silenciosa)
+    if [ -n "$DNS_SERVERS" ]; then
+        networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | \
+        sed 's/^\*//' | while IFS= read -r svc; do
+            [ -n "$svc" ] || continue
+            # shellcheck disable=SC2086
+            networksetup -setdnsservers "$svc" $DNS_SERVERS 2>/dev/null || true
+        done
+    fi
+
+    info "Túnel $INTERFACE ($REAL_INTERFACE) ativo"
+}
+
+# ── Derrubar o túnel ───────────────────────────────────────────────────────
+cmd_down() {
+    auto_su down "$CONFIG_FILE"
+
+    get_real_interface || die "'$INTERFACE' não é uma interface WireGuard ativa"
+
+    # Remover rotas da interface (coluna 4 do netstat do macOS = Netif)
+    netstat -nr -f inet 2>/dev/null | awk -v iface="$REAL_INTERFACE" '$4==iface{print $1}' | \
+    while read -r dst; do
+        route -q -n delete -inet "$dst" -interface "$REAL_INTERFACE" >/dev/null 2>&1 || true
+    done
+    delete_endpoint_routes
+
+    # Restaurar DNS
+    if [ -n "$DNS_SERVERS" ]; then
+        networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | \
+        sed 's/^\*//' | while IFS= read -r svc; do
+            [ -n "$svc" ] || continue
+            networksetup -setdnsservers "$svc" Empty 2>/dev/null || true
+        done
+    fi
+
+    cmd rm -f "/var/run/wireguard/${REAL_INTERFACE}.sock"
+    cmd rm -f "/var/run/wireguard/${INTERFACE}.name"
+    info "Túnel $INTERFACE derrubado"
+}
+
+# ── Entry point ─────────────────────────────────────────────────────────────
+case "${1:-}" in
+    up)
+        parse_options "${2:-}"
+        cmd_up
+        ;;
+    down)
+        parse_options "${2:-}"
+        cmd_down
+        ;;
+    -h|--help|help)
+        echo "Usage: $PROGRAM [ up | down ] CONFIG_FILE" >&2
+        ;;
+    *)
+        echo "Usage: $PROGRAM [ up | down ] CONFIG_FILE" >&2
+        exit 1
+        ;;
+esac

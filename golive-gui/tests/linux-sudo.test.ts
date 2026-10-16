@@ -130,7 +130,7 @@ describe("elevacao sudo no Linux", () => {
     expect(source).toContain("printf '%s\\n' \"$pass\"");
     expect(source).toContain("chmod 600 \"$pass_file\"");
     expect(source).toContain("unset LD_LIBRARY_PATH LD_PRELOAD");
-    expect(source).toContain('for askpass_file in "$SUDO_ASKPASS_HELPER"');
+    expect(source).toContain('for askpass_file in "${SUDO_ASKPASS_HELPER:-}"');
     expect(source).toContain("SUDO_PROMPT_FALLBACK_PKEXEC");
   });
 

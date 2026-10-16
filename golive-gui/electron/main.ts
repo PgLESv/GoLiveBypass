@@ -12,7 +12,7 @@ import {
 import path, { dirname } from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import fs from "fs";
 import { randomUUID } from "crypto";
 import { execFile, execFileSync, execSync, spawn } from "child_process";
@@ -36,10 +36,15 @@ import * as proton from "./proton";
 import { ProtonOptimizationCoordinator } from "./proton-optimization";
 import { restoreBypassOnStartup, type StartupOptimizationResult } from "./startup-restore";
 import { findWindowsDiscordInstall } from "./windows-discord-install";
+import { shouldAskRoutePreference } from "./route-preference-prompt";
 import { assembleWindowsDiscoverySnapshotFromRaw, collectWindowsDiscoveryPowerShell, collectWindowsDiscoveryPowerShellAsync, collectWindowsDiscoverySnapshot, createWindowsDiscoveryCache, failedWindowsDiscoveryRawFor, rootsForEnvironment, toPublicWindowsDiscoveryInstall, type WindowsDiscoveryEnvironment, type WindowsDiscoveryRaw, type WindowsDiscoverySnapshot, type WindowsDiscoverySnapshotCollectors } from "./windows-discord-discovery";
 import { waitForProcessRunning, waitForProcessStopped, type ProcessProbeState } from "./wait-condition";
 import { TUNNEL_STARTUP_SETTLE_MS, waitForTunnelStartupSettle } from "./tunnel-startup";
 import { linuxPreflightRepairable, parseLinuxPreflight, linuxPreflightMessage, type LinuxPreflight } from "./linux-preflight";
+import { createProcSeams } from "./linux-proc-seams";
+import { clearSelectedTarget, listRunningApps, selectManualTarget, type ManualTargetServiceDeps } from "./linux-manual-target-service";
+import { readManualTarget } from "./linux-manual-target";
+import { sessionMarkerPaths } from "./linux-session-marker";
 import { classifyLinuxHealth } from "./linux-health";
 import { PROTON_CAPTCHA_IPC_CHANNEL, isAllowedProtonCaptchaNavigation, parseProtonCaptchaChallenge, validateProtonCaptchaResponse } from "./proton-captcha";
 import { observeRouteDiagnostic } from "./route-diagnostics";
@@ -2502,7 +2507,7 @@ function linuxPreflight(force = false): Promise<LinuxPreflight> {
         ok: false, platform: "linux", distro: "Linux", archLike: false,
         dependencies: { missing: [], required: ["wg", "ip", "curl"] },
         elevation: { available: false, method: "none" }, netns: { available: false },
-        kernel: { wireguard: "unknown" }, discord: { found: false, count: 0, firstPath: "" },
+        kernel: { wireguard: "unknown" }, discord: { found: false, count: 0, firstPath: "", manual: { present: false, valid: false } },
         errors: [message], installCommand: "",
       } satisfies LinuxPreflight;
     })
@@ -2520,6 +2525,29 @@ function linuxPreflight(force = false): Promise<LinuxPreflight> {
     .finally(() => { if (linuxPreflightInFlight === operation) linuxPreflightInFlight = null; });
   linuxPreflightInFlight = operation;
   return operation;
+}
+
+// O fallback de alvo manual roda no processo principal, sem elevacao: a leitura de /proc, a
+// gravacao do registro e a resolucao da chave escolhida ficam fora do renderer. `force` no
+// preflight e o que invalida o cache de 5s depois de mudar o registro.
+function manualTargetDeps(): ManualTargetServiceDeps {
+  return {
+    settingsDir,
+    procSeams: createProcSeams,
+    preflight: (force = false) => linuxPreflight(force),
+  };
+}
+
+// Rotulo do alvo registrado para a UI. A validade e do script (`discord.manual.valid`); quando
+// o script nao reporta o bloco (versao antiga) a GUI nao inventa "invalido" sem evidencia.
+function manualTargetView(preflight: LinuxPreflight): { name: string; kind: string; valid: boolean } | null {
+  const record = readManualTarget(settingsDir());
+  if (!record) return null;
+  return {
+    name: record.label || record.key,
+    kind: record.kind,
+    valid: preflight.discord.manual.present ? preflight.discord.manual.valid : true,
+  };
 }
 
 // As ultimas linhas do stderr do script viram a mensagem de erro na UI. O ruido imutavel de
@@ -2677,12 +2705,12 @@ type LinuxElevationEventName =
   | "pkexec.result"
   | "authorization.requested"
   | "authorization";
-type LinuxElevationProvider = "none" | "root" | "sudo" | "zenity" | "kdialog" | "askpass" | "pkexec" | "tty" | "unknown";
+type LinuxElevationProvider = "none" | "root" | "sudo" | "zenity" | "kdialog" | "askpass" | "pkexec" | "tty" | "gui" | "unknown";
 type LinuxElevationResult = "not_attempted" | "requested" | "accepted" | "rejected" | "cancelled" | "unavailable" | "failed" | "cached" | "empty" | "authorized" | "unknown";
 type LinuxElevationDetails = {
   input?: "nonempty" | "empty" | "unknown" | "not_applicable";
   code?: "0" | "1" | "2" | "126" | "127" | "other";
-  reason?: "provider_missing" | "temporary_file";
+  reason?: "provider_missing" | "temporary_file" | "incorrect_password" | "not_in_sudoers" | "tty_required" | "account_blocked" | "pam_error" | "other";
   phase?: "dialog" | "polkit" | "password" | "tty" | "pre_activation";
   stderr?: "present" | "empty";
 };
@@ -2692,7 +2720,7 @@ type LinuxElevationRecord = {
   result: LinuxElevationResult;
   details: LinuxElevationDetails;
 };
-type LinuxElevationParserState = { pending: string };
+type LinuxElevationParserState = { pending: string; providerMissing: boolean; guiPasswordRejected: boolean };
 
 const LINUX_ELEVATION_PREFIX = "[elevation]";
 const LINUX_ELEVATION_MAX_LINE_LENGTH = 256;
@@ -2710,7 +2738,7 @@ const LINUX_ELEVATION_LOG_EVENTS: Record<LinuxElevationEventName, string> = {
   authorization: "elevation.authorization",
 };
 const LINUX_ELEVATION_PROVIDERS = new Set<LinuxElevationProvider>([
-  "none", "root", "sudo", "zenity", "kdialog", "askpass", "pkexec", "tty", "unknown",
+  "none", "root", "sudo", "zenity", "kdialog", "askpass", "pkexec", "tty", "gui", "unknown",
 ]);
 const LINUX_ELEVATION_RESULTS = new Set<LinuxElevationResult>([
   "not_attempted", "requested", "accepted", "rejected", "cancelled", "unavailable", "failed", "cached", "empty", "authorized", "unknown",
@@ -2721,7 +2749,7 @@ const LINUX_ELEVATION_DETAIL_RULES: Record<LinuxElevationEventName, readonly (ke
   "prompt.unavailable": ["input", "reason"],
   "prompt.failed": ["input", "reason"],
   "sudo.cached": ["phase"],
-  "sudo.validation": ["code", "phase"],
+  "sudo.validation": ["code", "phase", "reason"],
   "sudo.credential_store": ["reason", "phase"],
   "pkexec.invoked": ["phase"],
   "pkexec.result": ["code", "phase"],
@@ -2733,7 +2761,7 @@ const LINUX_ELEVATION_DETAIL_VALUES: {
 } = {
   input: ["nonempty", "empty", "unknown", "not_applicable"],
   code: ["0", "1", "2", "126", "127", "other"],
-  reason: ["provider_missing", "temporary_file"],
+  reason: ["provider_missing", "temporary_file", "incorrect_password", "not_in_sudoers", "tty_required", "account_blocked", "pam_error", "other"],
   phase: ["dialog", "polkit", "password", "tty", "pre_activation"],
   stderr: ["present", "empty"],
 };
@@ -2769,7 +2797,13 @@ function parseLinuxElevationLine(line: string): LinuxElevationRecord | null {
   }
 
   const expected = LINUX_ELEVATION_DETAIL_RULES[event];
-  if (detailKeys.length !== expected.length || expected.some((key, index) => details[key] === undefined || detailKeys[index] !== key)) return null;
+  // `reason` e opcional somente como ultimo campo de sudo.validation: as
+  // linhas antigas (askpass/tty, sem motivo) continuam validas e a ordem dos
+  // demais campos segue estrita.
+  const reasonOptional = event === "sudo.validation" && expected[expected.length - 1] === "reason";
+  if (detailKeys.length !== expected.length
+    && !(reasonOptional && detailKeys.length === expected.length - 1)) return null;
+  if (detailKeys.some((key, index) => key !== expected[index])) return null;
   return { event, provider, result, details };
 }
 
@@ -2800,7 +2834,16 @@ function consumeLinuxElevationEvents(chunk: string, state: LinuxElevationParserS
   for (const rawLine of lines) {
     const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
     const record = parseLinuxElevationLine(line);
-    if (record) persistLinuxElevationEvent(record);
+    if (record) {
+      persistLinuxElevationEvent(record);
+      if (record.event === "prompt.unavailable" && record.details.reason === "provider_missing") {
+        state.providerMissing = true;
+      }
+      if (record.event === "sudo.validation" && record.provider === "gui"
+        && record.result === "rejected" && record.details.reason === "incorrect_password") {
+        state.guiPasswordRejected = true;
+      }
+    }
   }
 
   // Nunca acumula stderr arbitrario: só retém um prefixo que ainda pode virar uma
@@ -2811,15 +2854,149 @@ function consumeLinuxElevationEvents(chunk: string, state: LinuxElevationParserS
   }
 }
 
+// Último recurso quando o sistema não tem zenity/kdialog nem agente polkit
+// alcançável: a senha do sudo é pedida na janela da própria GUI e entregue ao
+// script por arquivo temporário (GOLIVE_SUDO_PASS_FILE, provider "gui").
+// A senha nunca entra em log, argv ou variável legível — só no arquivo 0600,
+// apagado pelo script ao sair e por dispose() em qualquer caminho.
+const LINUX_GUI_PASSWORD_ATTEMPTS = 3;
+
+type LinuxPasswordFallback = {
+  run: (args: string[], onChunk: (chunk: string) => void) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+  dispose: () => void;
+};
+
+function promptLinuxSudoPassword(incorrect: boolean): Promise<string | null> {
+  const { promise, resolve } = Promise.withResolvers<string | null>();
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  const win = new BrowserWindow({
+    width: 440,
+    height: 300,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    parent: parent ?? undefined,
+    modal: parent !== null,
+    show: false,
+    autoHideMenuBar: true,
+    title: "Senha do sudo — GoLiveBypass",
+    backgroundColor: "#14161c",
+    icon: loadAsset("icon.png"),
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+    },
+  });
+  let settled = false;
+  const finish = (value: string | null) => {
+    if (settled) return;
+    settled = true;
+    ipcMain.removeListener("sudo-password-response", onResponse);
+    resolve(value);
+    if (!win.isDestroyed()) win.destroy();
+  };
+  const onResponse = (event: Electron.IpcMainEvent, message: unknown) => {
+    if (settled || event.sender !== win.webContents) return;
+    if (message === null) {
+      finish(null);
+      return;
+    }
+    const password = (message as { password?: unknown } | null)?.password;
+    if (typeof password !== "string" || password.length === 0 || password.length > 1024) {
+      finish(null);
+      return;
+    }
+    finish(password);
+  };
+  ipcMain.on("sudo-password-response", onResponse);
+  win.once("ready-to-show", () => {
+    if (!settled) win.show();
+  });
+  win.once("closed", () => finish(null));
+  if (process.env.VITE_DEV_SERVER_URL) {
+    const base = process.env.VITE_DEV_SERVER_URL.replace(/\/?$/, "/");
+    win.loadURL(`${base}sudo-password.html${incorrect ? "?incorrect=1" : ""}`).catch(() => finish(null));
+  } else {
+    win.loadFile(path.join(__dirname, "../dist/sudo-password.html"), { query: incorrect ? { incorrect: "1" } : {} }).catch(() => finish(null));
+  }
+  return promise;
+}
+
+function createLinuxPasswordFallback(
+  state: LinuxElevationParserState,
+  forwardChunk: (chunk: string) => void,
+): LinuxPasswordFallback {
+  let passFile: string | null = null;
+  let passDir: string | null = null;
+  const cleanupFile = () => {
+    // O script também apaga no EXIT; aqui vale para cancelamento e erro antes do spawn.
+    if (passFile) {
+      try { fs.unlinkSync(passFile); } catch { /* já removido */ }
+      passFile = null;
+    }
+    if (passDir) {
+      try { fs.rmdirSync(passDir); } catch { /* já removido */ }
+      passDir = null;
+    }
+  };
+  const storePassword = (password: string): string => {
+    cleanupFile();
+    passDir = fs.mkdtempSync(path.join(tmpdir(), "golive-sudo-"));
+    passFile = path.join(passDir, "pass");
+    fs.writeFileSync(passFile, `${password}\n`, { mode: 0o600 });
+    try { fs.chmodSync(passFile, 0o600); } catch { /* umask já garantiu */ }
+    return passFile;
+  };
+  const run = async (args: string[], onChunk: (chunk: string) => void) => {
+    const forward = (chunk: string) => {
+      forwardChunk(chunk);
+      if (onChunk !== forwardChunk) onChunk(chunk);
+    };
+    let extraEnv: Record<string, string> | undefined;
+    if (passFile) extraEnv = { GOLIVE_SUDO_PASS_FILE: passFile };
+    let result = await runScript(args, forward, extraEnv);
+    if (result.code === 0 || !state.providerMissing) return result;
+    // Sem providers, o script falha antes de qualquer stop_discord — repetir
+    // com a senha da GUI é seguro e resolve sozinho (NixOS enxuto, spins).
+    let incorrect = false;
+    for (let attempt = 0; attempt < LINUX_GUI_PASSWORD_ATTEMPTS; attempt += 1) {
+      state.guiPasswordRejected = false;
+      const password = await promptLinuxSudoPassword(incorrect);
+      if (password === null) return result;
+      const file = storePassword(password);
+      result = await runScript(args, forward, { GOLIVE_SUDO_PASS_FILE: file });
+      if (result.code === 0) return result;
+      if (!state.guiPasswordRejected) return result;
+      incorrect = true;
+    }
+    return result;
+  };
+  return { run, dispose: cleanupFile };
+}
+
 async function linuxActivate(onChunk: (c: string) => void) {
-  const elevationParserState: LinuxElevationParserState = { pending: "" };
+  const elevationParserState: LinuxElevationParserState = { pending: "", providerMissing: false, guiPasswordRejected: false };
   const forwardLinuxChunk = (chunk: string) => {
     consumeLinuxElevationEvents(chunk, elevationParserState);
     onChunk(chunk);
   };
+  const passwordFallback = createLinuxPasswordFallback(elevationParserState, forwardLinuxChunk);
+  try {
+    await linuxActivateInner(onChunk, forwardLinuxChunk, passwordFallback);
+  } finally {
+    passwordFallback.dispose();
+  }
+}
+
+async function linuxActivateInner(
+  onChunk: (c: string) => void,
+  forwardLinuxChunk: (chunk: string) => void,
+  elevated: LinuxPasswordFallback,
+) {
+  void onChunk;
   let preflight = await linuxPreflight();
   if (!preflight.ok && linuxPreflightRepairable(preflight)) {
-    const ensured = await runScript(["--ensure-dependencies"], forwardLinuxChunk);
+    const ensured = await elevated.run(["--ensure-dependencies"], forwardLinuxChunk);
     if (ensured.code !== 0) {
       throw new Error(tailErroScript(ensured.stderr, 4) || "Não foi possível preparar as dependências do Linux.");
     }
@@ -2838,7 +3015,7 @@ async function linuxActivate(onChunk: (c: string) => void) {
   }
   await ensureProtonActivationProfile();
   updateSharedSettings({ routeMode: "wireguard" });
-  const { code, stderr } = await runScript(["--yes", "--cleanup-legacy"], forwardLinuxChunk);
+  const { code, stderr } = await elevated.run(["--yes", "--cleanup-legacy"], forwardLinuxChunk);
   if (code !== 0) {
     throw new Error(
       tailErroScript(stderr, 3) ||
@@ -2852,12 +3029,9 @@ async function linuxActivate(onChunk: (c: string) => void) {
   try {
     const estado = await runScript(["--status", "--json", "--non-interactive"]);
     const data = JSON.parse(estado.stdout || "{}");
-    const nossos = Array.isArray(data?.discords)
-      ? data.discords
-          .filter((d: { state?: string }) => d?.state === "nosso")
-          .map((d: { path?: string }) => d?.path)
-          .filter((p: unknown): p is string => typeof p === "string")
-      : [];
+    // O alvo manual (fallback) pode nao ter `resources` no host: o filtro de caminho nao-vazio
+    // evita gravar um marcador apontando para lugar nenhum.
+    const nossos = sessionMarkerPaths(data?.discords);
     if (nossos.length > 0) {
       writeSessionMarker(
         nossos.map((resources) => ({
@@ -2884,15 +3058,25 @@ async function linuxDeactivate(onChunk: (c: string) => void) {
   stopProtonFailoverMonitor();
   pararWgStatsWatchdog();
   stopLinuxHealthWatchdog();
-  const { code, stderr } = await runScript(["--uninstall"], onChunk);
-  if (code !== 0) {
-    // Sem manter o marker: o disco continua "nosso"; o boot seguinte reverte a orfa assim
-    // que o cliente estiver fechado. O erro vai inteiro para a UI (stderr cortado no fim da
-    // linha), em vez dos ultimos 3 fragmentos que sumiam com altas linhas longas.
-    throw new Error(
-      tailErroScript(stderr, 6) ||
-        "Falha ao desativar (a elevacao provavelmente falhou)",
-    );
+  const elevationParserState: LinuxElevationParserState = { pending: "", providerMissing: false, guiPasswordRejected: false };
+  const forwardLinuxChunk = (chunk: string) => {
+    consumeLinuxElevationEvents(chunk, elevationParserState);
+    onChunk(chunk);
+  };
+  const passwordFallback = createLinuxPasswordFallback(elevationParserState, forwardLinuxChunk);
+  try {
+    const { code, stderr } = await passwordFallback.run(["--uninstall"], forwardLinuxChunk);
+    if (code !== 0) {
+      // Sem manter o marker: o disco continua "nosso"; o boot seguinte reverte a orfa assim
+      // que o cliente estiver fechado. O erro vai inteiro para a UI (stderr cortado no fim da
+      // linha), em vez dos ultimos 3 fragmentos que sumiam com altas linhas longas.
+      throw new Error(
+        tailErroScript(stderr, 6) ||
+          "Falha ao desativar (a elevacao provavelmente falhou)",
+      );
+    }
+  } finally {
+    passwordFallback.dispose();
   }
   clearSessionMarker();
   linuxStatusCache = null;
@@ -2977,7 +3161,31 @@ ipcMain.handle("get-status", async () => {
 ipcMain.handle("get-linux-preflight", async () => {
   if (!IS_LINUX) return null;
   const preflight = await linuxPreflight();
-  return { ...preflight, repairable: linuxPreflightRepairable(preflight) };
+  return {
+    ...preflight,
+    repairable: linuxPreflightRepairable(preflight),
+    // Fallback de alvo manual: sem instalacao reconhecida, a UI oferece a escolha.
+    discordMissing: preflight.discord.count === 0,
+    manualTarget: manualTargetView(preflight),
+  };
+});
+ipcMain.handle("list-linux-running-apps", () => {
+  if (!IS_LINUX) return { ok: false, apps: [], truncated: false, error: "Somente no Linux." };
+  return listRunningApps(manualTargetDeps());
+});
+ipcMain.handle("set-linux-manual-target", async (_event, payload: unknown) => {
+  if (!IS_LINUX) return { ok: false, error: "Somente no Linux." };
+  const result = await selectManualTarget(manualTargetDeps(), payload);
+  // O status do Linux tem cache de 1s e conta as linhas do --status --json: sem limpar, a UI
+  // poderia seguir mostrando "Discord nao encontrado" logo depois de registrar o alvo.
+  if (result.ok) linuxStatusCache = null;
+  return result;
+});
+ipcMain.handle("clear-linux-manual-target", async () => {
+  if (!IS_LINUX) return { ok: false, error: "Somente no Linux." };
+  const result = await clearSelectedTarget(manualTargetDeps());
+  if (result.ok) linuxStatusCache = null;
+  return result;
 });
 ipcMain.handle("get-startup", () => getStartup());
 ipcMain.handle("set-startup", (_event, enabled: unknown) => {
@@ -3943,6 +4151,7 @@ ipcMain.handle("get-proton-settings", async () => {
     tier: s.protonTier,
     planTitle: s.protonPlanTitle,
     isPaid: isPaid,
+    routePreferencePrompt: shouldAskRoutePreference(s),
   };
 });
 
@@ -3979,7 +4188,11 @@ ipcMain.handle("set-proton-settings", async (_event, settings: any) => {
     if (typeof settings?.autoFailover === "boolean") patch.protonAutoFailover = settings.autoFailover;
     if (settings?.routePreference === "auto" || settings?.routePreference === "manual") {
       patch.protonRoutePreference = settings.routePreference;
+      // Quem escolheu (aqui ou em Configuracoes) nao precisa mais da pergunta inicial.
+      patch.protonRoutePreferencePrompted = true;
     }
+    // Pergunta inicial dispensada sem escolher: nao volta a aparecer.
+    if (settings?.routePreferencePrompted === true) patch.protonRoutePreferencePrompted = true;
     return updateSharedSettings(patch);
   });
   if (!filterChanged && settings?.autoFailover === true) startProtonFailoverMonitor();

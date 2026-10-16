@@ -31,12 +31,18 @@ type fakeIssues struct {
 type fakeReleases struct {
 	release gh.Release
 	err     error
+	list    []gh.Release
+	listErr error
 	calls   int
 }
 
 func (f *fakeReleases) LatestStableRelease(context.Context) (gh.Release, error) {
 	f.calls++
 	return f.release, f.err
+}
+
+func (f *fakeReleases) ListReleases(context.Context) ([]gh.Release, error) {
+	return f.list, f.listErr
 }
 
 func (f *fakeIssues) CreateIssue(_ context.Context, iss gh.Issue) (gh.IssueResult, error) {

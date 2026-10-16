@@ -370,6 +370,83 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - Afetadas: GUI Windows e Linux de `2.0.6-beta-21` em diante, incluindo o estável `2.0.6`. Quem está em `2.0.6-beta-20` ou anterior não tem a regressão.
 - Limitação: validação por teste de renderer e compilação; a confirmação em Windows real depende deste beta.
 
+### Documentação: guia para compilar do zero (NixOS, Void e distros afins)
+
+- Novo [`docs/compilar-do-zero.md`](docs/compilar-do-zero.md), ligado no Índice, na seção do AppImage e no resumo em inglês do README: requisitos (Node 22.12+, Go 1.26.6+), toolchain por distro (Arch/CachyOS, Debian/Ubuntu, Fedora, Void Linux, NixOS, tarball oficial), o que cada script `build:*` faz e o roteiro até `dist-app/GoLiveBypass-<versão>.AppImage`.
+- Erros comuns com a mensagem exata, incluindo o relato do helper: `dial tcp: lookup proxy.golang.org on [::1]:53: … address family not supported by protocol` — causa (`/etc/resolv.conf` só com o nameserver `::1` num sistema sem pilha IPv6), diagnóstico e as duas correções (resolvedor IPv4; religar IPv6). Medido em netns: o resolvedor puro do Go **pula** um nameserver inutilizável quando existe outro depois dele, e `GODEBUG=netdns=cgo` não contorna o caso (lê o mesmo arquivo). Entram também o toolchain do Go (`GOTOOLCHAIN=local` vs. download automático, os dois medidos), proxy/espelho de npm/Electron/Go, cache de módulos para máquina sem DNS (`GOPROXY=off`), FUSE do AppImage e as dependências de ativação (`wireguard-tools`/`iproute2`/`curl`, módulo `wireguard`, sudo setuid do NixOS).
+
+### Linux: senha do sudo pedida na janela da GUI quando o sistema não tem diálogo nem polkit
+
+- Sem zenity/kdialog e sem agente polkit alcançável (NixOS enxuto, spins mínimos), a ativação morria em "não há agente de autenticação polkit" sem alternativa. Agora a GUI resolve sozinha: quando o script sinaliza `prompt.unavailable reason=provider_missing`, abre um modal próprio de senha e repete a operação com a credencial (provider `gui`), até 3 tentativas com aviso de "senha recusada" entre elas; cancelar mantém o erro original e o Discord intacto.
+- Contrato: `GOLIVE_SUDO_PASS_FILE` aponta um arquivo 0600 com a senha + newline, válido só com `GOLIVE_GUI=1`; vazio/ilegível/ausente cai no fluxo normal (zenity → kdialog → pkexec → askpass, ordem inalterada). A senha nunca entra em log, argv ou variável de ambiente — só no arquivo, apagado pelo trap EXIT do script e pelo `dispose()` da GUI em qualquer caminho. Com provider `gui`, senha incorreta falha na primeira tentativa (`reason=incorrect_password`, sem re-prompt interno): quem re-pergunta é a janela.
+- Fiação: `runScript` ganhou `extraEnv` opcional; `createLinuxPasswordFallback` envolve `--ensure-dependencies`, `--yes --cleanup-legacy` (ativação) e `--uninstall` (desativação); o parser de elevação aceita `provider=gui` e sinaliza `providerMissing`/`guiPasswordRejected`. Página `sudo-password.html` registrada no `vite.config.ts`; IPC `sudo-password-response` validado por sender, limite de 1024 chars.
+- Prova na VM NixOS 26.05 (sem diálogos externos): modal aberto, senha digitada, `sudo.validation provider=gui result=accepted`, túnel com handshake vivo e Discord relançado no namespace, nenhum arquivo residual. Cobertura: 3 casos no harness `linux-elevation.test.ts` + caso `provider=gui` no `linux-elevation-logger.test.ts`. Nada muda em Windows, macOS, plugin ou proxy legado.
+
+### Linux: fallback de alvo manual quando a varredura não reconhece a instalação
+
+- O usuário que **tem** o Discord instalado continuava vendo "Nenhuma instalação do Discord foi encontrada.": `discord_dirs` é uma lista de raízes e padrões (bootstrap em `~/.config`, nativo, paralelos, snap, Nix, flatpaks conhecidos), e o que escapa dela deixa o preflight `ok:false` — com `linuxPreflightRepairable` exigindo `discord.found`, a ativação ficava barrada mesmo com o WireGuard pronto. Faltava descobrir **o que** lançar dentro do namespace, não o túnel.
+- Quando `discord.count === 0`, o cartão de status troca a mensagem por um botão "Escolher programa…". Ele abre um dialog com os **programas abertos** do usuário atual (uma linha por app: os processos auxiliares de um Electron são agrupados pela identidade de lançamento) e a escolha **apenas registra** o alvo em `$INSTALL_DIR/manual-target.conf`. Quem aplica continua sendo o botão de ativação: fecha o app escolhido e o relança dentro do `discord-vpn`, como já faz com os flavours reconhecidos — não existe mover processo vivo para dentro de um namespace, e não foi tentado `ptrace`/`setns`.
+- O alvo entra no `$FOUND` como mais uma linha no formato que o script já consome (`resources|manual|manual[|flatpak_id]`), então ativação, boot seguinte, `--status --json`, `stop_discord`, rollback host-only, `--uninstall` e a linha do cartão tratam o app escolhido como um flavour — inclusive a identidade por `/proc` (escopo `app-flatpak-*` no cgroup, `APPIMAGE`/`SNAP_NAME` no ambiente, `readlink /proc/<pid>/exe`). `select_launch_target` passa a preferir a escolha explícita do usuário, e a linha continua no `$FOUND` para o status e a parada a cobrirem.
+- **Segurança do lançamento:** o renderer manda só uma `key` opaca; o processo principal a resolve numa varredura nova de `/proc` (payload com `argv`/`resources` forjados é ignorado) e o script **revalida cada argumento** do arquivo antes de virar linha de alvo — formas fechadas por kind (`flatpak run <app-id>`, `snap run <nome>`, caminho absoluto regular e executável) e recusa silenciosa do resto. O ramo manual usa argv posicional (`sh -c 'exec "$@"' sh "$@"`) em vez da string `target_cmd` dividida, o que também corrige caminho com espaço (`.AppImage` em `~/Apps/Minha Pasta/`). O caminho manual não toca em `app.asar` e herda `asar_is_ours`: pasta desconhecida nunca é apagada. Alvo morto é ignorado pelo script (`discord.manual.valid=false`) e a GUI mostra "Escolher programa…" e a remoção juntas.
+- O preflight ganha `discord.manual.present/valid` (aditivo; script antigo → ausente = sem alvo) e o `get-linux-preflight` passa a mandar `discordMissing`/`manualTarget`, para o renderer decidir sem casar texto de mensagem. O marcador de sessão passa a exigir caminho não-vazio: flatpak, snap e AppImage não têm `resources` no host, e um marcador vazio apontaria para lugar nenhum no boot seguinte.
+- Nada muda em Windows, macOS, plugin Vencord/Equicord ou no caminho legado de proxy/injeção. Sem arquivo de alvo, `$FOUND` e o comportamento observável são exatamente os de antes.
+- Cobertura: `linux-running-apps.test.ts` (13), `linux-manual-target.test.ts` (10), `linux-manual-target-ipc.test.ts` (6), `linux-proc-seams.test.ts` (6), `linux-session-marker.test.ts` (3), `manual-target-selection.test.ts` (4) e os dois casos novos em `linux-preflight.test.ts` (28 no arquivo, um deles rodando `--preflight --json` de verdade); shell `tests/test-manual-target.sh` com 33 casos (leitura/validação/linha/dedupe/JSON, identidade por `/proc` real, `discord_running`, `stop_discord`, `select_launch_target` e o ramo manual de `start_discord` com caminho contendo espaço). Suíte completa: 729 testes em 77 arquivos.
+- Evidência real no host: com um alvo vivo registrado, `--status --json` devolve a linha `flavour:"manual"`, `detected_by:"manual"`, `running:"sim"` e o `pid` correto **junto** da instalação reconhecida pela varredura, e o `--preflight --json` reporta `manual:{present:true,valid:true}` com `count` incluindo o alvo. A GUI renderizada (build servido, API simulada) mostra o botão no lugar da mensagem, o dialog com os apps abertos, a linha "Túnel aplicado em …" com Trocar/Remover e o estado "alvo indisponível" com as duas ações.
+- **Prova de ponta a ponta no host (executada nesta sessão):** com um alvo manual registrado (o binário do próprio Discord em `~/.config/discord/app-1.0.161/Discord`, layout bootstrap), a ativação criou o namespace `discord-vpn` e o `wg-discord`, lançou o alvo pelo ramo manual (`launch=manual kind=exec` no log) e o `--status --json` passou a devolver **duas** linhas com `running:"sim"` e **`inNamespace:"sim"`**, uma da varredura e outra `flavour:"manual"`. `ip netns pids discord-vpn` listou **9 processos** do cliente dentro do namespace, o `wg show` mostrou `latest handshake: 9 seconds ago` com `transfer: 761.10 KiB received / 162.63 KiB sent`, e o `curl` dentro do namespace devolveu `ip=146.70.230.147 loc=US` contra `loc=BR` no host — ou seja, o tráfego do app realmente sai pelo túnel. O `--uninstall` fechou o alvo, removeu o namespace e a interface, e a rede do host voltou ao normal (mesmo IP público).
+- Limites da prova: o peer usado foi o **perfil padrão embutido** do script (EUA), porque a máquina não tinha `wireguard.conf` nem sessão Proton — a rota é a do produto, mas não um servidor escolhido pelo usuário. O `wireguard-tools` faltava na máquina e foi instalado pelo próprio `--ensure-dependencies` (caminho do produto, também `openresolv`); o `compile` segue sem fechar por ausência do toolchain Go (`build:proton`), limitação de ambiente anterior a esta mudança. Um alvo que delega para instância já aberta (testado com `dolphin`) é confirmado no namespace e depois pode sair sozinho: a identidade continua válida, mas o app não permanece — caso do app, não do mecanismo. O caso positivo de identidade flatpak por cgroup ficou como `[SKIP]` no teste shell (exige um flatpak rodando de verdade).
+
+### Corrigido
+
+- **Elevação Linux (GUI):** a senha do sudo recusada voltava a cancelar a ativação sem nova tentativa e sem distinguir a causa. Agora a mensagem do `sudo` é lida apenas para classificar (`sudo_classify_failure`) e nunca é registrada: senha incorreta re-pergunta até 3 vezes; usuário sem sudoers, política `requiretty`, conta expirada/bloqueada e falha de PAM param na primeira recusa com mensagem própria e acionável. O caminho `sudo -A` (askpass, último recurso sem zenity/kdialog/pkexec) classifica o mesmo motivo e informa, sem re-perguntar. `cleanup_sudo_pass` passou a usar `${VAR:-}` porque o askpass faz `unset` dessas variáveis e a limpeza roda no trap de saída sob `set -eu`. O motivo entra no evento `sudo.validation` (`reason=incorrect_password|not_in_sudoers|tty_required|account_blocked|pam_error|other`), campo final opcional na whitelist do parser da GUI. Relacionado à issue #345.
+
+### Corrigido
+
+- **Plugin Vencord/Equicord:** o lock de atualização não fecha novamente um descritor já liberado, evitando fechar arquivos ou conexões que reutilizem esse número. A regressão cobre reutilização real do descritor, locks aninhados e preservação de outro owner.
+- **Relançamento Linux do plugin:** o helper separa nome e valor antes de chamar `setenv`, corrigindo `ambiente explícito inválido`; o ambiente permitido preserva `XAUTHORITY` para X11/XWayland. O helper embutido foi atualizado. A correção é exclusiva do plugin; GUI e standalone usam caminhos de ativação distintos. Recepção de transmissão validada em Fedora KDE/Wayland com Discord em XWayland e VPN isolada. Windows não foi testado ao vivo.
+
+### Adicionado
+
+- **Cliente macOS (`golive-gui-mac/`)** (#338, contribuição de @GabrielRanna): app Electron standalone que reativa o Go Live pondo só o tráfego do Discord num túnel WireGuard — split por IP nos ranges Cloudflare do Discord (com rejeição IPv6 para cair no IPv4 tunelado), helper root instalado em `/Library/PrivilegedHelperTools` com sudoers limitado a `up`/`down` e sanitização do conf, geração de perfil Proton via `proton-confgen` com escolha MX/US por ping, conta Proton reutilizável, DMG universal x86_64+arm64, tray, auto-reconexão e auto-updater por assets `GoLiveBypass-macos-<versão>-<arch>.dmg`. Testado em Macs M1/M2/M3 e Intel.
+
+- **GUI (modo Proton):** na primeira abertura, quem ainda não escolheu como lidar com a rota vê uma pergunta única — "Automática (recomendado)" ou "Manual" — com "Decidir depois" e Esc como saída. A resposta usa a preferência `protonRoutePreference` que já existia (a mesma de Configurações); responder ou dispensar grava `protonRoutePreferencePrompted` e a pergunta não volta, nem depois de sair da conta ou importar um `.conf`. Não aparece no modo `.conf` personalizado, nem para quem já tem preferência salva ou usou uma rota antes. A regra fica em `electron/route-preference-prompt.ts`.
+
+### Pendências do cliente macOS
+
+- O split é por IP, não por processo: outros sites servidos pelos ranges da Cloudflare também passam pelo túnel.
+- Sem notarização (assinatura ad-hoc): Gatekeeper avisa no primeiro uso e a permissão de Gerenciamento de Apps pode pedir renovação a cada versão.
+- Cobertura de ranges: a voz do Discord também usa `66.22.192.0/18` e IPs do GCP, e as listas comunitárias citam `162.158.0.0/15` e `172.64.0.0/13`. Hoje só `162.159.0.0/16` e `104.16.0.0/12` passam pelo túnel; ampliar exige medir se a voz/Go Live precisa disso e aceitar mais tráfego de outros sites no túnel.
+- `scripts/fetch-wg-binaries.sh` regenera os binários WireGuard a partir de bottles do Homebrew, que hoje só existem para `sonoma` x86_64; para regenerar o universal é preciso compilar `wireguard-go`/`wireguard-tools` da fonte fixada. O script confere o resultado contra `resources/bin/SHA256SUMS` e falha se divergir; para subir uma versão nova é preciso atualizar o pin à mão.
+
+## [macos-0.6.0] - 2026-10-08
+
+Primeira release do cliente macOS no repositório oficial (tag `macos-v0.6.0`).
+
+### Alterado
+
+- **Vencord/FakeNitro é opt-in:** a injeção só acontece com a opção **Extras › Instalar o Vencord com o plugin FakeNitro** ligada (desligada por padrão). O FakeNitro só é ligado se o usuário nunca escolheu nada para ele no Vencord, e o app do Discord só é tocado depois de a permissão de Gerenciamento de Apps estar confirmada (com o Vencord já injetado, o único ajuste é o FakeNitro, que fica num arquivo do próprio usuário).
+- **Releases não viram latest:** `golive-gui-mac/scripts/release-mac.mjs` (usado pelo workflow `release-macos.yml`) cria a release `macos-v<versão>` com `make_latest: false`, confere antes de publicar o DMG (versão, repositório de atualização e `proton-confgen` contra o manifesto) e, depois, os assets, o digest e que `/releases/latest` não mudou — se algo falhar, volta a release para draft, devolve a latest anterior e falha. Drafts são publicados com `acao=publicar-rascunho`, nunca pelo botão do GitHub (que marca latest por padrão).
+- **Atualização conferida:** o updater só oferece release com SHA-256 publicado (digest do GitHub ou sidecar `.sha256`), confere o DMG baixado antes de abrir e baixa só a release que o próprio app encontrou. Tags `macos-vX.Y.Z` são escolhidas pela maior versão, sem depender da ordem da API.
+- **`proton-confgen` da fonte:** compilado de `tools/proton-confgen` para darwin x64/arm64 com as flags determinísticas da GUI, juntado em universal e descrito em `proton-confgen-manifest.json` (commit da fonte, versão do Go e SHA-256). O app recusa rodar um binário que não confere com o manifesto; o binário deixou de ser commitado.
+- **Conf sem keepalive:** perfis sem `PersistentKeepalive` recebem `25`, para o handshake não depender de o Discord estar aberto.
+
+### Corrigido
+
+- Ícone da barra de menu (antes invisível) e ícone próprio do app e do DMG.
+- `ProtonFetcher` não fica mais preso em `busy`: falha ao iniciar o processo resolve na hora e cada etapa tem limite de 3 minutos.
+- Rotas IPv6 de rejeição que sobram de um crash são removidas ao abrir o app sem túnel ativo.
+- Reiniciar o Discord não deixa promessa pendente quando o `spawn` falha.
+- **Abertura não pode mais travar o botão Ativar:** a limpeza de rotas IPv6 do arranque roda dentro da operação do túnel e segura o estado `busy` sem emitir evento; um renderer que carregasse nessa janela ficava com o botão desabilitado até reiniciar o app. A limpeza agora devolve o estado ao terminar.
+- **Guarda de release falha fechada:** erro de API ao ler `/releases/latest` interrompe antes de publicar (antes era lido como "repositório sem latest" e deixava passar), digest ausente na resposta é erro em vez de conferência pulada, e a reversão para draft reporta a própria falha em vez de morrer no meio.
+- **Atualização a partir de build beta:** a comparação de versões do updater quebrava com sufixo de prerelease e nunca oferecia a versão estável seguinte.
+
+### Removido
+
+- Cópia não usada de `golivebypass.js` em `golive-gui-mac/resources/extra/bypass/`.
+
+### Infra
+
+- Workflow `macos-tests.yml`: typecheck, testes e build do `proton-confgen` em PRs e pushes que tocam o cliente macOS.
+
 ## [2.0.6] - 2026-09-18
 
 ### Devlog da release estável

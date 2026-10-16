@@ -53,7 +53,7 @@ app (GUI/standalone)                         │                              �
 No repositório `bezumiya/GoLiveBypass`, abra *Settings → Webhooks → Add webhook*
 e configure:
 
-- Payload URL: `https://api.skyplaceia.com/bugs/v1/updates/github/webhook`
+- Payload URL: `https://golivebypass.dev/bugs/v1/updates/github/webhook`
 - Content type: `application/json`
 - Secret: o valor de `GITHUB_WEBHOOK_SECRET`
 - Eventos: somente **Release**, com **Active** marcado
@@ -181,7 +181,7 @@ semver, e mantém o resultado em cache por cinco minutos. Se a atualização fal
 depois de existir uma resposta válida, responde `200` com `"stale": true`.
 
 O campo `assets` contém somente aliases conhecidos: `windows`, `linux`,
-`mac-dmg`, `mac-zip`, `plugin`, `plugin-sha`, `standalone` e `standalone-sha`.
+`mac-dmg`, `plugin`, `plugin-sha`, `standalone` e `standalone-sha`.
 
 ### `GET /v1/releases/latest/download/:asset`
 

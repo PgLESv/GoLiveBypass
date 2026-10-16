@@ -20,9 +20,10 @@ A arquitetura atual da GUI Windows/Linux é **WireGuard por aplicativo**: todo o
 | Linux e standalone | `golive-gui/electron/linux-helper.ts`, `standalone/golivebypass-standalone.sh` |
 | Proton e geração de perfil | `golive-gui/electron/proton.ts`, `tools/proton-confgen/` |
 | Plugin Vencord/Equicord WireGuard | `goLiveBypass/vpn-controller.ts`, `vpn-windows.ts`, `vpn-linux.ts`, `vpn-proton.ts`, `native.ts`; instaladores em `installer/` |
+| Cliente macOS standalone | `golive-gui-mac/package.json`, `golive-gui-mac/src/main/main.ts`; helper root em `src/main/privileged/` |
 | Proxy legado e standalone | `standalone/golivebypass.js`, `standalone/golivebypass-standalone.sh` |
 | API de suporte | `api/README.md`, `api/` |
-| Releases e atualizações | `.github/workflows/build-gui.yml`, `golive-gui/electron/updater*.ts`, `CHANGELOG.md` |
+| Releases e atualizações | `.github/workflows/build-gui.yml`, `golive-gui/electron/updater*.ts`, `CHANGELOG.md`; macOS em `.github/workflows/release-macos.yml` e `golive-gui-mac/scripts/release-*.mjs` |
 
 ## Invariantes
 
@@ -32,6 +33,7 @@ A arquitetura atual da GUI Windows/Linux é **WireGuard por aplicativo**: todo o
 - `golive-gui/electron/bypass.ts` é gerado de `standalone/golivebypass.js`: nunca editar à mão. Após alterar a fonte, execute `npm run sync-bypass` em `golive-gui/`.
 - Em mudanças de estabilidade, timeouts, probes ou troca de saída, avalie GUI, standalone e plugin. Porte o comportamento onde aplicável; documente lacunas no `CHANGELOG.md`, sem copiar mecanicamente arquiteturas distintas.
 - Toda versão com sufixo de prerelease deve ser publicada como **prerelease**, nunca como latest. Canal estável não recebe beta nem downgrade. Consulte a skill de release antes de preparar/publicar versões.
+- O cliente macOS (`golive-gui-mac/`) é um app Electron **standalone** com helper root e split-tunnel por IP — no macOS não há filtro por processo sem Network Extension; não presumir paridade com a GUI Windows/Linux. As releases macOS usam a tag `macos-v<versão>`, assets `GoLiveBypass-macos-<versão>-universal.dmg` + `.sha256` e **só** saem pelo workflow `release-macos.yml` (`golive-gui-mac/scripts/release-mac.mjs`), que publica com `make_latest: false` e falha se `/releases/latest` mudar: nenhuma release macOS pode virar a latest do repositório, da qual dependem o updater estável do Linux e o catálogo do site/API. O `proton-confgen` do macOS é compilado de `tools/proton-confgen` com manifesto; não commitar o binário.
 - Toda tag/release beta da produção deve partir de uma árvore que contenha o código do plugin compatível com a versão anterior suportada — **nunca de uma tag GUI-only**. Antes de subir `goLiveBypass-vencord.zip`, execute a regressão de archive/required files (`tests/test-plugin-update-archive.mjs`) e, **enquanto beta16 for suportada**, confirme `bug-report.ts` e `vpn-snapshot-worker.ts` no zip; valide também o SHA-256 publicado, `prerelease=true` e `latest=false`. Arquivo ausente **bloqueia** a publicação: corrija a árvore/artefato, nunca contorne relaxando o updater.
 - Diferencie fatos observados de hipóteses. Histórico de issues não substitui código atual ou reprodução; não atribua upload travado ao endpoint gratuito sem investigar.
 - **A fila de issues é o repositório de produção `bezumiya/GoLiveBypass`**, destino dos relatos da API (`GITHUB_REPO`). `pdl-clay/GoLiveBypass` é o fork de trabalho/teste: não tratar suas issues como fila de produto nem abrir, comentar ou fechar relatos lá. Investigação, comentário de causa/solução e fechamento acontecem na issue de `bezumiya/GoLiveBypass`; confira antes se o mesmo sintoma já tem issue aberta lá e referencie-a em vez de duplicar.
@@ -65,6 +67,7 @@ Execute a menor verificação que cubra o comportamento alterado. Confira os scr
 | Shell standalone | `bash -n standalone/golivebypass-standalone.sh` na raiz, além do teste comportamental pertinente |
 | API Go | `go test ./...` em `api/` |
 | Helper Proton Go | `go test ./...` em `tools/proton-confgen/` |
+| Cliente macOS | `npm test` em `golive-gui-mac/` |
 | Documentação/skills | Verificar links, frontmatter e `git diff --check`; dispensar build do app |
 
 Leia scripts de teste antes de executar os que operam Discord, VM, rede ou serviços. Testes unitários não comprovam roteamento real; quando não houver validação na plataforma afetada, diga isso. Não publique para testar build: use os scripts `build:*`, que têm `--publish never`.
