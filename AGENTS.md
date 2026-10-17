@@ -4,6 +4,7 @@
 
 - Responda em português, de forma direta. Conclua o trabalho solicitado e informe mudanças, validação e limitações reais.
 - Prossiga com inspeções, edições reversíveis e verificações necessárias ao pedido. Resolva escolhas rotineiras pelo contexto; pergunte quando faltar uma decisão que altere materialmente o resultado ou autorização para uma ação externa.
+- **O mantenedor (`pdl-clay`) é colaborador com permissão de push no repositório de produção (`bezumiya/GoLiveBypass`).** Merge de PR revisado, criação/movimentação de tag da versão pedida, disparo do workflow de release e publicação da release **já estão autorizados** quando o pedido aparece na conversa: não peça confirmação adicional nem pare no rascunho esperando um aval que já foi dado. Merge de PR de terceiro: confira o diff e os checks, comente o que achou e mergeie. Só operações destrutivas fora do pedido (apagar ou sobrescrever release/tag alheia, force-push, reescrever histórico compartilhado, apagar branch remota) pedem autorização explícita.
 - Instruções explícitas do usuário prevalecem sobre orientações de skills, respeitando as regras do ambiente. Planejamento, brainstorming, documentos de design e revisões formais devem ser proporcionais à tarefa; não exigir aprovação de plano para toda correção ou edição documental.
 - Use skills quando sua finalidade corresponder à tarefa, não por mera coincidência de palavras. Leia referências somente quando necessárias. Se uma skill impedir o avanço, cite o arquivo e a regra exata que causou o bloqueio.
 - Preserve alterações existentes do usuário. Um pedido de correção não implica publicação, deploy ou envio de mensagens; siga a autorização já dada sem pedi-la novamente.
@@ -28,6 +29,8 @@ A arquitetura atual da GUI Windows/Linux é **WireGuard por aplicativo**: todo o
 ## Invariantes
 
 - Preserve o isolamento por aplicativo e a restauração da rede. No Windows/Linux, probes de IP, HTTP e telemetria são apenas diagnóstico nos logs: não bloqueiam ativação, não exibem aviso nem derrubam o Discord. Estado ativo indica túnel/processo iniciados, não prova geográfica de saída. Não ampliar o filtro para todo PowerShell ou para a máquina inteira.
+- No Linux, a senha do sudo é pedida **uma vez por operação**: nas operações que a GUI conduz quem responde é a janela (`GOLIVE_SUDO_UI=1`), com o arquivo 0600 aproveitado pelos spawns e apagado no fim; a validação nunca pode usar `sudo -k` — ele descarta o ticket e a escalação deixa de ser lembrada (sudo 1.9; sem tty o ticket é por processo pai e não cruza spawns). Checagens que não exigem root vêm antes de pedir a senha e probes/watchdogs seguem sem prompt.
+- No Linux, o device WireGuard tem dois modos: módulo do kernel quando disponível e `wireguard-go` (usuário, empacotado no AppImage por `npm run build:wireguard-go`) quando o kernel em execução está sem a árvore de módulos. O modo de usuário exige `/dev/net/tun` com o driver `tun` e mantém o mesmo namespace, `wg`/socket UAPI e ciclo de vida (pidfile + log); nada é carregado no kernel do host. O plugin Vencord/Equicord não compartilha esse motor.
 - O plugin Vencord/Equicord tem transporte WireGuard/WireSock autônomo, Windows x64 e Linux x64, com estado em `GoLiveBypass/plugin-vpn`; não depende da GUI, não compartilha estado do standalone e recusa assumir ou parar um WireSock externo. A migração do plugin não autoriza alterações no standalone.
 - Os instaladores do plugin (`installer/*`) entregam o **zip da release**, com SHA-256 publicado conferido antes de extrair — não as fontes soltas da `main`, que pode estar atrás da tag da linha beta. `--plugin-source` e um checkout ao lado do script continuam vindo do disco. A linha é **beta**: os dois instaladores avisam isso e convidam a reportar bug. O standalone segue pausado por bloqueio próprio em `standalone/`.
 - `golive-gui/electron/bypass.ts` é gerado de `standalone/golivebypass.js`: nunca editar à mão. Após alterar a fonte, execute `npm run sync-bypass` em `golive-gui/`.
@@ -63,6 +66,7 @@ Execute a menor verificação que cubra o comportamento alterado. Confira os scr
 | --- | --- |
 | GUI/lógica TypeScript | `npm test -- tests/<arquivo>.test.ts` em `golive-gui/`; `npm test` para mudanças transversais |
 | Compilação da GUI | `npm run compile` em `golive-gui/` (inclui sync, helper Go, TypeScript e Vite) |
+| Tipos do processo principal (`electron/`) | `npm run typecheck:electron` em `golive-gui/` (o `tsc` padrão só cobre `src/`) |
 | Fonte do bypass legado | `npm run check-bypass` em `golive-gui/`, após sync, e regressões pertinentes de `tests/` |
 | Shell standalone | `bash -n standalone/golivebypass-standalone.sh` na raiz, além do teste comportamental pertinente |
 | API Go | `go test ./...` em `api/` |

@@ -1,10 +1,17 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it as vitestIt, vi } from "vitest";
+import { pluginHostSupported } from "./helpers/plugin-host";
+
+// O controlador do plugin só roda em Windows x64 e Linux x64; fora deles estes testes pulam.
+const it = vitestIt.skipIf(!pluginHostSupported);
 import { EventEmitter } from "events";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import vm from "node:vm";
+import ts from "typescript";
 
 import { PluginVpnController } from "../../goLiveBypass/vpn-controller";
+import { safeDiagnosticDetail } from "../../goLiveBypass/vpn-types";
 
 /**
  * Contratos observáveis do catálogo manual de rotas do plugin: catálogo
@@ -37,6 +44,13 @@ const helper = vi.hoisted(() => {
     args: [] as string[],
     stdin: [] as string[],
     progressCount: 0,
+    reset() {
+      scripts.length = 0;
+      spawnWaiters.length = 0;
+      progressWaiters.length = 0;
+      finishChild = null;
+      writeStderr = null;
+    },
     script(script: Script) {
       scripts.push(script);
     },
@@ -253,7 +267,74 @@ async function discoverOnce(harness: Harness, json: Record<string, unknown> = CA
   return result.measurementId;
 }
 
+function nativeRouteBridge(controller: PluginVpnController): Record<string, (...args: any[]) => any> {
+  // Carrega os exports reais da ponte por AST, sem executar o boot do Discord,
+  // watchdog, updater ou operações da máquina de teste.
+  const source = fs.readFileSync(path.resolve(process.cwd(), "../goLiveBypass/native.ts"), "utf8");
+  const parsed = ts.createSourceFile("native.ts", source, ts.ScriptTarget.Latest, true);
+  const names = new Set([
+    "cleanOptimizationOptions", "cleanRouteDiscoveryContext", "discoverProtonRoutes", "getProtonRouteDiscoveryStatus",
+    "cancelProtonRouteDiscovery", "selectProtonRoute", "cancelProtonRouteSelection",
+  ]);
+  const functions = parsed.statements.filter(node => ts.isFunctionDeclaration(node) && names.has(node.name?.text ?? ""));
+  const code = ts.transpileModule(functions.map(node => node.getText(parsed)).join("\n"), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const exports = {};
+  vm.runInNewContext(code, { exports, controller, safeDiagnosticDetail, runLogOperation: (_name: string, action: () => unknown) => action() });
+  return exports;
+}
+
+describe("ponte nativa da seleção manual de rotas", () => {
+  it("entrega o catálogo e aplica a escolha pelo IPC sem depender da otimização", async () => {
+    const harness = controllerFor(dataDirWithSession(PERFIL_ANTERIOR));
+    const bridge = nativeRouteBridge(harness.controller);
+    expect(typeof bridge.discoverProtonRoutes).toBe("function");
+    expect(typeof bridge.getProtonRouteDiscoveryStatus).toBe("function");
+    expect(typeof bridge.cancelProtonRouteDiscovery).toBe("function");
+    expect(typeof bridge.selectProtonRoute).toBe("function");
+    expect(typeof bridge.cancelProtonRouteSelection).toBe("function");
+    helper.script({ json: CATALOGO });
+    const catalog = await bridge.discoverProtonRoutes({}, { requestId: "req-ipc", country: "US", freeOnly: true, autoPing: true });
+    expect(catalog.success).toBe(true);
+    const status = bridge.getProtonRouteDiscoveryStatus({}, { username: CONTA, country: "US", freeOnly: true, autoPing: true });
+    expect(status.contextMatches).toBe(true);
+    expect(status.routes.map((candidate: { server: string }) => candidate.server)).toEqual(["US#1", "NL#2"]);
+    helper.script({ output: PERFIL_NOVO, json: { success: true, manual: true, preflight: "success", server: "US#1", pingMs: 41 } });
+    const selected = await bridge.selectProtonRoute({}, { measurementId: catalog.measurementId, server: "US#1" });
+    expect(selected.success).toBe(true);
+    expect(fs.readFileSync(harness.controller.paths.profilePath, "utf8")).toBe(PERFIL_NOVO);
+  });
+
+  it("informa compatibilidade da medição sem devolver a identidade da conta", async () => {
+    const harness = controllerFor(dataDirWithSession());
+    await discoverOnce(harness);
+    const context = { username: CONTA, country: "US", freeOnly: true, autoPing: true };
+    expect(harness.controller.getRouteDiscoveryStatus(context).contextMatches).toBe(true);
+    for (const changed of [{ username: "outra-conta" }, { country: "NL" }, { freeOnly: false }, { autoPing: false }]) {
+      const status = harness.controller.getRouteDiscoveryStatus({ ...context, ...changed });
+      expect(status.contextMatches).toBe(false);
+      expect(JSON.stringify(status)).not.toContain(CONTA_NORMALIZADA);
+    }
+  });
+
+  it("permite iniciar nova geração assim que a anterior foi cancelada", async () => {
+    const harness = controllerFor(dataDirWithSession());
+    helper.script({ hold: true, json: CATALOGO });
+    const old = harness.controller.discoverProtonRoutes({ requestId: "req-antiga" });
+    await helper.waitForSpawn();
+    harness.controller.cancelProtonRouteDiscovery("req-antiga");
+    helper.script({ json: CATALOGO });
+    const fresh = harness.controller.discoverProtonRoutes({ requestId: "req-nova" });
+    const [previous, next] = await Promise.all([old, fresh]);
+    expect(previous.cancelled).toBe(true);
+    expect(next.success).toBe(true);
+    expect(harness.controller.getRouteDiscoveryStatus().requestId).toBe("req-nova");
+  });
+});
+
 beforeEach(() => {
+  helper.reset();
   helper.spawns = 0;
   helper.args = [];
   helper.stdin = [];
@@ -605,8 +686,11 @@ describe("aplicação da rota escolhida", () => {
     helper.finish();
 
     await expect(selecao).resolves.toMatchObject({ success: true, server: "US#1" });
-    await expect(importacao).resolves.toMatchObject({ success: true, path: path.join(dir, "wireguard.conf") });
-    expect(fs.readFileSync(path.join(dir, "wireguard.conf"), "utf8")).toBe(customProfile);
+    await expect(importacao).resolves.toMatchObject({ success: true, path: path.join(dir, "custom-wireguard.conf") });
+    // A conf do usuário tem arquivo próprio: a seleção Proton não pode sobrescrevê-la,
+    // nem a importação pode trocar o perfil Proton que a seleção acabou de promover.
+    expect(fs.readFileSync(path.join(dir, "custom-wireguard.conf"), "utf8")).toBe(customProfile);
+    expect(fs.readFileSync(path.join(dir, "wireguard.conf"), "utf8")).toBe(PERFIL_NOVO);
   });
 
   it("prepara a rota sem ativar quando a VPN está inativa", async () => {

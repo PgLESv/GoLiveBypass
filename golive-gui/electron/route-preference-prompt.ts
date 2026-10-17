@@ -10,11 +10,16 @@ export interface RoutePreferencePromptSettings {
   protonLastServer?: unknown;
 }
 
+// Um objeto vazio nao e uma rota lembrada: so conta quem tem ao menos um campo gravado.
+function hasUsedRoute(lastServer: unknown): boolean {
+  return typeof lastServer === "object" && lastServer !== null && Object.keys(lastServer).length > 0;
+}
+
 export function shouldAskRoutePreference(settings: RoutePreferencePromptSettings): boolean {
   if (settings.protonRoutePreferencePrompted === true) return false;
   const mode = typeof settings.vpnMode === "string" && settings.vpnMode ? settings.vpnMode : "proton";
   if (mode !== "proton") return false;
   if (settings.protonRoutePreference === "auto" || settings.protonRoutePreference === "manual") return false;
-  if (settings.protonLastServer) return false;
+  if (hasUsedRoute(settings.protonLastServer)) return false;
   return true;
 }

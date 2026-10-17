@@ -5,7 +5,8 @@
 # Instala direto no Discord, sem Equicord e sem Vencord. Nao precisa de Node, nem de pnpm,
 # nem de git: o bypass e um arquivo .js que o proprio Discord carrega.
 #
-# Funciona tambem com o Discord instalado por flatpak, do sistema ou do usuario.
+# Funciona tambem com o Discord instalado por flatpak, do sistema, do usuario ou
+# pelo Nix (nixpkgs, NixOS ou nix em qualquer distro).
 #
 # Uso:
 #   ./golivebypass-standalone.sh
@@ -16,6 +17,7 @@
 #   ./golivebypass-standalone.sh --probe
 #   ./golivebypass-standalone.sh --refresh-route
 #   ./golivebypass-standalone.sh --refresh-route-from <profile.conf>  (GUI)
+#   ./golivebypass-standalone.sh --wireguard-go <caminho>  (WireGuard de usuario; GUI/testes)
 #   ./golivebypass-standalone.sh --check-update
 #   ./golivebypass-standalone.sh --update
 
@@ -60,6 +62,9 @@ unset -f _local_probe 2>/dev/null || true
 PATCHER_NAME="golivebypass.js"
 STANDALONE_VERSION="1.1.12-beta.13"
 WG_CONF_CLI=""
+# WireGuard de usuario (wireguard-go): caminho explicito via --wireguard-go/GOLIVE_WIREGUARD_GO.
+# Sem ele o script procura ao lado de si mesmo (AppImage), na arvore de desenvolvimento e no PATH.
+WIREGUARD_GO_CLI="${WIREGUARD_GO_CLI:-}"
 NETNS_NAME="discord-vpn"
 WG_IF="wg-discord"
 NONINTERACTIVE=0
@@ -113,6 +118,9 @@ STUB_PACKAGE='{"name":"discord","main":"index.js","version":"1.0.0"}'
 # Vesktop (dev.vencord.Vesktop), Legcord (app.legcord.Legcord) e Equibop
 # (org.equicord.equibop).
 FLATPAK_IDS="com.discordapp.Discord com.discordapp.DiscordPTB com.discordapp.DiscordCanary dev.vencord.Vesktop app.legcord.Legcord org.equicord.equibop"
+# Clientes de flatpak SEM Electron (nenhum app.asar para achar): o tunel envelopa o
+# processo do mesmo jeito. Serein (cz.viceverse.serein) e nativo em Rust.
+FLATPAK_TUNEL_IDS="cz.viceverse.serein"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # ---------------------------------------------------------------------------
@@ -248,6 +256,7 @@ fail() {
     printf '  %s[X]%s %s\n' "$C_RED" "$C_OFF" "$1" >&2
     exit 1
 }
+
 
 
 # =========================================================================== TUI (standalone)
@@ -512,6 +521,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --proxy) fail "Proxy nao e mais suportada; use uma configuracao WireGuard." ;;
         --wg-conf) WG_CONF_CLI="${2:-}"; shift ;;
+        --wireguard-go) WIREGUARD_GO_CLI="${2:-}"; shift ;;
         --excluded-countries) EXCLUDED="${2:-BR}"; shift ;;
         --net-mode) shift ;;
         --tor-addr|--tor) fail "Tor foi removido; use uma configuracao WireGuard." ;;
@@ -568,13 +578,69 @@ resolve_binary() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# O sudo exige um passo que os outros binarios nao exigem. No NixOS o pacote entra no
+# environment.systemPackages (/run/current-system/sw/bin/sudo, alcancado tambem por
+# /usr/bin/sudo) SEM o bit setuid, e quem eleva de verdade e o wrapper de
+# /run/wrappers/bin/sudo (security.wrappers). Somente o init do shell poem
+# /run/wrappers/bin na frente do PATH: uma GUI aberta por .desktop ou AppImage nao passa
+# por esse init, resolve o sudo sem setuid e toda operacao elevada morre com
+# "must be owned by uid 0 and have the setuid bit set" antes de ler a senha. O teste
+# `-u` e o do bit setuid; enquanto o PATH oferecer um sudo que eleva, o resultado e o
+# mesmo de antes.
+sudo_bin_resolve() {
+    local _glb_sudo="" _glb_dir="" _glb_ifs_saved=""
+    _glb_sudo="$(command -v sudo 2>/dev/null || true)"
+    if [ -n "$_glb_sudo" ] && [ -u "$_glb_sudo" ]; then
+        printf '%s\n' "$_glb_sudo"
+        return 0
+    fi
+    # PATH sem setuid: o resto do PATH antes ...
+    _glb_ifs_saved="$IFS"
+    IFS=":"
+    for _glb_dir in ${PATH:-}; do
+        IFS="$_glb_ifs_saved"
+        [ -n "$_glb_dir" ] || continue
+        [ -x "$_glb_dir/sudo" ] || continue
+        [ -u "$_glb_dir/sudo" ] || continue
+        printf '%s\n' "$_glb_dir/sudo"
+        return 0
+    done
+    IFS="$_glb_ifs_saved"
+    # ... e depois o wrapper do NixOS, que nao esta no PATH da GUI.
+    for _glb_dir in /run/wrappers/bin; do
+        [ -x "$_glb_dir/sudo" ] || continue
+        [ -u "$_glb_dir/sudo" ] || continue
+        printf '%s\n' "$_glb_dir/sudo"
+        return 0
+    done
+    # Nada com setuid: devolve o que o PATH resolveu (ou o nome, se nao houver) para
+    # o fluxo e a mensagem de falha tratarem o caso.
+    if [ -n "$_glb_sudo" ]; then
+        printf '%s\n' "$_glb_sudo"
+    else
+        printf '%s\n' sudo
+    fi
+    return 0
+}
+
 IP_BINARY="$(resolve_binary ip || true)"
 MODPROBE_BINARY="$(resolve_binary modprobe || true)"
 MODINFO_BINARY="$(resolve_binary modinfo || true)"
+SUDO_BIN="$(sudo_bin_resolve)"
+# O launcher do Discord (systemd-run/ip netns + troca de usuario) resolve o `env`
+# com o PATH minimo da unidade, que no NixOS nao contem o coreutils do store
+# (/run/current-system/sw/bin/env): sem o caminho absoluto, sudo/runuser/setpriv
+# falham com "env: comando nao encontrado" antes de o Discord nascer. Nas outras
+# distros resolve para /usr/bin/env e nada muda.
+ENV_BINARY="$(resolve_binary env || true)"
+[ -n "$ENV_BINARY" ] || ENV_BINARY="env"
 
 # Senha digitada numa janela (zenity/kdialog) para o sudo -S. Cacheada em arquivo
 # temporario para nao repetir a pergunta a cada operacao da injecao (mv, mkdir, cp).
 SUDO_PASS_FILE=""
+# 1 quando o arquivo veio da janela da GUI (GOLIVE_SUDO_PASS_FILE): ele e da GUI,
+# que o apaga no dispose() da operacao. O script so remove o que ele mesmo criou.
+SUDO_PASS_FILE_FROM_GUI=0
 SUDO_ASKPASS_HELPER=""
 SUDO_ASKPASS_EVENT_FILE=""
 SUDO_ASKPASS_RESULT_FILE=""
@@ -595,6 +661,8 @@ ACTIVATION_ROLLBACK_REOPEN=0
 ACTIVATION_ROLLBACK_TARGET=""
 ACTIVATION_NETNS_TOUCH_STARTED=0
 START_DISCORD_HOST_ONLY=0
+# Log do launcher da ultima abertura; a mensagem de falha da ativacao o cita.
+START_DISCORD_LOG=""
 WIREGUARD_TMP_CONF=""
 # Executor escolhido uma vez por ativacao. O nome nunca vai para logs; uid/gid
 # numericos permitem usar setpriv sem interpolar identidade em um comando shell.
@@ -636,7 +704,7 @@ elevation_event() {
     shift || true
     for detail in "$@"; do
         case "$detail" in
-            phase=dialog|phase=polkit|phase=password|phase=tty|phase=pre_activation|reason=provider_missing|reason=temporary_file|reason=incorrect_password|reason=not_in_sudoers|reason=tty_required|reason=account_blocked|reason=pam_error|reason=other|code=0|code=1|code=2|code=126|code=127|code=other|stderr=present|stderr=empty)
+            phase=dialog|phase=polkit|phase=password|phase=tty|phase=pre_activation|reason=provider_missing|reason=temporary_file|reason=incorrect_password|reason=not_in_sudoers|reason=tty_required|reason=account_blocked|reason=pam_error|reason=suid_missing|reason=other|code=0|code=1|code=2|code=126|code=127|code=other|stderr=present|stderr=empty)
                 printf ' %s' "$detail" >&2
                 ;;
         esac
@@ -653,13 +721,17 @@ elevation_code_detail() {
     esac
 }
 
+# Os quatro SUDO_ASKPASS_* podem estar desfeitos (unset) aqui: o caminho askpass
+# os remove logo apos validar e chama esta limpeza na sequencia. Sem o `:-`, o
+# `set -eu` do script transformaria a limpeza em saida silenciosa — o usuario
+# perderia a mensagem de falha e os eventos de elevacao.
 cleanup_sudo_pass() {
     cleanup_wireguard_temp
     rollback_activation
-    # `${VAR:-}` em vez de `$VAR`: o askpass faz `unset` dessas variaveis e esta
-    # limpeza roda no trap de saida; sob `set -eu` a referencia direta quebraria
-    # o script no exato momento de encerrar.
-    if [ -n "${SUDO_PASS_FILE:-}" ] && [ -f "${SUDO_PASS_FILE:-}" ]; then
+    # O arquivo da janela da GUI pertence a ela (dispose() no fim da operacao):
+    # apaga-lo aqui faria o spawn seguinte da mesma operacao pedir a senha de novo.
+    if [ "${SUDO_PASS_FILE_FROM_GUI:-0}" -ne 1 ] \
+        && [ -n "${SUDO_PASS_FILE:-}" ] && [ -f "${SUDO_PASS_FILE:-}" ]; then
         rm -f "${SUDO_PASS_FILE:-}" 2>/dev/null || true
     fi
     for askpass_file in "${SUDO_ASKPASS_HELPER:-}" "${SUDO_ASKPASS_EVENT_FILE:-}" "${SUDO_ASKPASS_RESULT_FILE:-}"; do
@@ -668,6 +740,7 @@ cleanup_sudo_pass() {
         fi
     done
     SUDO_PASS_FILE=""
+    SUDO_PASS_FILE_FROM_GUI=0
     SUDO_ASKPASS_HELPER=""
     SUDO_ASKPASS_EVENT_FILE=""
     SUDO_ASKPASS_RESULT_FILE=""
@@ -749,6 +822,7 @@ sudo_pass_get() {
         && [ -f "$GOLIVE_SUDO_PASS_FILE" ] && [ -r "$GOLIVE_SUDO_PASS_FILE" ] \
         && [ -s "$GOLIVE_SUDO_PASS_FILE" ]; then
         SUDO_PASS_FILE="$GOLIVE_SUDO_PASS_FILE"
+        SUDO_PASS_FILE_FROM_GUI=1
         ELEVATION_PROVIDER="gui"
         ELEVATION_RESULT="not_attempted"
         ELEVATION_INPUT_STATE="nonempty"
@@ -756,6 +830,22 @@ sudo_pass_get() {
         elevation_event "prompt.finished" "$(elevation_code_detail 0)" "stderr=empty"
         SUDO_PROMPT_OUTCOME="credential_received"
         return 0
+    fi
+    # Numa operacao da GUI (GOLIVE_SUDO_UI=1) quem pergunta e a janela do app:
+    # o modal dela devolve um arquivo reaproveitado por todos os spawns da
+    # operacao, enquanto zenity/kdialog/pkexec abrem um dialogo por spawn — o
+    # sudo do NixOS (timestamp por tty e, sem terminal, por processo pai) nao
+    # tem como lembrar a escalacao entre processos da GUI, que nao tem tty.
+    # Sem arquivo da janela, o script sinaliza o mesmo evento do sistema sem
+    # provedores e quem responde e a GUI; nenhum dialogo externo e aberto.
+    if [ "${GOLIVE_SUDO_UI:-0}" = "1" ]; then
+        ELEVATION_PROVIDER="none"
+        ELEVATION_RESULT="unavailable"
+        ELEVATION_INPUT_STATE="not_applicable"
+        SUDO_PROMPT_FALLBACK_PKEXEC=0
+        SUDO_PROMPT_OUTCOME="provider_unavailable"
+        elevation_event "prompt.unavailable" "reason=provider_missing"
+        return 1
     fi
     providers="$(sudo_prompt_provider 2>/dev/null || true)"
     if [ -z "$providers" ]; then
@@ -1028,12 +1118,15 @@ ASKPASS_HELPER
         elevation_event "prompt.failed" "reason=temporary_file"
         return 1
     }
-    # `askpass_status` precisa de valor inicial: sob `set -eu`, a atribuicao
-    # `askpass_status=$?` depois de um subshell que falha derrubaria o shell.
+    # `|| askpass_status=$?` em vez de atribuicao direta: sob `set -eu`, uma
+    # atribuicao com substituicao de comando que falha derrubaria o script.
+    # `askpass_stderr` guarda o CAMINHO do arquivo temporario — nao o conteudo.
     askpass_status=0
     (
         unset LD_LIBRARY_PATH LD_PRELOAD
-        SUDO_ASKPASS="$SUDO_ASKPASS_HELPER" sudo -A -k -v >/dev/null 2>"$askpass_stderr"
+        # Sem `-k` pelo mesmo motivo do caminho `-S`: a validacao precisa deixar
+        # o ticket vivo para o resto do spawn (e para o tty, quando existe).
+        SUDO_ASKPASS="$SUDO_ASKPASS_HELPER" "$SUDO_BIN" -A -v >/dev/null 2>"$askpass_stderr"
     ) || askpass_status=$?
     # A primeira linha do stderr do sudo so serve para classificar a causa; ela
     # nunca volta para o log nem para a interface.
@@ -1093,7 +1186,10 @@ ASKPASS_HELPER
                 printf '%s\n' 'Falha: o sudo recusou a autenticacao desta conta (senha expirada, conta bloqueada ou troca de senha obrigatoria). Resolva o acesso com sudo -v em um terminal e tente de novo; a ativacao foi cancelada.' >&2
                 ;;
             pam_error)
-                printf '%s\n' 'Falha: o sudo nao conseguiu autenticar esta conta pelo PAM do sistema (senha expirada, conta sem senha definida ou configuracao de PAM ausente — comum em instalacoes NixOS/enxutas). Rode "sudo -v" em um terminal para ver o motivo exato e corrija-o antes de ativar.' >&2
+                printf '%s\n' 'Falha: o sudo nao conseguiu autenticar esta conta pelo PAM do sistema (senha expirada, conta sem senha definida ou configuração de PAM ausente — comum em instalações NixOS/contêineres enxutas). Rode "sudo -v" em um terminal para ver o motivo exato e corrija-o antes de ativar.' >&2
+                ;;
+            suid_missing)
+                printf '%s\n' "Falha: o sudo encontrado (${SUDO_BIN}) nao tem o bit setuid e nao consegue elevar. No NixOS o sudo que funciona e o wrapper /run/wrappers/bin/sudo: o binario do systemPackages (/run/current-system/sw/bin/sudo, tambem alcancado por /usr/bin/sudo) nao tem setuid e recusa antes de ler a senha. Deixe /run/wrappers/bin na frente do PATH ou reinstale o sudo; a ativacao foi cancelada." >&2
                 ;;
             *)
                 printf '%s\n' 'Falha: o sudo recusou a autorizacao por um motivo nao identificado. A ativacao foi cancelada sem repetir o pedido; rode "sudo -v" em um terminal para ver o motivo real exibido pelo sudo.' >&2
@@ -1104,7 +1200,6 @@ ASKPASS_HELPER
     elevation_event "sudo.validation" "$(elevation_code_detail "$askpass_status")" "phase=password"
     return 1
 }
-
 
 # A mensagem do sudo e lida somente para classificar a causa da recusa; ela nunca
 # volta para o log nem para a interface. O retorno e sempre um motivo conhecido da
@@ -1125,16 +1220,23 @@ ASKPASS_HELPER
 #                       "no password was provided" (e equivalentes em pt) — e o
 #                       que sobra quando /etc/pam.d/sudo nao consegue autenticar,
 #                       como no NixOS enxuto; a senha digitada nunca chega a ser testada.
+#   sem setuid ........ "sudo: /run/current-system/sw/bin/sudo must be owned by uid 0
+#                       and have the setuid bit set" — NixOS: o binario do
+#                       systemPackages nao tem o bit; o utilizavel e o wrapper de
+#                       /run/wrappers/bin/sudo. A recusa vem antes de qualquer senha.
+#   conta travada ..... "sudo: account validation failure, is your account locked?"
 # A ordem importa: "PAM: Authentication failure" e senha incorreta, nao falha de
 # configuracao do PAM. Os padroes evitam os caracteres acentuados das mensagens
 # (cada idioma/localidade acentua de um jeito) e prendem o nucleo ASCII da frase.
 sudo_classify_failure() {
     case "${1:-}" in
+        *"setuid"*|*"owned by uid 0"*|*"not setuid"*)
+            printf '%s\n' 'suid_missing' ;;
         *"may not run sudo"*|*"executar sudo"*|*"is not in the sudoers file"*|*"not in the sudoers file"*|*"no arquivo sudoers"*|*sudoers*)
             printf '%s\n' 'not_in_sudoers' ;;
         *"you must have a tty"*|*"deve ter um tty"*|*"no tty present"*|*"no tty"*|*"terminal is required"*)
             printf '%s\n' 'tty_required' ;;
-        *expir*|*"redefina sua senha"*|*"reset your password"*|*"altera"*"senha"*|*"troca de senha"*)
+        *expir*|*"redefina sua senha"*|*"reset your password"*|*"altera"*"senha"*|*"troca de senha"*|*locked*|*bloquead*)
             printf '%s\n' 'account_blocked' ;;
         *"try again"*|*"tente novamente"*|*incorrect*|*incorret*|*"Authentication failure"*|*"falha de autentica"*)
             printf '%s\n' 'incorrect_password' ;;
@@ -1153,7 +1255,7 @@ sudo_authenticate_once() {
     [ "$(id -u)" -eq 0 ] && return 0
     [ "$SUDO_AUTH_READY" -eq 1 ] && return 0
 
-    if have sudo && sudo -n true 2>/dev/null; then
+    if have sudo && "$SUDO_BIN" -n true 2>/dev/null; then
         ELEVATION_PROVIDER="sudo"
         ELEVATION_RESULT="cached"
         elevation_event "sudo.cached" "phase=password"
@@ -1185,8 +1287,20 @@ sudo_authenticate_once() {
                 fi
                 return 1
             fi
-            sudo_stderr="$(sudo -S -k -v < "$SUDO_PASS_FILE" 2>&1 >/dev/null)"
-            sudo_status=$?
+            # A atribuicao com substituicao de comando falha junto com o sudo sob
+            # `set -eu`: sem o `||`, o script morreria aqui (sem mensagem e sem
+            # eventos) em chamadas de elevate fora de contexto de condicao, como
+            # `elevate ip netns add`. O status e capturado, nao ignorado.
+            # Validar sem `-k`: `sudo -k -v` ignora (e descarta) o ticket, e o
+            # sudo 1.9 nao grava um novo depois disso — conferido na VM
+            # nixos-26.05 (1.9.17p2): `-S -k -v` aceita a senha e o `sudo -n`
+            # seguinte volta a exigir senha. Sem `-k` a validacao grava o
+            # ticket (tty quando ha terminal; senao o processo pai) e a
+            # escalacao passa a ser lembrada enquanto a politica do sudo
+            # permitir. O arquivo continua sendo reenviado a cada comando.
+            sudo_stderr=""
+            sudo_status=0
+            sudo_stderr="$("$SUDO_BIN" -S -v < "$SUDO_PASS_FILE" 2>&1 >/dev/null)" || sudo_status=$?
             if [ "$sudo_status" -eq 0 ]; then
                 sudo_stderr=""
                 ELEVATION_RESULT="accepted"
@@ -1238,10 +1352,18 @@ sudo_authenticate_once() {
                     # Caminho comum em NixOS enxuto: o PAM do sistema nao resolve a
                     # conta (modulo/servico incompleto) e o sudo recusa antes de
                     # comparar a senha. A mensagem precisa dizer que a senha nao
-                    # estava em questao, senao o usuario a redigita sem sucesso.
+                    # estava em questao, senao o usuario a redigita infinitamente.
                     ELEVATION_RESULT="unavailable"
                     elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=pam_error"
-                    printf '%s\n' 'Falha: o sudo nao conseguiu autenticar esta conta pelo PAM do sistema (senha expirada, conta sem senha definida ou configuracao de PAM ausente — comum em instalacoes NixOS/enxutas). Rode "sudo -v" em um terminal para ver o motivo exato e corrija-o antes de ativar.' >&2
+                    printf '%s\n' 'Falha: o sudo nao conseguiu autenticar esta conta pelo PAM do sistema (senha expirada, conta sem senha definida ou configuração de PAM ausente — comum em instalações NixOS/contêineres enxutas). Rode "sudo -v" em um terminal para ver o motivo exato e corrija-o antes de ativar.' >&2
+                    return 1
+                    ;;
+                suid_missing)
+                    # NixOS: o sudo do PATH e o binario do systemPackages, sem o bit
+                    # setuid; quem eleva e /run/wrappers/bin/sudo, fora do PATH da GUI.
+                    ELEVATION_RESULT="unavailable"
+                    elevation_event "sudo.validation" "$(elevation_code_detail "$sudo_status")" "phase=password" "reason=suid_missing"
+                    printf '%s\n' "Falha: o sudo encontrado (${SUDO_BIN}) nao tem o bit setuid e nao consegue elevar. No NixOS o sudo que funciona e o wrapper /run/wrappers/bin/sudo: o binario do systemPackages (/run/current-system/sw/bin/sudo, tambem alcancado por /usr/bin/sudo) nao tem setuid e recusa antes de ler a senha. Deixe /run/wrappers/bin na frente do PATH ou reinstale o sudo; a ativacao foi cancelada." >&2
                     return 1
                     ;;
                 *)
@@ -1258,7 +1380,7 @@ sudo_authenticate_once() {
         ELEVATION_PROVIDER="tty"
         ELEVATION_RESULT="requested"
         elevation_event "prompt.requested" "phase=tty"
-        if sudo -v; then
+        if "$SUDO_BIN" -v; then
             ELEVATION_RESULT="accepted"
             elevation_event "sudo.validation" "$(elevation_code_detail 0)" "phase=tty"
             SUDO_AUTH_READY=1
@@ -1286,16 +1408,22 @@ sudo_has_gui_prompt() {
     have zenity || have kdialog
 }
 
-# Quando a senha veio da janela grafica, `-k -S` a reapresenta silenciosamente a
-# cada chamada. Comandos comuns leem somente o arquivo de senha: isso impede que
-# um `cat` espere para sempre pelo stdin herdado do processo Electron destacado.
-# `tee` e a unica chamada que recebe dados pelo stdin; nela anexamos o conteudo
-# original depois da senha, para o resolv.conf chegar intacto ao comando elevado.
+# Quando a senha veio da janela grafica, ela e reenviada silenciosamente a cada
+# chamada. Comandos comuns leem somente o arquivo de senha (o ticket do sudo,
+# quando existir, e usado primeiro); isso impede que um `cat` espere para sempre
+# pelo stdin herdado do processo Electron destacado. `tee` e a unica chamada que
+# recebe dados pelo stdin: com ticket vivo ela passa direto (`-n`), porque a
+# primeira linha com a senha iria junto para o arquivo de destino; sem ticket,
+# o conteudo original e anexado depois da senha como antes.
 sudo_with_cached_password() {
     if [ "${1:-}" = "tee" ]; then
-        (cat "$SUDO_PASS_FILE"; cat) | sudo -S -k -p '' "$@"
+        if "$SUDO_BIN" -n -p '' true 2>/dev/null; then
+            "$SUDO_BIN" -n -p '' "$@"
+        else
+            (cat "$SUDO_PASS_FILE"; cat) | "$SUDO_BIN" -S -k -p '' "$@"
+        fi
     else
-        sudo -S -k -p '' "$@" < "$SUDO_PASS_FILE"
+        "$SUDO_BIN" -S -p '' "$@" < "$SUDO_PASS_FILE"
     fi
 }
 
@@ -1355,7 +1483,7 @@ elevate() {
             sudo_with_cached_password "$@"
             return $?
         fi
-        sudo -n "$@"
+        "$SUDO_BIN" -n "$@"
     elif have pkexec && [ "${GOLIVE_GUI:-0}" = "1" ] && [ "${NONINTERACTIVE:-0}" -ne 1 ]; then
         pkexec_interactive "$@"
         return $?
@@ -1423,9 +1551,9 @@ run_user_netns_command() {
     case "$RUN_USER_METHOD" in
         sudo)
             case "$launch_mode" in
-                detached) elevate setsid -f ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- "$@" ;;
-                background) elevate ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
-                foreground) elevate ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- "$@" ;;
+                detached) elevate setsid -f ip netns exec "$NETNS_NAME" "$SUDO_BIN" -u "$RUN_USER_NAME" -- "$@" ;;
+                background) elevate ip netns exec "$NETNS_NAME" "$SUDO_BIN" -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
+                foreground) elevate ip netns exec "$NETNS_NAME" "$SUDO_BIN" -u "$RUN_USER_NAME" -- "$@" ;;
             esac
             ;;
         runuser)
@@ -1463,15 +1591,15 @@ run_user_systemd_command() {
 
     case "$RUN_USER_METHOD" in
         sudo)
-            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" sudo -u "$RUN_USER_NAME" -- env "$@"
+            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" "$SUDO_BIN" -u "$RUN_USER_NAME" -- "$ENV_BINARY" "$@"
             # A unidade permanece em foreground; o chamador captura sua saida:
             # sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1
             ;;
         runuser)
-            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" runuser -u "$RUN_USER_NAME" -- env "$@"
+            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" runuser -u "$RUN_USER_NAME" -- "$ENV_BINARY" "$@"
             ;;
         setpriv)
-            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- env "$@"
+            elevate systemd-run --collect --unit="$unit" ip netns exec "$NETNS_NAME" setpriv --reuid "$RUN_USER_UID" --regid "$RUN_USER_GID" --init-groups -- "$ENV_BINARY" "$@"
             ;;
         *)
             printf '%s\n' 'Falha: executor seguro do Discord nao foi preparado.' >&2
@@ -1508,9 +1636,9 @@ run_user_host_command() {
     case "$RUN_USER_METHOD" in
         sudo)
             case "$launch_mode" in
-                detached) setsid -f sudo -u "$RUN_USER_NAME" -- "$@" ;;
-                background) sudo -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
-                foreground) sudo -u "$RUN_USER_NAME" -- "$@" ;;
+                detached) setsid -f "$SUDO_BIN" -u "$RUN_USER_NAME" -- "$@" ;;
+                background) "$SUDO_BIN" -u "$RUN_USER_NAME" -- "$@" & return 0 ;;
+                foreground) "$SUDO_BIN" -u "$RUN_USER_NAME" -- "$@" ;;
             esac
             ;;
         runuser)
@@ -1574,11 +1702,169 @@ elevate_readonly() {
         "$@"
     elif [ "$NONINTERACTIVE" -eq 1 ]; then
         have sudo || return 1
-        sudo -n "$@"
+        "$SUDO_BIN" -n "$@"
     else
         elevate "$@"
     fi
 }
+# ======================= WireGuard de usuario (wireguard-go)
+# O modulo do kernel nao e a unica forma de existir um device WireGuard. Um kernel recem
+# atualizado fica sem a arvore de modulos (/lib/modules/<release> apagada pelo gerenciador)
+# ate o reinicio: `modprobe` e `ip link add type wireguard` falham e nenhuma ativacao tem
+# saida. O wireguard-go cria o MESMO device TUN com o mesmo protocolo no espaco do usuario,
+# sem carregar nada no kernel; o que ele exige e /dev/net/tun com o driver `tun` presente
+# (embutido ou ja carregado). O `wg` de wireguard-tools fala com ele pelo socket UAPI em
+# /var/run/wireguard/<interface>.sock, entao setconf/show/telemetria seguem iguais.
+WIREGUARD_GO_BINARY=""
+WIREGUARD_GO_SOURCE=""
+
+wireguard_go_pid_file() { printf '%s\n' "$INSTALL_DIR/wireguard-go.pid"; }
+wireguard_go_log_file() { printf '%s\n' "$INSTALL_DIR/logs/wireguard-go.log"; }
+
+# Ordem: caminho explicito (flag/env; usado pela GUI e pelos testes) -> empacotado ao lado do
+# script (AppImage: resources/extra/wireguard-go) -> arvore de desenvolvimento -> PATH
+# (pacote do sistema). Um caminho explicito vale mesmo quando nao e executavel (sem cair para
+# os seguintes): assim um override recusado e observavel em vez de virar modo silencioso.
+resolve_wireguard_go() {
+    if [ -n "$WIREGUARD_GO_BINARY" ]; then
+        return 0
+    fi
+    local script_dir candidate
+    if [ -n "${WIREGUARD_GO_CLI:-}" ]; then
+        [ -x "$WIREGUARD_GO_CLI" ] || return 1
+        WIREGUARD_GO_BINARY="$WIREGUARD_GO_CLI"
+        WIREGUARD_GO_SOURCE="explicito"
+        return 0
+    fi
+    if [ -n "${GOLIVE_WIREGUARD_GO:-}" ]; then
+        [ -x "$GOLIVE_WIREGUARD_GO" ] || return 1
+        WIREGUARD_GO_BINARY="$GOLIVE_WIREGUARD_GO"
+        WIREGUARD_GO_SOURCE="explicito"
+        return 0
+    fi
+    script_dir="$(dirname "$SCRIPT_PATH")"
+    for candidate in \
+        "$script_dir/../wireguard-go/wireguard-go" \
+        "$script_dir/../tools/wireguard-go/build/wireguard-go"; do
+        [ -n "$candidate" ] || continue
+        if [ -x "$candidate" ]; then
+            WIREGUARD_GO_BINARY="$candidate"
+            WIREGUARD_GO_SOURCE="pacote"
+            return 0
+        fi
+    done
+    candidate="$(resolve_binary wireguard-go || true)"
+    if [ -n "$candidate" ]; then
+        WIREGUARD_GO_BINARY="$candidate"
+        WIREGUARD_GO_SOURCE="sistema"
+        return 0
+    fi
+    return 1
+}
+
+# /sys/class/misc/tun existe quando o driver tun esta no kernel: sem ele nem o wireguard-go
+# consegue criar a interface, entao o modo de usuario nao conta como disponivel.
+wireguard_tun_available() {
+    [ -e /dev/net/tun ] || return 1
+    [ -e /sys/class/misc/tun ] || return 1
+    return 0
+}
+
+wireguard_userspace_available() {
+    resolve_wireguard_go || return 1
+    wireguard_tun_available || return 1
+    return 0
+}
+
+# 'kernel' com o modulo carregado, 'userspace' com wireguard-go + tun, 'none' sem device
+# possivel. Nunca falha: quem chama decide a mensagem.
+wireguard_device_mode() {
+    if wireguard_module_loaded; then
+        printf 'kernel'
+    elif wireguard_userspace_available; then
+        printf 'userspace'
+    else
+        printf 'none'
+    fi
+    return 0
+}
+
+# Barreira da ativacao, antes de fechar o Discord: o modulo do kernel e a primeira escolha
+# (nao depende de um processo a mais); sem ele o WireGuard de usuario entra no lugar. Sem
+# nenhum dos dois, a ativacao para com o motivo que o kernel deu.
+ensure_wireguard_device() {
+    local kernel_error=""
+    if kernel_error="$(ensure_wireguard_module 2>&1)"; then
+        WIREGUARD_DEVICE_MODE="kernel"
+        return 0
+    fi
+    if wireguard_userspace_available; then
+        WIREGUARD_DEVICE_MODE="userspace"
+        # Sem repetir o texto da tentativa do kernel: ele fala em cancelar a ativacao, o que
+        # deixou de ser verdade quando o device de usuario assume.
+        warn "Modulo WireGuard do kernel indisponivel; ativando com o WireGuard de usuario ($WIREGUARD_GO_BINARY)."
+        return 0
+    fi
+    printf '%s\n' "$kernel_error" >&2
+    return 1
+}
+
+# O socket UDP do daemon precisa nascer no uplink original, como o device do kernel.
+# Depois movemos somente o TUN para discord-vpn: o Discord usa o tunel, enquanto o
+# wireguard-go continua alcançando o peer pela rede normal. -f impede daemonizacao
+# para o pidfile identificar o processo vivo que stop_wireguard_userspace encerra.
+start_wireguard_userspace() {
+    local pid_file log_file
+    pid_file="$(wireguard_go_pid_file)"
+    log_file="$(wireguard_go_log_file)"
+    mkdir -p "$INSTALL_DIR/logs" 2>/dev/null || true
+    stop_wireguard_userspace
+    elevate rm -f "$pid_file" 2>/dev/null || true
+
+    step "Iniciando WireGuard de usuario '$WG_IF' com uplink original"
+    elevate sh -c 'echo "$$" > "$1"; shift; exec "$@"' sh "$pid_file" "$WIREGUARD_GO_BINARY" -f "$WG_IF" >>"$log_file" 2>&1 &
+    # Uma unica chamada elevada espera a interface nascer: o daemon cria o device TUN
+    # depois do exec, e criar o namespace tambem leva tempo.
+    if ! elevate sh -c 'i=0; while [ "$i" -lt 50 ]; do ip link show "$1" >/dev/null 2>&1 && exit 0; sleep 0.2; i=$((i+1)); done; exit 1' sh "$WG_IF"; then
+        stop_wireguard_userspace
+        return 1
+    fi
+    if ! elevate ip link set "$WG_IF" netns "$NETNS_NAME"; then
+        stop_wireguard_userspace
+        return 1
+    fi
+    return 0
+}
+
+# `/proc/<pid>` no lugar de `kill -0`: o daemon roda como root e o script como usuario, e o
+# kill(0) de um processo de outro dono responde EPERM (que pareceria processo morto).
+wireguard_go_alive() {
+    [ -n "${1:-}" ] && [ -d "/proc/$1" ]
+}
+
+stop_wireguard_userspace() {
+    local pid_file pid waited
+    pid_file="$(wireguard_go_pid_file)"
+    [ -e "$pid_file" ] || return 0
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    elevate rm -f "$pid_file" 2>/dev/null || true
+    case "$pid" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    wireguard_go_alive "$pid" || return 0
+
+    step "Encerrando o WireGuard de usuario (pid $pid)"
+    elevate kill "$pid" 2>/dev/null || true
+    waited=0
+    while [ "$waited" -lt 20 ]; do
+        wireguard_go_alive "$pid" || return 0
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    elevate kill -9 "$pid" 2>/dev/null || true
+    return 0
+}
+
 # O preflight nao carrega o modulo: ele apenas diferencia um modulo disponivel
 # no kernel de um modulo ja carregado. A ativacao interativa faz a carga depois
 # da autorizacao, mas antes de fechar o Discord ou criar o namespace.
@@ -1618,8 +1904,10 @@ ensure_wireguard_module() {
 # Ler campo a campo em vez de dar source: /etc/os-release e shell valido, e um arquivo torto
 # executaria comando neste script, que logo depois chama sudo.
 os_field() {
-    [ -r /etc/os-release ] || return 0
-    sed -n "s/^$1=//p" /etc/os-release | tr -d '"' | head -1
+    # OS_RELEASE_FILE existe para os testes; em uso normal vale /etc/os-release.
+    local file="${OS_RELEASE_FILE:-/etc/os-release}"
+    [ -r "$file" ] || return 0
+    sed -n "s/^$1=//p" "$file" | tr -d '"' | head -1
     return 0
 }
 
@@ -1651,13 +1939,17 @@ confirm() {
 # /usr/lib e /usr/lib64 (ou por symlinks); sem esta guarda o preflight contava duas vezes o
 # mesmo cliente e a ativação podia tentar o mesmo processo em duplicidade.
 discord_emit_dir() {
-    local resources="$1" flav="$2" detect="$3" flatpak_id="${4:-}"
+    local resources="$1" flav="$2" detect="$3" flatpak_id="${4:-}" require_asar="${5:-1}"
     local target target_key
 
     if [ -e "$resources/app.asar" ]; then
         target="$resources/app.asar"
     elif [ -e "$resources/_app.asar" ]; then
         target="$resources/_app.asar"
+    elif [ "$require_asar" -eq 0 ] && [ -d "$resources" ]; then
+        # Cliente nativo sem asar (ver FLATPAK_TUNEL_IDS): o proprio diretorio de
+        # deploy e a chave de dedupe; ele nunca recebe injecao.
+        target="$resources"
     else
         return 1
     fi
@@ -1678,6 +1970,139 @@ discord_emit_dir() {
     else
         printf '%s|%s|%s\n' "$resources" "$flav" "$detect"
     fi
+    return 0
+}
+
+# Raizes de pacote candidatas a partir de um link do perfil. A cadeia eh resolvida
+# elo a elo com readlink: cada etapa - e nao so o destino final - pode ser a que
+# revela o pacote. O Discord sem FHS aponta bin/<cliente> para opt/<cliente>/<cliente>
+# e o modo FHS aponta bin/<cliente> para um wrapper solto em /nix/store; achatar
+# tudo com readlink -f perderia esse <out> do meio, que eh quem guarda a saida
+# share. Dois pais por etapa cobrem os dois desenhos. Quando o destino final eh
+# script - wrapper do modo FHS ou makeWrapper dos modos - os caminhos absolutos do
+# texto tambem alimentam os candidatos (o makeWrapper embute o resources/app.asar).
+# ELF nao eh lido como texto: seria caro e as etapas ja resolvem esse caso.
+nix_package_roots() {
+    local alvo cur nxt parent avo base saida resolv primeira tok pai bisavo q s voltas
+    alvo="${1:-}"
+    [ -n "$alvo" ] && [ -e "$alvo" ] || return 0
+    cur="$alvo"
+    voltas=0
+    while [ "$voltas" -lt 8 ]; do
+        voltas=$((voltas + 1))
+        parent="$(dirname "$cur")"
+        # O proprio link dentro do perfil nao eh raiz de pacote: o perfil so
+        # reexporta paths de outros pacotes por symlinks e o seu path muda a cada
+        # instalacao. A primeira volta existe para entrar na cadeia.
+        if [ "$voltas" -ge 2 ]; then
+            printf '%s\n' "$cur"
+            avo="$(dirname "$parent")"
+            bisavo="$(dirname "$avo")"
+            printf '%s\n' "$parent"
+            printf '%s\n' "$avo"
+            printf '%s\n' "$bisavo"
+            # Saida secundaria: no modo FHS o pacote encadeia o app por um
+            # symlink de share (ln -s <unwrapped>/share $out/share). O wrapper
+            # atual do FHS roda bwrap com um container-init e nao menciona o app
+            # no texto, entao essa ponte pelo share do output eh o que alcanca o
+            # opt/<cliente> real. So symlink: um share mesclado de perfil eh
+            # diretorio comum e nao leva a pacote nenhum.
+            for base in "$parent" "$avo"; do
+                saida="$base/share"
+                [ -L "$saida" ] || continue
+                resolv="$(readlink -f "$saida" 2>/dev/null || printf '%s' '')"
+                if [ -n "$resolv" ] && [ "$resolv" != "$saida" ]; then
+                    printf '%s\n' "$resolv"
+                    printf '%s\n' "$(dirname "$resolv")"
+                fi
+            done
+        fi
+        nxt="$(readlink "$cur" 2>/dev/null)" || break
+        [ -n "$nxt" ] || break
+        case "$nxt" in
+            /*) cur="$nxt" ;;
+            *) cur="$parent/$nxt" ;;
+        esac
+    done
+    primeira=""
+    IFS= read -r primeira < "$cur" 2>/dev/null || true
+    [ -n "$primeira" ] || return 0
+    case "$primeira" in
+        "#!"*)
+            q='"'
+            s="'"
+            tr ' \t\r' '\n' < "$cur" 2>/dev/null | while IFS= read -r tok; do
+                tok="${tok%;}"
+                tok="${tok%$q}"
+                tok="${tok%$s}"
+                case "$tok" in
+                    $q/*) tok="${tok#$q}" ;;
+                    $s/*) tok="${tok#$s}" ;;
+                esac
+                case "$tok" in
+                    /*)
+                        printf '%s\n' "$tok"
+                        pai="${tok%/*}"
+                        printf '%s\n' "$pai"
+                        bisavo="${pai%/*}"
+                        printf '%s\n' "$bisavo"
+                        printf '%s\n' "${bisavo%/*}"
+                        ;;
+                esac
+            done || true
+            ;;
+    esac
+    return 0
+}
+
+# Nix/NixOS. O Discord e os modos paralelos do nixpkgs nao copiam nada para
+# /usr/share, /opt ou ~/.local/share: tudo mora no /nix/store e so aparece pelos
+# perfis do Nix, que linkam os outputs do pacote. ~/.nix-profile (nix profile ou
+# nix-env do usuario), /etc/profiles e /run/current-system/sw (system profile do
+# NixOS), os perfis do home-manager e o default do nix single-user. O Discord
+# oficial no modo FHS - o padrao do nixpkgs hoje - encadeia o app por um wrapper
+# para outro store path; os modos ficam em opt/<cliente> (vesktop, equibop) e
+# share/lib/legcord (legcord). O store eh somente-leitura e nao ha problema: a
+# injecao por pasta acabou, e o WireGuard por aplicativo envolve o processo sem
+# tocar no app.asar.
+discord_nix_dirs() {
+    local perfil cmd roots_file pkg_root layout sub flav
+    roots_file="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/golive-nix-roots.$$")"
+    : > "$roots_file"
+    for perfil in \
+        "$HOME/.nix-profile" \
+        /etc/profiles \
+        /run/current-system/sw \
+        "/etc/profiles/per-user/$(id -un 2>/dev/null || printf '%s' "${USER:-user}")" \
+        "${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles/profile" \
+        /nix/var/nix/profiles/default
+    do
+        [ -d "$perfil" ] || continue
+        for cmd in Discord DiscordPTB DiscordCanary discord discordptb discord-canary vesktop equibop legcord; do
+            [ -e "$perfil/bin/$cmd" ] || continue
+            nix_package_roots "$perfil/bin/$cmd" >> "$roots_file" 2>/dev/null || true
+        done
+    done
+    sort -u "$roots_file" -o "$roots_file" 2>/dev/null || true
+    while IFS= read -r pkg_root; do
+        [ -n "$pkg_root" ] || continue
+        for layout in opt/Discord opt/DiscordPTB opt/DiscordCanary opt/Vesktop opt/Equibop share/lib/legcord; do
+            sub="$pkg_root/$layout/resources"
+            [ -e "$sub/app.asar" ] || [ -e "$sub/_app.asar" ] || continue
+            flav="discord"
+            case "$layout" in
+                *DiscordPTB*) flav="discordptb" ;;
+                *DiscordCanary*) flav="discordcanary" ;;
+                *Vesktop*) flav="vesktop" ;;
+                *Equibop*) flav="equibop" ;;
+                *legcord*) flav="legcord" ;;
+            esac
+            if discord_emit_dir "$sub" "$flav" "nix"; then
+                count=$(( ${count:-0} + 1 ))
+            fi
+        done
+    done < "$roots_file"
+    rm -f "$roots_file"
     return 0
 }
 
@@ -1823,6 +2248,20 @@ discord_dirs() {
         done
     done
 
+    # Flatpak de cliente nativo sem Electron: nao ha o que achar de asar, a sessao e
+    # provada por `flatpak ps`. Vale como Discord instalado para preflight/ativacao.
+    detect="flatpak-nativo"
+    for raiz in /var/lib/flatpak/app "${XDG_DATA_HOME:-$HOME/.local/share}/flatpak/app"; do
+        [ -d "$raiz" ] || continue
+        for id in $FLATPAK_TUNEL_IDS; do
+            [ -d "$raiz/$id/current/active/files" ] || continue
+            flav="${id##*.}"
+            if discord_emit_dir "$raiz/$id/current/active/files" "$flav" "$detect" "$id" 0; then
+                count=$((count + 1))
+            fi
+        done
+    done
+
     # O mesmo bootstrap de que fala o comentario la em cima, so que dentro do flatpak: o HOME
     # do Discord vira ~/.var/app/<id>, e o app baixado cai la. Este e do proprio usuario.
     detect="flatpak-bootstrap"
@@ -1837,7 +2276,9 @@ discord_dirs() {
         done
     done
 
-    warn "trace: varridas 5 blocos de raizes, achei $count Discord(s)"
+    discord_nix_dirs
+
+    warn "trace: varridas 7 blocos de raizes, achei $count Discord(s)"
     return 0
 }
 
@@ -1958,6 +2399,7 @@ manual_target_manual_json() {
 # loop de tentativas de ativacao. Nao instala pacotes nem pede senha.
 linux_preflight_json() {
     local distro id_like missing="" errors="" install="" found_count=0 first_path="" netns_ok=false kernel="unknown" elevated=false
+    local kernel_running="" kernel_modules_installed=true userspace=false
     distro="$(os_field ID)"
     id_like="$(os_field ID_LIKE)"
 
@@ -1983,6 +2425,25 @@ linux_preflight_json() {
         else
             kernel="missing"
             errors="${errors}${errors:+,}modulo wireguard ausente"
+        fi
+    fi
+
+    # Um upgrade de kernel sem reinicio deixa o kernel em execucao sem a arvore de modulos
+    # dela (o gerenciador apaga /lib/modules/<versao antiga> ao instalar a nova): modinfo e
+    # modprobe nao acham nada e nenhuma tentativa de ativacao tem saida sem reiniciar.
+    # O relato de 24/09 chegou aqui com "modulo ausente" generico, depois de autorizar o sudo.
+    if have uname; then
+        kernel_running="$(uname -r 2>/dev/null || true)"
+    fi
+    if [ -n "$kernel_running" ] && [ ! -d "/lib/modules/$kernel_running" ]; then
+        kernel_modules_installed=false
+    fi
+
+    # Sem modulo do kernel o device pode vir do WireGuard de usuario (wireguard-go + tun):
+    # e o caso do kernel recem-atualizado, onde `modprobe` nunca vai funcionar até reiniciar.
+    if [ "$kernel" != "loaded" ] && [ "$kernel" != "available" ]; then
+        if wireguard_userspace_available; then
+            userspace=true
         fi
     fi
 
@@ -2012,14 +2473,20 @@ linux_preflight_json() {
     fi
     local ok=true
     [ -n "$missing" ] && ok=false
+    # "missing" nao e o modulo apenas descarregado: modinfo nao encontrou modulo para o kernel
+    # em execucao, entao o modprobe da ativacao falharia sempre. Reprovar aqui evita pedir a
+    # senha do sudo e criar namespace parcial para uma ativacao que nao tem como concluir —
+    # a menos que o WireGuard de usuario (wireguard-go) esteja disponivel, que e o caso em que
+    # a ativacao funciona sem o modulo.
+    [ "$kernel" = "missing" ] && [ "$userspace" != true ] && ok=false
     [ "$elevated" = true ] || ok=false
     [ "$netns_ok" = true ] || ok=false
     [ "$found_count" -gt 0 ] || ok=false
-    printf '{"ok":%s,"platform":"linux","distro":"%s","archLike":%s,"dependencies":{"missing":[%s],"required":["wg","ip","curl"]},"elevation":{"available":%s,"method":"%s"},"netns":{"available":%s},"kernel":{"wireguard":"%s"},"discord":{"found":%s,"count":%s,"firstPath":"%s"%s},"errors":[%s],"installCommand":"%s"}\n' \
+    printf '{"ok":%s,"platform":"linux","distro":"%s","archLike":%s,"dependencies":{"missing":[%s],"required":["wg","ip","curl"]},"elevation":{"available":%s,"method":"%s"},"netns":{"available":%s},"kernel":{"wireguard":"%s","running":"%s","modulesInstalled":%s,"userspace":%s},"discord":{"found":%s,"count":%s,"firstPath":"%s"%s},"errors":[%s],"installCommand":"%s"}\n' \
         "$ok" "$(json_escape "${distro:-Linux}")" \
         "$(case "$distro $id_like" in *arch*) printf true ;; *) printf false ;; esac)" \
         "$missing_json" "$elevated" "$(if [ "$(id -u)" -eq 0 ]; then printf root; elif have sudo; then printf sudo; elif have pkexec; then printf pkexec; else printf none; fi)" \
-        "$netns_ok" "$kernel" "$( [ "$found_count" -gt 0 ] && printf true || printf false )" "$found_count" "$(json_escape "$first_path")" "$(manual_target_manual_json)" "$error_json" "$(json_escape "$install")"
+        "$netns_ok" "$kernel" "$(json_escape "$kernel_running")" "$( [ "$kernel_modules_installed" = true ] && printf true || printf false )" "$userspace" "$( [ "$found_count" -gt 0 ] && printf true || printf false )" "$found_count" "$(json_escape "$first_path")" "$(manual_target_manual_json)" "$error_json" "$(json_escape "$install")"
 }
 
 # Instala somente os comandos indispensaveis que faltam para o tunel WireGuard.
@@ -2159,7 +2626,7 @@ linux_ensure_dependencies() {
 flatpak_app_id() {
     local parte
     for parte in $(printf '%s\n' "${1:-}" | tr '/' '\n'); do
-        case "$parte" in com.discordapp.*|dev.vencord.*|app.legcord.*|org.equicord.*) printf '%s\n' "$parte"; return 0 ;; esac
+        case "$parte" in com.discordapp.*|dev.vencord.*|app.legcord.*|org.equicord.*|cz.viceverse.*) printf '%s\n' "$parte"; return 0 ;; esac
     done
     return 1
 }
@@ -2175,8 +2642,19 @@ flatpak_running_id() {
         | awk -v wanted="$wanted" '$0 == wanted { found=1; exit } END { exit found ? 0 : 1 }'
 }
 
+# Normaliza sequencias decimais para que zero/zeros iniciais nunca sejam passados a kill.
+
+normalize_pid() {
+    local pid="${1:-}"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    while [ "${pid#0}" != "$pid" ]; do pid="${pid#0}"; done
+    [ -n "$pid" ] || return 1
+    printf '%s\n' "$pid"
+}
+
 # Retorna o PID do processo dentro do sandbox. O child-pid é preferido porque é o
 # processo que herda o namespace de rede; o wrapper fica no host em alguns runtimes.
+
 flatpak_pid_for_id() {
     local wanted="${1:-}" pid="" columns
     [ -n "$wanted" ] && have flatpak || return 1
@@ -2185,12 +2663,25 @@ flatpak_pid_for_id() {
     for columns in child-pid pid; do
         pid="$(flatpak ps --columns="$columns,application" 2>/dev/null \
             | awk -v wanted="$wanted" '$2 == wanted { print $1; exit }')"
-        case "$pid" in
-            ''|*[!0-9]*) continue ;;
-            *) printf '%s\n' "$pid"; return 0 ;;
-        esac
+        pid="$(normalize_pid "$pid" 2>/dev/null)" || continue
+        [ -n "$pid" ] || continue
+        printf '%s\n' "$pid"
+        return 0
     done
     return 1
+}
+
+# IDs da lista suportada que o `flatpak ps` mostra em execucao agora. O ID exato e a
+# chave que o `flatpak kill` aceita e o unico sinal que alcanca o cliente dentro do
+# sandbox do bubblewrap: pkill por nome no host nao encerra a sessao registrada e a
+# ativacao ficava presa no "SIGKILL nao matou" sem dizer qual ID sobrou (#327).
+flatpak_ids_em_execucao() {
+    local id
+    have flatpak || return 0
+    for id in $FLATPAK_IDS $FLATPAK_TUNEL_IDS; do
+        flatpak_running_id "$id" && printf '%s\n' "$id"
+    done
+    return 0
 }
 
 flatpak_is_user_install() {
@@ -2345,8 +2836,8 @@ wg_stats_json() {
     # --status continua sem pedir senha nem alterar o sistema.
     elif [ "$SUDO_AUTH_READY" -eq 1 ]; then
         dump="$(elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
-    elif have sudo && sudo -n true 2>/dev/null; then
-        dump="$(sudo -n ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
+    elif have sudo && "$SUDO_BIN" -n true 2>/dev/null; then
+        dump="$("$SUDO_BIN" -n ip netns exec "$NETNS_NAME" wg show "$WG_IF" dump 2>/dev/null)"
     else
         printf '{"ok":false,"error":"sem privilegio para ler (precisa root ou sudo sem senha)"}'
         return 0
@@ -2393,13 +2884,12 @@ discord_running() {
     pgrep -x discord-canary >/dev/null 2>&1 && return 0
     pgrep -x discordptb >/dev/null 2>&1 && return 0
 
-    # Clientes paralelos nativos (Vesktop, Equibop, Legcord): o processo costuma ser o
-    # binario generico do Electron (/usr/lib/electron*/electron), entao o NOME do processo
-    # nao identifica nada. O cmdline de todos carrega o caminho do app.asar da pasta
-    # instalada — o running_flav casa pelo nome do flav do install.
+    # Clientes oficiais e paralelos podem usar um Electron generico, cujo nome nao identifica
+    # o app. A raiz da instalacao comparada com /proc/PID/exe evita confundir
+    # outro cliente Electron nativo.
     if [ -n "${FOUND:-}" ]; then
-        if [ -n "$(printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav rest; do
-            case "$flav" in vesktop|equibop|legcord) running_flav "$flav" "" "$resources" && printf 'achou\n' ;; esac
+        if [ -n "$(printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav detect id; do
+            case "$flav" in discord|discordptb|discordcanary|vesktop|equibop|legcord) running_flav "$flav" "$id" "$resources" && printf 'achou\n' ;; esac
         done)" ]; then
             return 0
         fi
@@ -2409,7 +2899,7 @@ discord_running() {
     if have flatpak; then
         local rodando
         rodando="$(flatpak ps --columns=application 2>/dev/null || true)"
-        case "$rodando" in *com.discordapp.*|*dev.vencord.*|*app.legcord.*|*org.equicord.*) return 0 ;; esac
+        case "$rodando" in *com.discordapp.*|*dev.vencord.*|*app.legcord.*|*org.equicord.*|*cz.viceverse.*) return 0 ;; esac
     fi
     # Alvo manual (fallback): nao usa nenhum dos nomes acima nem vem da varredura — a
     # identidade esta no registro, e sem isso o cliente ficaria aberto dentro de um
@@ -2420,34 +2910,153 @@ discord_running() {
     return 1
 }
 
-# O cliente deste flav esta vivo? Oficiais ("discord*"): pelo NOME do processo. Paralelos
-# (vesktop|equibop|legcord): o caminho exato do app.asar da instalação é a fonte de verdade.
-parallel_pid_for_resources() {
-    local resources="$1" proc pid cmdline
+# Clientes Electron ELF podem omitir app.asar da linha de comando.
+# A identidade exata da instalação vem do executável em /proc/PID/exe.
+
+kill_flatpak_apps_forcefully() {
+    local id pid current_pid
+    have flatpak || return 0
+    for id in $FLATPAK_IDS $FLATPAK_TUNEL_IDS; do
+        pid="$(normalize_pid "$(flatpak_pid_for_id "$id" 2>/dev/null || true)" 2>/dev/null)" || continue
+        # Revalida a associação imediatamente antes do sinal: nunca mata apenas
+        # por nome/command line um processo que possa pertencer a outro cliente.
+        current_pid="$(normalize_pid "$(flatpak_pid_for_id "$id" 2>/dev/null || true)" 2>/dev/null)" || continue
+        [ "$pid" = "$current_pid" ] || continue
+        kill -9 "$pid" 2>/dev/null || true
+    done
+}
+
+parallel_app_root_for_resources() {
+    local resources="${1%/}"
     [ -n "$resources" ] || return 1
+    # O scan também aceita app.asar direto na raiz (por exemplo /usr/lib/equibop).
+    # Só a subpasta resources permite subir: o pai da raiz pode conter outros apps.
+    case "$resources" in */resources) resources="$resources/.." ;; esac
+    readlink -f "$resources" 2>/dev/null
+}
+
+parallel_pids_for_resources() {
+    local resources="$1" proc pid app_root
+    [ -n "$resources" ] || return 1
+    app_root="$(parallel_app_root_for_resources "$resources" || true)"
+    [ -n "$app_root" ] || return 1
+    # Uma captura com find evita um readlink externo por processo alheio. O teste
+    # de suporte é separado: /proc pode mudar ou negar acesso durante a captura,
+    # e esses erros normais não devem disparar outra varredura completa.
+    if find /proc/self/exe -maxdepth 0 -printf '' >/dev/null 2>&1; then
+        for pid in $(find /proc/[0-9]*/exe -maxdepth 0 -printf '%p\0%l\0' 2>/dev/null \
+            | GOLIVE_MATCH_APP_ROOT="$app_root" awk '
+                BEGIN { RS="\0"; root=ENVIRON["GOLIVE_MATCH_APP_ROOT"] }
+                NR % 2 { proc=$0; next }
+                {
+                    exe=$0
+                    sub(/ \(deleted\)$/, "", exe)
+                    name=exe; sub(/^.*\//, "", name)
+                    if (index(exe, root "/") != 1 &&
+                        name !~ /^(electron|Electron|node|nodejs|Discord|DiscordPTB|DiscordCanary|discord|discordptb|discord-canary|vesktop|equibop|legcord)$/ &&
+                        exe !~ /\/electron-?[0-9]/) next
+                    if (proc !~ /^\/proc\/[1-9][0-9]*\/exe$/) next
+                    sub(/^\/proc\//, "", proc); sub(/\/exe$/, "", proc)
+                    print proc
+                }
+            '); do
+            [ "$pid" = "$$" ] && continue
+            # A captura só escolhe candidatos; a identidade continua sendo
+            # conferida ao vivo, inclusive novamente antes de qualquer sinal.
+            parallel_process_belongs_to_resources "$resources" "$pid" "$app_root" && printf '%s\n' "$pid"
+        done
+        return 0
+    fi
     for proc in /proc/[0-9]*/cmdline; do
         [ -r "$proc" ] || continue
         pid="${proc#/proc/}"
         pid="${pid%/cmdline}"
         [ "$pid" = "$$" ] && continue
-        cmdline="$(tr '\0' ' ' < "$proc" 2>/dev/null || true)"
-        case "$cmdline" in
-            *"$resources/app.asar"*|*"$resources/_app.asar"*|*"$resources/arrpc"*)
-                printf '%s\n' "$pid"
-                return 0
-                ;;
+        parallel_process_belongs_to_resources "$resources" "$pid" "$app_root" && printf '%s\n' "$pid"
+    done
+}
+
+parallel_pid_for_resources() {
+    local resources="$1" pid cmdline fallback=""
+    for pid in $(parallel_pids_for_resources "$resources"); do
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        case " $cmdline " in
+            *" --type="*) [ -n "$fallback" ] || fallback="$pid" ;;
+            *) printf '%s\n' "$pid"; return 0 ;;
         esac
     done
+    [ -n "$fallback" ] && { printf '%s\n' "$fallback"; return 0; }
     return 1
 }
+
+parallel_process_belongs_to_resources() {
+    local resources="$1" pid="$2" app_root="${3:-}" exe
+    [ -n "$resources" ] && [ -n "$pid" ] || return 1
+    [ -n "$app_root" ] || app_root="$(parallel_app_root_for_resources "$resources" || true)"
+    [ -n "$app_root" ] || return 1
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    exe="${exe% (deleted)}"
+    case "$exe" in "$app_root"/*) return 0 ;; esac
+    # Pacotes AUR também podem usar o Electron do sistema, fora da raiz do app.
+    # Limitar o fallback a runtimes do cliente evita ler o cmdline de cada processo
+    # alheio. O separador NUL preserva argumentos multiline sem aceitar texto de shell.
+    case "$exe" in
+        */electron|*/Electron|*/electron[0-9]*|*/electron-[0-9]*|*/node|*/nodejs|*/Discord|*/DiscordPTB|*/DiscordCanary|*/discord|*/discordptb|*/discord-canary|*/vesktop|*/equibop|*/legcord) ;;
+        *) return 1 ;;
+    esac
+    # O Chromium reescreve o argv na memoria (espacos no lugar dos NULs, um NUL
+    # so no fim): provado no NixOS real com o Electron 42/43 do nixpkgs, para o
+    # Discord e o vesktop. Sem tratar isso, o cliente com Electron fora da raiz
+    # (nix, AUR) vira "nao esta rodando": o status erra, o stop deixa um orfao
+    # no host e o relaunch nao o preserva.
+    # A distincao e estrutural, nao textual: cmdline normal tem um NUL por
+    # argumento (arg exato ou prefixo arrpc, como antes); cmdline reescrito tem
+    # um unico NUL no fim e o path aparece como substring da linha colada. Uma
+    # mencao incidental dentro de um argumento maior continua sem identificar,
+    # porque ali os NULs entre argumentos estao intactos.
+    GOLIVE_MATCH_RESOURCES="$resources" awk '
+        BEGIN { RS="\0"; resources=ENVIRON["GOLIVE_MATCH_RESOURCES"]; n=0; partial=0 }
+        {
+            n++
+            if ($0 == resources "/app.asar" || $0 == resources "/_app.asar" ||
+                $0 == resources "/arrpc" || index($0, resources "/arrpc/") == 1) { exact=1; exit }
+            if (index($0, resources "/app.asar") || index($0, resources "/_app.asar") ||
+                index($0, resources "/arrpc")) partial=1
+        }
+        END { if (exact) exit 0; if (n == 1 && partial) exit 0; exit 1 }
+    ' "/proc/$pid/cmdline" 2>/dev/null
+}
+
+kill_parallel_by_path() {
+    local sig="${1:-}" pid
+    [ -n "${FOUND:-}" ] || return 0
+    while IFS='|' read -r resources flav rest; do
+        case "$flav" in
+            discord|discordptb|discordcanary|vesktop|equibop|legcord)
+                for pid in $(parallel_pids_for_resources "$resources" 2>/dev/null); do
+                    pid="$(normalize_pid "$pid" 2>/dev/null)" || continue
+                    parallel_process_belongs_to_resources "$resources" "$pid" || continue
+                    if [ -n "$sig" ]; then kill "$sig" "$pid" 2>/dev/null || true
+                    else kill "$pid" 2>/dev/null || true
+                    fi
+                done
+                ;;
+        esac
+    done <<EOF
+$(printf '%s\n' "$FOUND")
+EOF
+    return 0
+}
+
 
 running_flav() {
     local flav="$1" flatpak_id="${2:-}" resources="${3:-}"
     # No Bazzite/Fedora Atomic o portal pode manter o processo Electron dentro do
     # sandbox mesmo quando o nome dele não aparece no namespace de PID do host.
     # Consultar o ID exato também evita aceitar outro Discord aberto fora do túnel.
-    if [ -n "$flatpak_id" ] && flatpak_running_id "$flatpak_id"; then
-        return 0
+    if [ -n "$flatpak_id" ]; then
+        flatpak_running_id "$flatpak_id"
+        return $?
     fi
     case "$flav" in
         vesktop|equibop|legcord)
@@ -2458,6 +3067,10 @@ running_flav() {
             fi
             ;;
         discord|discordptb|discordcanary)
+            if [ -n "$resources" ]; then
+                parallel_pid_for_resources "$resources" >/dev/null
+                return $?
+            fi
             pgrep -x Discord >/dev/null 2>&1 || pgrep -x discord >/dev/null 2>&1 \
                 || pgrep -x discordptb >/dev/null 2>&1 || pgrep -x discord-canary >/dev/null 2>&1
             ;;
@@ -2492,6 +3105,7 @@ manual_pid_for_target() {
     done
     return 1
 }
+
 # Retorna o PID do cliente deste flavour. Usado pelo status para nao confundir um
 # Discord normal (fora do namespace) com a sessao protegida pelo WireGuard.
 discord_pid_flav() {
@@ -2500,8 +3114,10 @@ discord_pid_flav() {
         manual_pid_for_target
         return $?
     fi
-    if [ -n "$flatpak_id" ] && pid="$(flatpak_pid_for_id "$flatpak_id" 2>/dev/null || true)"; then
+    if [ -n "$flatpak_id" ]; then
+        pid="$(flatpak_pid_for_id "$flatpak_id" 2>/dev/null || true)"
         [ -n "$pid" ] && { printf '%s\n' "$pid"; return 0; }
+        return 1
     fi
     case "$flav" in
         vesktop|equibop|legcord)
@@ -2515,6 +3131,10 @@ discord_pid_flav() {
             done
             ;;
         discord|discordptb|discordcanary)
+            if [ -n "$resources" ]; then
+                parallel_pid_for_resources "$resources"
+                return $?
+            fi
             for pattern in Discord DiscordPTB discord discordptb discord-canary; do
                 pid="$(pgrep -x "$pattern" 2>/dev/null | head -n1 || true)"
                 [ -n "$pid" ] && { printf '%s\n' "$pid"; return 0; }
@@ -2577,28 +3197,22 @@ discord_pid_in_netns_elevated() {
     [ -n "$pid_ns" ] && [ -n "$netns_ns" ] && [ "$pid_ns" = "$netns_ns" ]
 }
 
-# Mata os clientes paralelos pelo caminho do app.asar: o nome do processo nao basta
-# (o Electron generico nao tem o nome do cliente), mas o cmdline carrega a pasta instalada.
-kill_parallel_by_path() {
-    local sig="${1:-}"
-    [ -n "${FOUND:-}" ] || return 0
-    printf '%s\n' "$FOUND" | while IFS='|' read -r resources flav rest; do
-        case "$flav" in
-            vesktop|equibop|legcord)
-                pkill $sig -f "/$flav/app.asar" 2>/dev/null || true
-                pkill $sig -f "/$flav/arrpc" 2>/dev/null || true
-                ;;
-        esac
-    done
-    return 0
-}
 
 stop_discord() {
     discord_running || return 0
     step "Fechando o Discord"
+    # Flatpak primeiro: o cliente mora no sandbox do bubblewrap e a sessao continua
+    # registrada no `flatpak ps` enquanto o gerenciador de instancia nao a encerra —
+    # pkill por nome no host nao derruba essa sessao (#327). FLATPAK_TUNEL_IDS junto:
+    # o Serein e um cliente de tunel sem asar; sem fecha-lo aqui, o `flatpak run` da
+    # reabertura so ativa a instancia velha (fora do namespace) e a confirmacao do
+    # PID nunca chega. Nenhum kill -9 genérico roda antes deste ponto.
+    local id
+    for id in $(flatpak_ids_em_execucao); do
+        step "Encerrando o Flatpak $id"
+        flatpak kill "$id" >/dev/null 2>&1 || warn "flatpak kill $id nao respondeu; tento de novo na escalada."
+    done
     # Os nomes possiveis do processo do Discord em Linux: maiusculo (Windows), minusculo
-    # (tar.gz/.deb/Flatpak) e os sufixos -canary/-ptb. pkill sem -x pegaria "discord" dentro
-    # de outro comando (ex.: "discordctl"), entao vamos de nome exato, um por um.
     pkill -x Discord 2>/dev/null || true
     pkill -x DiscordPTB 2>/dev/null || true
     pkill -x discord 2>/dev/null || true
@@ -2618,12 +3232,6 @@ stop_discord() {
     if [ -n "$manual_pid" ]; then
         kill "$manual_pid" 2>/dev/null || true
     fi
-    if have flatpak; then
-        local id
-        for id in $FLATPAK_IDS; do
-            flatpak kill "$id" >/dev/null 2>&1 || true
-        done
-    fi
 
     local i
     for i in $(seq 1 40); do
@@ -2631,9 +3239,14 @@ stop_discord() {
         discord_running || return 0
     done
 
-    # SIGTERM nao resolveu em 10s (Discord as vezes segura o fechamento). SIGKILL e o ultimo
-    # recurso: fechar a forca vale mais que travar a injecao com um processo teimoso.
+    # SIGTERM nao resolveu em 10s. Reenvia o TERM pelo gerenciador de instancia antes
+    # de qualquer kill -9 (e o unico canal que alcanca o sandbox) e so entao escala
+    # pelo child-pid associado ao application ID exato.
     step "O Discord nao respondeu, forçando o fechamento"
+    for id in $(flatpak_ids_em_execucao); do
+        flatpak kill "$id" >/dev/null 2>&1 || true
+    done
+    kill_flatpak_apps_forcefully
     pkill -9 -x Discord 2>/dev/null || true
     pkill -9 -x DiscordPTB 2>/dev/null || true
     pkill -9 -x discord 2>/dev/null || true
@@ -2648,7 +3261,14 @@ stop_discord() {
         sleep 0.25
         discord_running || return 0
     done
-    fail "O Discord nao fechou nem com SIGKILL. Feche na mao e rode de novo."
+    # A saida precisa dizer o que sobrou e qual comando roda: em Bazzite a sessao
+    # Flatpak sobrevivia a escalada por nome e o beco sem saida deixou a #327 sem
+    # caminho de recuperacao.
+    id="$(flatpak_ids_em_execucao | head -1)"
+    if [ -n "$id" ]; then
+        fail "O Discord nao fechou nem com SIGKILL: o Flatpak $id ainda consta no 'flatpak ps'. Rode 'flatpak kill $id' e ative de novo."
+    fi
+    fail "O Discord nao fechou nem com SIGKILL. Rode 'pkill -9 -x Discord' numa terminal e tente de novo."
 }
 
 install_patcher() {
@@ -2815,7 +3435,7 @@ EOF
     elif command -v systemctl >/dev/null 2>&1; then
         local real_user="${SUDO_USER:-$USER}"
         step "Registrando o Tor como servico do sistema (via sudo)"
-        sudo tee "/etc/systemd/system/$TOR_SERVICE" >/dev/null <<EOF
+        "$SUDO_BIN" tee "/etc/systemd/system/$TOR_SERVICE" >/dev/null <<EOF
 [Unit]
 Description=GoLiveBypass Tor (SOCKS 127.0.0.1:$TOR_PORT)
 After=network.target
@@ -2830,8 +3450,8 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-        sudo systemctl daemon-reload
-        sudo systemctl enable --now "$TOR_SERVICE" 2>/dev/null || {
+        "$SUDO_BIN" systemctl daemon-reload
+        "$SUDO_BIN" systemctl enable --now "$TOR_SERVICE" 2>/dev/null || {
             warn "Nao consegui ativar o servico do sistema. Tentando nohup."
             LD_LIBRARY_PATH="$TOR_LIBDIR" nohup "$TOR_EXE" -f "$TOR_TORRC" > "$TOR_BASE/tor.log" 2>&1 &
         }
@@ -2866,9 +3486,9 @@ remove_tor() {
         rm -f "$HOME/.config/systemd/user/$TOR_SERVICE"
         systemctl --user daemon-reload 2>/dev/null || true
         if [ -f "/etc/systemd/system/$TOR_SERVICE" ]; then
-            sudo systemctl disable --now "$TOR_SERVICE" 2>/dev/null || true
-            sudo rm -f "/etc/systemd/system/$TOR_SERVICE"
-            sudo systemctl daemon-reload 2>/dev/null || true
+            "$SUDO_BIN" systemctl disable --now "$TOR_SERVICE" 2>/dev/null || true
+            "$SUDO_BIN" rm -f "/etc/systemd/system/$TOR_SERVICE"
+            "$SUDO_BIN" systemctl daemon-reload 2>/dev/null || true
         fi
     fi
     rm -f "$HOME/.config/systemd/user/$TOR_SERVICE"
@@ -2974,7 +3594,14 @@ ensure_wireguard_conf() {
 setup_wireguard_netns() {
     have ip || fail "Comando 'ip' nao encontrado no sistema."
     have wg || fail "Comando 'wg' (wireguard-tools) nao encontrado. Instale com seu gerenciador de pacotes."
-    wireguard_module_loaded || fail "Modulo WireGuard nao esta carregado; ativacao cancelada antes de criar o namespace."
+
+    # O device vem do modulo do kernel quando ele esta carregado e do wireguard-go quando o
+    # kernel nao tem modulo nenhum (upgrade de kernel sem reinicio, por exemplo).
+    local device_mode device_note
+    device_mode="$(wireguard_device_mode)"
+    if [ "$device_mode" = "none" ]; then
+        fail "Sem device WireGuard possivel neste kernel: o modulo nao esta disponivel e o WireGuard de usuario (wireguard-go + /dev/net/tun) tambem nao. Ativacao cancelada antes de criar o namespace."
+    fi
 
     ensure_wireguard_conf
     local wg_file="$INSTALL_DIR/wireguard.conf"
@@ -2997,12 +3624,25 @@ setup_wireguard_netns() {
     WIREGUARD_TMP_CONF="$tmp_conf"
     grep -vE "^(Address|DNS)" "$wg_file" > "$tmp_conf"
 
-    elevate ip link add dev "$WG_IF" type wireguard
-    elevate wg setconf "$WG_IF" "$tmp_conf"
-    rm -f "$tmp_conf"
-    WIREGUARD_TMP_CONF=""
+    if [ "$device_mode" = "kernel" ]; then
+        elevate ip link add dev "$WG_IF" type wireguard
+        elevate wg setconf "$WG_IF" "$tmp_conf"
+        rm -f "$tmp_conf"
+        WIREGUARD_TMP_CONF=""
 
-    elevate ip link set "$WG_IF" netns "$NETNS_NAME"
+        elevate ip link set "$WG_IF" netns "$NETNS_NAME"
+    else
+        # O daemon cria o TUN no uplink e o move para o namespace, preservando seu
+        # socket UDP fora do tunel. O setconf usa o socket UAPI do wireguard-go.
+        if ! start_wireguard_userspace; then
+            rm -f "$tmp_conf"
+            WIREGUARD_TMP_CONF=""
+            fail "Nao consegui iniciar o WireGuard de usuario no namespace '$NETNS_NAME'."
+        fi
+        elevate ip netns exec "$NETNS_NAME" wg setconf "$WG_IF" "$tmp_conf"
+        rm -f "$tmp_conf"
+        WIREGUARD_TMP_CONF=""
+    fi
 
     local addr
     addr="$(grep -E "^Address" "$wg_file" | cut -d= -f2 | awk -F, '{print $1}' | tr -d ' ')"
@@ -3015,19 +3655,19 @@ setup_wireguard_netns() {
 
     elevate mkdir -p "/etc/netns/$NETNS_NAME"
     printf 'nameserver 10.2.0.1\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' | elevate tee "/etc/netns/$NETNS_NAME/resolv.conf" >/dev/null
-    ok "Tunel WireGuard 100% ativo no namespace '$NETNS_NAME'."
+    device_note=""
+    [ "$device_mode" = "kernel" ] || device_note=" (WireGuard de usuario: $WIREGUARD_GO_BINARY)"
+    ok "Tunel WireGuard 100% ativo no namespace '$NETNS_NAME'$device_note."
 }
 
 # Reaplica somente o peer na interface existente. O namespace, a interface e o processo do
 # Discord permanecem vivos; isso permite que a proxima chamada use a nova rota sem derrubar a
-# chamada atual. Se a interface ainda nao existir, o chamador deve usar a instalacao normal.
+# chamada atual. As checagens que nao exigem root (ip/wg/namespace) ficam no chamador, que
+# autoriza a elevacao depois delas para nao pedir senha quando nao ha o que trocar.
 refresh_wireguard_route() {
-    have ip || fail "Comando 'ip' nao encontrado no sistema."
-    have wg || fail "Comando 'wg' (wireguard-tools) nao encontrado."
-    if ! netns_exists; then
-        fail "Namespace WireGuard '$NETNS_NAME' nao esta ativo."
-    fi
-    if ! elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" >/dev/null 2>&1; then
+    # O stderr fica visivel de proposito: e nele que os eventos de elevacao viajam
+    # (a GUI depende deles para o prompt) e e ele que explica uma recusa real.
+    if ! elevate ip netns exec "$NETNS_NAME" wg show "$WG_IF" >/dev/null; then
         fail "Interface WireGuard '$WG_IF' nao esta ativa."
     fi
 
@@ -3063,6 +3703,14 @@ refresh_wireguard_route() {
     done <<EOF
 $addresses
 EOF
+    # O `addr flush` acima derruba junto a rota default do namespace (o kernel a
+    # remove com o endereco que a originou): sem re-adiciona-la aqui, trocar de rota
+    # deixa o cliente SEM internet dentro do namespace — upload e stream morrem
+    # depois de otimizar/trocar de rota. `replace` e idempotente, entao serve
+    # tambem quando a rota sobreviveu ao flush.
+    if ! elevate ip -n "$NETNS_NAME" route replace default dev "$WG_IF"; then
+        fail "Nao consegui restaurar a rota default do namespace depois de trocar a rota."
+    fi
     ok "Rota WireGuard atualizada sem reiniciar o Discord."
 }
 
@@ -3114,6 +3762,10 @@ wait_for_tunnel_startup() {
 }
 
 teardown_wireguard_netns() {
+    # O daemon de usuario precisa morrer junto: o namespace sai, o device deixa de existir e
+    # o processo ficaria orfao segurando o socket UAPI. Vale tambem para rollback de ativacao
+    # (namespace parcial) e para o uninstall com o namespace ja removido.
+    stop_wireguard_userspace
     if netns_exists; then
         step "Removendo namespace de rede '$NETNS_NAME' e interface WireGuard"
         if ! elevate ip netns del "$NETNS_NAME" 2>/dev/null; then
@@ -3202,6 +3854,7 @@ target_can_launch() {
 select_launch_target() {
     local found="${1:-}" resources flav detect id escolhido=""
     [ -n "$found" ] || return 0
+
     # Alvo manual (fallback): a escolha explicita do usuario vence a heuristica, inclusive
     # quando ela nao tem resources para comparar (flatpak, snap e AppImage ficam sem esse
     # caminho). A linha continua no FOUND para o status e a parada a cobrirem.
@@ -3211,7 +3864,6 @@ select_launch_target() {
         printf '%s\n' "$manual" | head -1
         return 0
     fi
-
 
     while IFS='|' read -r resources flav detect id; do
         [ -n "$resources" ] || continue
@@ -3255,10 +3907,17 @@ start_discord() {
     local discord_log_dir="$INSTALL_DIR/logs"
     local discord_log="$discord_log_dir/discord-vpn-$(date +%Y%m%d-%H%M%S).log"
     mkdir -p "$discord_log_dir"
+    # Caminho global: a mensagem de falha da ativacao aponta o log certo e cola a
+    # ultima saida real do launcher (flatpak/bwrap), que e o que o usuario precisa ver.
+    START_DISCORD_LOG="$discord_log"
 
     # Nao inventar wayland-1: em muitas sessoes o socket e wayland-0, e um
     # valor falso faz o Electron cair silenciosamente em XWayland.
-    local run_env="HOME=$_USER_HOME USER=$run_user LOGNAME=$run_user DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority} XDG_RUNTIME_DIR=$runtime_dir DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus} PULSE_SERVER=${PULSE_SERVER:-unix:$runtime_dir/pulse/native} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-} XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-} XDG_SESSION_DESKTOP=${XDG_SESSION_DESKTOP:-} DESKTOP_SESSION=${DESKTOP_SESSION:-} GDK_BACKEND=${GDK_BACKEND:-} QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-} PIPEWIRE_REMOTE=${PIPEWIRE_REMOTE:-} ELECTRON_OZONE_PLATFORM_HINT=${ELECTRON_OZONE_PLATFORM_HINT:-auto}"
+    # PATH e o do proprio script (onde o scan achou Discord/vesktop/sh): a unidade
+    # systemd e o sudo interno partem de um PATH minimo que no NixOS nao contem
+    # nem o sh nem os wrappers do nixpkgs. Sem ele, alvos relativos (vesktop,
+    # flatpak, snap) e o proprio `sh -c` nao resolvem dentro do namespace.
+    local run_env="PATH=$PATH HOME=$_USER_HOME USER=$run_user LOGNAME=$run_user DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority} XDG_RUNTIME_DIR=$runtime_dir DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus} PULSE_SERVER=${PULSE_SERVER:-unix:$runtime_dir/pulse/native} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-} XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-} XDG_SESSION_DESKTOP=${XDG_SESSION_DESKTOP:-} DESKTOP_SESSION=${DESKTOP_SESSION:-} GDK_BACKEND=${GDK_BACKEND:-} QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-} PIPEWIRE_REMOTE=${PIPEWIRE_REMOTE:-} ELECTRON_OZONE_PLATFORM_HINT=${ELECTRON_OZONE_PLATFORM_HINT:-auto}"
     printf '  Backend grafico: %s | Wayland=%s | portal=%s\n' "$(graphics_backend)" "${WAYLAND_DISPLAY:-nenhum}" "$(graphics_portal_state)" >&2
     printf '[%s] backend=%s wayland=%s session=%s portal=%s\n' "$(date -Is)" "$(graphics_backend)" "${WAYLAND_DISPLAY:-}" "${XDG_SESSION_TYPE:-}" "$(graphics_portal_state)" >>"$discord_log"
 
@@ -3285,11 +3944,11 @@ start_discord() {
         printf '[%s] launch=manual kind=%s key=%s\n' "$(date -Is)" "$MANUAL_KIND" "$MANUAL_KEY" >>"$discord_log"
         if [ "${START_DISCORD_HOST_ONLY:-0}" -eq 1 ]; then
             printf '[%s] launch=host-fallback\n' "$(date -Is)" >>"$discord_log"
-            run_user_host_command detached env $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
+            run_user_host_command detached "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
         elif have setsid; then
-            run_user_netns_command detached env $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
+            run_user_netns_command detached "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
         else
-            run_user_netns_command background env $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
+            run_user_netns_command background "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh "$@" >>"$discord_log" 2>&1 </dev/null
         fi
         printf '  Log do Discord: %s\n' "$discord_log" >&2
         return 0
@@ -3340,14 +3999,14 @@ start_discord() {
         # sem colocar um processo dentro de uma rota que nao foi validada.
         printf '[%s] launch=host-fallback\n' "$(date -Is)" >>"$discord_log"
         if have setsid; then
-            run_user_host_command detached env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+            run_user_host_command detached "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
         else
-            run_user_host_command background env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+            run_user_host_command background "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
         fi
         printf '  Log do Discord: %s\n' "$discord_log" >&2
         return 0
     fi
-
+    local lancamento_rc=0
     if [ -n "$id" ]; then
         # Flatpak depende do barramento e do portal da sessão gráfica do usuário.
         # Uma unidade transitória do systemd do sistema (o caminho anterior) inicia
@@ -3356,9 +4015,9 @@ start_discord() {
         # ambiente Wayland/DBus e ainda mantém o tráfego isolado no WireGuard.
         printf '[%s] launch=flatpak-direct app=%s\n' "$(date -Is)" "$id" >>"$discord_log"
         if have setsid; then
-            run_user_netns_command detached env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+            run_user_netns_command detached "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null || lancamento_rc=$?
         else
-            run_user_netns_command background env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+            run_user_netns_command background "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null || lancamento_rc=$?
         fi
     elif have systemd-run; then
         # O arquivo captura o stderr/stdout do cliente para diferenciar crash,
@@ -3369,7 +4028,7 @@ start_discord() {
         # processo destacado tentava le-la tarde demais, deixando o Discord
         # fechado apesar de o tunel estar ativo.
         run_user_systemd_command "discord-vpn-$(date +%s)" \
-            "HOME=$_USER_HOME" "USER=$run_user" "LOGNAME=$run_user" "DISPLAY=${DISPLAY:-}" \
+            "PATH=$PATH" "HOME=$_USER_HOME" "USER=$run_user" "LOGNAME=$run_user" "DISPLAY=${DISPLAY:-}" \
             "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" "XAUTHORITY=${XAUTHORITY:-$_USER_HOME/.Xauthority}" \
             "XDG_RUNTIME_DIR=$runtime_dir" "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$run_uid/bus}" \
             "PULSE_SERVER=${PULSE_SERVER:-unix:$runtime_dir/pulse/native}" "XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-}" \
@@ -3377,11 +4036,17 @@ start_discord() {
             "DESKTOP_SESSION=${DESKTOP_SESSION:-}" "GDK_BACKEND=${GDK_BACKEND:-}" \
             "QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-}" "PIPEWIRE_REMOTE=${PIPEWIRE_REMOTE:-}" \
             "ELECTRON_OZONE_PLATFORM_HINT=${ELECTRON_OZONE_PLATFORM_HINT:-auto}" \
-            sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1
+            sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 || lancamento_rc=$?
     else
-        run_user_netns_command background env $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null
+        run_user_netns_command background "$ENV_BINARY" $run_env sh -c 'exec "$@"' sh $target_cmd >>"$discord_log" 2>&1 </dev/null || lancamento_rc=$?
+    fi
+    if [ "$lancamento_rc" -ne 0 ]; then
+        # Registrado sem data entre colchetes no extrato final: a mensagem de falha
+        # da ativacao cola esta linha como a causa observada.
+        printf 'launch=falhou rc=%s alvo=%s\n' "$lancamento_rc" "$target_cmd" >>"$discord_log"
     fi
     printf '  Log do Discord: %s\n' "$discord_log" >&2
+    return "$lancamento_rc"
 }
 
 # O launcher confirma apenas que o processo foi solicitado; o Electron pode falhar
@@ -3392,15 +4057,67 @@ wait_discord_started() {
     resources="$(printf '%s' "$linha" | cut -d'|' -f1)"
     flav="$(printf '%s' "$linha" | cut -d'|' -f2)"
     flatpak_id="$(printf '%s' "$linha" | cut -d'|' -f4)"
+    # Motivo observado da espera: a mensagem de falha da ativacao usa isto para
+    # distinguir "o launcher nao abriu nada" de "uma instancia ficou fora do
+    # namespace" e dizer o proximo passo em vez de entregar um beco sem saida (#327).
+    WAIT_DISCORD_MOTIVO="sem-processo"
     while [ "$tentativas" -gt 0 ]; do
+        WAIT_DISCORD_MOTIVO="sem-processo"
         pid="$(discord_pid_flav "$flav" "$flatpak_id" "$resources" 2>/dev/null || true)"
-        if [ -n "$pid" ] && discord_pid_in_netns_elevated "$pid"; then
-            return 0
+        if [ -n "$pid" ]; then
+            if discord_pid_in_netns_elevated "$pid"; then
+                WAIT_DISCORD_MOTIVO="confirmado"
+                return 0
+            fi
+            # O processo existe, mas fora do namespace: instancia antiga que ficou
+            # fora do tunel (o `flatpak run` so reativaria ela, nunca criaria outra).
+            WAIT_DISCORD_MOTIVO="fora-do-namespace"
         fi
         tentativas=$((tentativas - 1))
         [ "$tentativas" -gt 0 ] && sleep 0.5
     done
     return 1
+}
+
+# Mensagem acionavel da ativacao quando o cliente nao apareceu no namespace. A GUI
+# mostra so as ultimas linhas do stderr, entao motivo, ultima saida do launcher, log
+# e proximo passo precisam caber nesta linha unica: "nao iniciou" sem saida nao pode
+# se repetir (#327/#330).
+falha_lancamento_mensagem() {
+    local linha="${1:-}" motivo="${WAIT_DISCORD_MOTIVO:-sem-processo}" id="" log="${START_DISCORD_LOG:-}" erro="" acao=""
+    case "$linha" in
+        *'|'*) id="$(printf '%s' "$linha" | cut -d'|' -f4)" ;;
+    esac
+    if [ -n "$log" ] && [ -f "$log" ]; then
+        # As linhas proprias do script trazem data entre colchetes ou marcadores
+        # launch=/backend=; o que sobra e a saida real do launcher (flatpak/bwrap/
+        # Electron), que e a causa visivel. Sem saida nenhuma, o proprio marcador
+        # de falha (rc/motivo) vira a causa.
+        erro="$(tail -n 20 "$log" 2>/dev/null | sed -E 's/^\[[^]]*\] //' \
+            | grep -Ev '^(backend=|launch=|$)' \
+            | tail -1 | tr -d '\r' | cut -c1-200 || true)"
+        if [ -z "$erro" ]; then
+            erro="$(grep -E 'launch=falhou' "$log" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-200 || true)"
+        fi
+    fi
+    case "$motivo" in
+        fora-do-namespace)
+            if [ -n "$id" ]; then
+                acao="uma instancia do $id ficou fora do namespace; rode 'flatpak kill $id' e ative de novo"
+            else
+                acao="um processo antigo ficou fora do namespace; feche o Discord e ative de novo"
+            fi
+            ;;
+        *)
+            if [ -n "$id" ]; then
+                acao="rode 'flatpak run $id' fora do bypass para ver o erro do sandbox, ou use o Discord nativo"
+            else
+                acao="abra o Discord fora do bypass para ver o erro, ou use outro Discord instalado"
+            fi
+            ;;
+    esac
+    printf 'Discord nao iniciou dentro do namespace WireGuard: %s; saida do launcher: %s; log: %s.' \
+        "$acao" "${erro:-nenhuma}" "${log:-nao gerado}"
 }
 
 printf '\n  %sGoLiveBypass standalone%s\n' "$C_CYAN" "$C_OFF" >&2
@@ -3577,12 +4294,31 @@ if [ "$MODE" = "install" ]; then
     preflight_ok="$(printf '%s' "$preflight_now" | sed -n 's/.*"ok":\(true\|false\).*/\1/p')"
     if [ "$preflight_ok" != "true" ]; then
         preflight_hint="$(printf '%s' "$preflight_now" | sed -n 's/.*"installCommand":"\([^"]*\)".*/\1/p')"
+        # O modulo ausente tem prioridade sobre o texto de dependencias: ele nao se resolve
+        # instalando pacote nenhum.
+        preflight_kernel="$(printf '%s' "$preflight_now" | sed -n 's/.*"wireguard":"\([^"]*\)".*/\1/p')"
+        if [ "$preflight_kernel" = "missing" ]; then
+            preflight_running="$(printf '%s' "$preflight_now" | sed -n 's/.*"running":"\([^"]*\)".*/\1/p')"
+            preflight_modules="$(printf '%s' "$preflight_now" | sed -n 's/.*"modulesInstalled":\(true\|false\).*/\1/p')"
+            if [ "$preflight_modules" = "false" ]; then
+                fail "O kernel Linux em execucao (${preflight_running:-atual}) nao possui os modulos instalados. Reinicie no kernel instalado, instale os modulos correspondentes ou instale o wireguard-go (WireGuard de usuario) antes de ativar."
+            fi
+            fail "O modulo WireGuard nao esta disponivel no kernel Linux em execucao (${preflight_running:-atual}). Instale ou ative o modulo WireGuard, ou instale o wireguard-go (WireGuard de usuario), antes de ativar."
+        fi
         fail "Preflight Linux reprovado. Instale as dependencias e tente novamente.${preflight_hint:+ Comando: $preflight_hint}"
     fi
 fi
 
 
 if [ "$MODE" = "refresh" ]; then
+    # Primeiro o que nao exige root: sem namespace ativo nao existe troca de rota,
+    # e pedir a senha so para descobrir isso era o comportamento antigo.
+    have ip || fail "Comando 'ip' nao encontrado no sistema."
+    have wg || fail "Comando 'wg' (wireguard-tools) nao encontrado."
+    netns_exists || fail "Namespace WireGuard '$NETNS_NAME' nao esta ativo."
+    # A troca reaplica peer, enderecos e rotas: autoriza uma vez, como a ativacao,
+    # com os eventos visiveis para a GUI decidir o prompt.
+    authorize_install_elevation || fail "Nao foi possivel autorizar a troca de rota (resultado ${ELEVATION_RESULT})."
     refresh_wireguard_route
     log_wireguard_readiness
     exit 0
@@ -3624,9 +4360,9 @@ if [ "$MODE" = "status" ]; then
     printf '  [Tunel WireGuard do Discord]\n' >&2
     if netns_exists; then
         printf '  [✓] Namespace "%s" ATIVO.\n' "$NETNS_NAME" >&2
-        if [ "$(id -u)" -eq 0 ] || (have sudo && sudo -n true 2>/dev/null); then
-            vpn_ip="$(sudo ip netns exec "$NETNS_NAME" curl -s -m 4 https://api.ipify.org 2>/dev/null || echo "N/A")"
-            vpn_loc="$(sudo ip netns exec "$NETNS_NAME" curl -s -m 4 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^loc=' | cut -d= -f2 || echo "N/A")"
+        if [ "$(id -u)" -eq 0 ] || (have sudo && "$SUDO_BIN" -n true 2>/dev/null); then
+            vpn_ip="$("$SUDO_BIN" ip netns exec "$NETNS_NAME" curl -s -m 4 https://api.ipify.org 2>/dev/null || echo "N/A")"
+            vpn_loc="$("$SUDO_BIN" ip netns exec "$NETNS_NAME" curl -s -m 4 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^loc=' | cut -d= -f2 || echo "N/A")"
             printf '    IP no Discord: %s\n' "$vpn_ip" >&2
             printf '    Pais         : %s\n' "$vpn_loc" >&2
         fi
@@ -3709,7 +4445,7 @@ authorize_install_elevation || fail "Nao foi possivel autorizar a ativacao Linux
 # troca segura para o usuario que deve possuir a sessao grafica.
 ACTIVATION_RUN_USER="${SUDO_USER:-$(id -un 2>/dev/null || whoami)}"
 prepare_run_user "$ACTIVATION_RUN_USER" || fail "Nao foi possivel preparar a execucao segura do Discord. O Discord nao foi encerrado."
-ensure_wireguard_module || fail "Nao foi possivel preparar o modulo WireGuard. O Discord nao foi encerrado."
+ensure_wireguard_device || fail "Nao foi possivel preparar o WireGuard (modulo do kernel ou wireguard-go). O Discord nao foi encerrado."
 # A limpeza legada apaga recursos e configuracoes antigas; so pode acontecer
 # depois de a autorizacao da ativacao ter sido concluida.
 if [ "$CLEANUP_LEGACY" -eq 1 ]; then
@@ -3733,6 +4469,9 @@ stop_discord
 while IFS='|' read -r resources flav detect id; do
     state="$(injection_state "$resources")"
     printf '  %s (%s): %s\n' "$resources" "$flav" "$state" >&2
+    case "$detect" in
+        flatpak-nativo) printf '  %sCliente nativo de flatpak: apenas o tunel, sem injecao de app.asar.%s\n' "$C_DIM" "$C_OFF" >&2 ;;
+    esac
 
     if [ "$state" = "outromod" ]; then
         # Desde a migracao para WireGuard Per-App VPN o bypass nao toca mais no app.asar de
@@ -3791,7 +4530,14 @@ log_wireguard_readiness
 
 # Modo portatil: reabre o Discord ja com o bypass ativo (mesmo comportamento do app do Windows).
 # head -1 em vez de pipe para o while: nohup num subshell morreria junto com ele.
-start_discord "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND}" | head -1)"
+# O launcher pode recusar o comando antes de existir qualquer processo (sem binario,
+# flatpak sem ID); falhar aqui evita esgotar a espera de 20s e entrega a mesma causa.
+if ! start_discord "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND}" | head -1)"; then
+    warn "O WireGuard ficou pronto, mas o launcher do Discord recusou o comando."
+    stop_discord || true
+    teardown_wireguard_netns
+    fail "$(falha_lancamento_mensagem "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND}" | head -1)")"
+fi
 if ! wait_discord_started "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND}" | head -1)"; then
     warn "O WireGuard ficou pronto, mas o processo do Discord nao iniciou."
     # Se o launcher chegou a criar um sandbox, mas o reconhecimento expirou, feche-o
@@ -3799,7 +4545,7 @@ if ! wait_discord_started "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND
     # interface WireGuard sem o nome discord-vpn.
     stop_discord || true
     teardown_wireguard_netns
-    fail "Discord nao iniciou dentro do namespace WireGuard. Verifique o log em $INSTALL_DIR/logs."
+    fail "$(falha_lancamento_mensagem "$(printf '%s\n' "${ACTIVATION_ROLLBACK_TARGET:-$FOUND}" | head -1)")"
 fi
 # A sessao ja esta confirmada dentro do namespace; a partir daqui o trap deve
 # apenas limpar segredos/temporarios e nunca reabrir o cliente fora do tunel.
@@ -3818,10 +4564,11 @@ esac
 # O deploy do flatpak e refeito do zero a cada atualizacao, e a injecao mora dentro dele. Nao
 # da para impedir isso de fora, e nem o proprio bypass consegue se remendar depois: dentro do
 # sandbox a pasta do app e montada somente leitura. So resta avisar antes de acontecer.
-case " $FOUND " in
-    *"/flatpak/app/"*)
-        printf '  %sEste Discord e flatpak: um "flatpak update" desfaz a injecao. Quando isso%s\n' "$C_DIM" "$C_OFF" >&2
-        printf '  %sacontecer, rode este instalador de novo.%s\n' "$C_DIM" "$C_OFF" >&2 ;;
-esac
+# O aviso so diz respeito a quem tem injecao dentro do deploy: um registro
+# "flatpak-nativo" (sem asar) e sobrevive ao update sozinho.
+if printf '%s\n' "$FOUND" | grep '/flatpak/app/' | grep -v '|flatpak-nativo|' | grep -q .; then
+    printf '  %sEste Discord e flatpak: um "flatpak update" desfaz a injecao. Quando isso%s\n' "$C_DIM" "$C_OFF" >&2
+    printf '  %sacontecer, rode este instalador de novo.%s\n' "$C_DIM" "$C_OFF" >&2
+fi
 printf '  %sRegistro em %s/golivebypass.log%s\n' "$C_DIM" "$INSTALL_DIR" "$C_OFF" >&2
 printf '  %sPara desfazer: ./golivebypass-standalone.sh --uninstall%s\n\n' "$C_DIM" "$C_OFF" >&2

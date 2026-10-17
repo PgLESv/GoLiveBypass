@@ -20,7 +20,8 @@ const workerHost = vi.hoisted(() => {
     type Reply =
         | { kind: "stdout"; stdout: string | null }
         | { kind: "later"; delayMs: number; stdout: string | null }
-        | { kind: "never"; };
+        | { kind: "sequence"; stdout: Array<string | null> }
+        | { kind: "never" };
 
     const state = {
         reply: { kind: "stdout", stdout: null } as Reply,
@@ -56,7 +57,8 @@ const workerHost = vi.hoisted(() => {
             this.posted.push(request);
             const reply = state.reply;
             if (reply.kind === "never") return;
-            const deliver = () => this.emit("message", { token: request.token, stdout: reply.stdout });
+            const stdout = reply.kind === "sequence" ? (reply.stdout.shift() ?? null) : reply.stdout;
+            const deliver = () => this.emit("message", { token: request.token, stdout });
             if (reply.kind === "later") setTimeout(deliver, reply.delayMs);
             else deliver();
         }
@@ -78,7 +80,7 @@ vi.mock("node:worker_threads", () => ({ Worker: workerHost.FakeWorker }));
 
 import { disposeWireSockSnapshotWorker } from "../../goLiveBypass/vpn-snapshot-worker";
 import { PluginVpnController } from "../../goLiveBypass/vpn-controller";
-import { inspectWireSock, inspectWireSockAsync } from "../../goLiveBypass/vpn-windows";
+import { inspectWireSock, inspectWireSockAsync, inspectWireSockUntilReliableAsync } from "../../goLiveBypass/vpn-windows";
 
 // A consulta do WireSock no Windows é um `powershell.exe`. Medido na VM (win11, 6 vCPU) com o
 // painel aberto: ~0,55s de janela parada a cada leitura do painel (5s), e tornar só a espera
@@ -304,5 +306,17 @@ describe("inspeção do WireSock fora do processo principal", () => {
         expect(inspectWireSock(PLUGIN_CONFIG)).toMatchObject({ active: true, owned: true });
         expect(scriptsRunInProcess()).toHaveLength(1);
         expect(workerHost.state.instances).toHaveLength(0);
+    });
+    it("escapa de uma primeira leitura incompleta quando a segunda é confiável", async () => {
+        vi.useFakeTimers();
+        const payload = snapshot([{ pid: 4242, commandLine: null }], 4242);
+        workerHost.state.reply = { kind: "sequence", stdout: [null, payload] };
+
+        const pending = inspectWireSockUntilReliableAsync(PLUGIN_CONFIG);
+        await vi.runAllTimersAsync();
+
+        await expect(pending).resolves.toMatchObject({ reliable: true, active: true, owned: true });
+        expect(workerHost.state.instances).toHaveLength(1);
+        expect(workerHost.state.instances[0].posted).toHaveLength(2);
     });
 });

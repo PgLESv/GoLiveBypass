@@ -1,5 +1,5 @@
 import {
-  app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, powerMonitor, net, shell,
+  app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, nativeTheme, powerMonitor, net, shell,
 } from 'electron';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -9,17 +9,22 @@ import { importConfig, readConfigState } from './config/store';
 import { configPath, settingsPath, sessionDir, appDataDir } from './paths';
 import { readDefaultRoute, publicIp, exitInfo } from './tunnel/collect';
 import { deriveStateFromRoute } from './tunnel/status';
-import { restartDiscord } from './discord/restart';
+import { restartDiscord, isDiscordRunning } from './discord/restart';
+import { DeferredDeactivation } from './tunnel/deferred';
+import { withDeadline } from './shutdown';
 import { defaultDiscordCandidates, pickDiscordPath } from './discord/locate';
 import { injectVencord, AppManagementDenied, canModifyApp } from './vencord/inject';
 import { activate } from './tunnel/up';
 import { deactivate } from './tunnel/down';
 import { runActivation, runDeactivation } from './tunnel/activation';
 import { cleanupStaleV6Rejects } from './privileged/helper';
-import { ProtonFetcher } from './proton/fetch';
+import { ProtonFetcher, type ProtonFetchOpts, type ProtonFetchResult, type CatalogRoute, type FetchMode, type ProtonPlan } from './proton/fetch';
+import { shouldAskRoutePreference } from './proton/route-prompt';
+import { FailoverMonitor } from './tunnel/failover';
+import { pingThroughTunnel } from './tunnel/traffic';
 import { readSavedAccount, clearSavedAccount } from './proton/account';
 import { checkForUpdate, downloadAndInstall, type UpdateInfo, type PendingUpdate } from './updater';
-import type { AppSettings, TunnelState } from '../shared/types';
+import type { AppSettings, UiSettings, ThemeChoice } from '../shared/types';
 
 const home   = os.homedir();
 const user   = os.userInfo().username;
@@ -79,12 +84,103 @@ function storeConfig(rawText: string) {
 
 // ─── Operações do túnel ──────────────────────────────────────────────────────
 
-type TunnelUiState = 'active' | 'inactive' | 'activating' | 'deactivating';
+type TunnelUiState = 'active' | 'inactive' | 'pending' | 'activating' | 'deactivating';
 let tunnelOp: Promise<unknown> | null = null;
 
-function pushState(state?: TunnelUiState) {
-  sendToWindow('tunnel:state', { state: state ?? (tunnelActive ? 'active' : 'inactive') });
+function currentUiState(): TunnelUiState {
+  if (!tunnelActive) return 'inactive';
+  return deferredOff.pending ? 'pending' : 'active';
 }
+
+function pushState(state?: TunnelUiState) {
+  const s = state ?? currentUiState();
+  sendToWindow('tunnel:state', { state: s });
+  syncMonitors(s);
+}
+
+// ─── Tráfego e troca automática de rota ──────────────────────────────────────
+
+let trafficTimer: NodeJS.Timeout | null = null;
+let failoverTimer: NodeJS.Timeout | null = null;
+
+async function trafficTick() {
+  sendToWindow('tunnel:traffic', { pingMs: await pingThroughTunnel() });
+}
+
+const failover = new FailoverMonitor({
+  probe: async () => (await exitInfo(1)) !== null,
+  onRouteDown: switchRoute,
+});
+
+function failoverEnabled(): boolean {
+  const s = loadSettings();
+  return s.autoFailover !== false && (s.connectionMode ?? 'proton') === 'proton'
+    && s.protonRoutePreference !== 'manual' && !!readSavedAccount(sessionDir(home));
+}
+
+function syncMonitors(s: TunnelUiState) {
+  const on = s === 'active' || s === 'pending';
+  if (on && !trafficTimer) {
+    trafficTimer = setInterval(() => { void trafficTick().catch(() => {}); }, 10_000);
+    void trafficTick().catch(() => {});
+  } else if (!on && s !== 'activating' && s !== 'deactivating' && trafficTimer) {
+    clearInterval(trafficTimer);
+    trafficTimer = null;
+  }
+  if (s === 'active' && !failoverTimer) {
+    failover.reset();
+    failoverTimer = setInterval(() => { if (failoverEnabled() && !tunnelOp) void failover.tick().catch(() => {}); }, 15_000);
+  } else if (s !== 'active' && failoverTimer) {
+    clearInterval(failoverTimer);
+    failoverTimer = null;
+  }
+}
+
+/** A rota Proton parou de responder: gera a próxima melhor e troca o túnel sem reiniciar o Discord. */
+async function switchRoute(): Promise<void> {
+  const account = readSavedAccount(sessionDir(home));
+  if (!account) return;
+  const current = loadSettings().protonServer?.server;
+  sendToWindow('log', `A rota ${current ?? 'atual'} parou de responder; procurando outra…`);
+  await exclusive(async () => {
+    const r = await runFetch({ username: account.username, mode: 'auto', exclude: current ? [current] : [] });
+    if (!r.ok) { sendToWindow('log', `Troca de rota falhou: ${r.error}${r.detail ? ` — ${r.detail}` : ''}`); return; }
+    pushState('activating');
+    const opts = await activationOpts();
+    await runDeactivation(opts);
+    const up = await runActivation(opts);
+    tunnelActive = up.ok;
+    if (up.ok) sendToWindow('log', `Rota trocada para ${r.chosen?.server ?? 'outra'}; o Discord reconecta sozinho.`);
+    else {
+      saveSettings({ lastTunnelState: 'inactive' });
+      sendToWindow('log', `Falha ao subir a rota nova: ${up.error}${up.detail ? ` — ${up.detail}` : ''}`);
+    }
+    updateTray();
+    pushState();
+    sendToWindow('proton:route', loadSettings().protonServer ?? null);
+  });
+}
+
+/** Desativar com o Discord aberto: o túnel cai quando ele fechar. */
+const deferredOff = new DeferredDeactivation({
+  isDiscordRunning,
+  onDiscordClosed: async () => {
+    const r = await exclusive(async () => {
+      pushState('deactivating');
+      const d = await runDeactivation(await activationOpts());
+      if (d.ok) {
+        tunnelActive = false;
+        sendToWindow('log', 'Discord fechado: túnel desligado e rede restaurada.');
+      } else {
+        sendToWindow('log', `Falha ao desligar o túnel depois de o Discord fechar: ${d.error}${d.detail ? ` — ${d.detail}` : ''}`);
+      }
+      updateTray();
+      pushState();
+    });
+    // Outra operação no meio: tenta de novo na próxima volta
+    if (r && typeof r === 'object' && 'error' in r && r.error === 'busy' && tunnelActive) deferredOff.start();
+  },
+});
 
 /** Uma ativação/desativação por vez; um pedido durante outra operação recebe 'busy'. */
 async function exclusive<T>(fn: () => Promise<T>): Promise<T | { error: 'busy' }> {
@@ -122,7 +218,10 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   isQuitting = true;
-  try { await deactivateBeforeQuit(); } finally { app.exit(0); }
+  deferredOff.cancel();
+  try {
+    if (await withDeadline(deactivateBeforeQuit()) === 'timeout') console.error('Limpeza do Sair passou do prazo; encerrando mesmo assim.');
+  } finally { app.exit(0); }
 }
 
 async function waitForNetwork(timeoutMs: number): Promise<void> {
@@ -137,7 +236,7 @@ async function waitForNetwork(timeoutMs: number): Promise<void> {
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
     {
-      label: tunnelActive ? 'Bypass: ATIVO' : 'Bypass: inativo',
+      label: !tunnelActive ? 'Bypass: inativo' : deferredOff.pending ? 'Bypass: desliga ao fechar o Discord' : 'Bypass: ATIVO',
       enabled: false,
     },
     { type: 'separator' },
@@ -176,8 +275,11 @@ function createTray() {
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 420,
-    height: 640,
-    resizable: false,
+    height: 680,
+    minWidth: 380,
+    minHeight: 520,
+    // Aberto no login, o app sobe só na barra de menu
+    show: !app.getLoginItemSettings().wasOpenedAtLogin,
     titleBarStyle: 'hiddenInset',
     vibrancy: 'under-window',
     visualEffectState: 'active',
@@ -188,6 +290,12 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+
+  // Links externos (créditos, CAPTCHA) abrem no navegador, nunca numa janela do app
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https:\/\//i.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
 
   // Fechar esconde para tray, não encerra o app
   mainWindow.on('close', (e) => {
@@ -231,7 +339,6 @@ async function tryInjectVencord(): Promise<InjectOutcome> {
 
 // ─── IPC handlers ────────────────────────────────────────────────────────────
 
-const protonFetcher = new ProtonFetcher();
 let pendingUpdate: (PendingUpdate & { version: string }) | null = null;
 
 /** Guarda a última checagem: some se a release sumir, troca se sair outra. */
@@ -242,14 +349,61 @@ function rememberUpdate(info: UpdateInfo): UpdateInfo {
   return info;
 }
 let protonFetching = false;
+const routesPath = () => path.join(appDataDir(home), 'proton-routes.json');
+
+function readRoutes(): CatalogRoute[] {
+  try { return JSON.parse(fs.readFileSync(routesPath(), 'utf8')).routes ?? []; } catch { return []; }
+}
+
+/**
+ * Roda o proton-confgen e, se gerou perfil, grava com a reescrita split tunnel.
+ * Um ProtonFetcher por chamada: a troca automática pode rodar junto da tela.
+ */
+function runFetch(o: Omit<ProtonFetchOpts, 'binDir' | 'sessDir' | 'confOut'>, onProgress?: (m: string) => void): Promise<ProtonFetchResult> {
+  fs.mkdirSync(appDataDir(home), { recursive: true, mode: 0o700 });
+  const confOut = path.join(appDataDir(home), `proton-raw-${process.pid}-${Date.now()}.conf`);
+  const f = new ProtonFetcher();
+  if (onProgress) f.on('progress', onProgress);
+  return new Promise<ProtonFetchResult>((resolve) => {
+    f.once('done', (result: ProtonFetchResult) => {
+      try {
+        if (result.routes?.length) fs.writeFileSync(routesPath(), JSON.stringify({ routes: result.routes, at: new Date().toISOString() }));
+        if (!result.ok || o.mode === 'catalog') return resolve(result);
+        // O conf do Proton vem full-tunnel; passa pela reescrita split tunnel
+        const stored = storeConfig(fs.readFileSync(confOut, 'utf8'));
+        if (!stored.ok) return resolve({ ok: false, error: 'unknown', detail: stored.errors.join(' ') });
+        saveSettings({ connectionMode: 'proton', ...(result.chosen ? { protonServer: result.chosen } : {}) });
+        resolve(result);
+      } catch (e: any) {
+        resolve({ ok: false, error: 'unknown', detail: String(e?.message ?? e) });
+      } finally {
+        fs.rmSync(confOut, { force: true });
+      }
+    });
+    void f.fetch({ ...o, binDir, sessDir: sessionDir(home), confOut });
+  });
+}
+
+const planFetcher = new ProtonFetcher();
+let planCache: { username: string; plan: ProtonPlan | null; at: number } | null = null;
 
 const handlers = {
   async importConfig({ rawText }: { rawText: string }) {
-    return storeConfig(rawText);
+    const r = storeConfig(rawText);
+    if (r.ok) saveSettings({ connectionMode: 'conf' });
+    return r;
   },
 
   async activate() {
     return exclusive(async () => {
+      // Desativação adiada e túnel ainda no ar: basta cancelar a espera
+      if (deferredOff.pending && tunnelActive) {
+        deferredOff.cancel();
+        saveSettings({ lastTunnelState: 'active' });
+        updateTray();
+        pushState();
+        return { state: 'active', publicIp: null };
+      }
       pushState('activating');
       const r = await activate({
         opts: await activationOpts(),
@@ -272,10 +426,24 @@ const handlers = {
     });
   },
 
-  async deactivate() {
+  async deactivate({ now }: { now?: boolean } = {}) {
     return exclusive(async () => {
+      if (!now && tunnelActive && await isDiscordRunning()) {
+        deferredOff.start();
+        resumeTunnel = false;
+        saveSettings({ lastTunnelState: 'inactive' });
+        updateTray();
+        pushState();
+        sendToWindow('log', 'Desativação pendente: o túnel desliga quando você fechar o Discord.');
+        return { state: 'pending' };
+      }
+      deferredOff.cancel();
       pushState('deactivating');
-      const r = await deactivate({ opts: await activationOpts(), restartDiscord });
+      // Agora com o Discord aberto: reinicia para ele largar as conexões do túnel
+      const r = await deactivate({
+        opts: await activationOpts(),
+        restartDiscord: async () => { if (await isDiscordRunning()) await restartDiscord(); },
+      });
       if ('error' in r) sendToWindow('log', `Falha ao desativar: ${r.error}${r.detail ? ` — ${r.detail}` : ''}`);
       else {
         tunnelActive = false;
@@ -291,44 +459,92 @@ const handlers = {
   async status() {
     const state = deriveStateFromRoute(await readDefaultRoute());
     if (!tunnelOp) tunnelActive = state === 'active';
-    return { state, hasConfig: refreshConfigState().hasConfig, busy: !!tunnelOp };
+    if (!tunnelActive) deferredOff.cancel();
+    return {
+      state: state === 'active' && deferredOff.pending ? 'pending' : state,
+      hasConfig: refreshConfigState().hasConfig,
+      busy: !!tunnelOp,
+    };
   },
 
-  async fetchProton({ username, password }: { username: string; password?: string }) {
+  /** Derruba e sobe o túnel numa operação só e reinicia o Discord. */
+  async restart() {
+    return exclusive(async () => {
+      deferredOff.cancel();
+      pushState('activating');
+      const opts = await activationOpts();
+      const down = await runDeactivation(opts);
+      if (!down.ok) {
+        sendToWindow('log', `Falha ao reiniciar (desligar): ${down.error}${down.detail ? ` — ${down.detail}` : ''}`);
+        pushState();
+        return { error: down.error ?? 'wg_failed', detail: down.detail };
+      }
+      tunnelActive = false;
+      const r = await activate({
+        opts,
+        restartDiscord: async () => {
+          if (loadSettings().vencordOptIn) await tryInjectVencord();
+          await restartDiscord();
+        },
+        publicIp,
+      });
+      if ('error' in r) {
+        saveSettings({ lastTunnelState: 'inactive' });
+        sendToWindow('log', `Falha ao reiniciar (ligar): ${r.error}${r.detail ? ` — ${r.detail}` : ''}`);
+      } else {
+        tunnelActive = true;
+        saveSettings({ lastTunnelState: 'active' });
+      }
+      updateTray();
+      pushState();
+      return r;
+    });
+  },
+
+  /** Rede presa depois de uma falha: tira rotas e IPv6 do helper, mesmo sem túnel conhecido. */
+  async restoreNetwork() {
+    return exclusive(async () => {
+      deferredOff.cancel();
+      pushState('deactivating');
+      const r = await runDeactivation(await activationOpts());
+      if (r.ok) {
+        tunnelActive = false;
+        resumeTunnel = false;
+        saveSettings({ lastTunnelState: 'inactive' });
+        sendToWindow('log', 'Rede restaurada.');
+      } else {
+        sendToWindow('log', `Falha ao restaurar a rede: ${r.error}${r.detail ? ` — ${r.detail}` : ''}`);
+      }
+      updateTray();
+      pushState();
+      return r.ok ? { ok: true } : { ok: false, error: r.error, detail: r.detail };
+    });
+  },
+
+  async fetchProton({ username, password, mode, server }: { username: string; password?: string; mode?: FetchMode; server?: string }) {
     if (protonFetching) return { ok: false, error: 'busy' };
     protonFetching = true;
-    return new Promise<object>((resolve) => {
-      fs.mkdirSync(appDataDir(home), { recursive: true, mode: 0o700 });
-      const confOut = path.join(appDataDir(home), `proton-raw-${process.pid}-${Date.now()}.conf`);
+    try {
+      const r = await runFetch({ username, password, mode, server }, m => sendToWindow('proton:progress', m));
+      if (r.ok && mode === 'manual') saveSettings({ protonRoutePreference: 'manual', protonRoutePreferencePrompted: true });
+      return { ...r, routes: r.routes ?? readRoutes() };
+    } finally {
+      protonFetching = false;
+    }
+  },
 
-      protonFetcher.removeAllListeners();
+  async protonRoutes() {
+    const s = loadSettings();
+    return { routes: readRoutes(), current: s.connectionMode === 'conf' ? null : s.protonServer ?? null };
+  },
 
-      protonFetcher.on('progress', (msg: string) => {
-        sendToWindow('proton:progress', msg);
-      });
-
-      protonFetcher.on('done', (result: { ok: boolean }) => {
-        protonFetching = false;
-        if (!result.ok) { fs.rmSync(confOut, { force: true }); return resolve(result); }
-        try {
-          // O conf do Proton vem full-tunnel; passa pela reescrita split tunnel
-          const stored = storeConfig(fs.readFileSync(confOut, 'utf8'));
-          resolve(stored.ok ? result : { ok: false, error: stored.errors.join(' ') });
-        } catch (e: any) {
-          resolve({ ok: false, error: String(e?.message ?? e) });
-        } finally {
-          fs.rmSync(confOut, { force: true });
-        }
-      });
-
-      protonFetcher.fetch({
-        username,
-        password,
-        binDir,
-        sessDir: sessionDir(home),
-        confOut,
-      });
-    });
+  async protonPlan({ force }: { force?: boolean } = {}) {
+    const account = readSavedAccount(sessionDir(home));
+    if (!account) return { plan: null };
+    if (!force && planCache?.username === account.username && Date.now() - planCache.at < 30 * 60_000) return { plan: planCache.plan };
+    const plan = await planFetcher.checkPlan(binDir, sessionDir(home), account.username);
+    planCache = { username: account.username, plan, at: Date.now() };
+    return { plan };
   },
 
   async vencordPermission() {
@@ -374,6 +590,7 @@ const handlers = {
 
   async protonLogout() {
     clearSavedAccount(sessionDir(home));
+    planCache = null;
     return { ok: true };
   },
 
@@ -395,6 +612,36 @@ const handlers = {
       sendToWindow('update:progress', msg);
     });
   },
+
+  async appInfo() {
+    return { version: app.getVersion() };
+  },
+
+  async getSettings(): Promise<UiSettings> {
+    const st = loadSettings();
+    return {
+      openAtLogin: app.getLoginItemSettings().openAtLogin,
+      devMode: st.devMode === true,
+      theme: st.theme ?? 'system',
+      routePreference: st.protonRoutePreference === 'manual' ? 'manual' : 'auto',
+      autoFailover: st.autoFailover !== false,
+      connectionMode: st.connectionMode ?? 'proton',
+      askRoutePreference: shouldAskRoutePreference(st),
+    };
+  },
+
+  async setSettings(patch: Partial<Pick<UiSettings, 'openAtLogin' | 'devMode' | 'theme' | 'routePreference' | 'autoFailover'>> & { routePromptAnswered?: boolean }): Promise<UiSettings> {
+    if (patch.openAtLogin !== undefined) app.setLoginItemSettings({ openAtLogin: patch.openAtLogin });
+    if (patch.theme) nativeTheme.themeSource = patch.theme;
+    saveSettings({
+      ...(patch.devMode !== undefined ? { devMode: patch.devMode } : {}),
+      ...(patch.theme ? { theme: patch.theme as ThemeChoice } : {}),
+      ...(patch.autoFailover !== undefined ? { autoFailover: patch.autoFailover } : {}),
+      ...(patch.routePreference ? { protonRoutePreference: patch.routePreference, protonRoutePreferencePrompted: true } : {}),
+      ...(patch.routePromptAnswered ? { protonRoutePreferencePrompted: true } : {}),
+    });
+    return handlers.getSettings();
+  },
 };
 
 const router = makeRouter(handlers as any);
@@ -414,6 +661,8 @@ app.whenReady().then(async () => {
   if (stored && (/AllowedIPs\s*=.*(0\.0\.0\.0\/0|::\/0)/i.test(stored) || !/^PersistentKeepalive\s*=/im.test(stored))) {
     storeConfig(stored);
   }
+  // Antes da janela: o vidro e o prefers-color-scheme do renderer seguem o themeSource
+  nativeTheme.themeSource = loadSettings().theme ?? 'system';
   createTray();
   createWindow();
 
@@ -434,8 +683,11 @@ app.whenReady().then(async () => {
 
   powerMonitor.on('suspend', () => {
     if (!tunnelActive) return;
+    // Desativação pendente: o usuário já pediu para desligar, então não volta ao acordar
+    const keep = !deferredOff.pending;
+    deferredOff.cancel();
     void exclusive(async () => {
-      if (await bringDownQuietly()) resumeTunnel = true;
+      if (await bringDownQuietly() && keep) resumeTunnel = true;
     });
   });
 

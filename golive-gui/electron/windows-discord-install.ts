@@ -38,10 +38,16 @@ export function findWindowsDiscordInstall(
       );
   }
   if (directExePath) {
+    // Em sistema de arquivos que ignora maiusculas (Windows, macOS) existsSync aceita qualquer
+    // grafia; devolve o nome real gravado no disco para o exePath ser o do arquivo existente.
+    let realName = path.basename(directExePath);
+    try {
+      realName = readdirSync(rootPath).find((n) => n.toLowerCase() === realName.toLowerCase()) ?? realName;
+    } catch { /* mantem o candidato confirmado por existsSync */ }
     return {
       appDir: rootPath,
       resources: path.join(rootPath, "resources"),
-      exePath: directExePath,
+      exePath: path.join(rootPath, realName),
     };
   }
 

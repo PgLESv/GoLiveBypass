@@ -8,7 +8,7 @@ import { AsyncLocalStorage } from "async_hooks";
 import { RendererSettings } from "@main/settings";
 import { execFile, execFileSync, spawn } from "child_process";
 import { createHash, randomUUID } from "crypto";
-import { app, BrowserWindow, dialog, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent, type OpenDialogOptions } from "electron";
 import {
     appendFileSync,
     closeSync,
@@ -61,7 +61,7 @@ import {
 } from "./update-channel";
 import { isCompatiblePluginManifest, releaseAssetUrl, securePluginUpdateUrl } from "./update-security";
 import { resolveWindowsPnpmBuildCommand } from "./plugin-build";
-import { defaultPluginVpnDataDir, PluginVpnController, type ProtonLoginPayload, type ProtonOptimizationOptions } from "./vpn-controller";
+import { defaultPluginVpnDataDir, PluginVpnController, type ProtonLoginPayload, type ProtonOptimizationOptions, type ProtonRouteDiscoveryContext } from "./vpn-controller";
 import { disposeWireSockSnapshotWorker } from "./vpn-snapshot-worker";
 import {
     DEFAULT_AUTH_PROMPT_TIMEOUT_MS,
@@ -77,7 +77,7 @@ import * as proton from "./vpn-proton";
 import { safeDiagnosticDetail } from "./vpn-types";
 import { createOperationId, createPluginLogger, trimJsonlTailByBytes, type PluginLogContext } from "./plugin-log";
 
-const PLUGIN_VERSION = "2.0.9";
+const PLUGIN_VERSION = "2.0.11";
 const PLUGIN_ASSET = "goLiveBypass-vencord.zip";
 const PLUGIN_CHECKSUM_ASSET = `${PLUGIN_ASSET}.sha256`;
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/PgLESv/GoLiveBypass/releases?per_page=20";
@@ -126,8 +126,8 @@ function requiredFilesForPlatform(platform: NodeJS.Platform = process.platform, 
     if (platform === "win32") files.push(resolvePlatformHelperRelativePath(platform, arch));
     return files;
 }
-function findLinuxNetnsLauncher(): string {
-    const candidates = [
+export function findLinuxNetnsLauncher(preferredCandidates?: string[], materializeDirectory = VPN_DATA_DIR): string {
+    const candidates = preferredCandidates ?? [
         join(__dirname, "bin", "linux-x64", "netns-launcher"),
         join(__dirname, "goLiveBypass", "bin", "linux-x64", "netns-launcher"),
         resolve(__dirname, "../../src/userplugins/goLiveBypass/bin/linux-x64/netns-launcher"),
@@ -138,13 +138,21 @@ function findLinuxNetnsLauncher(): string {
     for (const candidate of candidates) {
         try {
             const stat = lstatSync(candidate);
-            if (stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && (stat.mode & 0o111) !== 0 && (stat.mode & 0o022) === 0)
+            if (
+                stat.isFile() &&
+                !stat.isSymbolicLink() &&
+                stat.size > 0 &&
+                (stat.mode & 0o111) !== 0 &&
+                (stat.mode & 0o022) === 0 &&
+                proton.isValidEmbeddedLinuxAsset("netns-launcher", candidate)
+            ) {
                 return resolve(candidate);
+            }
         } catch {
             // try the next known package location
         }
     }
-    try { return proton.materializeEmbeddedLinuxAsset("netns-launcher", VPN_DATA_DIR); } catch {}
+    try { return proton.materializeEmbeddedLinuxAsset("netns-launcher", materializeDirectory); } catch {}
     throw new Error("O launcher Linux do namespace não foi encontrado no pacote do plugin.");
 }
 async function installFlatpakNetnsLauncher(flatpakSpawn: string, pkexec: string, launcher: string, uid: number): Promise<string> {
@@ -209,7 +217,12 @@ const LOG_FILE = join(VPN_DATA_DIR, "plugin-vpn.log");
 const logContext = new AsyncLocalStorage<PluginLogContext>();
 
 function trimPluginLogFile(): void {
-    const bytes = readFileSync(LOG_FILE);
+    // Sem arquivo ainda não há o que podar: o `readFileSync` daqui era o primeiro passo
+    // do registro e, sem o arquivo, ele lançava ANTES do append — a cauda era engolida
+    // pelo catch de `persistPluginLogLine` e o log nunca nascia em instalação nova.
+    let bytes: Buffer;
+    try { bytes = readFileSync(LOG_FILE); }
+    catch { return; }
     if (bytes.byteLength <= 256 * 1024) return;
     writeFileSync(LOG_FILE, trimJsonlTailByBytes(bytes, 256 * 1024));
 }
@@ -1034,8 +1047,8 @@ export function getPluginVpnPaths(_: IpcMainInvokeEvent) {
 // repositório público, com rate limit por IP — e por isso nunca é exportado ao renderer
 // nem escrito no log. O envio só acontece por ação do usuário: nada aqui é chamado em
 // boot, falha, ativação ou updater.
-const BUG_API_URL = "https://api.skyplaceia.com/bugs/v1/reports";
-const BUG_STATUS_URL = "https://api.skyplaceia.com/bugs/v1/block-status";
+const BUG_API_URL = "https://bugs.golivebypass.dev/bugs/v1/reports";
+const BUG_STATUS_URL = "https://bugs.golivebypass.dev/bugs/v1/block-status";
 const BUG_API_TOKEN = "c3d0bff691ecc3ddc6f6ca10037b9ac967c62547e681d3749204e50800504511";
 const BUG_REPORT_STATE_FILE = "bug-report-state.json";
 const BUG_STATUS_TIMEOUT_MS = 5_000;
@@ -1234,9 +1247,9 @@ export function importWireGuardConfig(_: IpcMainInvokeEvent, sourcePath: unknown
 export async function selectWireGuardConfig(event: IpcMainInvokeEvent) {
     try {
         const parent = BrowserWindow.fromWebContents(event.sender);
-        const options = {
+        const options: OpenDialogOptions = {
             title: "Selecionar configuração WireGuard",
-            properties: ["openFile"] as const,
+            properties: ["openFile"],
             filters: [{ name: "Configuração WireGuard", extensions: ["conf"] }],
         };
         const selected = parent
@@ -1275,7 +1288,7 @@ export async function loginProton(event: IpcMainInvokeEvent, value: unknown) {
         try {
             const payload = cleanLoginPayload(value);
             const parent = BrowserWindow.fromWebContents(event.sender);
-            const result = await controller.loginProton(payload, (url, signal) => solveCaptcha(url, parent, signal).then(captcha => captcha.ok ? captcha.token : null));
+            const result = await controller.loginProton(payload, (url, signal) => solveCaptcha(url, parent, signal));
             if (result.success && result.username) setStoredUsername(result.username);
             return result;
         } catch (error) {
@@ -1374,6 +1387,40 @@ export function optimizeProtonRoute(event: IpcMainInvokeEvent, value: unknown) {
 
 export function cancelProtonOptimization(_: IpcMainInvokeEvent, requestId: unknown) {
     return { cancelled: typeof requestId === "string" && controller.cancelOptimization(requestId) };
+}
+
+function cleanRouteDiscoveryContext(value: unknown): ProtonRouteDiscoveryContext {
+    const raw = value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
+    return {
+        username: typeof raw.username === "string" ? raw.username.trim().slice(0, 320) : "",
+        country: typeof raw.country === "string" ? raw.country.trim().slice(0, 128) : undefined,
+        freeOnly: typeof raw.freeOnly === "boolean" ? raw.freeOnly : undefined,
+        autoPing: typeof raw.autoPing === "boolean" ? raw.autoPing : undefined,
+    };
+}
+
+export function discoverProtonRoutes(_: IpcMainInvokeEvent, value: unknown) {
+    const { country, freeOnly, autoPing, requestId } = cleanOptimizationOptions(value);
+    return runLogOperation("proton-route-discovery", () => controller.discoverProtonRoutes({ country, freeOnly, autoPing, requestId }));
+}
+
+export function getProtonRouteDiscoveryStatus(_: IpcMainInvokeEvent, context?: unknown) {
+    return controller.getRouteDiscoveryStatus(context === undefined ? undefined : cleanRouteDiscoveryContext(context));
+}
+
+export function cancelProtonRouteDiscovery(_: IpcMainInvokeEvent, requestId?: unknown) {
+    return { cancelled: controller.cancelProtonRouteDiscovery(typeof requestId === "string" ? requestId : undefined) };
+}
+
+export function selectProtonRoute(_: IpcMainInvokeEvent, value: unknown) {
+    const raw = value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
+    const measurementId = typeof raw.measurementId === "string" ? raw.measurementId : "";
+    const server = typeof raw.server === "string" ? raw.server : "";
+    return runLogOperation("proton-route-selection", () => controller.selectProtonRoute({ measurementId, server }));
+}
+
+export function cancelProtonRouteSelection(_: IpcMainInvokeEvent) {
+    return { cancelled: controller.cancelProtonRouteSelection() };
 }
 
 // ------------------------------------------------------------------ atualização do userplugin
@@ -1611,9 +1658,21 @@ function releasePluginUpdateLock(lock: PluginUpdateLock | null | undefined): voi
     }
 }
 
-function quarantineLegacyPendingUpdate(pending: PendingPluginUpdate): void {
+/**
+ * Move o marcador do slot ativo para um nome de quarentena.
+ *
+ * Um journal que não descreve mais a árvore instalada (digest divergente, staging
+ * ausente, marcador legado sem digest) travava TODA consulta do painel com o mesmo erro
+ * e nenhum caminho do updater liberava o slot. A quarentena preserva o marcador para
+ * diagnóstico e libera a nova preparação.
+ */
+function quarantinePendingUpdate(
+    pending: PendingPluginUpdate,
+    reason: string,
+    options: { projectRoot?: string; removeBackup?: boolean } = {},
+): void {
     const source = pendingUpdatePath();
-    const prefix = `${PENDING_UPDATE_FILE}.legacy-${Date.now()}-${process.pid}`;
+    const prefix = `${PENDING_UPDATE_FILE}.${reason}-${Date.now()}-${process.pid}`;
     for (let attempt = 0; attempt < 8; attempt++) {
         const destination = join(VPN_DATA_DIR, `${prefix}-${attempt}.json`);
         if (existsSync(destination)) continue;
@@ -1621,20 +1680,28 @@ function quarantineLegacyPendingUpdate(pending: PendingPluginUpdate): void {
             // Preserve the old marker for diagnosis, but remove it from the
             // active slot atomically so a new preparation can proceed.
             renameSync(source, destination);
-            log("warn", "marcador legado do updater movido para quarentena; nova preparação liberada", {
-                versão: pending.version,
-                canal: pending.channel,
-                arquivo: basename(destination),
-            });
-            return;
         } catch (error) {
             // Another renderer call may have quarantined the marker first.
             if (!existsSync(source)) return;
             if (attempt === 7)
-                throw new Error(`não consegui mover o marcador legado para quarentena: ${safeDiagnosticDetail(error, 300)}`);
+                throw new Error(`não consegui mover o marcador do updater para quarentena: ${safeDiagnosticDetail(error, 300)}`);
+            continue;
         }
+        if (options.removeBackup && options.projectRoot) {
+            // O backup do update descartado não é restaurável por ninguém: sai junto para
+            // a pasta de backups não acumular árvore sem dono.
+            try { rmSync(safeBackupPath(options.projectRoot, pending.backupName), { recursive: true, force: true }); }
+            catch (error) { log("warn", "não consegui remover o backup do update descartado", { erro: error }); }
+        }
+        log("warn", "marcador do updater movido para quarentena; nova preparação liberada", {
+            versão: pending.version,
+            canal: pending.channel,
+            motivo: reason,
+            arquivo: basename(destination),
+        });
+        return;
     }
-    throw new Error("não consegui reservar um nome seguro para quarentenar o marcador legado");
+    throw new Error("não consegui reservar um nome seguro para quarentenar o marcador do updater");
 }
 
 function policyFrom(value: unknown, fallback = pluginUpdatePolicy): PluginUpdatePolicy {
@@ -2190,11 +2257,16 @@ function inspectPendingUpdate(): PendingUpdateInspection {
         const staged = stagedPluginSourcePath(projectRoot, pending);
         const digest = pending.sourceDigest;
         if (!staged || typeof digest !== "string") {
-            return {
-                pending,
-                trusted: null,
-                error: "update baixado não tem mais a fonte em staging; uma nova consulta vai baixar de novo",
-            };
+            try {
+                quarantinePendingUpdate(pending, "missing-staging");
+                return { pending: null, trusted: null, error: null };
+            } catch (error) {
+                return {
+                    pending,
+                    trusted: null,
+                    error: `update baixado não tem mais a fonte em staging e não consegui liberar nova preparação: ${safeDiagnosticDetail(error, 300)}`,
+                };
+            }
         }
         return { pending, trusted: { ...pending, sourceDigest: digest }, error: null };
     }
@@ -2210,7 +2282,7 @@ function inspectPendingUpdate(): PendingUpdateInspection {
     const { sourceDigest } = pending;
     if (typeof sourceDigest !== "string") {
         try {
-            quarantineLegacyPendingUpdate(pending);
+            quarantinePendingUpdate(pending, "legacy");
             return { pending: null, trusted: null, error: null };
         } catch (error) {
             return {
@@ -2222,14 +2294,21 @@ function inspectPendingUpdate(): PendingUpdateInspection {
     }
 
     try {
-        const { target } = userpluginSource();
+        const { target, projectRoot } = userpluginSource();
         const actualDigest = hashPluginSourceTree(target);
         if (actualDigest !== sourceDigest) {
-            return {
-                pending,
-                trusted: null,
-                error: "digest da árvore preparada não confere com a fonte atual; nova preparação é necessária",
-            };
+            try {
+                // A árvore mudou por fora (outro instalador, outro checkout, edição manual):
+                // a preparação não é mais promovível e o backup dela não tem dono.
+                quarantinePendingUpdate(pending, "stale-source", { projectRoot, removeBackup: true });
+                return { pending: null, trusted: null, error: null };
+            } catch (error) {
+                return {
+                    pending,
+                    trusted: null,
+                    error: `digest da árvore preparada não confere com a fonte atual e não consegui liberar nova preparação: ${safeDiagnosticDetail(error, 300)}`,
+                };
+            }
         }
     } catch (error) {
         return {

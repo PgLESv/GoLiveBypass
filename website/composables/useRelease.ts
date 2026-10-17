@@ -17,7 +17,7 @@ export function useRelease() {
 
   const apiBaseUrl = computed(() => {
     const configured = runtimeConfig.public.releaseApiBaseUrl
-    return typeof configured === 'string' && configured.trim() ? configured.trim() : 'https://golivebypass.dev/bugs'
+    return typeof configured === 'string' && configured.trim() ? configured.trim() : 'https://bugs.golivebypass.dev/bugs'
   })
 
   const load = async () => {

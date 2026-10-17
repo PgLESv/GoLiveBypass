@@ -258,7 +258,7 @@ function readWireSockSnapshotInProcessAsync(script: string, names: readonly stri
     const { promise, resolve } = Promise.withResolvers<WireSockSnapshot | null>();
     try {
         execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-            encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: 8000,
+            encoding: "utf8", windowsHide: true, timeout: 8000,
         }, (error, stdout) => {
             if (error || !stdout) {
                 resolve(null);
@@ -711,7 +711,7 @@ export async function startWireSockService(
         log("error", "WireSock não confirmou o perfil próprio após a ativação", { motivo: inspection.reason || "serviço ausente" });
         throw new Error("O serviço WireSock não confirmou o perfil do plugin após a ativação.");
     }
-    clearWireSockDns(log);
+    // Sanitized profiles omit DNS; activation cannot reset another adapter's saved DNS.
     log("info", "serviço WireSock ativo com filtro por aplicativo", { config: target, allowedApps });
     return { executable, configPath: target, allowedApps };
 }
@@ -732,23 +732,6 @@ function runAsAdministrator(file: string, args: string[], log: WireSockLogger): 
             log("warn", "operação elevada do WireSock falhou", { erro: logError(error) });
             return false;
         }
-    }
-}
-
-function resetNetworkLock(executable: string, log: WireSockLogger): boolean {
-    if (runAsAdministrator(executable, ["reset-network-lock"], log)) return true;
-    return false;
-}
-
-export function clearWireSockDns(log: WireSockLogger): boolean {
-    if (!isWindows()) return true;
-    try {
-        const script = "Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match 'ProTUN|WireSock' -or $_.InterfaceDescription -match 'ProTUN|WireSock' } | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue }";
-        execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
-        return true;
-    } catch (error) {
-        log("warn", "não consegui limpar DNS do adaptador WireSock", { erro: logError(error) });
-        return false;
     }
 }
 
@@ -775,34 +758,76 @@ async function inspectWireSockUntilReliable(configPath: string, guiConfigPath?: 
     return inspection;
 }
 
+/**
+ * Reconsulta uma leitura incompleta com orçamento fixo, reutilizando a worker persistente
+ * usada pelas inspeções assíncronas. Uma resposta não confiável nunca vira `active` e, se
+ * continuar incompleta, o chamador permanece em recuperação manual.
+ */
+export async function inspectWireSockUntilReliableAsync(configPath: string, guiConfigPath?: string): Promise<WireSockInspection> {
+    let inspection = await inspectWireSockAsync(configPath, guiConfigPath);
+    for (let attempt = 1; !inspection.reliable && attempt < WIRESOCK_INSPECTION_RETRIES; attempt++) {
+        await wait(500);
+        inspection = await inspectWireSockAsync(configPath, guiConfigPath);
+    }
+    return inspection;
+}
 
-export async function stopOwnedWireSock(configPath: string, log: WireSockLogger): Promise<WireSockCleanupResult> {
+
+export async function stopOwnedWireSock(
+    configPath: string,
+    log: WireSockLogger,
+    confirmedInspection?: WireSockInspection,
+    options?: { manual?: boolean },
+): Promise<WireSockCleanupResult> {
     if (!isWindows()) return { stopped: true, servicesResidual: [], processResidual: [], networkLockReset: false, dnsCleared: false, dnsFlushed: false };
-    const initial = inspectWireSock(configPath);
-    if (!initial.reliable) {
+    // `manual` marca a Restaurar rede do usuário (#306): é a única ação que segue
+    // com a leitura inconclusiva. Sem ele (watchdog, quit, boot, rollback de
+    // ativação) uma inspeção desconhecida continua recusando a parada.
+    const manual = options?.manual === true;
+    const initial = confirmedInspection ?? inspectWireSock(configPath);
+    if (!initial.reliable && !manual) {
         const error = initial.reason || UNKNOWN_WIRESOCK_STATE;
         log("warn", "limpeza adiada porque o estado do WireSock é desconhecido", { motivo: error });
         return { stopped: false, servicesResidual: initial.services, processResidual: initial.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
     }
+    // Preservação de recurso comprovadamente alheio vale também na ação manual:
+    // o caso que trava o usuário é a leitura desconhecida, não o externo provado.
     if (initial.active && !initial.owned) {
         const error = initial.reason || "WireSock externo detectado";
         log("warn", "limpeza recusada para preservar WireSock externo", { motivo: error });
         return { stopped: false, servicesResidual: initial.services, processResidual: initial.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
     }
+    if (!initial.reliable && manual)
+        log("warn", "restauração manual segue sem ownership comprovado", { motivo: initial.reason || UNKNOWN_WIRESOCK_STATE, servicos: initial.services, pids: initial.processIds });
 
     for (const name of initial.services) {
-        if (containsConfig(serviceCommand(name), configPath)) {
+        // Serviços listados são os que a leitura confirmou em execução; na ação
+        // manual a parada segue mesmo sem o argumento de configuração legível.
+        if (manual || containsConfig(serviceCommand(name), configPath)) {
             if (!runAsAdministrator("sc.exe", ["stop", name], log))
-                log("warn", "não consegui solicitar parada do serviço WireSock próprio", { servico: name });
+                log("warn", "não consegui solicitar parada do serviço WireSock", { servico: name, modo: manual ? "manual" : "proprio" });
         }
     }
+    if (manual && initial.processIds.length) killProcesses(initial.processIds, "da restauração manual", log);
     for (let attempt = 0; attempt < 2; attempt++) {
         await wait(500);
         const current = await inspectWireSockUntilReliable(configPath);
         if (!current.reliable) {
-            const error = current.reason || UNKNOWN_WIRESOCK_STATE;
-            log("error", "limpeza interrompida porque o estado do WireSock ficou desconhecido", { motivo: error });
-            return { stopped: false, servicesResidual: current.services, processResidual: current.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+            if (!manual) {
+                const error = current.reason || UNKNOWN_WIRESOCK_STATE;
+                log("error", "limpeza interrompida porque o estado do WireSock ficou desconhecido", { motivo: error });
+                return { stopped: false, servicesResidual: current.services, processResidual: current.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
+            }
+            // Leitura ainda inconclusiva na ação manual: encerra os processos e
+            // serviços WireSock listados e tenta de novo; o veredito final abaixo
+            // só afirma parada com leitura confiável.
+            log("warn", "restauração manual com leitura inconclusiva; nova tentativa", { motivo: current.reason || UNKNOWN_WIRESOCK_STATE, servicos: current.services, pids: current.processIds });
+            for (const name of current.services) {
+                if (!runAsAdministrator("sc.exe", ["stop", name], log))
+                    log("warn", "não consegui solicitar parada do serviço WireSock", { servico: name, modo: "manual" });
+            }
+            if (current.processIds.length) killProcesses(current.processIds, "da restauração manual", log);
+            continue;
         }
         if (!current.active) break;
         if (!current.owned) {
@@ -813,36 +838,24 @@ export async function stopOwnedWireSock(configPath: string, log: WireSockLogger)
         killOwnProcesses(current.processIds, log);
     }
 
-    const executable = findWireSockCandidate()?.executable;
-    // O lock de rede pertence à instância que acabamos de confirmar como nossa.
-    // Resetá-lo mesmo depois de o processo sumir fecha o caso de parada tardia.
-    const networkLockReset = executable ? resetNetworkLock(executable, log) : false;
-    const dnsCleared = clearWireSockDns(log);
-    let dnsFlushed = false;
-    try {
-        execFileSync("ipconfig.exe", ["/flushdns"], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
-        dnsFlushed = true;
-    } catch (error) {
-        log("warn", "flushdns falhou", { erro: logError(error) });
-    }
+    // Profiles omit DNS and disable network-lock. Config/PID ownership cannot
+    // authorize a global lock or DNS reset, including for an external adapter down.
+    const networkLockReset = false;
+    const dnsCleared = false;
     const residual = await inspectWireSockUntilReliable(configPath);
-    // O veredito e' o mesmo da GUI (electron/wiresock.ts: `!isWireSockActive() && residual.length === 0`)
-    // e o mesmo que o README promete: o tunel acabou quando servico E processos proprios
-    // sumiram, com leitura confiavel. `active` cobre exatamente esses dois (services/processIds);
-    // o network-lock nao entra.
-    //
-    // O reset do network-lock continua sendo TENTADO logo acima e reportado no resultado, mas
-    // nao decide mais nada: ele exige elevacao (UAC) e a config do plugin instala o servico com
-    // "-network-lock disabled" (vpn-windows.ts:469/477, confirmado por
-    // tests/test-distribution-parity.cjs), entao a nossa sessao nunca engata esse lock. Exigi-lo
-    // fazia a limpeza falhar em maquina onde o UAC nao era aceito no momento da saida -- com o
-    // tunel ja derrubado e a rede restaurada --, o que virava recovery_required, mantinha o
-    // lock do plugin e (antes da correcao do before-quit) deixava o Discord preso sem janela.
     const stopped = residual.reliable && !residual.active;
+    let dnsFlushed = false;
+    if (stopped && initial.active && initial.owned) {
+        try {
+            execFileSync("ipconfig.exe", ["/flushdns"], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
+            dnsFlushed = true;
+        } catch (error) {
+            log("warn", "flushdns falhou", { erro: logError(error) });
+        }
+    }
     if (!stopped && !residual.reliable) log("error", "limpeza não confirmou o estado final do WireSock", { motivo: residual.reason || UNKNOWN_WIRESOCK_STATE });
     else if (!stopped) log("error", "limpeza deixou resíduo WireSock próprio", { services: residual.services, pids: residual.processIds });
-    else if (networkLockReset) log("info", "WireSock próprio, lock e processo verificados como parados");
-    else log("warn", "WireSock próprio parado (serviço e processos); o reset do network-lock não foi confirmado -- exige elevação e o plugin não habilita esse lock", { networkLockReset });
+    else log("info", "WireSock próprio parado; lock global e DNS de adaptadores foram preservados");
     return {
         stopped,
         servicesResidual: residual.services,
@@ -850,8 +863,6 @@ export async function stopOwnedWireSock(configPath: string, log: WireSockLogger)
         networkLockReset,
         dnsCleared,
         dnsFlushed,
-        // So ha erro quando o veredito falhou. O reset do network-lock nao entra aqui: virou
-        // aviso, porque nao diz nada sobre o tunel ter parado.
         ...(stopped ? {} : {
             error: !residual.reliable
                 ? residual.reason || UNKNOWN_WIRESOCK_STATE
@@ -915,11 +926,9 @@ export async function stopManagedWireSock(configPath: string, guiConfigPath: str
         return { stopped: false, servicesResidual: residual.services, processResidual: residual.processIds, networkLockReset: false, dnsCleared: false, dnsFlushed: false, error };
     }
 
-    // Tudo que foi encerrado era GoLiveBypass comprovado: o lock e o DNS do adaptador
-    // pertenciam à sessão morta, não a uma VPN externa viva.
-    const executable = findWireSockCandidate()?.executable;
-    const networkLockReset = executable ? resetNetworkLock(executable, log) : false;
-    const dnsCleared = clearWireSockDns(log);
+    // A managed config/PID does not prove ownership of global lock/DNS state.
+    const networkLockReset = false;
+    const dnsCleared = false;
     let dnsFlushed = false;
     try {
         execFileSync("ipconfig.exe", ["/flushdns"], { stdio: "ignore", windowsHide: true, timeout: 10_000 });

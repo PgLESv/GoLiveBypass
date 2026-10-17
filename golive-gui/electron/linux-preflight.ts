@@ -11,8 +11,15 @@ export type LinuxPreflight = {
   dependencies: { missing: string[]; required: string[] };
   elevation: { available: boolean; method: string };
   netns: { available: boolean };
-  kernel: { wireguard: "available" | "loaded" | "missing" | "unknown" | string };
-  discord: { found: boolean; count: number; firstPath: string };
+  kernel: {
+    wireguard: "available" | "loaded" | "missing" | "unknown" | string;
+    /** Versão do kernel em execução (`uname -r`); vazio quando o script não informa. */
+    running: string;
+    /** `false` quando `/lib/modules/<kernel em execução>` não existe (upgrade sem reinício). */
+    modulesInstalled: boolean;
+    /** `true` quando há wireguard-go + `/dev/net/tun`: o device sai no espaço do usuário. */
+    userspace: boolean;
+  };
   discord: {
     found: boolean;
     count: number;
@@ -83,6 +90,10 @@ export function parseLinuxPreflight(raw: string): LinuxPreflight {
     netns: { available: netns.available === true },
     kernel: {
       wireguard: typeof kernel.wireguard === "string" ? kernel.wireguard : "unknown",
+      running: typeof kernel.running === "string" ? kernel.running : "",
+      // Script antigo nao manda o campo: ausente nao pode ser lido como "sem modulos".
+      modulesInstalled: kernel.modulesInstalled !== false,
+      userspace: kernel.userspace === true,
     },
     discord: {
       found: discord.found === true || count > 0,
@@ -100,7 +111,15 @@ export function linuxPreflightMessage(preflight: LinuxPreflight): string {
   if (preflight.dependencies.missing.length > 0) {
     return `Dependências ausentes: ${preflight.dependencies.missing.join(", ")}.`;
   }
-  if (preflight.kernel.wireguard === "missing") return "O módulo WireGuard não está disponível neste kernel.";
+  if (preflight.kernel.wireguard === "missing") {
+    // Mesmo texto-base do plugin (`formatLinuxWireGuardModuleIssue`) com a saida extra desta
+    // variante: o wireguard-go cria o device no espaco do usuario sem tocar no kernel.
+    const release = preflight.kernel.running.trim() || "atual";
+    if (!preflight.kernel.modulesInstalled) {
+      return `O kernel Linux em execução (${release}) não possui os módulos instalados. Reinicie no kernel instalado, instale os módulos correspondentes ou instale o wireguard-go antes de ativar.`;
+    }
+    return `O módulo WireGuard não está disponível no kernel Linux em execução (${release}). Instale ou ative o módulo WireGuard, ou instale o wireguard-go, antes de ativar.`;
+  }
   if (!preflight.elevation.available) return "É necessária autorização sudo ou pkexec para criar o túnel.";
   if (!preflight.netns.available) return "O sistema não permite consultar namespaces de rede (ip netns).";
   if (!preflight.discord.found) return "Nenhuma instalação do Discord foi encontrada.";

@@ -27,9 +27,21 @@ const DISCOVERY_ENV_PLACEHOLDERS: ReadonlyArray<readonly [string, string]> = [
 ];
 // Raizes fixas que nao identificam o usuario e podem aparecer como estao (mac).
 const DISCOVERY_FIXED_ROOTS: readonly string[] = ["/Applications"];
+const DISCOVERY_ROOT_DEDUPE_MS = 4_000;
+const recentDiscoveryRoots = new Map<string, number>();
 
 function clipDiscoveryValue(value: string, max = DISCOVERY_PATH_MAX): string {
   return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
+function sanitizeDiscoveryErrorDetail(value: string): string {
+  return value
+    .split(/\r?\n/, 1)[0]
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\|\/)[^\r\n]*/g, "[path]")
+    .replace(/[,;]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, DISCOVERY_TAIL_MAX);
 }
 
 function shortDiscoveryHash(value: string): string {
@@ -84,8 +96,14 @@ export function scanInicio(plataforma: string, localAppData?: string) {
 // Cada raiz/flavour testado: raiz + resultado do existsSync. A raiz entra
 // sanitizada (placeholder/hash), nunca o caminho cru.
 export function scanRaiz(raiz: string, existe: boolean, flavour?: string) {
+  const sanitizedRoot = sanitizeDiscoveryPath(raiz);
+  const key = `${sanitizedRoot}|${existe ? "sim" : "nao"}|${flavour ?? ""}`;
+  const now = Date.now();
+  const previous = recentDiscoveryRoots.get(key);
+  if (previous !== undefined && now >= previous && now - previous < DISCOVERY_ROOT_DEDUPE_MS) return;
+  recentDiscoveryRoots.set(key, now);
   const data: Record<string, unknown> = {
-    raiz: sanitizeDiscoveryPath(raiz),
+    raiz: sanitizedRoot,
     existe: existe ? "sim" : "nao",
   };
   if (flavour) data.flavour = flavour;
@@ -117,7 +135,7 @@ export function runningTasklist(imagem: string, ok: boolean, erro?: string) {
 // Resultado do script Linux --status --json: code + se o JSON parseou.
 // O stderr (banner, avisos) nao vai mais como blob — as linhas de trace viram
 // eventos proprios (scriptTrace) para o log ficar legivel.
-export function scriptStatus(code: number, jsonOk: boolean) {
+export function scriptStatus(code: number | null, jsonOk: boolean) {
   logger.info("discord", "script.status", { code, json_ok: jsonOk ? "sim" : "nao" });
 }
 
@@ -147,11 +165,6 @@ export function scriptJsonInvalido(stdout: string) {
 export function ativacaoSemDiscord(motivo: string) {
   logger.warn("discord", "ativacao.sem_discord", { motivo });
 }
-
-// Descoberta Windows (#300): cada fonte reporta origem/status/contagem/truncation/
-// errorCode e cada candidato reporta flavour/detected_by. Nenhum registro aceita
-// caminho cru, CommandLine, argumentos, stdout ou PID: origem e detected_by sao
-// categorias fechadas, entao um path nunca entra no log por este caminho.
 export type DiscoveryScanSource = "root" | "process" | "registry" | "shortcut";
 export type DiscoveryScanStatus = "ok" | "empty" | "partial" | "error";
 
@@ -159,6 +172,7 @@ export interface DiscoveryScanFonteExtras {
   total?: number;
   truncated?: boolean;
   errorCode?: string;
+  errorDetail?: string;
 }
 
 // Resultado de uma fonte pontual. "truncated" so aparece quando o teto de coleta
@@ -173,6 +187,7 @@ export function scanFonte(
   if (typeof extras.total === "number") data.total = extras.total;
   if (extras.truncated) data.truncated = "sim";
   if (extras.errorCode) data.error_code = extras.errorCode;
+  if (extras.errorDetail) data.error_detail = sanitizeDiscoveryErrorDetail(extras.errorDetail);
   logger.info("discord", "scan.fonte", data);
 }
 

@@ -174,7 +174,7 @@ export async function sha256File(filePath: string): Promise<string> {
   const digest = crypto.createHash("sha256");
   await new Promise<void>((resolve, reject) => {
     const input = fs.createReadStream(filePath);
-    input.on("data", (chunk: Buffer) => digest.update(chunk));
+    input.on("data", (chunk: Buffer | string) => { digest.update(chunk); });
     input.on("error", reject);
     input.on("end", resolve);
   });

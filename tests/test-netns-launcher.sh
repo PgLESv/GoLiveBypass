@@ -51,6 +51,10 @@ cat > "$work/harness.c" <<'C_EOF'
 #undef main
 
 int main(int argc, char **argv) {
+    char environment[] = "--env=WAYLAND_DISPLAY=wayland-0";
+    char *environment_args[] = {environment};
+    if (set_explicit_environment(1, environment_args, 0, 1) != 1 ||
+        strcmp(getenv("WAYLAND_DISPLAY"), "wayland-0") != 0) return 3;
     if (argc < 3) return 2;
     return write_confirmation(argv[1], argv[2]) == 0 ? 0 : 1;
 }

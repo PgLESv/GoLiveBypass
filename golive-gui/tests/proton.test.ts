@@ -19,6 +19,12 @@ import {
   normalizeProtonPlanResult,
   normalizeProtonSessionResult,
 } from "../electron/proton";
+import { resolveConfgenBinary } from "./helpers/confgen-binary";
+
+// Estes testes executam o helper Go de verdade; sem o binário compilado (e sem
+// `go` para compilá-lo) eles pulam, pois sem ele o produto tentaria baixar o runtime.
+const hasConfgen = resolveConfgenBinary() !== undefined;
+const itConfgen = it.skipIf(!hasConfgen);
 
 describe("ProtonVPN Integration & Sidecar", () => {
   it("registra as fases do helper sem expor sessão ou credenciais", () => {
@@ -43,7 +49,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
     expect(result).toEqual({ success: true, server: "US-FREE#137", pingMs: 34 });
   });
 
-  it("encontra o binario proton-confgen compilado", () => {
+  itConfgen("encontra o binario proton-confgen compilado", () => {
     const exe = findProtonConfgenExe();
     expect(fs.existsSync(exe)).toBe(true);
     expect(path.basename(exe)).toMatch(/proton-confgen(\.exe)?$/);
@@ -55,7 +61,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
     expect(sessionFile).toBe(path.join(tmpDir, "proton-session.json"));
   });
 
-  it("recupera somente o usuario da sessao pelo contrato do helper", async () => {
+  itConfgen("recupera somente o usuario da sessao pelo contrato do helper", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
       fs.writeFileSync(path.join(tmpDir, "proton-session.json"), JSON.stringify({
@@ -164,7 +170,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
       .toMatchObject({ valid: false, retryable: true });
   });
 
-  it("cria a pasta de dados antes de executar o login", async () => {
+  itConfgen("cria a pasta de dados antes de executar o login", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     const nested = path.join(root, "nested", "data");
     try {
@@ -176,7 +182,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
     }
   });
 
-  it("inicia proton-confgen sem duplicar flags globais", async () => {
+  itConfgen("inicia proton-confgen sem duplicar flags globais", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
       const sessionFile = path.join(tmpDir, "dummy-session.json");
@@ -206,7 +212,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
     expect(res.error).toBe("Usuário não especificado.");
   });
 
-  it("checkProtonSession detecta sessao inexistente", async () => {
+  itConfgen("checkProtonSession detecta sessao inexistente", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
       const res = await checkProtonSession(tmpDir, "usuario_inexistente");
@@ -220,7 +226,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
   // O sidecar faz uma chamada real ao endpoint Proton; em CI/VM o DNS/TLS pode
   // demorar mais que o timeout padrão de 5s do Vitest. O timeout do produto é
   // 25s, portanto o teste deve aguardar essa mesma janela sem mascarar travas.
-  it("loginProton reporta erro quando credenciais sao invalidas", async () => {
+  itConfgen("loginProton reporta erro quando credenciais sao invalidas", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
       const res = await loginProton(tmpDir, "usuario_falso_golive_xyz", "senha_incorreta_123");
@@ -231,7 +237,7 @@ describe("ProtonVPN Integration & Sidecar", () => {
     }
   }, 30000);
 
-  it("generateOptimalProtonConfig falha graciosamente se nao houver sessao ativa", async () => {
+  itConfgen("generateOptimalProtonConfig falha graciosamente se nao houver sessao ativa", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "proton-test-"));
     try {
       const res = await generateOptimalProtonConfig(tmpDir, {

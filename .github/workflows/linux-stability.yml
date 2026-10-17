@@ -10,6 +10,9 @@ on:
       - 'standalone/**'
       - 'tests/test-linux-matrix.sh'
       - 'tests/test-linux-vm.sh'
+      - 'tests/test-linux-wireguard-userspace.sh'
+      - 'tools/wireguard-go/**'
+      - 'golive-gui/scripts/build-wireguard-go.mjs'
       - 'golive-gui/electron/linux-preflight.ts'
       - '.github/workflows/linux-stability.yml'
 
@@ -62,6 +65,12 @@ jobs:
         run: |
           npm ci
           npm run build:linux
+      - name: Provar o WireGuard de usuario (sem modulo do kernel)
+        run: |
+          sudo apt-get install -y --no-install-recommends wireguard-tools
+          # O binario sai do proprio passo de compilacao; sem user namespace o teste sai 0 com
+          # SKIP, entao uma restricao do runner nao vira falha de produto.
+          ./tests/test-linux-wireguard-userspace.sh
       - name: Auditar AppImage em bases atuais e anteriores
         env:
           RUNTIME: podman

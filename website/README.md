@@ -24,7 +24,7 @@ A saída estática fica em `.output/public`.
 
 ## Downloads dinâmicos
 
-O site consulta no navegador `GET https://golivebypass.dev/bugs/v1/releases/latest`.
+O site consulta no navegador `GET https://bugs.golivebypass.dev/bugs/v1/releases/latest`.
 O catálogo Go consulta o GitHub, rejeita prereleases e mantém cache por cinco
 minutos. Os botões usam os aliases `/v1/releases/latest/download/windows`,
 `linux`, `mac-dmg`, `plugin` e `standalone`, então uma nova release

@@ -38,7 +38,8 @@ const temporaryRoots: string[] = [];
 
 describe("logs do helper Proton", () => {
     it("registra fases, duração e bytes sem registrar stdin/stdout/stderr", async () => {
-        const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-helper-log-"));
+        // realpath: o helper recusa caminho com link simbólico, e no macOS /var é link para /private/var.
+        const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "golive-helper-log-"));
         temporaryRoots.push(root);
         const executable = path.join(root, "proton-confgen");
         fs.writeFileSync(executable, "helper");

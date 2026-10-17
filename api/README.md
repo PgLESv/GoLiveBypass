@@ -53,7 +53,7 @@ app (GUI/standalone)                         │                              �
 No repositório `bezumiya/GoLiveBypass`, abra *Settings → Webhooks → Add webhook*
 e configure:
 
-- Payload URL: `https://golivebypass.dev/bugs/v1/updates/github/webhook`
+- Payload URL: `https://bugs.golivebypass.dev/bugs/v1/updates/github/webhook`
 - Content type: `application/json`
 - Secret: o valor de `GITHUB_WEBHOOK_SECRET`
 - Eventos: somente **Release**, com **Active** marcado

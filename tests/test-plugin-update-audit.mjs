@@ -9,7 +9,7 @@ const workflowSource = readFileSync(new URL("../.github/workflows/build-gui.yml"
 
 test("a versão usada pelo updater acompanha o manifest reescrito no asset", () => {
     const nativeFallback = nativeSource.match(/const PLUGIN_VERSION = "([^"]+)"/)?.[1];
-    assert.equal(nativeFallback, "2.0.9");
+    assert.equal(nativeFallback, "2.0.11");
     assert.match(workflowSource, /sed -i .*manifest\.json/);
     assert.doesNotMatch(workflowSource, /native\.ts/);
     assert.match(nativeSource, /function readInstalledPluginVersion\(/);
@@ -159,10 +159,19 @@ test("backup beta ausente preserva o marcador para recuperação posterior", () 
 test("marcador legado é preservado fora do slot ativo sem bloquear nova preparação", () => {
     const legacyStart = nativeSource.indexOf("if (typeof sourceDigest !== \"string\")");
     const legacyBlock = nativeSource.slice(legacyStart, nativeSource.indexOf("\n    try {", legacyStart));
-    assert.match(nativeSource, /function quarantineLegacyPendingUpdate\(pending: PendingPluginUpdate\)/);
-    assert.match(legacyBlock, /quarantineLegacyPendingUpdate\(pending\)/);
+    assert.match(nativeSource, /function quarantinePendingUpdate\(\s*pending: PendingPluginUpdate,\s*reason: string,/);
+    assert.match(legacyBlock, /quarantinePendingUpdate\(pending, "legacy"\)/);
     assert.match(legacyBlock, /return \{ pending: null, trusted: null, error: null \}/);
     assert.doesNotMatch(legacyBlock, /clearPendingUpdate|rmSync/);
+});
+
+test("preparação presa vai para quarentena em vez de travar toda consulta", () => {
+    // Digest divergente e staging ausente antes deixavam o marcador no slot ativo e toda
+    // consulta do painel repetia o mesmo erro. Agora o marcador sai para quarentena (com o
+    // backup órfão, no caso do digest) e a nova preparação é liberada.
+    assert.match(nativeSource, /quarantinePendingUpdate\(pending, "stale-source", \{ projectRoot, removeBackup: true \}\)/);
+    assert.match(nativeSource, /quarantinePendingUpdate\(pending, "missing-staging"\)/);
+    assert.match(nativeSource, /rmSync\(safeBackupPath\(options\.projectRoot, pending\.backupName\), \{ recursive: true, force: true \}\)/);
 });
 
 test("marcador novo prova a árvore preparada e legado exige nova preparação", () => {

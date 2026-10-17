@@ -33,12 +33,19 @@ mount -t tmpfs golive-netns-config /etc/netns
 # Carrega exatamente o helper do standalone, sem executar o restante do instalador.
 awk '/^netns_exists\(\) \{/{capture=1} capture {print} capture && /^}/{exit}' \
   "$root/standalone/golivebypass-standalone.sh" > "$work/helper.sh"
+# O teardown real passou a encerrar tambem o daemon do WireGuard de usuario: o bloco inteiro
+# entra no helper (as funcoes que dependem de resolve_binary nao sao chamadas aqui).
+sed -n '/^# ======================= WireGuard de usuario (wireguard-go)/,/^# O preflight nao carrega o modulo:/p' \
+  "$root/standalone/golivebypass-standalone.sh" | sed '$d' >> "$work/helper.sh"
 awk '/^teardown_wireguard_netns\(\) \{/{capture=1} capture {print} capture && /^}/{exit}' \
   "$root/standalone/golivebypass-standalone.sh" >> "$work/helper.sh"
 source "$work/helper.sh"
 step() { :; }
 ok() { :; }
 elevate() { "$@"; }
+
+# Sem daemon iniciado neste teste, o pidfile nao existe e o encerramento sai imediato.
+INSTALL_DIR="$work/dados"
 
 NETNS_NAME="$target"
 ip netns add "$prefix"

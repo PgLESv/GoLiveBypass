@@ -6,15 +6,36 @@ import { EventEmitter } from 'events';
 
 export const PREFERRED_COUNTRIES = ['MX', 'US'];
 
+/**
+ * auto: mede o ping do catálogo e gera o de menor ping.
+ * manual: valida e gera o servidor escolhido (-manual-probe).
+ * speed: mede download/upload por um túnel em espaço de usuário (-speed-test), sem tocar nas rotas do Mac.
+ * catalog: só lista as rotas com ping, sem gerar perfil.
+ */
+export type FetchMode = 'auto' | 'manual' | 'speed' | 'catalog';
+
 export interface ProtonFetchOpts {
   username: string;
   password?: string;
   binDir: string;
   sessDir: string;
   confOut: string;
+  mode?: FetchMode;
+  server?: string;
+  /** Servidores fora da escolha automática (troca de rota quando a atual cai). */
+  exclude?: string[];
 }
 
-export interface ChosenServer { server: string; country: string; city: string; pingMs?: number }
+export interface ChosenServer {
+  server: string;
+  country: string;
+  city: string;
+  pingMs?: number;
+  downloadMbps?: number;
+  uploadMbps?: number;
+}
+
+export interface CatalogRoute { server: string; country: string; city: string; load: number; pingMs?: number }
 
 export interface ProtonFetchResult {
   ok: boolean;
@@ -23,12 +44,15 @@ export interface ProtonFetchResult {
   captchaUrl?: string;
   confPath?: string;
   chosen?: ChosenServer;
+  routes?: CatalogRoute[];
 }
 
 interface RunResult { code: number | null; out: string; err: string; timedOut: boolean }
 
 // O catálogo com ping de todos os servidores MX/US leva bem menos que isto
 const RUN_TIMEOUT_MS = 3 * 60_000;
+// O speed test valida até doze rotas e mede até seis (~3 min pelo próprio helper)
+const SPEED_TIMEOUT_MS = 5 * 60_000;
 
 /** O binário só roda se o hash bater com o manifesto gerado por scripts/build-proton.mjs. */
 export async function binaryMatchesManifest(bin: string): Promise<boolean> {
@@ -43,7 +67,7 @@ export async function binaryMatchesManifest(bin: string): Promise<boolean> {
   } catch { return false; }
 }
 
-interface CatalogRoute { server: string; country: string; city: string; load: number; pingMs?: number }
+export const confgenPath = (binDir: string) => path.join(binDir, '..', 'extra', 'proton-confgen', 'proton-confgen');
 
 /** Servidor com menor ping medido; empate desempata pela menor carga. */
 export function pickLowestPing(routes: CatalogRoute[]): ChosenServer | null {
@@ -52,6 +76,46 @@ export function pickLowestPing(routes: CatalogRoute[]): ChosenServer | null {
   measured.sort((a, b) => a.pingMs! - b.pingMs! || a.load - b.load);
   const { server, country, city, pingMs } = measured[0];
   return { server, country, city, pingMs };
+}
+
+/** Última linha JSON da saída (o -json imprime um objeto por execução). */
+export function lastJson(out: string): any {
+  const lines = out.trim().split('\n').reverse();
+  for (const l of lines) {
+    try { const v = JSON.parse(l); if (v && typeof v === 'object') return v; } catch {}
+  }
+  return null;
+}
+
+/** Rotas do catálogo com os campos que a interface usa; descarta o resto. */
+export function normalizeRoutes(raw: unknown): CatalogRoute[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((r: any) => {
+    if (typeof r?.server !== 'string' || !r.server) return [];
+    const pingMs = Number(r.pingMs);
+    return [{
+      server: r.server,
+      country: typeof r.country === 'string' ? r.country : '',
+      city: typeof r.city === 'string' ? r.city : '',
+      load: Number.isFinite(Number(r.load)) ? Number(r.load) : 100,
+      ...(Number.isFinite(pingMs) && pingMs > 0 ? { pingMs } : {}),
+    }];
+  });
+}
+
+const finitePositive = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v > 0;
+
+/** Resultado de uma geração (-json): só os campos conhecidos, números conferidos. */
+export function chosenFromJson(j: any): ChosenServer | null {
+  if (!j || j.success !== true || typeof j.server !== 'string' || !j.server) return null;
+  return {
+    server: j.server,
+    country: typeof j.country === 'string' ? j.country : '',
+    city: typeof j.city === 'string' ? j.city : '',
+    ...(finitePositive(j.pingMs) ? { pingMs: j.pingMs } : {}),
+    ...(finitePositive(j.downloadMbps) ? { downloadMbps: j.downloadMbps } : {}),
+    ...(finitePositive(j.uploadMbps) ? { uploadMbps: j.uploadMbps } : {}),
+  };
 }
 
 function classifyFailure(combined: string): ProtonFetchResult {
@@ -64,7 +128,18 @@ function classifyFailure(combined: string): ProtonFetchResult {
   if (/no.*server|zero.*server|sem.*servidor|nenhum servidor/i.test(combined)) {
     return { ok: false, error: 'no_servers' };
   }
-  return { ok: false, error: 'unknown' };
+  const detail = lastJson(combined)?.error;
+  return { ok: false, error: 'unknown', ...(typeof detail === 'string' ? { detail: detail.slice(0, 300) } : {}) };
+}
+
+export interface ProtonPlan { status: 'free' | 'premium'; maxTier: number; planTitle?: string }
+
+/** Contrato do -check-plan; MaxTier ausente ou inválido nunca vira "Free". */
+export function normalizePlan(v: any): ProtonPlan | null {
+  if (!v || v.success !== true || !Number.isInteger(v.maxTier) || v.maxTier < 0) return null;
+  // planName é um código ("free", "vpn2022"); só o planTitle serve para a tela
+  const title = typeof v.planTitle === 'string' && v.planTitle.trim() && v.planTitle.length <= 120 ? v.planTitle : null;
+  return { status: v.maxTier === 0 ? 'free' : 'premium', maxTier: v.maxTier, ...(title ? { planTitle: title.trim() } : {}) };
 }
 
 /** Emite 'progress' (string) e 'done' (ProtonFetchResult) */
@@ -73,7 +148,7 @@ export class ProtonFetcher extends EventEmitter {
 
   constructor(private readonly timeoutMs = RUN_TIMEOUT_MS) { super(); }
 
-  run(bin: string, args: string[], stdin?: string): Promise<RunResult> {
+  run(bin: string, args: string[], stdin?: string, timeoutMs = this.timeoutMs): Promise<RunResult> {
     return new Promise(resolve => {
       let out = '';
       let err = '';
@@ -87,7 +162,7 @@ export class ProtonFetcher extends EventEmitter {
       };
       const proc = child_process.spawn(bin, args, { stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
       this.proc = proc;
-      const timer = setTimeout(() => { proc.kill('SIGKILL'); finish(null, true); }, this.timeoutMs);
+      const timer = setTimeout(() => { proc.kill('SIGKILL'); finish(null, true); }, timeoutMs);
       proc.stdin?.on('error', () => {});
       if (stdin !== undefined) proc.stdin?.end(stdin);
       proc.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
@@ -105,21 +180,28 @@ export class ProtonFetcher extends EventEmitter {
     }
   }
 
+  /** Plano da conta pela sessão salva; não pede senha nem gera perfil. */
+  async checkPlan(binDir: string, sessDir: string, username: string): Promise<ProtonPlan | null> {
+    const bin = confgenPath(binDir);
+    if (!fs.existsSync(bin) || !(await binaryMatchesManifest(bin))) return null;
+    const r = await this.run(bin, [
+      '-username', username, '-session-file', path.join(sessDir, 'session.json'), '-check-plan', '-json',
+    ], undefined, 20_000);
+    return r.code === 0 ? normalizePlan(lastJson(r.out)) : null;
+  }
+
   private async fetchInner(opts: ProtonFetchOpts): Promise<void> {
-    const bin = path.join(opts.binDir, '..', 'extra', 'proton-confgen', 'proton-confgen');
-    if (!fs.existsSync(bin)) {
-      this.emit('done', { ok: false, error: 'binary_missing' } satisfies ProtonFetchResult);
-      return;
-    }
-    if (!(await binaryMatchesManifest(bin))) {
-      this.emit('done', { ok: false, error: 'binary_integrity' } satisfies ProtonFetchResult);
-      return;
-    }
+    const done = (r: ProtonFetchResult) => { this.emit('done', r); };
+    const bin = confgenPath(opts.binDir);
+    if (!fs.existsSync(bin)) return done({ ok: false, error: 'binary_missing' });
+    if (!(await binaryMatchesManifest(bin))) return done({ ok: false, error: 'binary_integrity' });
     fs.mkdirSync(opts.sessDir, { recursive: true });
 
+    const mode = opts.mode ?? 'auto';
     // A senha vai pelo stdin (-stdin-secrets), nunca na linha de comando visível no `ps`.
     // Sem senha, o proton-confgen reutiliza a sessão salva em -session-file.
     const secrets = opts.password ? JSON.stringify({ password: opts.password }) : undefined;
+    const exclude = (opts.exclude ?? []).filter(s => /^[\w#-]{1,40}$/.test(s));
     const common = [
       '-username', opts.username,
       ...(secrets ? ['-stdin-secrets'] : []),
@@ -129,19 +211,35 @@ export class ProtonFetcher extends EventEmitter {
       '-json',
     ];
 
-    this.emit('progress', '[1/3] Medindo ping dos servidores do México e EUA…');
-    const cat = await this.run(bin, [...common, '-route-catalog', '-auto-ping'], secrets);
-    if (cat.timedOut) { this.emit('done', { ok: false, error: 'timeout' } satisfies ProtonFetchResult); return; }
-    if (cat.code !== 0) {
-      this.emit('done', classifyFailure(cat.out + cat.err));
-      return;
+    if (mode === 'manual' || mode === 'speed') {
+      if (mode === 'manual' && !opts.server) return done({ ok: false, error: 'unknown', detail: 'nenhum servidor escolhido' });
+      this.emit('progress', mode === 'manual'
+        ? `Validando ${opts.server}…`
+        : 'Medindo download e upload das melhores rotas (até 3 min)…');
+      const args = mode === 'manual'
+        ? [...common, '-server', opts.server!, '-manual-probe', '-output', opts.confOut]
+        : [...common, '-speed-test', ...(exclude.length ? ['-exclude-servers', exclude.join(',')] : []), '-output', opts.confOut];
+      const r = await this.run(bin, args, secrets, mode === 'speed' ? SPEED_TIMEOUT_MS : this.timeoutMs);
+      if (r.timedOut) return done({ ok: false, error: 'timeout' });
+      const chosen = chosenFromJson(lastJson(r.out));
+      const measured = mode === 'manual' || (chosen?.downloadMbps && chosen?.uploadMbps);
+      if (r.code === 0 && chosen && measured && fs.existsSync(opts.confOut)) {
+        this.emit('progress', 'Configuração obtida com sucesso!');
+        return done({ ok: true, confPath: opts.confOut, chosen });
+      }
+      return done(classifyFailure(r.out + r.err));
     }
 
-    let chosen: ChosenServer | null = null;
-    try {
-      const last = cat.out.trim().split('\n').pop() ?? '';
-      chosen = pickLowestPing(JSON.parse(last).routes ?? []);
-    } catch { /* catálogo ilegível: cai na escolha automática */ }
+    this.emit('progress', '[1/3] Medindo ping dos servidores do México e EUA…');
+    const cat = await this.run(bin, [...common, '-route-catalog', '-auto-ping'], secrets);
+    if (cat.timedOut) return done({ ok: false, error: 'timeout' });
+    if (cat.code !== 0) return done(classifyFailure(cat.out + cat.err));
+
+    const routes = normalizeRoutes(lastJson(cat.out)?.routes);
+    if (mode === 'catalog') return done({ ok: true, routes });
+
+    // Sem senha daqui em diante: a primeira execução já salvou a sessão
+    const chosen = pickLowestPing(routes.filter(r => !exclude.includes(r.server)));
 
     this.emit('progress', chosen
       ? `[2/3] Melhor: ${chosen.server} (${chosen.city}) · ${chosen.pingMs} ms`
@@ -150,17 +248,18 @@ export class ProtonFetcher extends EventEmitter {
     this.emit('progress', '[3/3] Gerando configuração WireGuard…');
     const gen = await this.run(bin, [
       ...common,
-      ...(chosen ? ['-server', chosen.server] : ['-auto-ping']),
+      ...(chosen ? ['-server', chosen.server] : ['-auto-ping', ...(exclude.length ? ['-exclude-servers', exclude.join(',')] : [])]),
       '-output', opts.confOut,
     ], secrets);
 
-    if (gen.timedOut) { this.emit('done', { ok: false, error: 'timeout' } satisfies ProtonFetchResult); return; }
+    if (gen.timedOut) return done({ ok: false, error: 'timeout' });
     if (gen.code === 0 && fs.existsSync(opts.confOut)) {
       this.emit('progress', 'Configuração obtida com sucesso!');
-      this.emit('done', { ok: true, confPath: opts.confOut, ...(chosen ? { chosen } : {}) } satisfies ProtonFetchResult);
-      return;
+      const generated = chosenFromJson(lastJson(gen.out));
+      const final = chosen ?? generated;
+      return done({ ok: true, confPath: opts.confOut, routes, ...(final ? { chosen: final } : {}) });
     }
-    this.emit('done', classifyFailure(gen.out + gen.err));
+    done(classifyFailure(gen.out + gen.err));
   }
 
   cancel(): void {

@@ -1,6 +1,6 @@
 import { request as nodeRequest } from "https";
 
-export const UPDATE_STREAM_URL = "https://api.skyplaceia.com/bugs/v1/updates/stream";
+export const UPDATE_STREAM_URL = "https://bugs.golivebypass.dev/bugs/v1/updates/stream";
 
 export type UpdatePulseEvent = {
   deliveryId: string;

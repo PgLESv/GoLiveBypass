@@ -52,3 +52,29 @@ describe('binaryMatchesManifest', () => {
     expect(await binaryMatchesManifest(setup('abc'))).toBe(false);
   });
 });
+
+import { lastJson, normalizeRoutes, chosenFromJson, normalizePlan } from '../../src/main/proton/fetch';
+
+describe('saídas do proton-confgen', () => {
+  it('pega a última linha JSON e ignora texto', () => {
+    expect(lastJson('aviso\n{"a":1}\n{"b":2}\nfim')).toEqual({ b: 2 });
+    expect(lastJson('nada')).toBeNull();
+  });
+  it('rotas: só os campos usados, ping inválido sai', () => {
+    expect(normalizeRoutes([{ server: 'US-FREE#1', country: 'US', city: 'Miami', load: 40, pingMs: 0, extra: 1 }, { nome: 'x' }]))
+      .toEqual([{ server: 'US-FREE#1', country: 'US', city: 'Miami', load: 40 }]);
+    expect(normalizeRoutes(null)).toEqual([]);
+  });
+  it('resultado do speed test traz as velocidades', () => {
+    expect(chosenFromJson({ success: true, server: 'US-FREE#7', country: 'US', city: 'NY', pingMs: 120, downloadMbps: 25.8, uploadMbps: 6.6 }))
+      .toEqual({ server: 'US-FREE#7', country: 'US', city: 'NY', pingMs: 120, downloadMbps: 25.8, uploadMbps: 6.6 });
+    expect(chosenFromJson({ success: false, server: 'x' })).toBeNull();
+  });
+  it('plano: MaxTier inválido nunca vira Free', () => {
+    expect(normalizePlan({ success: true, maxTier: 0, planTitle: 'Proton VPN Free' })).toEqual({ status: 'free', maxTier: 0, planTitle: 'Proton VPN Free' });
+    expect(normalizePlan({ success: true, maxTier: 2 })).toEqual({ status: 'premium', maxTier: 2 });
+    expect(normalizePlan({ success: true, maxTier: 0, planName: 'free', planTitle: '' })).toEqual({ status: 'free', maxTier: 0 });
+    expect(normalizePlan({ success: true })).toBeNull();
+    expect(normalizePlan({ success: false, maxTier: 0 })).toBeNull();
+  });
+});

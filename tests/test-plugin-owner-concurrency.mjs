@@ -16,9 +16,9 @@ test("initialize é serializado e não assume lock vivo de outra instância", ()
 });
 
 test("aquisição limpa probes somente depois de obter ownership", () => {
-    assert.match(start, /owner = await this\.acquireOwnership\(\);\s+await this\.cleanupStaleProbes\(this\.probePath/);
+    assert.match(start, /owner = await this\.acquireOwnership\(existing\);\s+await this\.cleanupStaleProbes\(this\.probePath/);
     const normalActivation = start.slice(start.indexOf("this.state = \"preparing\""));
-    assert.doesNotMatch(normalActivation.slice(0, normalActivation.indexOf("owner = await this.acquireOwnership()")), /cleanupStaleProbes/);
+    assert.doesNotMatch(normalActivation.slice(0, normalActivation.indexOf("owner = await this.acquireOwnership(existing)")), /cleanupStaleProbes/);
 });
 
 test("escrita do owner é atômica e não usa arquivo parcialmente criado", () => {
@@ -46,4 +46,41 @@ test("liberação compara o token completo e falha fechado se o owner mudou", ()
     assert.match(owner, /await this\.withOwnerMutex/);
 });
 
-console.log("plugin owner concurrency tests: 5/5");
+// #306: só a Restaurar rede (ação explícita) entra pelo sinal manual; as demais
+// entradas de stopInternal seguem fail-closed diante de inspeção desconhecida.
+test("restauração manual é a única entrada de limpeza sem ownership comprovado", () => {
+    const restore = source.slice(source.indexOf("public restoreNetwork()"), source.indexOf("public restartDiscord()"));
+    assert.match(restore, /return this\.serial\(\(\) => this\.stopInternal\(isLinux\(\), \{ manual: true \}\)\);/);
+    const stop = source.slice(source.indexOf("private async stopInternal"), source.indexOf("private async stopLinuxInternal"));
+    assert.match(stop, /if \(isUnknownWireSockInspection\(inspection\)\)/);
+    assert.match(stop, /if \(!manual && !ownershipProven\) \{/);
+    assert.match(stop, /if \(isUnknownWireSockInspection\(inspection\) && !manual\) \{/);
+    assert.match(stop, /stopOwnedWireSock\(this\.serviceConfigPath, this\.options\.log, inspection, \{ manual \}\)/);
+    assert.match(stop, /if \(inspection\.reliable && inspection\.active && !inspection\.owned\)/);
+});
+
+// #281: sem owner.lock não há sessão esperada no boot e o serviço próprio vira
+// órfão; com owner.lock a sessão continua sendo re-adoptada e gerida.
+test("boot sem owner.lock para o serviço órfão e com owner.lock re-adopta", () => {
+    const orphan = initialize.slice(initialize.indexOf("if (!owner) {"));
+    assert.ok(orphan.length > 10, "bloco de serviço órfão presente no boot");
+    assert.match(orphan, /boot encontrou WireSock próprio sem owner\.lock; parando serviço órfão/);
+    assert.match(orphan, /const orphan = await windows\.stopOwnedWireSock\(this\.serviceConfigPath, this\.options\.log, inspection\);/);
+    assert.match(orphan, /if \(!orphan\.stopped\) \{[\s\S]*?this\.state = "recovery_required";/);
+    assert.match(orphan, /this\.state = "inactive";/);
+    assert.match(initialize, /const adopted = await this\.claimActiveOwnership\(owner, inspection\);/);
+});
+
+// #331: o watchdog re-adopta a sessão própria quando uma inspeção fresca a
+// confirma; ele continua sem nenhuma chamada destrutiva.
+test("watchdog re-adopta sessão própria sem chamar parada destrutiva", () => {
+    const watchdog = source.slice(source.indexOf("private async checkWatchdog"), source.indexOf("private startWatchdog"));
+    assert.match(watchdog, /watchdog re-adoptou a sessão WireSock própria/);
+    assert.match(watchdog, /const recheck = await windows\.inspectWireSockUntilReliableAsync\(this\.serviceConfigPath, this\.guiConfigPath\);/);
+    assert.match(watchdog, /if \(recheck\.active && recheck\.owned\) \{/);
+    assert.doesNotMatch(watchdog, /stopOwnedWireSock|stopManagedWireSock|taskkill|process\.kill|runAsAdministrator|execFile|execSync/);
+    // A ausência confirmada sem sessão própria continua saindo do estado ativo.
+    assert.match(watchdog, /if \(!confirmation\.active\) \{[\s\S]*?this\.state = "inactive";/);
+});
+
+console.log("plugin owner concurrency tests: 8/8");

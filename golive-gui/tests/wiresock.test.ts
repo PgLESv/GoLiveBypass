@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { elevatedPowerShellFileArgs, wireSockDirectScript, wireSockServiceScript } from "../electron/wiresock-service";
+import { elevatedPowerShellFileArgs, wireSockCleanupScript, wireSockDirectScript, wireSockServiceScript } from "../electron/wiresock-service";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -18,6 +18,10 @@ describe("WireSock no Windows", () => {
       expect(decoded).toContain(config);
       expect(decoded).toContain(result);
     }
+    const cleanup = Buffer.from(wireSockCleanupScript(config, result), "utf8");
+    expect([...cleanup.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+    expect(new TextDecoder("utf-8").decode(cleanup)).toContain(config);
+    expect(new TextDecoder("utf-8").decode(cleanup)).toContain(result);
   });
 
   it("preserva whitespace e palavras do diagnóstico capturado", () => {
@@ -94,6 +98,23 @@ describe("WireSock no Windows", () => {
       code: "WIRESOCK_PERMISSION",
     });
     expect(classifyWireSockActivationFailure(cancelado).message).toMatch(/administrador/);
+  });
+
+  it("só culpa o driver com evidência de driver, não com erro do SCM nem log do cliente", () => {
+    // Genuíno: o cliente reclamando do driver NDIS.
+    expect(classifyWireSockActivationFailure({ stderr: "GOLIVE_WIRESOCK_DIRECT_ERROR: 1061 WireSock: NDIS filter driver not installed" }))
+      .toMatchObject({ kind: "driver", code: "WIRESOCK_DRIVER" });
+    expect(classifyWireSockActivationFailure({ stderr: "ndiswg service is not running" }))
+      .toMatchObject({ kind: "driver", code: "WIRESOCK_DRIVER" });
+    // 1061 = o serviço não aceita mensagens de controle agora (STOP_PENDING): é tempo, não
+    // driver — a mensagem antiga mandava reiniciar o Windows por causa de um stop atrasado.
+    const atrasado = classifyWireSockActivationFailure({ stderr: "GOLIVE_WIRESOCK_ERROR: STOP_TIMEOUT: servico=wiresock-client-service estado=StopPending Win32ExitCode=1061" });
+    expect(atrasado).toMatchObject({ kind: "timeout", code: "WIRESOCK_TIMEOUT" });
+    expect(atrasado.message).not.toMatch(/Reinicie o Windows/);
+    // Log JSON rotineiro do cliente (é o que o detalhe carrega com -log-level info).
+    const rotineiro = classifyWireSockActivationFailure({ stderr: '{"log_level":"error","message":"[TUN]: Failed to figure out the route to the VPN server"} {"log_level":"info","message":"filter initialized"}' });
+    expect(rotineiro).toMatchObject({ kind: "unknown", code: "WIRESOCK_UNKNOWN" });
+    expect(rotineiro.message).not.toMatch(/componente de rede/);
   });
 
   it("explica a elevação que termina sem resultado", () => {
@@ -180,7 +201,6 @@ describe("WireSock no Windows", () => {
     expect(script).toContain("@('run', '-config'");
     expect(script).toContain("DIRECT_RUNNING: pid=");
     expect(script).toContain("wiresock-pro-client-service");
-    expect(script).toContain("Stop-Process -Force");
     expect(script).toContain("-network-lock', 'disabled'");
     expect(script).toContain("-RedirectStandardOutput");
     expect(script).toContain("-RedirectStandardError");
@@ -212,12 +232,12 @@ describe("WireSock no Windows", () => {
 
   it("prioriza o modo direto oficial e não usa fallback genérico do serviço", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
-    expect(src).toContain("wireSockDirectScript(wsExe, targetConf, directResultPath)");
+    expect(src).toContain("wireSockDirectScript(wsExe, targetConf, directResultPath, { guiPid: process.pid, stopFlagPath })");
     expect(src).toContain("classifyWireSockDirectResult");
     expect(src).toContain("mayUseServiceCompatibility(directResult)");
     expect(src).toContain("activation.compatibility_fallback");
     expect(src).toContain("wireSockServiceScript(wsExe, targetConf, serviceResultPath)");
-    expect(src.indexOf("wireSockDirectScript(wsExe, targetConf, directResultPath)")).toBeLessThan(
+    expect(src.indexOf("wireSockDirectScript(wsExe, targetConf, directResultPath, { guiPid: process.pid, stopFlagPath })")).toBeLessThan(
       src.indexOf("wireSockServiceScript(wsExe, targetConf, serviceResultPath)"),
     );
     expect(src).toContain('directResult.kind === "running"');
@@ -250,7 +270,7 @@ describe("WireSock no Windows", () => {
 
   it("inclui o diretorio app do Discord para cobrir todos os subprocessos", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    const fn = src.slice(src.indexOf("function windowsAllowedAppPaths"), src.indexOf("function logRouteProbe"));
+    const fn = src.slice(src.indexOf("function windowsAllowedAppPaths"), src.indexOf("function stopWindowsRouteWatchdog"));
     expect(fn).toContain("path.dirname(path.resolve(install.exePath))");
     expect(fn).not.toContain("proton.findProtonConfgenExe()");
   });
@@ -296,26 +316,20 @@ describe("WireSock no Windows", () => {
   it("nao deixa DNS global nem network lock residual no fluxo normal", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("DNS\\s*=");
-    expect(src).toContain("reset-network-lock");
-    expect(src).toContain('"/flushdns"');
     expect(wireSockServiceScript("C:\\WireSock\\client.exe", "C:\\GoLive\\wg.conf")).toContain("-network-lock disabled");
   });
 
-  it("encerra a arvore do cliente e aguarda o servico sair antes de confirmar a limpeza", () => {
-    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
-    expect(src).toContain('"/F", "/T", "/IM", "wiresock-client.exe"');
-    expect(src).toContain("for (let pass = 0; pass < 2; pass++)");
-    expect(src).toContain("residuo encontrado; repetindo limpeza elevada");
-    expect(src).toContain("await esperar(250)");
-    expect(src).toContain('"sc.exe", ["stop", name]');
-    expect(src).toContain("stopWireSockServiceElevated");
-    expect(src).toContain("-Verb RunAs");
-    expect(src).toContain("-PassThru");
-    expect(src).toContain("windowsHide: false");
-    expect(src).toContain("killWireSockProcessElevated");
+  it.each([
+    ["WIRESOCK_EXTERNAL: processo externo preservado", "WIRESOCK_EXTERNAL"],
+    ["WIRESOCK_INSPECTION_FAILED: consulta CIM incompleta", "WIRESOCK_STATE_UNKNOWN"],
+  ])("explica a recusa por ownership sem recomendar perfil ou serviço global", (detail, code) => {
+    const direct = classifyWireSockDirectResult(`GOLIVE_WIRESOCK_DIRECT_ERROR: ${detail}`);
+    expect(direct.kind).toBe("failed");
+    expect(mayUseServiceCompatibility(direct)).toBe(false);
+    expect(classifyWireSockActivationFailure(direct.detail).code).toBe(code);
   });
 
-  it("retorna os detalhes da limpeza e valida DNS/HTTPS antes de declarar recuperacao", () => {
+  it("retorna os detalhes da limpeza e registra DNS/HTTPS em diagnóstico assíncrono", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("attempts: number");
     expect(src).toContain("servicesResidual: string[]");
@@ -325,7 +339,7 @@ describe("WireSock no Windows", () => {
     expect(src).toContain("ok: cleanup.stopped");
   });
 
-  it("repete a sondagem para não liberar o Discord com DNS intermitente", () => {
+  it("repete a sondagem para registrar amostras consecutivas com DNS intermitente", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain("export async function verifyWindowsNetworkStable(");
     expect(src).toContain("await esperar(Math.max(0, intervalMs))");
@@ -352,7 +366,7 @@ describe("WireSock no Windows", () => {
     expect(stable.ok).toBe(true);
   });
 
-  it("valida o endpoint do updater antes de liberar o Discord", () => {
+  it("inclui o endpoint do updater no diagnóstico de conectividade", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/wiresock.ts"), "utf8");
     expect(src).toContain('dns.lookup("updates.discord.com")');
     expect(src).toContain('testarHttps("https://updates.discord.com/")');

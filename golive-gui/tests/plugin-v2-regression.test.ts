@@ -1,10 +1,15 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn(), execFileSync: vi.fn() }));
 
+import * as windows from "../../goLiveBypass/vpn-windows";
+import { PluginVpnController } from "../../goLiveBypass/vpn-controller";
+import { VPN_OWNER_KIND } from "../../goLiveBypass/vpn-types";
+import { forcePluginHost } from "./helpers/plugin-host";
 import { inspectWireSock, stopManagedWireSock, stopOwnedWireSock } from "../../goLiveBypass/vpn-windows";
 
 const windowsSource = fs.readFileSync(
@@ -161,6 +166,23 @@ describe("atribuição do WireSock pelo PID do serviço próprio", () => {
         expect(vi.mocked(execFileSync).mock.calls.some(([file]) => file === "taskkill.exe")).toBe(false);
     });
 
+    it("parada própria não reseta lock nem DNS global de adaptadores externos", async () => {
+        vi.useFakeTimers();
+        let snapshotCall = 0;
+        vi.mocked(execFileSync).mockImplementation(((file: string, args?: readonly string[]) => {
+            if (file === "powershell.exe" && (args?.[3] ?? "").includes("ConvertTo-Json")) {
+                snapshotCall++;
+                return snapshotCall === 1 ? snapshot([{ pid: 4242, commandLine: SERVICE_COMMAND }], 4242) : stoppedSnapshot([]);
+            }
+            if (file === "powershell.exe" && (args?.[3] ?? "").includes(".PathName")) return SERVICE_COMMAND;
+            return "";
+        }) as never);
+        const pending = stopOwnedWireSock(PLUGIN_CONFIG, vi.fn());
+        await vi.runAllTimersAsync();
+        expect(await pending).toMatchObject({ stopped: true, networkLockReset: false, dnsCleared: false });
+        expect(vi.mocked(execFileSync).mock.calls.some(([, args]) => (args ?? []).some(arg => /reset-network-lock|Set-DnsClientServerAddress|Get-NetAdapter/.test(String(arg))))).toBe(false);
+    });
+
     it("classifica a config exata da GUI mesmo com espaços no caminho", () => {
         windows(customSnapshot(GUI_SERVICE_COMMAND, [{ pid: 4242, commandLine: GUI_SERVICE_COMMAND }], 4242));
 
@@ -249,9 +271,174 @@ describe("atribuição do WireSock pelo PID do serviço próprio", () => {
             expect.any(Object),
         ]);
         expect(vi.mocked(execFileSync).mock.calls.some(([, args]) => Array.isArray(args) && args.includes("/IM"))).toBe(false);
+        expect(cleanup).toMatchObject({ networkLockReset: false, dnsCleared: false });
+        expect(vi.mocked(execFileSync).mock.calls.some(([, args]) => (args ?? []).some(arg => /reset-network-lock|Set-DnsClientServerAddress|Get-NetAdapter/.test(String(arg))))).toBe(false);
     });
 });
 
+describe("recuperação segura para inspeção WireSock desconhecida", () => {
+    let restoreHost = () => { };
+
+    beforeEach(() => {
+        restoreHost = forcePluginHost("win32");
+        vi.mocked(execFileSync).mockReset();
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.mocked(execFileSync).mockReset();
+        restoreHost();
+    });
+
+    const unknown = (): windows.WireSockInspection => ({
+        active: false,
+        owned: false,
+        reliable: false,
+        services: ["wiresock-client-service"],
+        processIds: [4242],
+        reason: "Não foi possível confirmar o estado do WireSock; estado desconhecido.",
+        origin: "unknown",
+        managedServices: [],
+        managedProcessIds: [],
+    });
+
+    const inactive = (): windows.WireSockInspection => ({
+        active: false,
+        owned: false,
+        reliable: true,
+        services: [],
+        processIds: [],
+        reason: null,
+        origin: "unknown",
+        managedServices: [],
+        managedProcessIds: [],
+    });
+
+    const ownActive = (): windows.WireSockInspection => ({
+        active: true,
+        owned: true,
+        reliable: true,
+        services: ["wiresock-client-service"],
+        processIds: [4242],
+        reason: null,
+        origin: "plugin",
+        managedServices: [],
+        managedProcessIds: [],
+    });
+
+    function controller(dataDir: string): PluginVpnController {
+        return new PluginVpnController({
+            dataDir,
+            guiDataDir: dataDir,
+            readSettings: () => ({}),
+            isEnabled: () => true,
+            log: () => { },
+        });
+    }
+
+    it("não deixa a primeira inspeção incompleta prender o estado em recovery_required", async () => {
+        const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "golive-recovery-retry-"));
+        try {
+            vi.spyOn(windows, "inspectWireSock").mockReturnValueOnce(unknown()).mockReturnValue(inactive());
+            const inspectRetry = vi.spyOn(windows, "inspectWireSockUntilReliableAsync").mockResolvedValue(inactive());
+            const instance = controller(dataDir);
+
+            await instance.initialize();
+
+            expect(inspectRetry).toHaveBeenCalled();
+            expect(instance.getStatus(inactive()).state).toBe("inactive");
+        } finally {
+            fs.rmSync(dataDir, { recursive: true, force: true });
+        }
+    });
+
+    it("restauração manual limpa mesmo sem ownership comprovado (#306)", async () => {
+        const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "golive-recovery-manual-"));
+        try {
+            vi.spyOn(windows, "inspectWireSock").mockReturnValue(unknown());
+            vi.spyOn(windows, "inspectWireSockUntilReliableAsync").mockResolvedValue(unknown());
+            const cleanup = vi.spyOn(windows, "stopOwnedWireSock").mockResolvedValue({
+                stopped: true,
+                servicesResidual: [],
+                processResidual: [],
+                networkLockReset: false,
+                dnsCleared: false,
+                dnsFlushed: false,
+            });
+            const instance = controller(dataDir);
+            const result = await instance.restoreNetwork();
+
+            expect(cleanup).toHaveBeenCalledWith(
+                instance.paths.serviceConfigPath,
+                expect.any(Function),
+                expect.objectContaining({ reliable: false }),
+                { manual: true },
+            );
+            expect(result).toMatchObject({ success: true, state: "inactive" });
+        } finally {
+            fs.rmSync(dataDir, { recursive: true, force: true });
+        }
+    });
+
+    it("ações automáticas continuam sem chamar limpeza com inspeção desconhecida (#306)", async () => {
+        const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "golive-recovery-external-"));
+        try {
+            vi.spyOn(windows, "inspectWireSock").mockReturnValue(unknown());
+            vi.spyOn(windows, "inspectWireSockUntilReliableAsync").mockResolvedValue(unknown());
+            const cleanup = vi.spyOn(windows, "stopOwnedWireSock");
+
+            // Quit/parada em segundo plano: sem o sinal manual nada é destruído.
+            const result = await controller(dataDir).shutdown(false);
+            expect(cleanup).not.toHaveBeenCalled();
+            expect(result).toMatchObject({ success: false, state: "recovery_required" });
+
+            // Boot também continua não-destrutivo: leitura desconhecida adia o
+            // cleanup em modo diagnóstico, sem tocar em serviço ou processo.
+            await controller(dataDir).initialize();
+            expect(cleanup).not.toHaveBeenCalled();
+        } finally {
+            fs.rmSync(dataDir, { recursive: true, force: true });
+        }
+    });
+
+    it("com owner/config próprios, tenta só cleanup próprio e sanitiza falha sem confirmação", async () => {
+        const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "golive-recovery-owned-"));
+        try {
+            const instance = controller(dataDir);
+            fs.writeFileSync(instance.paths.ownerPath, JSON.stringify({
+                kind: VPN_OWNER_KIND,
+                pid: process.pid,
+                generation: 1,
+                profilePath: instance.paths.profilePath,
+                configPath: instance.paths.serviceConfigPath,
+                createdAt: Date.now(),
+            }));
+            vi.spyOn(windows, "inspectWireSock").mockReturnValue(unknown());
+            vi.spyOn(windows, "inspectWireSockUntilReliableAsync").mockResolvedValue(ownActive());
+            const cleanup = vi.spyOn(windows, "stopOwnedWireSock").mockResolvedValue({
+                stopped: false,
+                servicesResidual: ["wiresock-client-service"],
+                processResidual: [4242],
+                networkLockReset: false,
+                dnsCleared: false,
+                dnsFlushed: false,
+                error: "token=super-secret\nstack interno",
+            });
+
+            const result = await instance.restoreNetwork();
+
+            expect(cleanup).toHaveBeenCalled();
+            expect(result.success).toBe(false);
+            expect(result.state).toBe("recovery_required");
+            expect(result.error).toMatch(/token=<redacted>/);
+            expect(result.error).not.toContain("super-secret");
+            expect(result.error).not.toContain("\n");
+        } finally {
+            fs.rmSync(dataDir, { recursive: true, force: true });
+        }
+    });
+
+});
 describe("plugin v2 WireSock ownership regression", () => {
     it("does not treat a stopped legacy service registration as an active external tunnel", () => {
         expect(windowsSource).toMatch(

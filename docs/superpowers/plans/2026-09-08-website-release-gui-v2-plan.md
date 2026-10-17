@@ -135,7 +135,7 @@ Adicionar em `nuxt.config.ts`:
 ```ts
 runtimeConfig: {
   public: {
-    releaseApiBaseUrl: process.env.NUXT_PUBLIC_RELEASE_API_BASE_URL || 'https://api.skyplaceia.com/bugs',
+    releaseApiBaseUrl: process.env.NUXT_PUBLIC_RELEASE_API_BASE_URL || 'https://bugs.golivebypass.dev/bugs',
   },
 },
 ```
@@ -473,7 +473,7 @@ git commit -m "docs(site): alinhar arquitetura WireGuard por aplicativo"
 
 Remover “edite `data/release.ts` para trocar tag, versão e assets”. Documentar:
 
-- API padrão `https://api.skyplaceia.com/bugs`;
+- API padrão `https://bugs.golivebypass.dev/bugs`;
 - `NUXT_PUBLIC_RELEASE_API_BASE_URL` para desenvolvimento;
 - que a API resolve somente stable e os downloads usam aliases;
 - fallback 2.0.4 apenas como contingência de indisponibilidade;

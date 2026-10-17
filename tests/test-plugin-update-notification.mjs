@@ -8,8 +8,9 @@ const nativeSource = readFileSync(new URL("../goLiveBypass/native.ts", import.me
 const controllerSource = readFileSync(new URL("../goLiveBypass/vpn-controller.ts", import.meta.url), "utf8");
 
 test("update pendente usa toast customizado no rodape", () => {
-  assert.match(source, /Toasts\.Type\.CUSTOM/);
-  assert.match(source, /Toasts\.Position\.BOTTOM/);
+  // O tipo/posição do toast deixaram de ser pinados aqui: a API do cliente mudou
+  // (Toasts.Type/Position sumiram no Equicord atual) e o contrato da chamada é
+  // verificado em test-plugin-runtime-compatibility.mjs, executando a função real.
   assert.match(source, /component:\s*<PluginUpdateToast/);
   assert.match(source, /duration:\s*15_000/);
   assert.match(source, /role="status"/);

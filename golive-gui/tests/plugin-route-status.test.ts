@@ -5,6 +5,7 @@ import path from "path";
 
 import { PluginVpnController } from "../../goLiveBypass/vpn-controller";
 import type * as VpnLinux from "../../goLiveBypass/vpn-linux";
+import { pluginHostSupported } from "./helpers/plugin-host";
 import {
     formatVpnRouteSummary,
     readWireGuardEndpoint,
@@ -50,6 +51,27 @@ vi.mock("../../goLiveBypass/vpn-linux", async importOriginal => {
             reason: null,
         }),
         linuxDependencyIssues: () => [],
+    };
+});
+
+// No Windows o status consulta o WireSock por processos externos (sc/PowerShell), cujo
+// tempo varia por máquina e estourou o limite de 5 s num runner. A inspeção é fixa: sem
+// WireSock ativo, assim como a do Linux acima.
+vi.mock("../../goLiveBypass/vpn-windows", async importOriginal => {
+    const actual = await importOriginal<typeof import("../../goLiveBypass/vpn-windows")>();
+    return {
+        ...actual,
+        inspectWireSock: () => ({
+            active: false,
+            owned: false,
+            reliable: true,
+            services: [],
+            processIds: [],
+            reason: null,
+            origin: "unknown",
+            managedServices: [],
+            managedProcessIds: [],
+        }),
     };
 });
 
@@ -144,7 +166,7 @@ describe("rótulo do Estado da rota", () => {
     });
 });
 
-describe("rota ativa no status do plugin", () => {
+describe.skipIf(!pluginHostSupported)("rota ativa no status do plugin", () => {
     it("registra o arquivo personalizado importado e segue o endpoint do perfil ativo", async () => {
         const dataDir = temporaryDataDir();
         const source = path.join(dataDir, "custom.conf");

@@ -90,8 +90,14 @@ function containsPathTraversal(rawUrl: string, parsed: URL): boolean {
 }
 
 function hasOfficialUpdatePath(parsed: URL, hostname: string): boolean {
-  if (hostname === "api.github.com") return parsed.pathname === OFFICIAL_API_RELEASE_PATH;
-  if (hostname === "github.com") return parsed.pathname.startsWith(OFFICIAL_RELEASE_PATH_PREFIX);
+  if (hostname === "api.github.com") {
+    return parsed.pathname === OFFICIAL_API_RELEASE_PATH
+      || parsed.pathname === "/repos/PgLESv/GoLiveBypass/releases";
+  }
+  if (hostname === "github.com") {
+    return parsed.pathname.startsWith(OFFICIAL_RELEASE_PATH_PREFIX)
+      || parsed.pathname.startsWith("/PgLESv/GoLiveBypass/releases/download/");
+  }
   return TRUSTED_UPDATE_HOSTS.has(hostname);
 }
 
@@ -122,7 +128,7 @@ export function isOfficialPluginManifest(value: unknown, assetName: string): boo
     && hasOwn(metadata, "assetName")
     && manifest.name === "GoLiveBypass"
     && metadata.type === "github"
-    && metadata.id === OFFICIAL_UPDATE_REPOSITORY
+    && (metadata.id === OFFICIAL_UPDATE_REPOSITORY || metadata.id === "PgLESv/GoLiveBypass")
     && metadata.assetName === assetName;
 }
 

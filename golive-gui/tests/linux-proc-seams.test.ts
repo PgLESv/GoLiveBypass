@@ -22,15 +22,17 @@ function escreve(file: string, conteudo: string): string {
   return file;
 }
 
-describe.skipIf(process.platform === "win32")("seams reais de /proc e .desktop", () => {
-  it("le /proc respeitando o teto de bytes pedido", () => {
+describe("seams reais de /proc e .desktop", () => {
+  // Depende de /proc real do Linux.
+  it.skipIf(process.platform !== "linux")("le /proc respeitando o teto de bytes pedido", () => {
     const seams = createProcSeams();
 
     expect(seams.readText("/proc/self/status", 8192)).toContain("Uid:");
     expect(seams.readText("/proc/self/status", 5)).toHaveLength(5);
   });
 
-  it("devolve vazio em vez de lancar quando o arquivo nao existe ou nao e link", () => {
+  // Depende de /proc real do Linux.
+  it.skipIf(process.platform !== "linux")("devolve vazio em vez de lancar quando o arquivo nao existe ou nao e link", () => {
     const seams = createProcSeams();
 
     expect(seams.readLink("/proc/self/nao-existe")).toBe("");
@@ -53,7 +55,8 @@ describe.skipIf(process.platform === "win32")("seams reais de /proc e .desktop",
     expect(seams.desktopLookup({ kind: "flatpak", identidade: "org.exemplo.Outro", argv: [], resources: "" })).toBeNull();
   });
 
-  it("resolve o .desktop de um executavel pelo realpath do Exec", () => {
+  // Depende de realpath/symlinks POSIX do Linux.
+  it.skipIf(process.platform !== "linux")("resolve o .desktop de um executavel pelo realpath do Exec", () => {
     const data = tempDir();
     const bin = escreve(path.join(tempDir(), "Discord", "discord"), "#!/bin/sh\n");
     fs.chmodSync(bin, 0o755);

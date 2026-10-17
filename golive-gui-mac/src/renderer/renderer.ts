@@ -22,6 +22,10 @@ const permOpen    = document.getElementById('perm-open') as HTMLButtonElement;
 const permRetry   = document.getElementById('perm-retry') as HTMLButtonElement;
 const permStatus  = document.getElementById('perm-status')!;
 const vencordOptIn = document.getElementById('vencord-optin') as HTMLInputElement;
+const pendingHint = document.getElementById('pending-hint')!;
+const restartBtn  = document.getElementById('restart-btn') as HTMLButtonElement;
+const offNowBtn   = document.getElementById('off-now-btn') as HTMLButtonElement;
+const restoreBtn  = document.getElementById('restore-btn') as HTMLButtonElement;
 const updateBanner  = document.getElementById('update-banner')!;
 const updateMsg     = document.getElementById('update-msg')!;
 const updateBtn     = document.getElementById('update-btn') as HTMLButtonElement;
@@ -65,9 +69,22 @@ function log(m: string, isErr = false) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function setState(s: 'inactive' | 'active' | 'busy' | 'unknown') {
+type UiState = 'inactive' | 'active' | 'pending' | 'busy' | 'unknown';
+
+function setState(s: UiState) {
   document.body.dataset.state = s;
-  if (s === 'active') {
+  restartBtn.hidden = s !== 'active';
+  if (s !== 'active' && s !== 'pending') {
+    (document.getElementById('traffic') as HTMLElement).hidden = true;
+  }
+  offNowBtn.hidden = pendingHint.hidden = s !== 'pending';
+  if (s === 'busy') restoreBtn.hidden = true;
+  if (s === 'pending') {
+    stateLabel.textContent = 'Desliga ao fechar o Discord';
+    toggle.setAttribute('aria-label', 'Manter ativo');
+    hideExit();
+    ipLabel.textContent = '';
+  } else if (s === 'active') {
     stateLabel.textContent = 'Bypass ativo';
     toggle.setAttribute('aria-label', 'Desativar');
   } else if (s === 'inactive' || s === 'unknown') {
@@ -92,9 +109,10 @@ function applyTunnelState(st: string) {
     return;
   }
   const wasActive = active;
+  // Pendente conta como inativo para o botão: clicar reativa (cancela a espera)
   active = st === 'active';
-  setState(active ? 'active' : st === 'unknown' ? 'unknown' : 'inactive');
-  toggle.disabled = !(active || hasConfig);
+  setState(st === 'active' || st === 'pending' || st === 'unknown' ? st : 'inactive');
+  toggle.disabled = !(active || st === 'pending' || hasConfig);
   if (active && (!wasActive || exitLabel.hidden)) showExit();
 }
 
@@ -134,69 +152,189 @@ toggle.addEventListener('click', async () => {
     log(`Erro: ${msg}${r.detail ? ` — ${r.detail}` : ''}`, true);
     await refresh();
     ipLabel.textContent = `Erro: ${msg}`;
+    if (r.error !== 'busy' && r.error !== 'user_cancelled') restoreBtn.hidden = false;
     return;
   }
 
+  restoreBtn.hidden = true;
   applyTunnelState(r?.state ?? (deactivating ? 'inactive' : 'active'));
 });
 
-// ── ProtonVPN fetch ───────────────────────────────────────────────────────────
+async function runSecondary(btn: HTMLButtonElement, label: string, call: () => Promise<any>) {
+  log(label);
+  btn.disabled = toggle.disabled = true;
+  setState('busy');
+  try {
+    const r = await call();
+    if (r?.error) {
+      log(`Erro: ${r.error}${r.detail ? ` — ${r.detail}` : ''}`, true);
+      if (r.error !== 'busy' && r.error !== 'user_cancelled') restoreBtn.hidden = false;
+    } else if (btn === restoreBtn) {
+      restoreBtn.hidden = true;
+    }
+  } finally {
+    btn.disabled = false;
+    await refresh();
+  }
+}
+
+restartBtn.addEventListener('click', () => runSecondary(restartBtn, 'Reiniciando bypass…', () => golive.restart()));
+offNowBtn.addEventListener('click', () => runSecondary(offNowBtn, 'Desativando agora…', () => golive.deactivate(true)));
+restoreBtn.addEventListener('click', () => runSecondary(restoreBtn, 'Restaurando a internet…', () => golive.restoreNetwork()));
+
+// ── Conexão Proton ────────────────────────────────────────────────────────────
+
+const tabProton   = document.getElementById('tab-proton') as HTMLButtonElement;
+const tabConf     = document.getElementById('tab-conf') as HTMLButtonElement;
+const paneProton  = document.getElementById('pane-proton')!;
+const paneConf    = document.getElementById('pane-conf')!;
+const loginBox    = document.getElementById('login-box')!;
+const routeBox    = document.getElementById('route-box')!;
+const routeSelect = document.getElementById('route-select') as HTMLSelectElement;
+const optimizeBtn = document.getElementById('optimize-btn') as HTMLButtonElement;
+const planRow     = document.getElementById('plan-row')!;
+const planLabel   = document.getElementById('plan-label')!;
+const planRefresh = document.getElementById('plan-refresh') as HTMLButtonElement;
+const confStatus  = document.getElementById('conf-status')!;
+
+interface Route { server: string; country: string; city: string; pingMs?: number; downloadMbps?: number; uploadMbps?: number }
+let routes: Route[] = [];
+let currentRoute: Route | null = null;
+let routePreference: 'auto' | 'manual' = 'auto';
+let protonBusy = false;
+
+function selectTab(which: 'proton' | 'conf') {
+  tabProton.setAttribute('aria-selected', String(which === 'proton'));
+  tabConf.setAttribute('aria-selected', String(which === 'conf'));
+  paneProton.hidden = which !== 'proton';
+  paneConf.hidden = which !== 'conf';
+}
+tabProton.addEventListener('click', () => selectTab('proton'));
+tabConf.addEventListener('click', () => selectTab('conf'));
+
+function setStatus(text: string, kind: 'info' | 'ok' | 'err' = 'info') {
+  protonStatus.hidden = !text;
+  protonStatus.textContent = text;
+  protonStatus.className = `status-line${kind === 'info' ? '' : ` ${kind}`}`;
+}
+
+const AUTO = '__auto';
+const LOAD = '__load';
+
+function routeLabel(r: Route): string {
+  const flag = r.country ? `${flagEmoji(r.country)} ` : '';
+  return `${flag}${r.server}${r.city ? ` · ${r.city}` : ''}${r.pingMs ? ` · ${r.pingMs} ms` : ''}`;
+}
+
+function renderRoutes() {
+  routeSelect.textContent = '';
+  const add = (value: string, label: string) => {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = label;
+    routeSelect.appendChild(o);
+    return o;
+  };
+  const autoLabel = routePreference === 'auto' && currentRoute
+    ? `Automática · ${routeLabel(currentRoute)}`
+    : 'Automática · menor ping';
+  add(AUTO, autoLabel);
+  const sorted = [...routes].sort((a, b) => (a.pingMs ?? 9999) - (b.pingMs ?? 9999));
+  for (const r of sorted) add(r.server, routeLabel(r));
+  if (!routes.length) add(LOAD, 'Carregar lista de rotas…');
+  const manualCurrent = routePreference === 'manual' && currentRoute;
+  if (manualCurrent && !routes.some(r => r.server === currentRoute!.server)) add(currentRoute!.server, routeLabel(currentRoute!));
+  routeSelect.value = manualCurrent ? currentRoute!.server : AUTO;
+}
+
+function describeChosen(c: Route | undefined, prefix: string): string {
+  if (!c) return `${prefix}.`;
+  const speed = c.downloadMbps && c.uploadMbps ? ` (↓ ${c.downloadMbps.toFixed(1)} / ↑ ${c.uploadMbps.toFixed(1)} Mbps medidos${c.pingMs ? ` · ${c.pingMs} ms` : ''})` : c.pingMs ? ` (${c.pingMs} ms)` : '';
+  return `${prefix} ${c.server}${speed}.`;
+}
+
+const errMsgs: Record<string, string> = {
+  auth_failed:    'Usuário ou senha incorretos.',
+  no_servers:     'Nenhum servidor free disponível agora.',
+  busy:           'Já existe uma busca em andamento.',
+  binary_missing: 'proton-confgen não encontrado nos recursos.',
+  binary_integrity: 'proton-confgen não confere com o manifesto do app; reinstale o GoLiveBypass.',
+  timeout:        'O Proton demorou demais para responder. Tente de novo.',
+  unknown:       'Erro desconhecido — veja o log.',
+};
+
+async function runProton(mode: 'auto' | 'manual' | 'speed' | 'catalog', opts: { password?: string; server?: string; btn?: HTMLButtonElement } = {}) {
+  const user = savedAccount?.username ?? protonUser.value.trim();
+  if (!user) { setStatus('Preencha usuário e senha.', 'err'); return; }
+  if (protonBusy) return;
+  protonBusy = true;
+  captchaHint.hidden = true;
+  fetchBtn.disabled = optimizeBtn.disabled = routeSelect.disabled = true;
+  opts.btn?.classList.add('spinning');
+  setStatus(mode === 'speed' ? 'Medindo as melhores rotas…' : 'Iniciando…');
+  try {
+    const r = await golive.fetchProton(user, opts.password, mode, opts.server);
+    protonPass.value = '';
+    if (Array.isArray(r.routes)) routes = r.routes;
+    await refreshAccount();
+    if (r.ok) {
+      if (mode === 'catalog') { setStatus(''); renderRoutes(); return; }
+      if (r.chosen) currentRoute = r.chosen;
+      hasConfig = true;
+      if (document.body.dataset.state !== 'busy') toggle.disabled = false;
+      renderRoutes();
+      const after = active ? ' Use Reiniciar bypass para trocar agora.' : ' Ative o bypass para usá-la.';
+      setStatus(describeChosen(r.chosen, 'Rota') + after, 'ok');
+      log(`Rota Proton: ${r.chosen?.server ?? '?'} (${mode}).`);
+      return;
+    }
+    renderRoutes();
+    if (r.error === 'captcha') {
+      setStatus('CAPTCHA requerido — veja abaixo.', 'err');
+      captchaHint.hidden = false;
+      if (r.captchaUrl) {
+        captchaLink.href = r.captchaUrl;
+        captchaLink.onclick = (e) => { e.preventDefault(); window.open(r.captchaUrl, '_blank'); };
+      }
+      return;
+    }
+    setStatus(`Erro: ${errMsgs[r.error] ?? r.error}${r.detail ? ` (${r.detail})` : ''}`, 'err');
+    log(`ProtonVPN erro: ${r.error}${r.detail ? ` — ${r.detail}` : ''}`, true);
+  } finally {
+    protonBusy = false;
+    fetchBtn.disabled = optimizeBtn.disabled = routeSelect.disabled = false;
+    opts.btn?.classList.remove('spinning');
+  }
+}
 
 golive.onProtonProgress?.((msg: string) => {
-  protonStatus.textContent = msg;
+  setStatus(msg);
   log(msg);
 });
 
-fetchBtn.addEventListener('click', async () => {
+fetchBtn.addEventListener('click', () => {
   const user = protonUser.value.trim();
   const pass = protonPass.value;
-  const usesSession = !!savedAccount && savedAccount.username === user;
-  if (!user || (!pass && !usesSession)) { protonStatus.textContent = 'Preencha usuário e senha.'; return; }
-
-  captchaHint.hidden = true;
-  fetchBtn.disabled = true;
-  protonStatus.textContent = 'Iniciando…';
-
-  const r = await golive.fetchProton(user, pass || undefined);
-
-  fetchBtn.disabled = false;
-  protonPass.value = '';
-  await refreshAccount();
-
-  if (r.ok) {
-    const c = r.chosen;
-    const where = c ? `${c.country ? flagEmoji(c.country) + ' ' : ''}${c.city} (${c.server})${c.pingMs ? ` · ${c.pingMs} ms` : ''}` : '';
-    protonStatus.textContent = where
-      ? `Servidor: ${where}.${active ? ' Desative e ative de novo para usar.' : ' Você já pode ativar.'}`
-      : 'Servidor configurado! Você já pode ativar.';
-    hasConfig = true;
-    if (document.body.dataset.state !== 'busy') toggle.disabled = false;
-    log('Config ProtonVPN importada com sucesso.');
-    return;
-  }
-
-  if (r.error === 'captcha') {
-    protonStatus.textContent = 'CAPTCHA requerido — veja abaixo.';
-    captchaHint.hidden = false;
-    if (r.captchaUrl) {
-      captchaLink.href = r.captchaUrl;
-      captchaLink.onclick = (e) => { e.preventDefault(); window.open(r.captchaUrl, '_blank'); };
-    }
-    return;
-  }
-
-  const errMsgs: Record<string, string> = {
-    auth_failed:    'Usuário ou senha incorretos.',
-    no_servers:     'Nenhum servidor free disponível agora.',
-    busy:           'Já existe uma busca em andamento.',
-    binary_missing: 'proton-confgen não encontrado nos recursos.',
-    binary_integrity: 'proton-confgen não confere com o manifesto do app; reinstale o GoLiveBypass.',
-    timeout:        'O Proton demorou demais para responder. Tente de novo.',
-    unknown:       'Erro desconhecido — veja o log.',
-  };
-  protonStatus.textContent = `Erro: ${errMsgs[r.error] ?? r.error}`;
-  log(`ProtonVPN erro: ${r.error}`, true);
+  if (!user || (!pass && savedAccount?.username !== user)) { setStatus('Preencha usuário e senha.', 'err'); return; }
+  void runProton('auto', { password: pass || undefined });
 });
+
+optimizeBtn.addEventListener('click', () => void runProton('speed', { btn: optimizeBtn }));
+
+routeSelect.addEventListener('change', async () => {
+  const v = routeSelect.value;
+  if (v === LOAD) { void runProton('catalog'); return; }
+  if (v === AUTO) {
+    routePreference = 'auto';
+    await golive.setSettings({ routePreference: 'auto' }).then(applySettings).catch(() => {});
+    void runProton('auto');
+    return;
+  }
+  routePreference = 'manual';
+  void runProton('manual', { server: v });
+});
+
+golive.onRoute?.((r: Route | null) => { currentRoute = r; renderRoutes(); });
 
 // ── Importar .conf ────────────────────────────────────────────────────────────
 
@@ -204,39 +342,61 @@ importBtn.addEventListener('click', async () => {
   const raw = await golive.pickConf();
   if (!raw) return;
   const r = await golive.importConfig(raw);
-  if (!r.ok) { log('Erro ao importar: ' + r.errors?.join(' '), true); return; }
+  if (!r.ok) { confStatus.textContent = 'Erro ao importar: ' + (r.errors?.join(' ') ?? ''); log('Erro ao importar: ' + r.errors?.join(' '), true); return; }
   r.warnings?.forEach((w: string) => log('Aviso: ' + w));
   hasConfig = true;
+  currentRoute = null;
   if (document.body.dataset.state !== 'busy') toggle.disabled = false;
-  protonStatus.textContent = 'Configuração importada.';
+  confStatus.textContent = active ? 'Configuração importada. Use Reiniciar bypass para usá-la agora.' : 'Configuração importada. Você já pode ativar.';
   log('Config .conf importada com sucesso.');
 });
 
-// ── Conta Proton salva ────────────────────────────────────────────────────────
+// ── Conta Proton salva e plano ────────────────────────────────────────────────
+
+async function refreshPlan(force = false) {
+  if (!savedAccount) { planRow.hidden = true; return; }
+  planRow.hidden = false;
+  planLabel.textContent = 'Plano: verificando…';
+  const { plan } = await golive.protonPlan(force).catch(() => ({ plan: null }));
+  planLabel.textContent = plan
+    ? `Plano: ${plan.planTitle ?? (plan.status === 'free' ? 'Proton VPN Free' : 'Proton VPN pago')}`
+    : 'Plano: não deu para confirmar';
+}
+planRefresh.addEventListener('click', () => void refreshPlan(true));
 
 async function refreshAccount() {
+  const prev = savedAccount?.username;
   savedAccount = await golive.protonAccount().catch(() => null);
+  loginBox.hidden = !!savedAccount;
+  routeBox.hidden = !savedAccount;
   if (!savedAccount) {
     accountRow.hidden = true;
-    protonPass.placeholder = 'Senha';
+    planRow.hidden = true;
     return;
   }
   const until = new Date(savedAccount.expiresAt).toLocaleDateString('pt-BR');
-  accountLabel.textContent = `Conta salva: ${savedAccount.username} · sessão até ${until}`;
+  accountLabel.textContent = `${savedAccount.username} · sessão até ${until}`;
   accountLabel.title = savedAccount.username;
   accountRow.hidden = false;
-  if (!protonUser.value) protonUser.value = savedAccount.username;
-  protonPass.placeholder = 'Senha (não precisa)';
+  if (prev !== savedAccount.username) void refreshPlan();
 }
 
 logoutBtn.addEventListener('click', async () => {
   await golive.protonLogout();
   protonUser.value = '';
   protonPass.value = '';
-  protonStatus.textContent = 'Sessão removida. A configuração atual continua salva.';
+  setStatus('Sessão removida. A configuração atual continua salva.');
   log('Sessão Proton removida.');
   await refreshAccount();
 });
+
+async function loadRoutes() {
+  const r = await golive.protonRoutes().catch(() => null);
+  if (!r) return;
+  routes = r.routes ?? [];
+  currentRoute = r.current;
+  renderRoutes();
+}
 
 // ── Permissão de Gerenciamento de Apps (Vencord) ───────────────────────────────
 
@@ -327,11 +487,146 @@ updateBtn.addEventListener('click', async () => {
   updateMsg.textContent = 'Arraste o novo GoLiveBypass para Aplicativos e reabra o app.';
 });
 
+const checkUpdateBtn = document.getElementById('check-update') as HTMLButtonElement;
+checkUpdateBtn.addEventListener('click', async () => {
+  if (checkUpdateBtn.classList.contains('spinning')) return;
+  checkUpdateBtn.classList.add('spinning');
+  try {
+    const info = await golive.checkUpdate();
+    checkUpdateBtn.title = info?.available
+      ? `Nova versão: v${info.latestVersion}`
+      : `Você está na última versão (v${info?.currentVersion ?? '?'})`;
+    showUpdate(info);
+  } catch (e) {
+    checkUpdateBtn.title = 'Não deu para checar agora';
+    log(`[update] erro ao checar: ${e}`, true);
+  } finally {
+    checkUpdateBtn.classList.remove('spinning');
+  }
+});
+
+// ── Painéis ───────────────────────────────────────────────────────────────────
+
+function openPanel(panel: HTMLElement) {
+  panel.classList.remove('closing');
+  panel.hidden = false;
+  (panel.querySelector('[data-close].icon-btn') as HTMLElement | null)?.focus();
+}
+
+function closePanel(panel: HTMLElement) {
+  if (panel.hidden || panel.classList.contains('closing')) return;
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduced) { panel.hidden = true; return; }
+  panel.classList.add('closing');
+  setTimeout(() => { panel.hidden = true; panel.classList.remove('closing'); }, 160);
+}
+
+const panels = Array.from(document.querySelectorAll<HTMLElement>('.panel:not(.dialog)'));
+for (const p of panels) {
+  p.querySelectorAll('[data-close]').forEach((el: Element) => el.addEventListener('click', () => closePanel(p)));
+}
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') panels.forEach(closePanel);
+});
+document.getElementById('open-help')!.addEventListener('click', () => openPanel(document.getElementById('help-panel')!));
+document.getElementById('open-settings')!.addEventListener('click', () => openPanel(document.getElementById('settings-panel')!));
+
+// ── Configurações ─────────────────────────────────────────────────────────────
+
+const openAtLogin = document.getElementById('open-at-login') as HTMLInputElement;
+const devMode     = document.getElementById('dev-mode') as HTMLInputElement;
+
+const autoFailover = document.getElementById('auto-failover') as HTMLInputElement;
+const routePrefInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="route-pref"]'));
+
+const themeInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="theme"]'));
+
+interface UiSettings {
+  openAtLogin: boolean; devMode: boolean; theme: 'system' | 'light' | 'dark'; routePreference: 'auto' | 'manual';
+  autoFailover: boolean; connectionMode: 'proton' | 'conf'; askRoutePreference: boolean;
+}
+
+function applySettings(s: UiSettings | null) {
+  if (!s) return;
+  openAtLogin.checked = s.openAtLogin;
+  devMode.checked = s.devMode;
+  themeInputs.forEach(i => { i.checked = i.value === s.theme; });
+  logEl.hidden = !s.devMode;
+  if (s.devMode) logEl.scrollTop = logEl.scrollHeight;
+  routePreference = s.routePreference;
+  routePrefInputs.forEach(i => { i.checked = i.value === s.routePreference; });
+  autoFailover.checked = s.autoFailover;
+  autoFailover.disabled = s.routePreference === 'manual';
+}
+
+async function saveSetting(input: HTMLInputElement, patch: Record<string, unknown>) {
+  input.disabled = true;
+  try { applySettings(await golive.setSettings(patch)); }
+  catch (e) { log(`Falha ao salvar a configuração: ${e}`, true); }
+  finally { input.disabled = false; }
+}
+
+openAtLogin.addEventListener('change', () => saveSetting(openAtLogin, { openAtLogin: openAtLogin.checked }));
+devMode.addEventListener('change', () => saveSetting(devMode, { devMode: devMode.checked }));
+themeInputs.forEach(i => i.addEventListener('change', () => { if (i.checked) void saveSetting(i, { theme: i.value }); }));
+autoFailover.addEventListener('change', () => saveSetting(autoFailover, { autoFailover: autoFailover.checked }));
+routePrefInputs.forEach(i => i.addEventListener('change', async () => {
+  if (!i.checked) return;
+  await saveSetting(i, { routePreference: i.value });
+  renderRoutes();
+}));
+
+// ── Pergunta única de rota ────────────────────────────────────────────────────
+
+const routePrompt = document.getElementById('route-prompt')!;
+
+async function answerRoutePrompt(choice: 'auto' | 'manual' | null) {
+  if (routePrompt.hidden) return;
+  closePanel(routePrompt);
+  try {
+    applySettings(await golive.setSettings(choice ? { routePreference: choice } : { routePromptAnswered: true }));
+  } catch (e) {
+    log(`Falha ao salvar a resposta da pergunta de rota: ${e}`, true);
+  }
+  renderRoutes();
+  if (choice === 'manual' && savedAccount) {
+    if (!routes.length) void runProton('catalog');
+    routeSelect.focus();
+  }
+}
+document.getElementById('route-prompt-auto')!.addEventListener('click', () => void answerRoutePrompt('auto'));
+document.getElementById('route-prompt-manual')!.addEventListener('click', () => void answerRoutePrompt('manual'));
+routePrompt.querySelectorAll('[data-later]').forEach((el: Element) => el.addEventListener('click', () => void answerRoutePrompt(null)));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') void answerRoutePrompt(null); });
+
+golive.getSettings?.().then((s: UiSettings) => {
+  applySettings(s);
+  selectTab(s.connectionMode);
+  renderRoutes();
+  if (s.askRoutePreference) openPanel(routePrompt);
+}).catch(() => {});
+
+golive.appInfo?.().then((i: { version: string }) => {
+  document.getElementById('app-version')!.textContent = `Go Live · macOS · v${i.version}`;
+}).catch(() => {});
+
 // ── Notificação de segundo plano (ao fechar janela) ────────────────────────────
 
 golive.onLog?.((m: string) => log(m));
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
+// ── Tráfego ───────────────────────────────────────────────────────────────────
+
+const trafficEl = document.getElementById('traffic')!;
+const tPing = document.getElementById('t-ping')!;
+
+golive.onTraffic?.((t: { pingMs: number | null }) => {
+  const st = document.body.dataset.state;
+  if (st !== 'active' && st !== 'pending') return;
+  trafficEl.hidden = false;
+  tPing.textContent = t.pingMs ? `${t.pingMs} ms` : '–';
+});
+
 refresh();
-refreshAccount();
+refreshAccount().then(loadRoutes);

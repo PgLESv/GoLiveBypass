@@ -8,7 +8,8 @@ export type WindowsDiscoveryFlavour =
   | "DiscordCanary"
   | "Vesktop"
   | "Equibop"
-  | "Legcord";
+  | "Legcord"
+  | "Serein";
 
 export const WINDOWS_DISCOVERY_FLAVOURS: readonly WindowsDiscoveryFlavour[] = [
   "Discord",
@@ -17,6 +18,7 @@ export const WINDOWS_DISCOVERY_FLAVOURS: readonly WindowsDiscoveryFlavour[] = [
   "Vesktop",
   "Equibop",
   "Legcord",
+  "Serein",
 ];
 
 export type DiscoverySource = "root" | "process" | "registry" | "shortcut";
@@ -44,6 +46,7 @@ export interface WindowsDiscoveryRawBlock<Row> {
   rows: Row[];
   truncated: boolean;
   errorCode?: string;
+  errorDetail?: string;
 }
 
 export interface WindowsDiscoveryRaw {
@@ -60,13 +63,13 @@ export interface WindowsDiscoveryCandidate {
   exePath: string;
   detectedBy: DiscoverySource;
 }
-
 export interface WindowsDiscoverySnapshot {
   installs: WindowsDiscoveryCandidate[];
   capturedAtMs: number;
   stale?: boolean;
   collectionFailed: boolean;
   sourceFailure?: string;
+  sourceFailureDetail?: string;
 }
 
 export interface WindowsDiscoveryEnvironment {
@@ -146,6 +149,12 @@ const FLAVOUR_BY_EXE = new Map<string, WindowsDiscoveryFlavour>(
   WINDOWS_DISCOVERY_FLAVOURS.map((flavour) => [`${flavour.toLowerCase()}.exe`, flavour]),
 );
 
+// Electron exige um `resources/` ao lado do exe; clientes nativos (Serein, Rust/egui)
+// nao tem essa marca — o exe plano e a instalacao. Entrada ausente = exige resources.
+const FLAVOUR_ELECTRON_REQUIREMENTS: Partial<Record<WindowsDiscoveryFlavour, false>> = {
+  Serein: false,
+};
+
 const RAW_STATUSES = new Set<DiscoveryBlockStatus>(["ok", "empty", "partial", "error"]);
 const RAW_KINDS = new Set<WindowsDiscoveryRegistryKind>(["app-paths", "uninstall", "url-handler"]);
 const RAW_HIVES = new Set<WindowsDiscoveryRegistryHive>(["hkcu", "hklm", "wow6432"]);
@@ -183,9 +192,10 @@ export function shortcutRootsForEnvironment(env: WindowsDiscoveryEnvironment): s
 }
 export const WINDOWS_DISCOVERY_POWERSHELL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-$flavours = @('Discord','DiscordPTB','DiscordCanary','Vesktop','Equibop','Legcord')
-$schemes = @('discord','discordptb','discordcanary','vesktop','equibop','legcord')
-$processFilter = "Name = 'Discord.exe' OR Name = 'DiscordPTB.exe' OR Name = 'DiscordCanary.exe' OR Name = 'Vesktop.exe' OR Name = 'Equibop.exe' OR Name = 'Legcord.exe'"
+$ProgressPreference = 'SilentlyContinue'
+$flavours = @('Discord','DiscordPTB','DiscordCanary','Vesktop','Equibop','Legcord','Serein')
+$schemes = @('discord','discordptb','discordcanary','vesktop','equibop','legcord','serein')
+$processQuery = "SELECT Name, ProcessId, ExecutablePath FROM Win32_Process WHERE Name = 'Discord.exe' OR Name = 'DiscordPTB.exe' OR Name = 'DiscordCanary.exe' OR Name = 'Vesktop.exe' OR Name = 'Equibop.exe' OR Name = 'Legcord.exe' OR Name = 'Serein.exe'"
 
 # The 65th matching process is a sentinel: emit at most 64 rows but report truncation.
 $processRows = @()
@@ -193,12 +203,13 @@ $processStatus = 'ok'
 $processError = $null
 $processTruncated = $false
 try {
-  $processMatches = @(Get-CimInstance Win32_Process -Filter $processFilter -ErrorAction Stop | ForEach-Object {
+  # [wmisearcher] (System.Management) evita importar o modulo CimCmdlets, que sozinho custa centenas de ms.
+  $processMatches = @(([wmisearcher]$processQuery).Get() | ForEach-Object {
     $processPath = $null
-    if ($_.ExecutablePath) { $processPath = [string]$_.ExecutablePath }
+    if ($_['ExecutablePath']) { $processPath = [string]$_['ExecutablePath'] }
     [pscustomobject]@{
-      name = [string]$_.Name
-      pid = [int]$_.ProcessId
+      name = [string]$_['Name']
+      pid = [int]$_['ProcessId']
       path = $processPath
     }
   } | Select-Object -First 65)
@@ -217,20 +228,24 @@ $processBlock = [ordered]@{
 }
 if ($processError) { $processBlock['errorCode'] = $processError }
 
+# Registro via .NET: o provider do PowerShell custa dezenas de ms por chave e a varredura
+# le ate 384 chaves de Uninstall. RegistryKey le a mesma chave em microssegundos.
 $registryRows = @()
 $registryErrors = 0
 $registryTruncated = $false
+$hives = @{ hkcu = [Microsoft.Win32.Registry]::CurrentUser; hklm = [Microsoft.Win32.Registry]::LocalMachine; wow6432 = [Microsoft.Win32.Registry]::LocalMachine }
+$wow = 'Software\WOW6432Node\'
 $appPathSpecs = @(
-  @{hive='hkcu'; root='HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths'},
-  @{hive='hklm'; root='HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths'},
-  @{hive='wow6432'; root='HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths'}
+  @{hive='hkcu'; root='Software\Microsoft\Windows\CurrentVersion\App Paths'},
+  @{hive='hklm'; root='Software\Microsoft\Windows\CurrentVersion\App Paths'},
+  @{hive='wow6432'; root=($wow + 'Microsoft\Windows\CurrentVersion\App Paths')}
 )
 foreach ($spec in $appPathSpecs) {
   foreach ($flavour in $flavours) {
     try {
-      $key = Join-Path $spec.root ($flavour + '.exe')
-      if (Test-Path -LiteralPath $key) {
-        $value = [string]((Get-Item -LiteralPath $key -ErrorAction Stop).GetValue(''))
+      $key = $hives[$spec.hive].OpenSubKey($spec.root + '\' + $flavour + '.exe')
+      if ($key) {
+        try { $value = [string]$key.GetValue('') } finally { $key.Close() }
         $registryRows += [pscustomobject]@{
           hive = $spec.hive
           kind = 'app-paths'
@@ -243,16 +258,16 @@ foreach ($spec in $appPathSpecs) {
 }
 
 $urlSpecs = @(
-  @{hive='hkcu'; root='HKCU:\Software\Classes'},
-  @{hive='hklm'; root='HKLM:\Software\Classes'},
-  @{hive='wow6432'; root='HKLM:\Software\WOW6432Node\Classes'}
+  @{hive='hkcu'; root='Software\Classes'},
+  @{hive='hklm'; root='Software\Classes'},
+  @{hive='wow6432'; root=($wow + 'Classes')}
 )
 for ($index = 0; $index -lt $schemes.Count; $index++) {
   foreach ($spec in $urlSpecs) {
     try {
-      $key = Join-Path (Join-Path (Join-Path (Join-Path $spec.root $schemes[$index]) 'shell') 'open') 'command'
-      if (Test-Path -LiteralPath $key) {
-        $value = [string]((Get-Item -LiteralPath $key -ErrorAction Stop).GetValue(''))
+      $key = $hives[$spec.hive].OpenSubKey($spec.root + '\' + $schemes[$index] + '\shell\open\command')
+      if ($key) {
+        try { $value = [string]$key.GetValue('') } finally { $key.Close() }
         $registryRows += [pscustomobject]@{
           hive = $spec.hive
           kind = 'url-handler'
@@ -265,40 +280,48 @@ for ($index = 0; $index -lt $schemes.Count; $index++) {
 }
 
 $uninstallSpecs = @(
-  @{hive='hkcu'; root='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'},
-  @{hive='hklm'; root='HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall'},
-  @{hive='wow6432'; root='HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'}
+  @{hive='hkcu'; root='Software\Microsoft\Windows\CurrentVersion\Uninstall'},
+  @{hive='hklm'; root='Software\Microsoft\Windows\CurrentVersion\Uninstall'},
+  @{hive='wow6432'; root=($wow + 'Microsoft\Windows\CurrentVersion\Uninstall')}
 )
 foreach ($spec in $uninstallSpecs) {
   try {
-    # A 129th item is read only as a sentinel so the processed set stays bounded at 128.
-    $subkeys = @(Get-ChildItem -LiteralPath $spec.root -ErrorAction Stop | Select-Object -First 129)
-    if ($subkeys.Count -gt 128) { $registryTruncated = $true }
-    foreach ($key in @($subkeys | Select-Object -First 128)) {
-      try {
-        $properties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
-        $displayName = [string]$properties.DisplayName
-        if (!$displayName -or $displayName -notmatch '(?i)(Discord|Vesktop|Equibop|Legcord)') { continue }
-        $defaultValue = [string]((Get-Item -LiteralPath $key.PSPath -ErrorAction Stop).GetValue(''))
-        $displayIcon = [string]$properties.DisplayIcon
-        $installLocation = [string]$properties.InstallLocation
-        $hint = $null
-        if ($displayName -match '(?i)Discord\s*Canary') { $hint = 'DiscordCanary' }
-        elseif ($displayName -match '(?i)Discord\s*PTB') { $hint = 'DiscordPTB' }
-        elseif ($displayName -match '(?i)Discord') { $hint = 'Discord' }
-        elseif ($displayName -match '(?i)Vesktop') { $hint = 'Vesktop' }
-        elseif ($displayName -match '(?i)Equibop') { $hint = 'Equibop' }
-        elseif ($displayName -match '(?i)Legcord') { $hint = 'Legcord' }
-        $registryRows += [pscustomobject]@{
-          hive = $spec.hive
-          kind = 'uninstall'
-          value = $defaultValue
-          flavourHint = $hint
-          displayIcon = $displayIcon
-          installLocation = $installLocation
-        }
-      } catch { $registryErrors++ }
-    }
+    $parent = $hives[$spec.hive].OpenSubKey($spec.root)
+    if (!$parent) { throw 'UNINSTALL_ROOT_MISSING' }
+    try {
+      # A 129th item is read only as a sentinel so the processed set stays bounded at 128.
+      $names = @($parent.GetSubKeyNames() | Select-Object -First 129)
+      if ($names.Count -gt 128) { $registryTruncated = $true }
+      foreach ($name in @($names | Select-Object -First 128)) {
+        try {
+          $sub = $parent.OpenSubKey($name)
+          if (!$sub) { continue }
+          try {
+            $displayName = [string]$sub.GetValue('DisplayName')
+            if (!$displayName -or $displayName -notmatch '(?i)(Discord|Vesktop|Equibop|Legcord|Serein)') { continue }
+            $defaultValue = [string]$sub.GetValue('')
+            $displayIcon = [string]$sub.GetValue('DisplayIcon')
+            $installLocation = [string]$sub.GetValue('InstallLocation')
+          } finally { $sub.Close() }
+          $hint = $null
+          if ($displayName -match '(?i)Discord\s*Canary') { $hint = 'DiscordCanary' }
+          elseif ($displayName -match '(?i)Discord\s*PTB') { $hint = 'DiscordPTB' }
+          elseif ($displayName -match '(?i)Discord') { $hint = 'Discord' }
+          elseif ($displayName -match '(?i)Vesktop') { $hint = 'Vesktop' }
+          elseif ($displayName -match '(?i)Equibop') { $hint = 'Equibop' }
+          elseif ($displayName -match '(?i)Legcord') { $hint = 'Legcord' }
+          elseif ($displayName -match '(?i)Serein') { $hint = 'Serein' }
+          $registryRows += [pscustomobject]@{
+            hive = $spec.hive
+            kind = 'uninstall'
+            value = $defaultValue
+            flavourHint = $hint
+            displayIcon = $displayIcon
+            installLocation = $installLocation
+          }
+        } catch { $registryErrors++ }
+      }
+    } finally { $parent.Close() }
   } catch { $registryErrors++ }
 }
 
@@ -322,14 +345,54 @@ elseif ($registryTruncated) { $registryBlock['errorCode'] = 'UNINSTALL_LIMIT' }
 } | ConvertTo-Json -Compress -Depth 6
 `;
 
+const WINDOWS_DISCOVERY_ERROR_DETAIL_MAX = 96;
+
 export class WindowsDiscoveryCollectionError extends Error {
   readonly errorCode: string;
+  readonly errorDetail?: string;
 
-  constructor(errorCode: string) {
+  constructor(errorCode: string, errorDetail?: string) {
     super(errorCode);
     this.name = "WindowsDiscoveryCollectionError";
     this.errorCode = errorCode;
+    this.errorDetail = errorDetail;
   }
+}
+
+function sanitizeDiscoveryErrorDetail(error: unknown): string | undefined {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : "";
+  const firstLine = message.split(/\r?\n/, 1)[0]?.trim();
+  if (!firstLine) return undefined;
+  const sanitized = firstLine
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\|\/)[^\r\n]*/g, "[path]")
+    .replace(/[,;]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized.slice(0, WINDOWS_DISCOVERY_ERROR_DETAIL_MAX);
+}
+
+function classifyWindowsDiscoveryError(error: unknown): {
+  errorCode: string;
+  errorDetail?: string;
+} {
+  const record = typeof error === "object" && error !== null
+    ? error as Record<string, unknown>
+    : {};
+  const code = record.code;
+  if (code === "ENOENT" || (typeof record.syscall === "string" && record.syscall.startsWith("spawn"))) {
+    return { errorCode: "POWERSHELL_SPAWN", errorDetail: sanitizeDiscoveryErrorDetail(error) };
+  }
+  if (code === "ETIMEDOUT" || code === "ETIME" || record.killed === true || record.timedOut === true) {
+    return { errorCode: "POWERSHELL_TIMEOUT", errorDetail: sanitizeDiscoveryErrorDetail(error) };
+  }
+  if (typeof code === "number" || (typeof code === "string" && /^\d+$/.test(code))) {
+    return { errorCode: "POWERSHELL_EXIT", errorDetail: sanitizeDiscoveryErrorDetail(error) };
+  }
+  return { errorCode: "POWERSHELL_EXIT", errorDetail: sanitizeDiscoveryErrorDetail(error) };
 }
 
 function defaultWindowsDiscoveryPowerShellRunner(file: string, args: readonly string[]): string {
@@ -352,7 +415,8 @@ function defaultWindowsDiscoveryPowerShellRunnerAsync(
     execFile(file, [...args], {
       encoding: "utf8",
       windowsHide: true,
-      timeout: 3_000,
+      // Assincrono: nao trava a janela. Folga para maquina carregada (a varredura leva ~1s).
+      timeout: 8_000,
     }, (error, stdout) => {
       if (error) reject(error);
       else resolve(String(stdout ?? ""));
@@ -387,8 +451,9 @@ export function collectWindowsDiscoveryPowerShell(
   let stdout: string;
   try {
     stdout = runner("powershell.exe", windowsDiscoveryPowerShellArgs());
-  } catch {
-    throw new WindowsDiscoveryCollectionError("POWERSHELL_EXIT");
+  } catch (error) {
+    const failure = classifyWindowsDiscoveryError(error);
+    throw new WindowsDiscoveryCollectionError(failure.errorCode, failure.errorDetail);
   }
   return parseWindowsDiscoveryStdout(stdout);
 }
@@ -399,8 +464,9 @@ export async function collectWindowsDiscoveryPowerShellAsync(
   let stdout: string;
   try {
     stdout = await runner("powershell.exe", windowsDiscoveryPowerShellArgs());
-  } catch {
-    throw new WindowsDiscoveryCollectionError("POWERSHELL_EXIT");
+  } catch (error) {
+    const failure = classifyWindowsDiscoveryError(error);
+    throw new WindowsDiscoveryCollectionError(failure.errorCode, failure.errorDetail);
   }
   return parseWindowsDiscoveryStdout(stdout);
 }
@@ -414,15 +480,18 @@ function asRows(value: unknown): unknown[] | null {
   if (value === undefined || value === null) return null;
   return [value];
 }
+
 export interface WindowsDiscoveryCollectionHealth {
   collectionFailed: boolean;
   sourceFailure?: string;
+  sourceFailureDetail?: string;
 }
 
 export function summarizeWindowsDiscoveryCollection(
   raw: WindowsDiscoveryRaw,
 ): WindowsDiscoveryCollectionHealth {
   const sourceFailures: string[] = [];
+  const sourceFailureDetails: string[] = [];
   let collectionFailed = false;
   for (const [source, block] of [["process", raw.process], ["registry", raw.registry]] as const) {
     const code = block.errorCode;
@@ -433,14 +502,18 @@ export function summarizeWindowsDiscoveryCollection(
     if (isError) {
       collectionFailed = true;
       sourceFailures.push(`${source}:${code || block.status}`);
+      const detail = sanitizeDiscoveryErrorDetail(block.errorDetail);
+      if (detail) sourceFailureDetails.push(`${source}:${detail}`);
     } else if (block.truncated || boundedLimit) {
       sourceFailures.push(`${source}:${code || (source === "process" ? "PROCESS_LIMIT" : "UNINSTALL_LIMIT")}`);
     }
   }
   const sourceFailure = sourceFailures.join(",");
+  const sourceFailureDetail = sourceFailureDetails.join(",");
   return {
     collectionFailed,
     ...(sourceFailure ? { sourceFailure } : {}),
+    ...(sourceFailureDetail ? { sourceFailureDetail } : {}),
   };
 }
 
@@ -470,6 +543,9 @@ function parseBlock<Row>(
   };
   if (typeof value.errorCode === "string" && value.errorCode.trim()) {
     result.errorCode = value.errorCode.trim();
+  }
+  if (typeof value.errorDetail === "string" && value.errorDetail.trim()) {
+    result.errorDetail = sanitizeDiscoveryErrorDetail(value.errorDetail);
   }
   return result;
 }
@@ -676,6 +752,10 @@ export function validateWindowsProcessExecutable(
 ): string | null {
   const normalized = validateWindowsExecutable(target, flavour, fsSeam);
   if (!normalized) return null;
+  // Flavours sem Electron (ver FLAVOUR_ELECTRON_REQUIREMENTS) sao aceitos pelo proprio
+  // exe: exigir resources/ descartaria o Serein rodando, e ele e justamente o caso em
+  // que o status precisa distinguir "dentro do tunel" de "fora".
+  if (FLAVOUR_ELECTRON_REQUIREMENTS[flavour] === false) return normalized;
   const parent = path.win32.basename(path.win32.dirname(normalized));
   if (/^app-/i.test(parent)) return normalized;
   return fsSeam.exists(path.win32.join(path.win32.dirname(normalized), "resources")) ? normalized : null;
@@ -979,16 +1059,20 @@ export function mergeWindowsDiscoveryCandidates(
   }
   return merged;
 }
-function failedWindowsDiscoveryRaw(errorCode: string): WindowsDiscoveryRaw {
+function failedWindowsDiscoveryRaw(errorCode: string, errorDetail?: string): WindowsDiscoveryRaw {
+  const detail = errorDetail ? { errorDetail } : {};
   return {
     schema: 1,
-    process: { status: "error", rows: [], truncated: false, errorCode },
-    registry: { status: "error", rows: [], truncated: false, errorCode },
+    process: { status: "error", rows: [], truncated: false, errorCode, ...detail },
+    registry: { status: "error", rows: [], truncated: false, errorCode, ...detail },
   };
 }
 
-function discoveryErrorCode(error: unknown): string {
-  return error instanceof WindowsDiscoveryCollectionError ? error.errorCode : "POWERSHELL_EXIT";
+function discoveryFailure(error: unknown): { errorCode: string; errorDetail?: string } {
+  if (error instanceof WindowsDiscoveryCollectionError) {
+    return { errorCode: error.errorCode, errorDetail: error.errorDetail };
+  }
+  return classifyWindowsDiscoveryError(error);
 }
 
 function assembleWindowsDiscoverySnapshot(
@@ -1010,6 +1094,7 @@ function assembleWindowsDiscoverySnapshot(
     capturedAtMs,
     collectionFailed: health.collectionFailed,
     sourceFailure: health.sourceFailure,
+    sourceFailureDetail: health.sourceFailureDetail,
   };
 }
 
@@ -1026,7 +1111,8 @@ export function assembleWindowsDiscoverySnapshotFromRaw(
 }
 
 export function failedWindowsDiscoveryRawFor(error: unknown): WindowsDiscoveryRaw {
-  return failedWindowsDiscoveryRaw(discoveryErrorCode(error));
+  const failure = discoveryFailure(error);
+  return failedWindowsDiscoveryRaw(failure.errorCode, failure.errorDetail);
 }
 
 export function collectWindowsDiscoverySnapshot(
@@ -1039,7 +1125,8 @@ export function collectWindowsDiscoverySnapshot(
   try {
     raw = deps.collectPowerShell();
   } catch (error) {
-    raw = failedWindowsDiscoveryRaw(discoveryErrorCode(error));
+    const failure = discoveryFailure(error);
+    raw = failedWindowsDiscoveryRaw(failure.errorCode, failure.errorDetail);
   }
   return assembleWindowsDiscoverySnapshot(raw, env, deps, capturedAtMs, roots);
 }
@@ -1080,6 +1167,7 @@ function copySnapshot(snapshot: WindowsDiscoverySnapshot, stale: boolean): Windo
     stale,
     collectionFailed: snapshot.collectionFailed,
     sourceFailure: snapshot.sourceFailure,
+    sourceFailureDetail: snapshot.sourceFailureDetail,
   };
 }
 

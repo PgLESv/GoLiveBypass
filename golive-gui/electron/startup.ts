@@ -10,6 +10,11 @@
  * instalador (que nao escreveu nada), e nao tem como a interface saber que a
  * chamada "funcionou" sem efeito.
  *
+ * Atualizacao: o Electron 43 aceita `path`, `args` e `name` no Windows e grava o valor da Run key
+ * dentro do proprio processo, sem abrir o reg.exe (setStartup confere o valor gravado e, se ele nao
+ * sair igual ao esperado, cai no reg.exe descrito abaixo). O reg.exe como processo filho com a linha
+ * `reg add ... Run ... --hidden` foi barrado pelo Microsoft Defender (#361).
+ *
  * Workaround: no Windows, escrever direto em HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run
  * via reg.exe. O reg.exe ja vem com o Windows, nao exige elevacao (HKCU e do
  * usuario), e o caminho do exe e o `process.execPath` (que no portable e o .exe
@@ -24,6 +29,7 @@ import { app } from "electron";
 import path from "path";
 import fs from "fs";
 import { execFileSync } from "child_process";
+import * as logger from "./logger";
 
 const IS_WINDOWS = process.platform === "win32";
 const IS_LINUX = process.platform === "linux";
@@ -73,9 +79,80 @@ function desktopExecPath(value: string): string {
   return `"${value.replace(/([\\"`$])/g, "\\$1")}"`;
 }
 
+// Entradas da Run key que iniciam ESTE app. O nome do valor mudou entre
+// versoes: o canonico e ENTRY_NAME, mas versoes antigas gravaram sob outros
+// nomes (o nome do app do Electron, o nome do exe portatil renomeado). O
+// toggle gerenciava so o valor canonico, entao desligar "deixava passar" as
+// entradas legadas e o app continuava subindo no boot com o checkbox
+// desligado. O criterio aqui e o ALVO do valor: qualquer registro cujo
+// comando aponte para o exe do GoLiveBypass pertence a este toggle. Valores
+// de terceiros e o GoLiveBypassTor do standalone (o alvo dele e o
+// wscript/tor, nao este app) ficam de fora.
+type RunEntry = { name: string; data: string };
+
+function launchesThisApp(data: string): boolean {
+  const quoted = data.match(/^"([^"]+)"/);
+  const target = quoted ? quoted[1] : data.trim().split(/\s+/)[0] ?? "";
+  const base = target.split(/[\\/]/).pop() ?? "";
+  return /^golivebypass.*\.exe$/i.test(base);
+}
+
+function listOwnRunEntries(): RunEntry[] {
+  let output: string;
+  try {
+    output = execFileSync("reg.exe", ["query", RUN_KEY], { encoding: "utf8", windowsHide: true });
+  } catch {
+    // Chave Run ilegivel (sessao sem perfil, politica de grupo): nao ha
+    // entrada comprovada, e quem chama decide o que fazer com a lista vazia.
+    return [];
+  }
+  const entries: RunEntry[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = line.match(/^\s*(.+?)\s{2,}(REG_\w+)\s{2,}(.*)$/);
+    if (!match) continue;
+    const name = match[1].trim();
+    const data = match[3].trim();
+    if (name === ENTRY_NAME || launchesThisApp(data)) entries.push({ name, data });
+  }
+  return entries;
+}
+
+// O Electron grava o valor da Run key dentro do proprio processo. O `reg.exe add ... Run ... --hidden`
+// aberto como processo filho ja foi barrado pelo Microsoft Defender como Trojan:Win32/Commando.A!ml
+// (#361), entao ele fica so de reserva: se o valor nao aparecer exatamente como esperado, o
+// chamador cai no reg.exe.
+function gravarRunPeloElectron(executable: string, value: string): boolean {
+  try {
+    app.setLoginItemSettings({ openAtLogin: true, path: executable, args: ["--hidden"], name: ENTRY_NAME });
+    const ok = listOwnRunEntries().some((entry) => entry.name === ENTRY_NAME && entry.data === value);
+    if (ok) logger.info("autostart", "run.gravado", { via: "electron" });
+    else logger.warn("autostart", "run.electron.valor-diferente", { acao: "usando o reg.exe" });
+    return ok;
+  } catch (error) {
+    logger.warn("autostart", "run.electron.falhou", { erro: error instanceof Error ? error.message : String(error), acao: "usando o reg.exe" });
+    return false;
+  }
+}
+
+function deleteRunValue(name: string): void {
+  try {
+    execFileSync("reg.exe", [
+      "delete",
+      RUN_KEY,
+      "/v", name,
+      "/f",
+    ], { stdio: "ignore", windowsHide: true });
+  } catch {
+    // Ignorar quando a entrada nao existe: o `reg delete` falha com nivel
+    // de erro 1 quando o valor nao esta presente, e o caller nao distingue
+    // isso de um erro real. O resultado final e conferido com uma nova
+    // listagem depois da exclusao -- nunca por sucesso presumido.
+  }
+}
+
 /**
  * Marca o app para iniciar com o login do usuario.
- * - Windows: HKCU\...\Run via reg.exe (funciona em portable)
+ * - Windows: HKCU\...\Run via app.setLoginItemSettings (reg.exe so de reserva)
  * - macOS: app.setLoginItemSettings (funciona em dmg/zip)
  * - Linux: ~/.config/autostart/golivebypass.desktop
  *
@@ -96,36 +173,45 @@ export function setStartup(enabled: boolean): StartupResult {
       // o registro. O prefixo " so serve se o valor comecar com aspas;
       // aqui o caminho e o valor inteiro do registro.
       const value = `\"${executable}\" --hidden`;
-      try {
-        execFileSync("reg.exe", [
-          "add",
-          RUN_KEY,
-          "/v", ENTRY_NAME,
-          "/t", "REG_SZ",
-          "/d", value,
-          "/f",
-        ], { stdio: "ignore" });
-      } catch (error) {
-        // Sem HKCU: usuario sem perfil movel, ou sessao sem permissao (raro
-        // mas pode acontecer em kiosk). Silencioso -- a UI nao foi projetada
-        // para mostrar erro, e o usuario pode re-tentar.
-        console.error("falha ao adicionar entrada de Run:", error);
-        return { success: false, error: "O Windows recusou a criação da inicialização automática." };
+      if (!gravarRunPeloElectron(executable, value)) {
+        try {
+          execFileSync("reg.exe", [
+            "add",
+            RUN_KEY,
+            "/v", ENTRY_NAME,
+            "/t", "REG_SZ",
+            "/d", value,
+            "/f",
+          ], { stdio: "ignore", windowsHide: true });
+          logger.info("autostart", "run.gravado", { via: "reg.exe" });
+        } catch (error) {
+          // Sem HKCU: usuario sem perfil movel, ou sessao sem permissao (raro
+          // mas pode acontecer em kiosk). Silencioso -- a UI nao foi projetada
+          // para mostrar erro, e o usuario pode re-tentar.
+          console.error("falha ao adicionar entrada de Run:", error);
+          return { success: false, error: "O Windows recusou a criação da inicialização automática." };
+        }
+      }
+      // Normaliza: com a entrada canonica no lugar, entrada legada do mesmo
+      // app sobrando iniciaria uma segunda copia no login.
+      for (const entry of listOwnRunEntries()) {
+        if (entry.name !== ENTRY_NAME) deleteRunValue(entry.name);
       }
       if (!getStartup()) return { success: false, error: "A entrada foi criada, mas não pôde ser confirmada no registro do Windows." };
     } else {
-      try {
-        execFileSync("reg.exe", [
-          "delete",
-          RUN_KEY,
-          "/v", ENTRY_NAME,
-          "/f",
-        ], { stdio: "ignore" });
-      } catch {
-        // Ignorar quando a entrada nao existe: o `reg delete` falha com nivel
-        // de erro 1 quando a chave nao esta presente, e o caller nao distingue
-        // isso de um erro real. O retorno e mapeado em getStartup() de qualquer
-        // jeito.
+      // Desligar precisa limpar TODAS as entradas do app e provar que limpou:
+      // apagar so o valor canonico deixava as entradas legadas vivas, e o
+      // sucesso retornado sem verificacao fazia a UI mentir ("desligado")
+      // enquanto o app continuava subindo com o Windows.
+      for (const entry of listOwnRunEntries()) deleteRunValue(entry.name);
+      const remaining = listOwnRunEntries();
+      if (remaining.length > 0) {
+        return {
+          success: false,
+          error: "O Windows manteve a inicialização automática (" +
+            remaining.map((entry) => entry.name).join(", ") +
+            "). Remova a entrada manualmente em Inicializar (msconfig) e reporte o resultado do diagnostico.ps1.",
+        };
       }
     }
     return { success: true };
@@ -195,18 +281,9 @@ export function getStartup(): boolean {
     return fs.existsSync(file);
   }
   if (IS_WINDOWS) {
-    try {
-      const output = execFileSync("reg.exe", [
-        "query",
-        RUN_KEY,
-        "/v", ENTRY_NAME,
-      ], { encoding: "utf8" });
-      // /v so imprime a chave pedida; se ela existir, aparece "GoLiveBypass" no stdout.
-      // Se nao existir, reg.exe sai com codigo 1 e escreve no stderr.
-      return output.includes(ENTRY_NAME);
-    } catch {
-      return false;
-    }
+    // Qualquer entrada do app vale: valor legado sob outro nome tambem
+    // inicia o app, e o checkbox precisa refletir o que o Windows vai fazer.
+    return listOwnRunEntries().length > 0;
   }
   return app.getLoginItemSettings().openAtLogin;
 }

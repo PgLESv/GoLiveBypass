@@ -7,8 +7,20 @@
   <title>GoLiveBypass</title>
 </head>
 <body>
-  <!-- Área de arrasto da titlebar oculta -->
-  <div class="drag-region"></div>
+  <!-- Titlebar oculta: arrasta a janela; os ícones ficam à direita dos semáforos -->
+  <header class="topbar">
+    <div class="top-actions">
+      <button id="open-help" class="icon-btn" title="Como funciona" aria-label="Como funciona">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5z" /><path d="M4 20.5A2.5 2.5 0 0 0 6.5 23H20v-5" /></svg>
+      </button>
+      <button id="check-update" class="icon-btn" title="Checar atualizações" aria-label="Checar atualizações">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8" /><path d="M4 3v5h5" /><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16" /><path d="M20 21v-5h-5" /></svg>
+      </button>
+      <button id="open-settings" class="icon-btn" title="Configurações" aria-label="Configurações">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg>
+      </button>
+    </div>
+  </header>
 
   <!-- Banner de atualização (oculto por padrão) -->
   <div id="update-banner" hidden>
@@ -17,75 +29,253 @@
   </div>
 
   <main>
-    <!-- Botão de ativar/desativar com spinner -->
-    <div class="power-wrap">
-      <button id="toggle" class="power" disabled aria-label="Ativar">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M12 3v8" />
-          <path d="M6.3 6.8a8 8 0 1 0 11.4 0" />
-        </svg>
-      </button>
+    <div class="brand">
+      <h1>GoLiveBypass</h1>
+      <p id="app-version" class="brand-sub">Go Live · macOS</p>
     </div>
 
-    <p id="state-label" class="state-label">Verificando…</p>
-    <p id="exit-label" class="exit-label" hidden>
-      <span id="exit-flag" class="exit-flag"></span>
-      <span id="exit-country" class="exit-country"></span>
-    </p>
-    <p id="ip-label" class="ip-label"></p>
+    <div class="layout">
+      <section class="col col-status">
+        <!-- Botão de ativar/desativar com spinner -->
+        <div class="power-wrap">
+          <button id="toggle" class="power" disabled aria-label="Ativar">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v8" />
+              <path d="M6.3 6.8a8 8 0 1 0 11.4 0" />
+            </svg>
+          </button>
+        </div>
 
-    <!-- Permissão de Gerenciamento de Apps (Vencord) -->
-    <section class="card perm-card" id="perm-card" hidden>
-      <h2 class="card-title">Permissão necessária</h2>
-      <p class="perm-text">Para colocar o Vencord com FakeNitro no Discord, o macOS precisa que você libere o GoLiveBypass para modificar apps.</p>
-      <ol class="perm-steps">
-        <li>Clique em <strong>Abrir Ajustes</strong>.</li>
-        <li>Em <strong>Gerenciamento de Apps</strong>, ligue a chave do <strong>GoLiveBypass</strong>.<br><span class="hint">Não aparece? Clique em <strong>+</strong> e escolha o GoLiveBypass em Aplicativos.</span></li>
-        <li>Volte para cá: o app continua sozinho.</li>
-      </ol>
-      <div class="btn-row">
-        <button id="perm-open" class="pill-btn">Abrir Ajustes</button>
-        <button id="perm-retry" class="pill-btn ghost">Já liberei</button>
-      </div>
-      <p id="perm-status" class="hint"></p>
-    </section>
+        <p class="state-row"><span class="state-dot" aria-hidden="true"></span><span id="state-label" class="state-label">Verificando…</span></p>
+        <p id="exit-label" class="exit-label" hidden>
+          <span id="exit-flag" class="exit-flag"></span>
+          <span id="exit-country" class="exit-country"></span>
+        </p>
+        <p id="ip-label" class="ip-label"></p>
+        <div id="traffic" class="traffic" hidden>
+          <span class="t-k">Ping</span><span id="t-ping" class="t-v">–</span>
+        </div>
+        <p id="pending-hint" class="hint center" hidden>O Discord continua no túnel até você fechar ele. Quando ele fechar, o app desliga o túnel e restaura a rede.</p>
+        <div class="action-row">
+          <button id="restart-btn" class="pill-btn ghost mini" hidden>Reiniciar bypass</button>
+          <button id="off-now-btn" class="pill-btn ghost mini" hidden>Desativar agora</button>
+          <button id="restore-btn" class="pill-btn ghost mini" hidden title="Tira as rotas do túnel que tenham sobrado">Restaurar internet</button>
+        </div>
 
-    <!-- Seção ProtonVPN -->
-    <section class="card" id="proton-section">
-      <h2 class="card-title">Configuração ProtonVPN</h2>
-      <div id="account-row" class="account-row" hidden>
-        <span class="account-dot" aria-hidden="true"></span>
-        <span id="account-label" class="account-label"></span>
-        <button id="logout-btn" class="link-btn">Sair da conta</button>
-      </div>
-      <div class="field-row">
-        <input id="proton-user" type="text"    placeholder="Usuário" autocomplete="off" spellcheck="false" />
-        <input id="proton-pass" type="password" placeholder="Senha" />
-      </div>
-      <div class="btn-row">
-        <button id="fetch-btn" class="pill-btn">Buscar melhor servidor</button>
-        <button id="import-btn" class="pill-btn ghost">Importar .conf</button>
-      </div>
-      <p id="proton-status" class="hint"></p>
-      <p id="captcha-hint" class="hint warn" hidden>
-        Verificação humana necessária. Resolva o CAPTCHA no navegador e tente novamente.
-        <a id="captcha-link" href="#" class="pill-btn mini">Abrir CAPTCHA</a>
-      </p>
-    </section>
+        <!-- Permissão de Gerenciamento de Apps (Vencord) -->
+        <section class="card perm-card" id="perm-card" hidden>
+          <h2 class="card-title">Permissão necessária</h2>
+          <p class="perm-text">Para colocar o Vencord com FakeNitro no Discord, o macOS precisa que você libere o GoLiveBypass para modificar apps.</p>
+          <ol class="perm-steps">
+            <li>Clique em <strong>Abrir Ajustes</strong>.</li>
+            <li>Em <strong>Gerenciamento de Apps</strong>, ligue a chave do <strong>GoLiveBypass</strong>.<br><span class="hint">Não aparece? Clique em <strong>+</strong> e escolha o GoLiveBypass em Aplicativos.</span></li>
+            <li>Volte para cá: o app continua sozinho.</li>
+          </ol>
+          <div class="btn-row">
+            <button id="perm-open" class="pill-btn">Abrir Ajustes</button>
+            <button id="perm-retry" class="pill-btn ghost">Já liberei</button>
+          </div>
+          <p id="perm-status" class="hint"></p>
+        </section>
+      </section>
 
-    <!-- Extras opcionais -->
-    <section class="card" id="extras-section">
-      <h2 class="card-title">Extras</h2>
-      <label class="toggle-row">
-        <input id="vencord-optin" type="checkbox" />
-        <span>Instalar o Vencord com o plugin FakeNitro ao ativar</span>
-      </label>
-      <p class="hint">Opcional e desligado por padrão: modifica o app do Discord e não faz parte do bypass. Se você desligar o FakeNitro no Vencord, o GoLiveBypass não liga de novo.</p>
-    </section>
+      <section class="col col-config">
+        <!-- Conexão: Proton ou .conf -->
+        <section class="card" id="proton-section">
+          <h2 class="card-title">Conexão segura</h2>
+          <div class="tabs" role="tablist">
+            <button id="tab-proton" class="tab" role="tab" aria-selected="true" aria-controls="pane-proton">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z" /></svg>Proton Otimizado
+            </button>
+            <button id="tab-conf" class="tab" role="tab" aria-selected="false" aria-controls="pane-conf">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" /><path d="M14 3v6h6" /></svg>Arquivo .conf
+            </button>
+          </div>
 
-    <!-- Log -->
-    <pre id="log" class="log"></pre>
+          <div id="pane-proton" class="pane" role="tabpanel">
+            <div id="account-row" class="account-row" hidden>
+              <span class="account-dot" aria-hidden="true"></span>
+              <span id="account-label" class="account-label"></span>
+              <button id="logout-btn" class="pill-btn ghost mini">Sair</button>
+            </div>
+            <div id="plan-row" class="plan-row" hidden>
+              <span id="plan-label">Plano: verificando…</span>
+              <button id="plan-refresh" class="link-btn">Atualizar plano</button>
+            </div>
+
+            <div id="login-box" class="login-box">
+              <div class="field-row">
+                <input id="proton-user" type="text"    placeholder="Usuário Proton" autocomplete="off" spellcheck="false" />
+                <input id="proton-pass" type="password" placeholder="Senha" />
+              </div>
+              <button id="fetch-btn" class="pill-btn">Entrar e buscar rota</button>
+              <p class="hint">A conta grátis do Proton já serve. A senha não fica salva, só a sessão.</p>
+            </div>
+
+            <div id="route-box" class="route-box" hidden>
+              <p class="step-label">Escolha sua rota</p>
+              <div class="route-row">
+                <select id="route-select" aria-label="Rota"></select>
+                <button id="optimize-btn" class="pill-btn ghost" title="Mede download e upload de verdade pelo túnel, sem fechar o Discord">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8" /><path d="M4 3v5h5" /><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16" /><path d="M20 21v-5h-5" /></svg>Otimizar rota
+                </button>
+              </div>
+            </div>
+
+            <p id="proton-status" class="status-line" hidden></p>
+            <p id="captcha-hint" class="hint warn" hidden>
+              Verificação humana necessária. Resolva o CAPTCHA no navegador e tente novamente.
+              <a id="captcha-link" href="#" class="pill-btn mini">Abrir CAPTCHA</a>
+            </p>
+          </div>
+
+          <div id="pane-conf" class="pane" role="tabpanel" hidden>
+            <p class="hint">Use um perfil WireGuard seu (de qualquer VPN). Só os ranges do Discord passam por ele; DNS e scripts do arquivo são ignorados.</p>
+            <div class="btn-row"><button id="import-btn" class="pill-btn">Importar .conf</button></div>
+            <p id="conf-status" class="hint"></p>
+          </div>
+        </section>
+
+        <!-- Log: só no modo desenvolvedor -->
+        <pre id="log" class="log" hidden></pre>
+      </section>
+    </div>
+
+    <p class="footer">Projeto open source, feito por <a href="https://github.com/bezumiya/GoLiveBypass#agradecimentos" target="_blank" rel="noopener" class="footer-link">muita gente</a>.</p>
   </main>
+
+  <!-- Painel: Configurações -->
+  <div id="settings-panel" class="panel" hidden role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="panel-backdrop" data-close></div>
+    <div class="panel-sheet">
+      <div class="panel-head">
+        <div>
+          <p class="panel-kicker">Preferências</p>
+          <h2 id="settings-title">Configurações</h2>
+        </div>
+        <button class="icon-btn" data-close aria-label="Fechar">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+        </button>
+      </div>
+      <div class="panel-body">
+        <section class="settings-group">
+          <h3 class="card-title">Geral</h3>
+          <div class="theme-row">
+            <span>Tema</span>
+            <div class="segmented" role="radiogroup" aria-label="Tema">
+              <label><input type="radio" name="theme" value="system" /><span>Sistema</span></label>
+              <label><input type="radio" name="theme" value="light" /><span>Claro</span></label>
+              <label><input type="radio" name="theme" value="dark" /><span>Escuro</span></label>
+            </div>
+          </div>
+          <label class="toggle-row">
+            <input id="open-at-login" type="checkbox" />
+            <span>Abrir ao iniciar a sessão</span>
+          </label>
+          <p class="hint">O app sobe direto na barra de menu e, se o bypass estava ativo, liga de novo.</p>
+          <label class="toggle-row">
+            <input id="dev-mode" type="checkbox" />
+            <span>Modo desenvolvedor</span>
+          </label>
+          <p class="hint">Mostra o log na janela principal.</p>
+        </section>
+
+        <section class="settings-group">
+          <h3 class="card-title">Rota Proton</h3>
+          <label class="toggle-row"><input type="radio" name="route-pref" value="auto" /><span>Automática</span></label>
+          <p class="hint">O app escolhe a rota de menor ping e pode trocá-la sozinho.</p>
+          <label class="toggle-row"><input type="radio" name="route-pref" value="manual" /><span>Manual</span></label>
+          <p class="hint">Você escolhe a rota na lista e ela é mantida.</p>
+          <label class="toggle-row">
+            <input id="auto-failover" type="checkbox" />
+            <span>Trocar de servidor se a rota cair</span>
+          </label>
+          <p class="hint">Com a rota automática: se o servidor parar de responder por uns 45 s, o app gera outro e troca o túnel sem fechar o Discord.</p>
+        </section>
+
+        <section class="settings-group">
+          <h3 class="card-title">Extras</h3>
+          <label class="toggle-row">
+            <input id="vencord-optin" type="checkbox" />
+            <span>Instalar o Vencord com o plugin FakeNitro ao ativar</span>
+          </label>
+          <p class="hint">Opcional e desligado por padrão: modifica o app do Discord e não faz parte do bypass. Se você desligar o FakeNitro no Vencord, o GoLiveBypass não liga de novo.</p>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pergunta única: rota automática ou manual -->
+  <div id="route-prompt" class="panel dialog" hidden role="dialog" aria-modal="true" aria-labelledby="route-prompt-title" aria-describedby="route-prompt-hint">
+    <div class="panel-backdrop" data-later></div>
+    <div class="panel-sheet">
+      <div class="panel-body">
+        <h2 id="route-prompt-title">Como você quer escolher a rota?</h2>
+        <p id="route-prompt-hint" class="hint">Você pode mudar isso depois em Configurações.</p>
+        <button id="route-prompt-auto" class="choice">
+          <span class="choice-name">Automática <span class="badge">recomendado</span></span>
+          <span class="choice-desc">O app procura e otimiza a rota para você.</span>
+        </button>
+        <button id="route-prompt-manual" class="choice">
+          <span class="choice-name">Manual</span>
+          <span class="choice-desc">Você escolhe a rota e ela é mantida.</span>
+        </button>
+        <div class="btn-row end"><button id="route-prompt-later" class="pill-btn ghost" data-later>Decidir depois</button></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Painel: Como funciona -->
+  <div id="help-panel" class="panel" hidden role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <div class="panel-backdrop" data-close></div>
+    <div class="panel-sheet">
+      <div class="panel-head">
+        <div>
+          <p class="panel-kicker">Passo a passo</p>
+          <h2 id="help-title">Como funciona</h2>
+        </div>
+        <button class="icon-btn" data-close aria-label="Fechar">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+        </button>
+      </div>
+      <div class="panel-body">
+        <div class="flow" aria-hidden="true">
+          <div class="flow-box">
+            <span class="flow-kicker">Seu Mac</span>
+            <span class="flow-node">Discord</span>
+            <span class="flow-node">Outros apps</span>
+          </div>
+          <div class="flow-lines">
+            <span class="flow-line tunnel"><span>túnel só pro Discord</span></span>
+            <span class="flow-line direct"><span>direto, sem túnel</span></span>
+          </div>
+          <div class="flow-box end">
+            <span class="flow-node vpn">Servidor VPN</span>
+            <span class="flow-node">Internet</span>
+          </div>
+        </div>
+
+        <p class="help-intro">O Discord bloqueia o Go Live e a câmera pelo IP de quem está no Brasil. O GoLiveBypass faz só o Discord sair por um servidor de outro país, e o resto do seu Mac continua igual.</p>
+
+        <ol class="steps">
+          <li><strong>Escolha a conexão</strong>Entre com sua conta Proton (a grátis já serve) ou importe um arquivo WireGuard <code>.conf</code> seu. O app cria o perfil de conexão sozinho.</li>
+          <li><strong>Escolha a rota</strong>Na rota automática o app mede o ping dos servidores do México e dos EUA e fica com o mais rápido. Em <em>Otimizar rota</em> ele mede download e upload de verdade, o que importa pra stream; a medição usa um túnel à parte, então o Discord não fecha. Na rota manual, você escolhe na lista e ela é mantida.</li>
+          <li><strong>Clique em Ativar</strong>Na primeira vez o macOS pede a senha de administrador para instalar o helper. O app liga o túnel e reinicia o Discord, que já volta por ele.</li>
+          <li><strong>Só o Discord usa o túnel</strong>No macOS a separação é por endereço: só os ranges da Cloudflare usados pelo Discord passam pela VPN. Navegador, jogos e outros apps continuam na sua internet normal; um site que use esses mesmos ranges também passa pelo túnel.</li>
+          <li><strong>Enquanto estiver ativo</strong>O card mostra o ping até o Discord pelo túnel. Se a rota Proton grátis cair, a troca automática muda de servidor sem fechar o Discord (dá pra desligar nas Configurações). Se o Mac dormir, o túnel cai e volta sozinho ao acordar.</li>
+          <li><strong>Clique em Desativar</strong>O Discord que já está aberto continua no túnel até você fechar ele. Quando ele fecha, o app desliga o túnel e restaura a rede; da próxima vez, o Discord abre pela internet normal. Com pressa, use <em>Desativar agora</em>: o túnel cai na hora e o Discord reinicia.</li>
+          <li><strong>Fechar ou sair</strong>Fechar a janela só esconde o app na barra de menu, perto do relógio. Para desligar tudo na hora, use Sair no ícone de lá ou Cmd+Q.</li>
+        </ol>
+
+        <div class="help-trouble">
+          <p class="panel-kicker">Se algo der errado</p>
+          <p>Stream travando costuma ser servidor grátis lotado. Tente <em>Otimizar rota</em> ou use um <code>.conf</code> próprio, que não é dividido com ninguém.</p>
+          <p>Se a internet parar depois de usar o app, aparece o botão <em>Restaurar internet</em> na tela principal. <em>Reiniciar bypass</em> refaz a ativação inteira sem precisar desativar e ativar.</p>
+          <p>Se o macOS disser que o app é de desenvolvedor desconhecido, rode <code>xattr -dr com.apple.quarantine /Applications/GoLiveBypass.app</code> no Terminal.</p>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="renderer.js"></script>
 </body>

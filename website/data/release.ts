@@ -44,13 +44,13 @@ export interface ReleaseCatalog {
 
 const owner = 'PgLESv'
 const repo = 'GoLiveBypass'
-const fallbackTag = 'v2.1.9'
-const fallbackVersion = '2.1.9'
+const fallbackTag = 'v2.1.10'
+const fallbackVersion = '2.1.10'
 // O cliente macOS é outra aplicação, com release própria (macos-vX.Y.Z) e
 // make_latest=false: ele não aparece na estável da GUI. O fallback do site
 // precisa apontar para essa tag, senão oferece um arquivo que não existe.
-const macReleaseTag = 'macos-v0.6.0'
-const macReleaseVersion = '0.6.0'
+const macReleaseTag = 'macos-v0.7.0'
+const macReleaseVersion = '0.7.0'
 const macDmgAssetName = `GoLiveBypass-macos-${macReleaseVersion}-universal.dmg`
 const repositoryUrl = `https://github.com/${owner}/${repo}`
 

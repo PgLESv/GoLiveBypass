@@ -3,6 +3,7 @@ import path from "path";
 import {
   buildWindowsDiscoveryPowerShell,
   collectWindowsDiscoveryPowerShell,
+  WindowsDiscoveryCollectionError,
   collectWindowsDiscoveryPowerShellAsync,
   collectWindowsDiscoverySnapshot,
   createWindowsDiscoveryCache,
@@ -106,6 +107,63 @@ function shortcutDeps(
 }
 
 describe("discovery Windows puro", () => {
+  it("preserva timeout do runner com codigo estavel e detalhe sanitizado", async () => {
+    const erro = Object.assign(
+      new Error("Command failed: C:\\Users\\segredo\\AppData\\Local\\Temp\\runner.js"),
+      { code: "ETIMEDOUT", killed: true },
+    );
+
+    let capturado: unknown;
+    try {
+      await collectWindowsDiscoveryPowerShellAsync(async () => {
+        throw erro;
+      });
+    } catch (error) {
+      capturado = error;
+    }
+
+    expect(capturado).toBeInstanceOf(WindowsDiscoveryCollectionError);
+    expect((capturado as WindowsDiscoveryCollectionError).errorCode).toBe("POWERSHELL_TIMEOUT");
+    const detalhe = (capturado as WindowsDiscoveryCollectionError).errorDetail;
+    expect(detalhe).toBeTruthy();
+    expect(detalhe.length).toBeLessThanOrEqual(96);
+    expect(detalhe).not.toContain("C:\\Users\\segredo");
+    expect(detalhe).not.toContain("runner.js");
+    expect(detalhe).not.toContain(" at ");
+  });
+  it("classifica saída não-zero como exit sem vazar caminho", async () => {
+    const erro = Object.assign(new Error("Command failed C:\\Users\\segredo\\powershell.ps1"), { code: 7 });
+
+    await expect(collectWindowsDiscoveryPowerShellAsync(async () => {
+      throw erro;
+    })).rejects.toMatchObject({
+      errorCode: "POWERSHELL_EXIT",
+      errorDetail: "Command failed [path]",
+    });
+  });
+
+
+  it("preserva candidatos de filesystem quando PowerShell sai com codigo nao-zero", () => {
+    const root = "C:\\Program Files";
+    const executable = `${root}\\Discord\\app-1.0.10\\Discord.exe`;
+    const fs = fakeFs([executable]);
+    const install: WindowsDiscordInstall = {
+      appDir: path.win32.dirname(executable),
+      resources: path.win32.join(path.win32.dirname(executable), "resources"),
+      exePath: executable,
+    };
+    const snapshot = collectWindowsDiscoverySnapshot({ ProgramFiles: root }, {
+      ...registryDeps(fs, [install]),
+      collectPowerShell: () => {
+        throw Object.assign(new Error("PowerShell exit 1"), { code: 1 });
+      },
+    }, 123);
+
+    expect(snapshot.installs).toHaveLength(1);
+    expect(snapshot.installs[0]).toMatchObject({ source: "root", flavour: "Discord", exePath: executable });
+    expect(snapshot.sourceFailure).toContain("POWERSHELL_EXIT");
+  });
+
   it("gera roots Windows determinísticos, deduplica envs e não bloqueia sem LOCALAPPDATA", () => {
     const env: WindowsDiscoveryEnvironment = {
       LOCALAPPDATA: "C:\\Users\\A\\AppData\\Local",
@@ -344,11 +402,14 @@ describe("discovery Windows puro", () => {
     expect(invocation?.args).not.toContain("-Command");
     const encoded = invocation?.args[3] ?? "";
     expect(Buffer.from(encoded, "base64").toString("utf16le")).toBe(buildWindowsDiscoveryPowerShell());
-    expect(buildWindowsDiscoveryPowerShell()).toContain("Get-CimInstance Win32_Process");
+    expect(buildWindowsDiscoveryPowerShell()).toContain("FROM Win32_Process WHERE Name = 'Discord.exe'");
     expect(buildWindowsDiscoveryPowerShell()).toContain("Select-Object -First 65");
     expect(buildWindowsDiscoveryPowerShell()).toContain("$processStatus = 'partial'");
     expect(buildWindowsDiscoveryPowerShell()).toContain("Select-Object -First 129");
-    expect(buildWindowsDiscoveryPowerShell()).toContain("HKLM:\\Software\\WOW6432Node\\Classes");
+    expect(buildWindowsDiscoveryPowerShell()).toContain("$wow + 'Classes'");
+    // O registro vai por RegistryKey (.NET): o provider do PowerShell levava ~35s nesta varredura.
+    expect(buildWindowsDiscoveryPowerShell()).toContain("[Microsoft.Win32.Registry]::LocalMachine");
+    expect(buildWindowsDiscoveryPowerShell()).not.toMatch(/Get-ItemProperty|Get-ChildItem|Get-CimInstance|Test-Path/);
   });
 
   it("coleta o mesmo JSON pelo runner assincrono, com os mesmos erros mapeados", async () => {
@@ -560,6 +621,23 @@ describe("discovery Windows puro", () => {
     const resources = path.win32.join(path.win32.dirname(exe), "resources");
     const fs = fakeFs([exe], [resources]);
     expect(validateWindowsProcessExecutable(exe, "Discord", fs)).toBe(exe);
+  });
+
+  it("aceita Serein plano sem resources; Electron continua exigindo a marca", () => {
+    const serein = "C:\\Users\\a\\AppData\\Local\\Programs\\Serein\\serein.exe";
+    expect(flavourFromExecutableName("Serein.exe")).toBe("Serein");
+    expect(validateWindowsProcessExecutable(serein, "Serein", fakeFs([serein]))).toBe(serein);
+    // mesma ausencia de resources continua rejeitando o Electron (Vesktop sem app-*/resources)
+    const vesktop = "C:\\Apps\\Vesktop\\Vesktop.exe";
+    expect(validateWindowsProcessExecutable(vesktop, "Vesktop", fakeFs([vesktop]))).toBeNull();
+  });
+
+  it("handleProcessRows reconhece sessão do Serein sem pasta resources", () => {
+    const exe = "C:\\Users\\a\\AppData\\Local\\Programs\\Serein\\serein.exe";
+    const fs = fakeFs([exe]);
+    const candidates = handleProcessRows([{ name: "serein.exe", pid: 42, path: exe }], fs);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({ flavour: "Serein", source: "process", exePath: exe });
   });
 
   it("rejeita args sem aspas mesmo quando o último argumento termina em .exe", () => {

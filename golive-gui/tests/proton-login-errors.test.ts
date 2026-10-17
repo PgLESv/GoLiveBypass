@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterAll, describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
@@ -21,7 +21,13 @@ vi.mock('child_process', () => ({
   }),
 }));
 
+// Sem o stub o produto tentaria baixar o runtime Proton pela rede (no macOS nem existe runtime).
+vi.mock('../electron/proton-runtime', async (original) =>
+  (await import('./helpers/confgen-runtime-stub')).stubProtonRuntime(await original<object>()));
+import { removeConfgenStub } from './helpers/confgen-runtime-stub';
 import { classifyProtonError, loginProton } from '../electron/proton';
+
+afterAll(removeConfgenStub);
 
 describe('classificação dos erros de login Proton', () => {
   beforeEach(() => {

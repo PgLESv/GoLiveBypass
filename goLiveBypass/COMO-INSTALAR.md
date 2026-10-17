@@ -13,9 +13,13 @@ Electron, não compartilha o estado de rede do standalone e não altera o `app.a
 O standalone continua sendo um caminho separado — e segue pausado nesta linha — e não é
 modificado por esta migração.
 
+O plugin roda **dentro** do Discord via Equicord/Vencord: clientes nativos sem Electron — como
+o Serein (`cz.viceverse.serein`) — não hospedam plugin nenhum. Para rotear esses clientes pelo
+túnel, use a GUI (Windows e Linux), que aplica o mesmo WireGuard por aplicativo.
+
 ## Linha v2 beta
 
-A versão atual do plugin é **2.0.9**. Nesta linha, a VPN WireGuard/WireSock é
+A versão atual do plugin é **2.0.11**. Nesta linha, a VPN WireGuard/WireSock é
 iniciada e controlada pelo próprio plugin, com estado privado em
 `%LOCALAPPDATA%\\GoLiveBypass\\plugin-vpn` no Windows ou
 `$XDG_DATA_HOME/GoLiveBypass/plugin-vpn` no Linux (por padrão `~/.local/share/GoLiveBypass/plugin-vpn`).
@@ -29,7 +33,7 @@ necessária para o build empacotado.
 
 O beta ainda não é um release estável. O updater ignora prereleases quando consulta o
 canal estável; para testar esta linha, instale o código-fonte do plugin e recompile o
-checkout do Equicord/Vencord. A release usa `2.0.9`; a tag GitHub acrescenta
+checkout do Equicord/Vencord. A release usa `2.0.11`; a tag GitHub acrescenta
 apenas o prefixo `v`.
 
 ## Atualizações do plugin

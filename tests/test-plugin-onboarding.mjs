@@ -13,7 +13,8 @@ test("onboarding do modo customizado mantém duas etapas sem credenciais Proton"
     assert.match(labels, /customMode[\s\S]*?Configuração WireGuard/);
     assert.match(labels, /:\s*\[[\s\S]*?Conta Proton/);
     assert.doesNotMatch(labels.slice(0, labels.indexOf(":")), /Conta Proton/);
-    assert.match(source, /const customMode = settings\.store\.vpnMode === "custom"/);
+    assert.match(source, /settings\.use\(\["vpnMode", "protonCountry", "protonFreeOnly", "protonAutoPing"\]\)/);
+    assert.match(source, /const customMode = vpnMode === "custom"/);
     assert.match(source, /O modo personalizado não usa conta Proton nem solicita credenciais/);
     assert.match(source, /if \(customMode\) \{[\s\S]*?setPage\("route"\);/);
 });
@@ -50,7 +51,7 @@ test("painel customizado não exibe login Proton e conserva ações do túnel", 
 test("primeira inicialização não ativa a VPN antes do onboarding", () => {
     const startBlock = source.slice(source.indexOf("    start()"), source.indexOf("    stop()"));
     assert.match(startBlock, /const onboardingRequired = Native && settings\.store\.onboardingCompleted !== true/);
-    assert.match(startBlock, /if \(onboardingRequired\) \{[\s\S]*?openPluginOnboarding\(\)/);
+    assert.match(startBlock, /if \(onboardingRequired && settings\.store\.onboardingSkipped !== true\) \{[\s\S]*?openPluginOnboarding\(\)/);
     assert.match(startBlock, /if \(!onboardingRequired && typeof Native\?\.enableAutomatic === "function"\)/);
 });
 
@@ -63,7 +64,7 @@ test("o processo nativo também respeita o gate do onboarding no boot", () => {
     assert.match(boot, /VPN não foi ativada no boot porque o onboarding ainda não foi concluído/);
 });
 
-test("onboarding inicial não permite pular a página de rotas", () => {
+test("a primeira página não conclui o onboarding; fechar registra skip explícito", () => {
     const actionsStart = source.indexOf("const actions");
     const actionsEnd = source.indexOf("\n    if (!Native)", actionsStart);
     assert.notEqual(actionsStart, -1, "ações do onboarding não encontradas");
@@ -71,10 +72,16 @@ test("onboarding inicial não permite pular a página de rotas", () => {
     const actions = source.slice(actionsStart, actionsEnd);
     const accountActions = actions.slice(0, actions.indexOf('] : page === "route"'));
     assert.notEqual(accountActions.indexOf("page === \"account\""), -1, "ações da primeira página não encontradas");
+    // Concluir continua impossível fora da tela final: nem chamada de complete
+    // nem o antigo atalho "Fazer depois" que marcava concluído sem a página de rota.
     assert.doesNotMatch(accountActions, /complete/);
     assert.doesNotMatch(accountActions, /Fazer depois/);
   assert.match(source, /const requiredOnOpen = Boolean\(Native && settings\.store\.onboardingCompleted !== true\)/);
-  assert.match(source, /if \(requiredOnOpen && settings\.store\.onboardingCompleted !== true && page !== "ready"\) return/);
+  // O X não é mais engolido (softlock da #334): fechar sem concluir grava o skip.
+  assert.doesNotMatch(source, /page !== "ready"\) return/);
+  const close = source.slice(source.indexOf("const closeModal"), source.indexOf("const complete = ()"));
+  assert.match(close, /if \(requiredOnOpen && settings\.store\.onboardingCompleted !== true\) settings\.store\.onboardingSkipped = true;/);
+  assert.match(close, /modalProps\.onClose\(\);/);
 });
 
 test("onboarding informativo pode ser fechado sem bridge nativa", () => {
@@ -163,4 +170,65 @@ test("falha da otimização automática mede o catálogo para a escolha manual p
     assert.match(emptyState, /discovery\.active \? null : \(/);
 });
 
-console.log("plugin onboarding source tests: 15/15");
+test("a seleção manual permanece visível com a sessão travada", () => {
+    // O relato era a seção inteira sumir: falha temporária da verificação de
+    // sessão zerava o catálogo no hook e o gate de trava escondia a lista.
+    // Invariantes: o hook só limpa o catálogo quando a chave de contexto muda;
+    // sob trava, a lista medida continua renderizada com os controles bloqueados.
+    const hook = source.slice(source.indexOf("function useProtonRouteSelection"), source.indexOf("function ProtonRouteSelection"));
+    assert.match(hook, /const contextChanged = filtersKeyRef\.current !== filtersKey;/);
+    assert.match(hook, /if \(contextChanged\) \{\s*\n\s*measurementIdRef\.current = null;\s*\n\s*statusSignatureRef\.current = "";\s*\n\s*setCandidates\(new Map\(\)\);\s*\n\s*setAppliedServer\(null\);\s*\n\s*\}/);
+    // A desativação ("!active") não pode voltar a limpar o catálogo: só cancela e sai.
+    const inactiveExit = hook.slice(hook.indexOf("if (!active || !Native"), hook.indexOf("let disposed = false"));
+    assert.doesNotMatch(inactiveExit, /setCandidates\(new Map\(\)\)/);
+    const gated = source.slice(source.indexOf("lockedReason ? ("), source.indexOf("selectionError && <Paragraph"));
+    assert.match(gated, /\{ordered\.length > 0 && routeList\}/);
+    assert.match(source, /disabled=\{applying \? false : \(!selectable \|\| exclusive \|\| Boolean\(lockedReason\)\)\}/);
+});
+
+test("skip do onboarding é estado estável e não libera ativação automática", () => {
+    const startBlock = source.slice(source.indexOf("    start()"), source.indexOf("    stop()"));
+    // Sem skip, a primeira execução continua agendando o assistente.
+    assert.match(startBlock, /const onboardingRequired = Native && settings\.store\.onboardingCompleted !== true/);
+    // Com skip, ele não reabre sozinho: era o ciclo que travava o usuário na #334.
+    assert.match(startBlock, /if \(onboardingRequired && settings\.store\.onboardingSkipped !== true\) \{/);
+    assert.match(startBlock, /if \(settings\.store\.onboardingSkipped === true\) return;/);
+    // O updater é observado fora do gate do onboarding: skip não pode quebrar updates.
+    const scheduled = startBlock.indexOf("schedulePluginUpdateStatusObservation(lifecycleGeneration)");
+    const gated = startBlock.indexOf("if (onboardingRequired");
+    assert.notEqual(scheduled, -1, "observador do updater ausente no start");
+    assert.ok(scheduled > gated, "o updater precisa ficar fora do gate do onboarding");
+    // Sem conclusão não há ativação automática nem com skip: pode não existir configuração.
+    assert.match(startBlock, /if \(!onboardingRequired && typeof Native\?\.enableAutomatic === "function"\)/);
+    // A opção persiste, começa falsa e a conclusão limpa o skip.
+    const skippedOption = source.slice(source.indexOf("onboardingSkipped: {"), source.indexOf("vpnMode: {"));
+    assert.match(skippedOption, /type: OptionType\.BOOLEAN/);
+    assert.match(skippedOption, /default: false/);
+    const complete = source.slice(source.indexOf("const complete = ()"), source.indexOf("const checkSession"));
+    assert.match(complete, /settings\.store\.onboardingSkipped = false;/);
+    // A ação explícita de adiar fecha via closeModal, que é quem grava o skip.
+    const actionsStart = source.indexOf("const actions");
+    const actionsEnd = source.indexOf("\n    if (!Native)", actionsStart);
+    const accountActions = source.slice(actionsStart, actionsEnd);
+    assert.match(accountActions, /text: "Configurar depois"/);
+    assert.match(accountActions, /onClick: closeModal/);
+});
+
+test("onboarding oferece caminho de VPN custom e volta para o Proton", () => {
+    const modal = source.slice(source.indexOf("function PluginOnboardingModal"), source.indexOf("function openPluginOnboarding"));
+    // O modo vem das settings inscritas: trocar no meio do assistente re-renderiza
+    // a página de conta com o fluxo escolhido, sem fechar o modal.
+    assert.match(modal, /settings\.use\(\["vpnMode", "protonCountry", "protonFreeOnly", "protonAutoPing"\]\)/);
+    assert.match(modal, /const customMode = vpnMode === "custom"/);
+    const switchMode = modal.slice(modal.indexOf("const switchVpnMode"), modal.indexOf("const continueToRoute"));
+    assert.match(switchMode, /settings\.store\.vpnMode = mode;/);
+    assert.match(switchMode, /if \(busy\) return;/);
+    // O ramo Proton oferece a saída para VPN própria (Mullvad/WireGuard)...
+    assert.match(modal, /switchVpnMode\("custom"\)/);
+    assert.match(modal, /Usar minha própria VPN \(Mullvad ou outro WireGuard\)/);
+    // ...e o ramo custom oferece voltar, sem virar armadilha de mão única.
+    assert.match(modal, /switchVpnMode\("proton"\)/);
+    assert.match(modal, /Usar a VPN Proton do plugin/);
+});
+
+console.log("plugin onboarding source tests: 18/18");

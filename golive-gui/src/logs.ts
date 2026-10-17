@@ -86,6 +86,7 @@ copyDiagBtn.addEventListener('click', async () => {
   }
 });
 
+
 openLogFolderBtn.addEventListener('click', async () => {
   try {
     const dir = await api.openLogFolder();

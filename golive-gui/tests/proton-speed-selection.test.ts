@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterAll, describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
@@ -96,8 +96,15 @@ vi.mock('child_process', () => ({
   }),
 }));
 
+// O produto exige um helper existente; o stub evita depender do proton-confgen compilado.
+vi.mock('../electron/proton-runtime', async (original) =>
+  (await import('./helpers/confgen-runtime-stub')).stubProtonRuntime(await original<object>()));
+import { removeConfgenStub } from './helpers/confgen-runtime-stub';
+
 import { canReuseMeasuredProfile, generateManualProtonConfig, generateOptimalProtonConfig, generateProtonRouteCatalog, generateProtonRoutePool, findProtonConfgenExe, MEASUREMENT_CRITERION_VERSION, removeStagedProtonConfig, runConfgen } from '../electron/proton';
 import * as logger from '../electron/logger';
+
+afterAll(removeConfgenStub);
 
 describe('medidor isolado da regra WireSock', () => {
   beforeEach(() => {

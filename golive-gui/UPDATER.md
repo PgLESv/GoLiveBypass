@@ -30,7 +30,7 @@ O `publish` está configurado em `golive-gui/package.json`:
 A GUI conecta em:
 
 ```text
-https://api.skyplaceia.com/bugs/v1/updates/stream
+https://bugs.golivebypass.dev/bugs/v1/updates/stream
 ```
 
 O servidor mantém o SSE público com limite de 100 conexões, no máximo 2 por IP
@@ -42,7 +42,7 @@ retentativas em 30 s e 120 s.
 No deploy da API, configure `GITHUB_WEBHOOK_SECRET` e o webhook do repositório:
 
 ```text
-POST https://api.skyplaceia.com/bugs/v1/updates/github/webhook
+POST https://bugs.golivebypass.dev/bugs/v1/updates/github/webhook
 X-GitHub-Event: release
 ```
 

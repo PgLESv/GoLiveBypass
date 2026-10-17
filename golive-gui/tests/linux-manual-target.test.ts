@@ -92,7 +92,8 @@ describe("registro do alvo manual", () => {
     expect(parseManualTarget("schema=1\nkind=exec\nkey=/opt/app\nlabel=App\nresources=\n")).toBeNull();
   });
 
-  it("grava no disco com permissao restrita e le de volta", () => {
+  // chmod/modo POSIX 0600 não existe no Windows.
+  it.skipIf(process.platform === "win32")("grava no disco com permissao restrita e le de volta", () => {
     const dir = tempDir();
     expect(writeManualTarget(dir, flatpak)).toBe(true);
 

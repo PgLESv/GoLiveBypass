@@ -1,10 +1,15 @@
 import { ipcRenderer } from 'electron';
 import type { ProtonOptimizationProgress } from './proton';
+import type { TunnelStats } from './wiresock';
 (window as any).api = {
   platform: process.platform,
   activate: () => ipcRenderer.invoke('activate'),
   deactivate: () => ipcRenderer.invoke('deactivate'),
   restoreInternet: () => ipcRenderer.invoke('restore-internet'),
+  restartBypass: () => ipcRenderer.invoke('restart-bypass'),
+  checkUpdates: () => ipcRenderer.invoke('check-updates'),
+  getCompactWindow: () => ipcRenderer.invoke('get-compact-window'),
+  setCompactWindow: (enabled: boolean) => ipcRenderer.invoke('set-compact-window', enabled),
   getStatus: () => ipcRenderer.invoke('get-status'),
   getLinuxPreflight: () => ipcRenderer.invoke('get-linux-preflight'),
   listLinuxRunningApps: () => ipcRenderer.invoke('list-linux-running-apps'),
@@ -37,6 +42,8 @@ import type { ProtonOptimizationProgress } from './proton';
   onRefreshStartup: (callback: () => void) => ipcRenderer.on('refresh-startup', callback),
   onRefreshAutoUpdate: (callback: () => void) => ipcRenderer.on('refresh-auto-update', callback),
   onRefreshStatus: (callback: () => void) => ipcRenderer.on('refresh-status', callback),
+  onTunnelStats: (callback: (stats: TunnelStats | null) => void) =>
+    ipcRenderer.on('tunnel-stats', (_event, stats) => callback(stats)),
   resizeWindow: (height: number) => ipcRenderer.send('resize-window', height),
   setTheme: (theme: string) => ipcRenderer.send('set-theme', theme),
   getVpnMode: () => ipcRenderer.invoke('get-vpn-mode'),

@@ -95,4 +95,36 @@ describe("logger", () => {
     expect(logger.clipLogText("123456789", 5)).toBe("12345…");
     expect(logger.redactLogValue("PrivateKey=xyz")).toBe("PrivateKey=[redacted]");
   });
+
+  it("tee de console absorve EIO e preserva no ring sem arquivo", () => {
+    logger._resetForTests();
+    logger.initLogger("/dev/null/caminho-impossivel");
+    const throwsEio = (..._args: unknown[]): never => {
+      const error = new Error("broken pipe") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    };
+    const alvo = {
+      log: throwsEio,
+      info: throwsEio,
+      warn: (..._args: unknown[]) => {},
+      error: (..._args: unknown[]) => {},
+    };
+    const originalLog = alvo.log;
+    const originalInfo = alvo.info;
+    const restore = logger.patchConsole(alvo);
+    try {
+      const secondRestore = logger.patchConsole(alvo);
+      secondRestore();
+      expect(alvo.info).not.toBe(originalInfo);
+      expect(() => alvo.info("mensagem-info")).not.toThrow();
+      expect(() => alvo.log("mensagem-log")).not.toThrow();
+      expect(logger.getRecent()).toContain("mensagem-info");
+      expect(logger.getRecent()).toContain("mensagem-log");
+    } finally {
+      restore();
+    }
+    expect(alvo.log).toBe(originalLog);
+    expect(alvo.info).toBe(originalInfo);
+  });
 });

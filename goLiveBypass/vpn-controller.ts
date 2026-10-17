@@ -70,6 +70,14 @@ export interface ProtonRouteDiscoveryOptions {
     onProgress?: (progress: proton.ProtonOptimizationProgress & { requestId: string; measurementId: string }) => void;
 }
 
+/** Contexto esperado pelo renderer; a resposta só expõe se ele ainda coincide. */
+export interface ProtonRouteDiscoveryContext {
+    username: string;
+    country?: string;
+    freeOnly?: boolean;
+    autoPing?: boolean;
+}
+
 /**
  * Projeção pública de uma rota catalogada. `status` descreve apenas a medição
  * de ping: "testing" aguarda a sonda, "success" tem ping válido e "failed"
@@ -126,6 +134,7 @@ export interface ProtonRouteDiscoveryStatus {
     error?: string;
     updatedAt: number | null;
     expiresAt: number | null;
+    contextMatches?: boolean;
 }
 
 /** Detalhe preservado da ponte de CAPTCHA: recusa e cancelamento não são a mesma coisa. */
@@ -136,6 +145,12 @@ export type ProtonCaptchaSolution =
 const OWNER_FILE = "owner.lock";
 const MIGRATION_FILE = "migration-v1.json";
 const PROFILE_FILE = "wireguard.conf";
+/**
+ * Cópia privada da conf WireGuard do usuário. Arquivo próprio de propósito: o
+ * `wireguard.conf` é regravado pela geração Proton, e o modo personalizado não pode
+ * subir o túnel do servidor Proton apresentando-o como conf importada pelo usuário.
+ */
+const CUSTOM_PROFILE_FILE = "custom-wireguard.conf";
 const PROFILE_ACCOUNT_FILE = "wireguard-profile-account.json";
 const SERVICE_CONFIG_FILE = "wiresock-discord.conf";
 /**
@@ -192,7 +207,10 @@ function isUnknownWireSockInspection(inspection: windows.WireSockInspection): bo
 }
 
 function unknownWireSockMessage(inspection: windows.WireSockInspection): string {
-    return inspection.reason || "Não foi possível confirmar o estado do WireSock; estado desconhecido.";
+    const reason = safeDiagnosticDetail(inspection.reason || "Não foi possível confirmar o estado do WireSock; estado desconhecido.", 300);
+    // Restaurar rede é a ação manual do usuário e executa a limpeza mesmo sem
+    // ownership comprovado (#306); as ações automáticas continuam fail-closed.
+    return `${reason} Use Restaurar rede: a limpeza manual segue mesmo sem ownership comprovado; nenhuma ação automática interrompe uma VPN sem prova de ownership.`;
 }
 
 function processAlive(pid: number): boolean {
@@ -352,6 +370,7 @@ export class PluginVpnController {
     private readonly options: PluginVpnControllerOptions;
     private readonly dataDir: string;
     private readonly profilePath: string;
+    private readonly customProfilePath: string;
     private readonly profileAccountPath: string;
     private readonly activeRoutePath: string;
     private readonly serviceConfigPath: string;
@@ -382,6 +401,7 @@ export class PluginVpnController {
         this.options = options;
         this.dataDir = path.resolve(options.dataDir);
         this.profilePath = path.join(this.dataDir, PROFILE_FILE);
+        this.customProfilePath = path.join(this.dataDir, CUSTOM_PROFILE_FILE);
         this.profileAccountPath = path.join(this.dataDir, PROFILE_ACCOUNT_FILE);
         this.activeRoutePath = path.join(this.dataDir, ACTIVE_ROUTE_FILE);
         this.serviceConfigPath = path.join(this.dataDir, SERVICE_CONFIG_FILE);
@@ -437,7 +457,7 @@ export class PluginVpnController {
         try {
             await this.migrateGuiState();
             const owner = this.readOwner();
-            const inspection = this.inspectWindows();
+            const inspection = await windows.inspectWireSockUntilReliableAsync(this.serviceConfigPath, this.guiConfigPath);
             if (isUnknownWireSockInspection(inspection)) {
                 this.initialized = false;
                 this.state = "recovery_required";
@@ -485,6 +505,29 @@ export class PluginVpnController {
                 await this.claimActiveOwnership(owner, inspection);
                 const cleanup = await this.stopInternal(false);
                 if (!cleanup.success) this.initialized = false;
+                return;
+            }
+            if (!owner) {
+                // Sem owner.lock nenhuma sessão do plugin é esperada neste boot: um
+                // serviço próprio que sobreviveu a quit forçado/reboot é órfão (#281).
+                // A parada usa a configuração própria já comprovada na inspeção; com
+                // owner.lock a sessão é re-adoptada e gerida logo abaixo.
+                this.options.log("warn", "boot encontrou WireSock próprio sem owner.lock; parando serviço órfão", {
+                    services: inspection.services,
+                    processIds: inspection.processIds,
+                });
+                const orphan = await windows.stopOwnedWireSock(this.serviceConfigPath, this.options.log, inspection);
+                if (!orphan.stopped) {
+                    this.initialized = false;
+                    this.state = "recovery_required";
+                    this.externalReason = null;
+                    this.setDiagnostic("ownership", false, orphan.error || "não foi possível parar o serviço órfão WireSock no boot");
+                    this.options.log("warn", "boot não conseguiu parar o serviço órfão WireSock; ação manual necessária", { mode: "diagnostic-only" });
+                    return;
+                }
+                await this.removeProbe({ sweep: true });
+                this.state = "inactive";
+                this.discordPid = null;
                 return;
             }
             this.generation = Math.max(this.generation, owner?.generation ?? 0);
@@ -708,7 +751,10 @@ export class PluginVpnController {
                 ? unknownWireSockMessage(inspection)
                 : this.statusMessage();
             return {
-                state: this.state,
+                // Uma sessão que a inspeção não confirma não pode ser exibida como
+                // ligada (#309): a UI vê `recovery_required`, mostra o motivo e oferece
+                // Restaurar rede. Ações automáticas continuam sem destruir por aqui.
+                state: this.state === "active" ? "recovery_required" : this.state,
                 platform: "windows",
                 architecture: process.arch,
                 owned: false,
@@ -821,7 +867,10 @@ export class PluginVpnController {
         this.optimization?.controller.abort();
         this.cancelProtonRouteDiscovery();
         this.cancelProtonRouteSelection();
-        return this.serial(() => this.stopInternal(isLinux()));
+        // Ação explícita do usuário (#306): a restauração manual executa a limpeza
+        // mesmo sem ownership comprovado. Boot, watchdog e desativação em segundo
+        // plano continuam sem destruir recursos sem prova de ownership.
+        return this.serial(() => this.stopInternal(isLinux(), { manual: true }));
     }
 
     public restartDiscord(): Promise<VpnOperationResult> {
@@ -833,28 +882,50 @@ export class PluginVpnController {
     }
 
     public importCustomConfig(sourcePath: string): Promise<{ success: boolean; error?: string; path?: string }> {
-        return this.serial(async () => {
-            try {
-                if (!isWindows() && !isLinux()) throw new Error("O transporte VPN do plugin exige Windows x64 ou Linux x64.");
-                const source = path.resolve(sourcePath.trim());
-                if (!source || !fs.existsSync(source) || !fs.statSync(source).isFile()) throw new Error("Arquivo WireGuard não encontrado.");
-                const raw = fs.readFileSync(source, "utf8");
-                const validation = validateWireGuardConfig(raw);
-                if (!validation.valid) throw new Error(validation.error);
-                this.clearProtonProfileAccount();
-                this.writeProfileAtomically(raw);
-                this.writeActiveRoute({ mode: "custom", server: null, source: "imported" });
-                return { success: true, path: this.profilePath };
-            } catch (error) {
-                return { success: false, error: errorMessage(error) };
-            }
-        });
+        return this.serial(async () => this.importCustomConfigUnlocked(sourcePath));
+    }
+
+    /**
+     * Importa a conf do usuário para a cópia privada. Sem `serial` de propósito: a
+     * ativação já está dentro da fila e chamar a versão pública aqui travava a operação
+     * para sempre (a fila só libera quando a ativação termina).
+     */
+    private importCustomConfigUnlocked(sourcePath: string): { success: boolean; error?: string; path?: string } {
+        try {
+            if (!isWindows() && !isLinux()) throw new Error("O transporte VPN do plugin exige Windows x64 ou Linux x64.");
+            const raw = fs.readFileSync(this.resolveCustomConfigSource(sourcePath), "utf8");
+            const validation = validateWireGuardConfig(raw);
+            if (!validation.valid) throw new Error(validation.error);
+            this.clearProtonProfileAccount();
+            this.writeProfileAtomically(raw, this.customProfilePath);
+            this.writeActiveRoute({ mode: "custom", server: null, source: "imported" });
+            return { success: true, path: this.customProfilePath };
+        } catch (error) {
+            return { success: false, error: errorMessage(error) };
+        }
+    }
+
+    /**
+     * Valida o caminho escolhido para a conf do usuário. O layout antigo guardava a conf
+     * importada em `wireguard.conf`, o mesmo arquivo da geração Proton: com o marcador da
+     * conta presente esse arquivo é o perfil Proton, não a conf do usuário, e usá-lo
+     * subiria o servidor Proton como se fosse o arquivo escolhido.
+     */
+    private resolveCustomConfigSource(sourcePath: string | undefined): string {
+        const requested = typeof sourcePath === "string" ? sourcePath.trim() : "";
+        if (!requested) throw new Error("Nenhum arquivo WireGuard personalizado foi importado ainda.");
+        const source = path.resolve(requested);
+        if (!source || !fs.existsSync(source) || !fs.statSync(source).isFile()) throw new Error("Arquivo WireGuard não encontrado.");
+        if (source === this.profilePath && fs.existsSync(this.profileAccountPath))
+            throw new Error("A configuração personalizada aponta para o perfil Proton em uso. Selecione o arquivo .conf novamente.");
+        return source;
     }
 
     public testConfig(sourcePath?: string): { success: boolean; error?: string; path?: string } {
         try {
-            const target = sourcePath?.trim() ? path.resolve(sourcePath.trim()) : this.profilePath;
-            if (!fs.existsSync(target)) throw new Error("Nenhuma configuração WireGuard foi encontrada.");
+            // Sem argumento o alvo é a conf configurada no painel (o que o botão
+            // "Testar .conf" promete) — nunca o perfil ativo do túnel.
+            const target = this.resolveCustomConfigSource(sourcePath?.trim() ? sourcePath : this.settings().customConfigPath);
             const validation = validateWireGuardConfig(fs.readFileSync(target, "utf8"));
             if (!validation.valid) throw new Error(validation.error);
             return { success: true, path: target };
@@ -1093,12 +1164,13 @@ export class PluginVpnController {
             return Promise.resolve({ success: false, error: "Já existe uma seleção de rota Proton em andamento." });
         if (this.protonLogin)
             return Promise.resolve({ success: false, error: "Termine o login Proton antes de escolher uma rota." });
-        if (this.routeMeasurement?.active)
+        if (this.routeMeasurement?.active && !this.routeMeasurement.controller.signal.aborted)
             return Promise.resolve({ success: false, error: "Já existe uma descoberta de rotas Proton em andamento." });
 
         const requestId = normalizeLoginRequestId(options.requestId);
         const controller = new AbortController();
         const now = Date.now();
+        const initialSettings = this.settings();
         const measurement: ProtonRouteMeasurement = {
             measurementId: randomUUID().replaceAll("-", ""),
             requestId,
@@ -1106,10 +1178,10 @@ export class PluginVpnController {
             // mais a geração decidem se um evento ou seleção ainda vale.
             owner: Symbol("proton-route-measurement"),
             generation: ++this.routeMeasurementGeneration,
-            username: "",
-            country: "",
-            freeOnly: true,
-            autoPing: true,
+            username: normalizeUsername(initialSettings.protonUsername),
+            country: normalizeCountry(options.country ?? initialSettings.protonCountry),
+            freeOnly: options.freeOnly ?? initialSettings.protonFreeOnly,
+            autoPing: options.autoPing ?? initialSettings.protonAutoPing,
             controller,
             active: true,
             phase: "preparing",
@@ -1192,7 +1264,7 @@ export class PluginVpnController {
         return true;
     }
 
-    public getRouteDiscoveryStatus(): ProtonRouteDiscoveryStatus {
+    public getRouteDiscoveryStatus(context?: ProtonRouteDiscoveryContext): ProtonRouteDiscoveryStatus {
         this.sweepRouteMeasurement();
         const measurement = this.routeMeasurement;
         if (!measurement) {
@@ -1206,9 +1278,20 @@ export class PluginVpnController {
                 measured: 0,
                 updatedAt: null,
                 expiresAt: null,
+                ...(context ? { contextMatches: false } : {}),
             };
         }
         const routes = this.routeCatalogViews(measurement);
+        let contextMatches: boolean | undefined;
+        if (context) {
+            const settings = this.settings();
+            contextMatches = protonUsernamesMatch(measurement.username, normalizeUsername(context.username))
+                && protonUsernamesMatch(measurement.username, settings.protonUsername)
+                && measurement.country === normalizeCountry(context.country ?? settings.protonCountry)
+                && measurement.freeOnly === (context.freeOnly ?? settings.protonFreeOnly)
+                && measurement.autoPing === (context.autoPing ?? settings.protonAutoPing)
+                && !(measurement.active && measurement.controller.signal.aborted);
+        }
         return {
             active: measurement.active,
             requestId: measurement.requestId,
@@ -1220,6 +1303,7 @@ export class PluginVpnController {
             error: measurement.error,
             updatedAt: measurement.updatedAt,
             expiresAt: measurement.expiresAt,
+            ...(context ? { contextMatches } : {}),
         };
     }
 
@@ -1533,7 +1617,7 @@ export class PluginVpnController {
     private writeActiveRoute(entry: { mode: VpnMode; server: string | null; source: VpnRouteSource }): void {
         try {
             fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
-            const profileRaw = this.activeProfileRaw();
+            const profileRaw = this.activeProfileRaw(entry.mode);
             const record: ActiveRouteRecord = {
                 schema: VPN_SCHEMA_VERSION,
                 mode: entry.mode,
@@ -1565,8 +1649,14 @@ export class PluginVpnController {
         try { fs.rmSync(this.activeRoutePath, { force: true }); } catch { }
     }
 
-    private activeProfileRaw(): string {
-        for (const candidate of [this.serviceConfigPath, this.profilePath]) {
+    private activeProfileRaw(mode: VpnMode): string {
+        // O serviço ativo manda (é o perfil que o WireSock lê agora); sem ele vale o
+        // arquivo do modo em uso — a conf do usuário e o perfil Proton têm arquivos
+        // próprios desde a correção do modo personalizado.
+        const profileForMode = mode === "custom" ? this.customProfilePath : this.profilePath;
+        const legacySharedProfile = mode === "custom" ? this.profilePath : null;
+        for (const candidate of [this.serviceConfigPath, profileForMode, legacySharedProfile]) {
+            if (!candidate) continue;
             try {
                 if (fs.existsSync(candidate)) return fs.readFileSync(candidate, "utf8");
             } catch { }
@@ -1576,8 +1666,6 @@ export class PluginVpnController {
 
     /** Lê o registro e relê o endpoint do perfil ativo — o registro nunca inventa o que está em uso. */
     private readActiveRoute(): VpnRouteInfo | null {
-        const raw = this.activeProfileRaw();
-        if (!raw) return null;
         let record: Partial<ActiveRouteRecord> | null = null;
         try {
             const parsed = JSON.parse(fs.readFileSync(this.activeRoutePath, "utf8")) as unknown;
@@ -1587,6 +1675,8 @@ export class PluginVpnController {
         }
         const accountKnown = fs.existsSync(this.profileAccountPath);
         const mode: VpnMode = record?.mode === "custom" || (!record && !accountKnown) ? "custom" : "proton";
+        const raw = this.activeProfileRaw(mode);
+        if (!raw) return null;
         return {
             mode,
             server: mode === "proton" ? validRouteServer(record?.server) : null,
@@ -1692,7 +1782,7 @@ export class PluginVpnController {
             this.externalReason = "A VPN do plugin nesta versão está disponível somente no Windows x64.";
             return { success: false, state: this.state, error: this.externalReason };
         }
-        const existing = this.inspectWindows();
+        const existing = await windows.inspectWireSockUntilReliableAsync(this.serviceConfigPath, this.guiConfigPath);
         if (isUnknownWireSockInspection(existing)) {
             this.state = "recovery_required";
             this.externalReason = null;
@@ -1743,7 +1833,7 @@ export class PluginVpnController {
         let started = false;
         try {
             await this.migrateGuiState();
-            owner = await this.acquireOwnership();
+            owner = await this.acquireOwnership(existing);
             await this.cleanupStaleProbes(this.probePath ? [this.probePath] : []);
             const settings = this.settings();
             if (settings.mode === "proton") {
@@ -1763,10 +1853,10 @@ export class PluginVpnController {
                 }
             } else {
                 if (!settings.customConfigPath) throw new Error("Configure um arquivo WireGuard personalizado antes de ativar.");
-                const imported = await this.importCustomConfig(settings.customConfigPath);
+                const imported = this.importCustomConfigUnlocked(settings.customConfigPath);
                 if (!imported.success) throw new Error(imported.error);
             }
-            const raw = fs.readFileSync(this.profilePath, "utf8");
+            const raw = fs.readFileSync(settings.mode === "custom" ? this.customProfilePath : this.profilePath, "utf8");
             const validation = windows.validateWireGuardProfile(raw);
             if (!validation.valid) throw new Error(validation.error);
 
@@ -1954,11 +2044,11 @@ export class PluginVpnController {
                 }
             } else {
                 if (!settings.customConfigPath) throw new Error("Configure um arquivo WireGuard personalizado antes de ativar.");
-                const imported = await this.importCustomConfig(settings.customConfigPath);
+                const imported = this.importCustomConfigUnlocked(settings.customConfigPath);
                 if (!imported.success) throw new Error(imported.error);
             }
 
-            const raw = fs.readFileSync(this.profilePath, "utf8");
+            const raw = fs.readFileSync(settings.mode === "custom" ? this.customProfilePath : this.profilePath, "utf8");
             const validation = validateWireGuardConfig(raw);
             if (!validation.valid) throw new Error(validation.error);
             this.state = "authorizing";
@@ -2020,22 +2110,47 @@ export class PluginVpnController {
         }
     }
 
-    private async stopInternal(relaunch: boolean): Promise<VpnOperationResult> {
+    private async stopInternal(relaunch: boolean, options: { manual?: boolean } = {}): Promise<VpnOperationResult> {
         if (isLinux()) return this.stopLinuxInternal(relaunch);
         if (!isSupportedWindowsArchitecture(process.platform, process.arch)) return { success: false, state: "blocked_external", error: "A VPN do plugin nesta versão exige Windows x64." };
         this.stopWatchdog();
         this.diagnosticGeneration++;
-        const inspection = this.inspectWindows();
+        // Restaurar rede é a única entrada manual deste caminho (#306): com o sinal
+        // manual a limpeza segue mesmo sem ownership comprovado. Sem ele (quit,
+        // otimização, rota, boot) nada muda — leitura desconhecida continua adiando
+        // a parada em modo diagnóstico.
+        const manual = options.manual === true;
+        let inspection = this.inspectWindows();
+        const owner = this.readOwner();
         if (isUnknownWireSockInspection(inspection)) {
+            const ownershipProven = Boolean(owner && owner.configPath === this.serviceConfigPath && !this.isLiveForeignOwner(owner));
+            if (!manual && !ownershipProven) {
+                this.state = "recovery_required";
+                this.externalReason = null;
+                const error = unknownWireSockMessage(inspection);
+                this.setDiagnostic("ownership", false, error);
+                this.options.log("warn", "restauração adiada porque owner/configuração próprios não foram confirmados", { mode: "diagnostic-only" });
+                return { success: false, state: this.state, error };
+            }
+            inspection = await windows.inspectWireSockUntilReliableAsync(this.serviceConfigPath, this.guiConfigPath);
+            if (isUnknownWireSockInspection(inspection) && !manual) {
+                this.state = "recovery_required";
+                this.externalReason = null;
+                const error = unknownWireSockMessage(inspection);
+                this.setDiagnostic("ownership", false, error);
+                this.options.log("warn", "restauração adiada porque o estado do WireSock continuou desconhecido", { mode: "diagnostic-only" });
+                return { success: false, state: this.state, error };
+            }
+        }
+        if (!manual && inspection.active && inspection.owned && (!owner || owner.configPath !== this.serviceConfigPath || this.isLiveForeignOwner(owner))) {
             this.state = "recovery_required";
-            this.externalReason = null;
-            const error = unknownWireSockMessage(inspection);
-            this.setDiagnostic("wireguard", false, error);
-            this.options.log("warn", "restauração adiada porque o estado do WireSock é desconhecido", { mode: "diagnostic-only" });
+            const error = "WireSock próprio detectado sem owner/configuração confirmados; ação manual necessária.";
+            this.setDiagnostic("ownership", false, error);
+            this.options.log("warn", "restauração recusada sem prova de owner/configuração próprios", { mode: "diagnostic-only" });
             return { success: false, state: this.state, error };
         }
-        const owner = this.readOwner();
         const needsInactiveCleanup = Boolean(owner)
+            || (manual && isUnknownWireSockInspection(inspection))
             || this.state === "preparing"
             || this.state === "starting"
             || this.state === "stopping"
@@ -2059,16 +2174,18 @@ export class PluginVpnController {
             return { success: true, state: this.state, message: this.statusMessage() };
         }
         if (inspection.reliable && inspection.active && !inspection.owned) {
-            this.blockExternal(inspection.reason || "WireSock externo está ativo; não será interrompido.");
+            const reason = inspection.reason || "WireSock externo está ativo; não será interrompido.";
+            this.blockExternal(reason);
             return { success: false, state: this.state, error: this.externalReason || undefined };
         }
         this.state = "stopping";
-        const cleanup = await windows.stopOwnedWireSock(this.serviceConfigPath, this.options.log);
+        const cleanup = await windows.stopOwnedWireSock(this.serviceConfigPath, this.options.log, inspection, { manual });
         if (!cleanup.stopped) {
             await this.removeProbe({ sweep: false });
             this.state = "recovery_required";
-            this.setDiagnostic("wireguard", false, cleanup.error || "limpeza incompleta");
-            return { success: false, state: this.state, error: cleanup.error || "Não foi possível restaurar a rede." };
+            const error = errorMessage(cleanup.error || "limpeza incompleta");
+            this.setDiagnostic("wireguard", false, error);
+            return { success: false, state: this.state, error: error || "Não foi possível restaurar a rede." };
         }
         await this.removeProbe({ sweep: true });
         if (owner && !await this.releaseOwnership(owner)) {
@@ -2415,6 +2532,40 @@ export class PluginVpnController {
                     return;
                 }
                 if (!confirmation.active) {
+                    // A sessão é do plugin (owner.lock próprio) e a leitura vazia pode
+                    // ser transitória logo após a ativação (#331): re-adopta quando uma
+                    // inspeção fresca confirmar o túnel de novo, em vez de derrubar o
+                    // estado. Sem owner.lock não há sessão a re-adoptar e a ausência
+                    // confirmada segue como antes, sem tocar em recurso algum.
+                    const sessionOwner = this.readOwner();
+                    if (sessionOwner && sessionOwner.configPath === this.serviceConfigPath && !this.isLiveForeignOwner(sessionOwner)) {
+                        const recheck = await windows.inspectWireSockUntilReliableAsync(this.serviceConfigPath, this.guiConfigPath);
+                        if (!isCurrent()) return;
+                        if (!recheck.reliable) {
+                            this.setDiagnostic("wireguard", false, recheck.reason || "Estado do WireSock desconhecido.");
+                            this.options.log("warn", "watchdog não re-adoptou a sessão própria porque a leitura continuou desconhecida", { mode: "diagnostic-only" });
+                            return;
+                        }
+                        if (recheck.active && recheck.owned) {
+                            try {
+                                const readopted = await this.claimActiveOwnership(sessionOwner, recheck);
+                                this.generation = Math.max(this.generation, readopted.generation);
+                                this.options.log("warn", "watchdog re-adoptou a sessão WireSock própria", {
+                                    mode: "diagnostic-only",
+                                    services: recheck.services,
+                                    processIds: recheck.processIds,
+                                });
+                                this.startDiagnostics("watchdog");
+                                return;
+                            } catch (error) {
+                                // Lock mudou de dono durante a re-adoção: mantém o estado
+                                // atual e deixa o próximo ciclo decidir; nada foi parado.
+                                if (isCurrent()) this.setDiagnostic("wireguard", false, errorMessage(error));
+                                this.options.log("warn", "watchdog não re-adoptou a sessão própria", { mode: "diagnostic-only", erro: errorMessage(error) });
+                                return;
+                            }
+                        }
+                    }
                     this.diagnosticGeneration++;
                     this.state = "inactive";
                     this.discordPid = null;
@@ -2648,11 +2799,11 @@ export class PluginVpnController {
         });
     }
 
-    private async acquireOwnership(): Promise<VpnOwnerRecord> {
+    private async acquireOwnership(knownInspection?: windows.WireSockInspection): Promise<VpnOwnerRecord> {
         return this.withOwnerMutex(async () => {
             const existing = this.readOwner();
             const ownerFileExists = fs.existsSync(this.ownerPath);
-            const inspection = this.inspectWindows();
+            const inspection = knownInspection ?? this.inspectWindows();
             if (isUnknownWireSockInspection(inspection)) throw new Error(unknownWireSockMessage(inspection));
             // Conflito gerenciado (GUI/pool do GoLiveBypass) não bloqueia a reserva do lock:
             // a retomada acontece depois, no start, já sob posse desta instância. WireSock
@@ -2820,10 +2971,10 @@ export class PluginVpnController {
         return current !== null && !sameOwnership(current, owner);
     }
 
-    private writeProfileAtomically(raw: string): void {
+    private writeProfileAtomically(raw: string, target: string = this.profilePath): void {
         fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
         if (process.platform === "linux") fs.chmodSync(this.dataDir, 0o700);
-        const temporary = `${this.profilePath}.${process.pid}.${Date.now()}.tmp`;
+        const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
         let fd: number | undefined;
         try {
             fd = fs.openSync(temporary, "wx", 0o600);
@@ -2831,8 +2982,8 @@ export class PluginVpnController {
             fs.fsyncSync(fd);
             fs.closeSync(fd);
             fd = undefined;
-            fs.renameSync(temporary, this.profilePath);
-            if (process.platform === "linux") fs.chmodSync(this.profilePath, 0o600);
+            fs.renameSync(temporary, target);
+            if (process.platform === "linux") fs.chmodSync(target, 0o600);
         } catch (error) {
             if (fd !== undefined) {
                 try { fs.closeSync(fd); } catch { }

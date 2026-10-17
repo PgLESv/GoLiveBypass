@@ -79,7 +79,8 @@ describe("transporte Linux do plugin", () => {
     }
   });
 
-  it.runIf(process.platform === "linux")("confirma a carga do módulo antes de criar a interface", () => {
+  // Executa /bin/sh e /usr/bin/true do Linux.
+  it.skipIf(process.platform !== "linux")("confirma a carga do módulo antes de criar a interface", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-module-check-"));
     try {
       const ausente = path.join(root, "wireguard-nao-existe");
@@ -178,7 +179,8 @@ describe("transporte Linux do plugin", () => {
     expect(launcher.indexOf("setuid(uid)")).toBeLessThan(launcher.indexOf("write_confirmation(confirm_path, argv[1])"));
   });
 
-  it.runIf(process.platform === "linux")("agrupa comandos privilegiados e executa rollback no mesmo processo", () => {
+  // Executa /bin/sh e /usr/bin/touch do Linux.
+  it.skipIf(process.platform !== "linux")("agrupa comandos privilegiados e executa rollback no mesmo processo", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "golive-privileged-sequence-"));
     const marker = path.join(root, "rollback-marker");
     try {

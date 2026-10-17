@@ -120,6 +120,8 @@ chmod +x GoLiveBypass-*.AppImage
 
 > **Nota:** se o seu Discord é flatpak do sistema, a primeira ativação pode pedir sua senha (via `pkexec`) para liberar a pasta do bypass para o sandbox.
 
+> **Serein**: o cliente Discord nativo em Rust (`cz.viceverse.serein`, Windows e Linux) também entra no túnel por aplicativo da GUI. Ele não usa Electron nem hospeda plugins — com ele, o GoLiveBypass funciona só pelo transporte (a injeção do plugin não se aplica).
+
 ### Dependências no Arch Linux
 
 Na primeira abertura a GUI executa um preflight somente leitura. Se faltar alguma dependência,
@@ -511,7 +513,7 @@ O painel também permite autenticar, resolver o CAPTCHA em uma janela oficial is
 
 - **WireSock externo detectado**: encerre a GUI, o standalone ou o outro plugin que controla o túnel. O plugin não faz `taskkill` amplo e não assume serviços externos.
 - **Windows x64 necessário**: Linux, macOS, Windows 32-bit e Windows ARM64 permanecem fora desta primeira etapa da migração.
-- **`recovery_required`**: a parada do serviço ou a restauração do lock/DNS não foi confirmada. Não tente iniciar outro perfil; abra o log e use **Restaurar rede** ou reinicie o Windows se o filtro continuar ativo.
+- **`recovery_required`**: não foi possível confirmar o perfil ou a parada dos serviços/processos próprios. Não tente iniciar outro perfil; abra o log e use **Restaurar rede** ou reinicie o Windows se o filtro continuar ativo. Perfis atuais omitem DNS e desabilitam `network-lock`; a limpeza preserva DNS de adaptadores e locks globais de outras VPNs.
 - **CAPTCHA Proton**: o login abre uma janela com origem oficial Proton, sem downloads, permissões ou navegação externa. Fechar a janela cancela a tentativa sem alterar a sessão.
 - **Quer ver o que aconteceu**: rode `/golivebypass` ou abra `%LOCALAPPDATA%\GoLiveBypass\plugin-vpn\plugin-vpn.log` (veja [O registro](#o-registro-o-que-o-plugin-anotou)). O arquivo inclui estado, ownership, início/parada do WireSock e probes log-only; não inclui senha nem token.
 - **A região da call não mudou**: saia e entre de novo no canal. Canais de servidor com região fixada por um admin ignoram sua preferência, e numa call que já está rolando a região já foi decidida.
@@ -539,7 +541,7 @@ No plugin, `/golivebypass` copia o estado atual e o ring buffer do processo prin
 O registro responde as perguntas que a tela não responde:
 
 - **se a instância é dona do serviço WireSock** ou encontrou outro controlador
-- **se o WireGuard iniciou, parou e restaurou o lock/DNS**
+- **se o WireGuard iniciou e os serviços/processos próprios foram confirmados como parados**
 - **se os probes de rota e conectividade responderam** — sempre como diagnóstico
 - **se o Discord abriu a sessão com o guard de vídeo atribuído**
 
@@ -593,7 +595,7 @@ Ou seja, o fluxo do GoLiveBypass — **o Discord nasce dentro do WireGuard, enqu
 
 ## Avisos importantes
 
-- **O transporte do plugin funciona nesta etapa somente no Discord desktop Windows x64** com Equicord ou Vencord injetado. Linux, macOS, Vesktop, Equibop, Snap e navegador continuam fora desta migração de transporte.
+- **O transporte do plugin funciona no Discord desktop Windows x64 e Linux x64** (linha beta) com Equicord ou Vencord injetado. macOS, Vesktop/Equibop (hosts sem validação de transporte), Serein, Snap e navegador continuam fora desta migração de transporte.
 - Usar clientes modificados viola os Termos de Serviço do Discord. Use por sua conta e risco.
 - O WireGuard do plugin carrega o processo inteiro do Discord por aplicativo. A GUI, navegadores, jogos e os demais programas ficam fora do filtro.
 - `network-lock` fica desativado de propósito para preservar a rede normal do computador. Se a inicialização falhar, a operação é abortada; estado ativo significa que o processo/serviço próprio foi iniciado, não prova geográfica do IP de saída.
@@ -606,7 +608,7 @@ O plugin mantém duas responsabilidades separadas:
 1. O patch do renderer mantém a interface de câmera/Go Live coerente com o experimento de vídeo do Discord e preserva as preferências de região da call/stream.
 2. O processo principal controla uma sessão WireGuard/WireSock por aplicativo. O perfil usa a rota padrão, mas `AllowedApps` limita o túnel ao `Discord.exe`, ao `Update.exe` da instalação atual e, quando disponível, a um helper temporário de diagnóstico.
 
-Ao ativar, o controlador valida ou gera o perfil, reserva o lock global, sanitiza DNS/AllowedApps, configura o serviço com `network-lock disabled`, confirma o ownership e reinicia o Discord. Ao desativar, ele para apenas serviços e PIDs cujo comando aponta para o perfil privado, reseta o network lock, limpa DNS somente dos adaptadores WireSock/ProTUN e confirma que não sobrou processo.
+Ao ativar, o controlador valida ou gera o perfil, reserva o lock global, sanitiza DNS/AllowedApps, configura o serviço com `network-lock disabled`, confirma o ownership e reinicia o Discord. Ao desativar, ele para apenas serviços e PIDs cujo comando aponta para o perfil privado e confirma que não sobrou processo próprio. Perfis atuais não alteram DNS global nem habilitam o network-lock; a limpeza preserva essas configurações e pode limpar o cache DNS após confirmar a parada própria. Resíduos de versões antigas que habilitaram lock ou alteraram DNS exigem diagnóstico específico: o perfil/PID atual não prova a origem desses recursos globais.
 
 O estado `active` é deliberadamente operacional: significa que o serviço e o processo próprio foram confirmados. Os probes de DNS, HTTPS e rota são executados em segundo plano e ficam no log como evidência auxiliar; uma falha de probe não bloqueia a ativação, não troca a saída no meio da call e não encerra o Discord.
 
@@ -666,6 +668,7 @@ O plugin **só funciona no app de computador** (ele usa recursos do Electron que
 
 - **Discord normal**: baixe em [discord.com/download](https://discord.com/download) (stable, PTB ou Canary servem). O Flatpak (`com.discordapp.Discord`) também serve, do sistema ou do usuário; ou
 - **Vesktop/Equibop**: apps alternativos que já trazem o mod embutido. Os instaladores daqui não mexem neles; o patch do plugin pode ser carregado manualmente, mas o transporte VPN desta etapa não foi validado nesses hosts.
+- **Serein**: cliente Discord nativo em Rust — **não** hospeda Vencord/Equicord nem este plugin. Para rotear o Serein pelo túnel, use a GUI (Windows e Linux).
 - **Não funciona** no Discord aberto no navegador nem no celular.
 
 ### Componentes da VPN do plugin

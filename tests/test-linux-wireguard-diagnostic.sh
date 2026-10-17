@@ -16,6 +16,13 @@ cleanup() {
 }
 trap cleanup EXIT
 ip link set lo up
+# O teste monta um WireGuard DO KERNEL (`ip link add type wireguard`): num kernel em execucao
+# sem a arvore de modulos (upgrade sem reinicio) ele nao tem como rodar — o modo de usuario
+# tem teste proprio em tests/test-linux-wireguard-userspace.sh.
+if [ ! -e /sys/module/wireguard ] && ! modinfo wireguard >/dev/null 2>&1; then
+  printf 'SKIP: modulo WireGuard ausente no kernel em execucao (nem modinfo)\n'
+  exit 0
+fi
 unshare -n sleep 120 &
 child=$!
 # Wait until the child has entered its own network namespace.

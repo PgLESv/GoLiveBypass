@@ -8,7 +8,7 @@ import { createContext, runInContext } from "node:vm";
 
 const source = fs.readFileSync(new URL("../goLiveBypass/native.ts", import.meta.url), "utf8");
 const start = source.indexOf("function acquirePluginUpdateLock()");
-const end = source.indexOf("function quarantineLegacyPendingUpdate", start);
+const end = source.indexOf("function quarantinePendingUpdate", start);
 assert.ok(start >= 0 && end > start);
 const functions = stripTypeScriptTypes(source.slice(start, end));
 

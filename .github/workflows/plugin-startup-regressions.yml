@@ -6,6 +6,7 @@ on:
       - 'goLiveBypass/**'
       - 'tests/test-plugin-update-lock.mjs'
       - 'tests/test-plugin-netns-environment.mjs'
+      - 'tests/test-plugin-runtime-compatibility.mjs'
       - 'tests/test-plugin-autostart-loop.mjs'
       - 'tests/test-plugin-update-archive.mjs'
       - '.github/workflows/plugin-startup-regressions.yml'
@@ -28,5 +29,6 @@ jobs:
           node --test
           tests/test-plugin-update-lock.mjs
           tests/test-plugin-netns-environment.mjs
+          tests/test-plugin-runtime-compatibility.mjs
           tests/test-plugin-autostart-loop.mjs
           tests/test-plugin-update-archive.mjs

@@ -24,6 +24,12 @@ describe("pergunta de rota na primeira abertura", () => {
     expect(shouldAskRoutePreference({ protonLastServer: { server: "BR#1", manual: false } })).toBe(false);
   });
 
+  it("trata protonLastServer vazio ou inválido como sem rota usada e pergunta", () => {
+    expect(shouldAskRoutePreference({ protonLastServer: {} })).toBe(true);
+    expect(shouldAskRoutePreference({ protonLastServer: null })).toBe(true);
+    expect(shouldAskRoutePreference({ protonLastServer: "" })).toBe(true);
+  });
+
   it("não pergunta de novo depois de respondida ou dispensada, mesmo sem preferência", () => {
     expect(shouldAskRoutePreference({ protonRoutePreferencePrompted: true })).toBe(false);
     expect(shouldAskRoutePreference({ protonRoutePreferencePrompted: true, protonRoutePreference: undefined })).toBe(false);

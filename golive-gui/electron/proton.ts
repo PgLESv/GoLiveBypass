@@ -40,7 +40,6 @@ export interface ProtonLoginResult {
   error?: string;
   retryable?: boolean;
   captchaUrl?: string;
-  username?: string;
   tier?: number;
   planTitle?: string;
   isPaid?: boolean;
@@ -158,9 +157,9 @@ export function recordManualMeasurementProgress(
     speedStatus: 'not-tested',
   };
   const status = progress.status === 'success' ? 'success' : progress.status === 'failed' ? 'failed' : 'pending';
-  if (Number.isFinite(progress.pingMs) && progress.pingMs > 0 && progress.pingMs < 999) current.pingMs = progress.pingMs;
-  if (Number.isFinite(progress.downloadMbps) && progress.downloadMbps > 0) current.downloadMbps = progress.downloadMbps;
-  if (Number.isFinite(progress.uploadMbps) && progress.uploadMbps > 0) current.uploadMbps = progress.uploadMbps;
+  if (typeof progress.pingMs === 'number' && Number.isFinite(progress.pingMs) && progress.pingMs > 0 && progress.pingMs < 999) current.pingMs = progress.pingMs;
+  if (typeof progress.downloadMbps === 'number' && Number.isFinite(progress.downloadMbps) && progress.downloadMbps > 0) current.downloadMbps = progress.downloadMbps;
+  if (typeof progress.uploadMbps === 'number' && Number.isFinite(progress.uploadMbps) && progress.uploadMbps > 0) current.uploadMbps = progress.uploadMbps;
   if (progress.phase === 'ping') current.pingStatus = status;
   else if (progress.phase === 'preparing') current.preflightStatus = status;
   else if (progress.phase === 'testing') current.speedStatus = status;
@@ -1157,7 +1156,7 @@ export async function generateProtonRouteCatalog(
     if (!server || server.length > 200 || !country || country.length > 32 || city.length > 200 ||
       !tier || tier.length > 80 || !Number.isFinite(load) || load < 0 || load > 100 ||
       !Number.isFinite(score) || score < 0 ||
-      (raw.pingMs !== undefined && (!Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999))) {
+      (pingMs !== undefined && (!Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999))) {
       invalidRoute = true;
       continue;
     }

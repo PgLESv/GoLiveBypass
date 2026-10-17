@@ -23,14 +23,27 @@ só para o tráfego do Discord. DMG **universal**: Apple Silicon e Intel.
 
 ## Uso
 
-- **Conta Proton:** usuário e senha de uma conta ProtonVPN gratuita e **Buscar melhor
-  servidor** (mede o ping dos servidores MX e US). A sessão fica salva, a senha não.
-  Também dá para **Importar .conf** de um WireGuard próprio.
-- **Ativar:** o botão central liga o túnel e reinicia o Discord por ele.
-- **Extras (opcional):** **Instalar o Vencord com o plugin FakeNitro ao ativar** vem
-  desligado. Ligado, o app injeta o Vencord no Discord (pede a permissão de
-  **Gerenciamento de Apps**) e liga o FakeNitro só se você nunca o configurou; se você
-  desligar o FakeNitro no Vencord, o app não liga de novo.
+- **Proton Otimizado:** usuário e senha de uma conta ProtonVPN gratuita e **Entrar e
+  buscar rota** (mede o ping dos servidores MX e US). A sessão fica salva, a senha não.
+  Depois disso aparecem o plano da conta e a lista de rotas:
+  - **Automática:** fica com o menor ping e, se a rota cair, troca de servidor sozinha
+    sem fechar o Discord.
+  - **Manual:** você escolhe o servidor na lista e ele é mantido.
+  - **Otimizar rota:** mede download e upload de verdade num túnel à parte, sem fechar o
+    Discord, e fica com a melhor.
+- **Arquivo .conf:** importa um WireGuard próprio.
+- **Ativar:** o botão central liga o túnel e reinicia o Discord por ele. Com o bypass
+  ativo aparecem o ping até o Discord e **Reiniciar bypass**.
+- **Desativar:** com o Discord aberto, o túnel fica até você fechar o Discord e então
+  cai sozinho. **Desativar agora** derruba na hora. Se a rede ficar presa depois de uma
+  falha, aparece **Restaurar internet**.
+- **Configurações** (engrenagem): tema (Sistema, Claro ou Escuro), abrir ao iniciar a sessão, modo desenvolvedor (log),
+  rota automática ou manual, troca automática de servidor e o extra opcional
+  **Instalar o Vencord com o plugin FakeNitro ao ativar**, que vem desligado. Ligado, o
+  app injeta o Vencord no Discord (pede a permissão de **Gerenciamento de Apps**) e liga
+  o FakeNitro só se você nunca o configurou; se você desligar o FakeNitro no Vencord, o
+  app não liga de novo.
+- **Como funciona** (livro) explica o passo a passo.
 - O app fica na barra de menu: fechar a janela não desliga o bypass. Para sair, **Sair**
   no ícone da barra de menu ou Cmd+Q.
 

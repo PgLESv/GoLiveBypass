@@ -18,13 +18,21 @@ test("helper aplica nome/valor separados sem privilégios nem namespace", () => 
 #include ${JSON.stringify(source)}
 #undef main
 int main(void) {
-    char *args[] = {"--env=DISPLAY=:0", "--env=XAUTHORITY=/tmp/test-cookie", "--env=TEST_VALUE=a=b", "--env=EMPTY="};
+    /* O launcher desta linha separa nome/valor no próprio argv (gravável em
+     * produção); buffers mutáveis mantêm a mesma prova. */
+    char arg_display[] = "--env=DISPLAY=:0";
+    char arg_xauthority[] = "--env=XAUTHORITY=/tmp/test-cookie";
+    char arg_value[] = "--env=TEST_VALUE=a=b";
+    char arg_empty[] = "--env=EMPTY=";
+    char *args[] = {arg_display, arg_xauthority, arg_value, arg_empty};
     if (!set_explicit_environment(4, args, 0, 4)) return 1;
     if (strcmp(getenv("DISPLAY"), ":0") || strcmp(getenv("XAUTHORITY"), "/tmp/test-cookie")) return 2;
     if (strcmp(getenv("TEST_VALUE"), "a=b") || strcmp(getenv("EMPTY"), "")) return 3;
-    char *bad[] = {"--env=BAD-NAME=value"};
+    char bad_name[] = "--env=BAD-NAME=value";
+    char *bad[] = {bad_name};
     if (set_explicit_environment(1, bad, 0, 1)) return 4;
-    char *missing[] = {"--env=NO_VALUE"};
+    char missing_value[] = "--env=NO_VALUE";
+    char *missing[] = {missing_value};
     if (set_explicit_environment(1, missing, 0, 1)) return 5;
     return 0;
 }

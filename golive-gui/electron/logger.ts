@@ -5,10 +5,10 @@
 // Formato das linhas (grep-friendly):
 //   [HH:MM:SS] [nivel][categoria] mensagem | chave=valor chave=valor
 //
-// O patchConsole() intercepta console.log/warn/error do main process uma unica vez,
-// entao todo o logging que ja existe ([tor], [updater], [restore], [settings]) passa
-// a persistir em arquivo sem tocar nos pontos de chamada. A tag entre colchetes vira
-// a categoria da linha.
+// O patchConsole() intercepta console.log/info/warn/error do main process uma
+// unica vez, entao todo o logging que ja existe ([tor], [updater], [restore],
+// [settings]) passa a persistir em arquivo sem tocar nos pontos de chamada. A
+// tag entre colchetes vira a categoria da linha.
 
 import fs from "fs";
 import path from "path";
@@ -179,10 +179,12 @@ export function _resetForTests() {
 // Tee do console: mantem a saida original (dev/terminal) e persiste no logger.
 // ---------------------------------------------------------------------------
 
+type ConsoleMethod = (...a: unknown[]) => void;
 let consolaOriginal: {
-  log: typeof console.log;
-  warn: typeof console.warn;
-  error: typeof console.error;
+  log: ConsoleMethod;
+  info: ConsoleMethod;
+  warn: ConsoleMethod;
+  error: ConsoleMethod;
 } | null = null;
 
 // Tags que ja existem espalhadas no codigo -> categorias canonicas do formato.
@@ -204,38 +206,48 @@ function stringifyArg(a: unknown): string {
 }
 
 export function patchConsole(alvo: {
-  log: (...a: unknown[]) => void;
-  warn: (...a: unknown[]) => void;
-  error: (...a: unknown[]) => void;
+  log: ConsoleMethod;
+  info: ConsoleMethod;
+  warn: ConsoleMethod;
+  error: ConsoleMethod;
 } = console): () => void {
   if (consolaOriginal) return () => {};
   consolaOriginal = {
-    log: alvo.log.bind(alvo),
-    warn: alvo.warn.bind(alvo),
-    error: alvo.error.bind(alvo),
+    log: alvo.log,
+    info: alvo.info,
+    warn: alvo.warn,
+    error: alvo.error,
   };
 
   const interceptar =
-    (nivel: Nivel, original: (...a: unknown[]) => void) =>
-    (...args: unknown[]) => {
-      original(...args);
-      try {
-        const texto = args.map(stringifyArg).join(" ");
-        const m = /^\[([A-Za-z-]+)\]/.exec(texto);
-        const cat = m ? (CAT_MAP[m[1].toLowerCase()] ?? m[1].toLowerCase()) : "app";
-        escrever(nivel, cat, m ? texto.slice(m[0].length).trimStart() : texto);
-      } catch {
-        // O tee jamais pode propagar erro pra dentro do app que esta logando.
-      }
+    (nivel: Nivel, original: ConsoleMethod) => {
+      const chamadaOriginal = original.bind(alvo);
+      return (...args: unknown[]) => {
+        try {
+          chamadaOriginal(...args);
+        } catch {
+          // A saida original pode falhar (por exemplo, EIO/EPIPE); o tee segue.
+        }
+        try {
+          const texto = args.map(stringifyArg).join(" ");
+          const m = /^\[([A-Za-z-]+)\]/.exec(texto);
+          const cat = m ? (CAT_MAP[m[1].toLowerCase()] ?? m[1].toLowerCase()) : "app";
+          escrever(nivel, cat, m ? texto.slice(m[0].length).trimStart() : texto);
+        } catch {
+          // O tee jamais pode propagar erro pra dentro do app que esta logando.
+        }
+      };
     };
 
   alvo.log = interceptar("info", consolaOriginal.log);
+  alvo.info = interceptar("info", consolaOriginal.info);
   alvo.warn = interceptar("warn", consolaOriginal.warn);
   alvo.error = interceptar("error", consolaOriginal.error);
 
   return () => {
     if (!consolaOriginal) return;
     alvo.log = consolaOriginal.log;
+    alvo.info = consolaOriginal.info;
     alvo.warn = consolaOriginal.warn;
     alvo.error = consolaOriginal.error;
     consolaOriginal = null;

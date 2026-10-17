@@ -52,13 +52,10 @@ function makeActivationPreflight() {
 }
 
 function makeLinuxPreflight() {
-  let fn: ts.FunctionDeclaration;
-  try {
-    fn = findFunction("linuxActivateInner");
-  } catch {
-    fn = findFunction("linuxActivate");
-  }
-  if (!fn.body || !ts.isBlock(fn.body)) throw new Error("linuxActivate sem corpo");
+  // O bloco de preparo/validação vive em linuxActivateInner desde que a
+  // ativação ganhou o fallback de senha da GUI (linuxActivate só orquestra).
+  const fn = findFunction("linuxActivateInner");
+  if (!fn.body || !ts.isBlock(fn.body)) throw new Error("linuxActivateInner sem corpo");
   const statements = [...fn.body.statements];
   const end = statements.findIndex((s) => s.getText(file).includes("if (!preflight.ok)"));
   if (end < 0) throw new Error("bloco de validação Linux não encontrado");
@@ -68,8 +65,8 @@ function makeLinuxPreflight() {
   }).outputText;
   return new Function(`return async function(ctx) {
     const { linuxPreflight, runScript, onChunk, linuxPreflightMessage, linuxPreflightRepairable, tailErroScript } = ctx;
-    const forwardLinuxChunk = ctx.forwardLinuxChunk || onChunk;
-    const elevated = ctx.elevated || { run: async (args, chunk) => runScript(args, chunk) };
+    const forwardLinuxChunk = ctx.forwardLinuxChunk || onChunk || (() => {});
+    const elevated = ctx.elevated || { run: async (args, forward) => runScript(args, forward) };
     ${body}
     return preflight;
   }`)();

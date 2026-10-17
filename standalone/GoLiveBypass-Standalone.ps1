@@ -1,4 +1,4 @@
-﻿<#
+<#
     GoLiveBypass standalone - instalador
 
     Instala direto no Discord, sem Equicord e sem Vencord. Nao precisa de Node, nem de pnpm,
@@ -259,6 +259,7 @@ function Confirm-Action($question) {
     $answer = Read-Host "  $question [s/N]"
     return $answer -match '^[sSyY]'
 }
+
 
 
 # =========================================================================== TUI (PowerShell)

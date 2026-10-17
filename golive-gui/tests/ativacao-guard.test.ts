@@ -88,12 +88,26 @@ describe("guarda de ativacao duplicada", () => {
 
   it("desativar WireSock serializa a recuperacao e so relanca o Discord apos validacao", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    const fnStart = src.indexOf("async function deactivateAll()");
-    const fnBody = src.slice(fnStart, fnStart + 2200);
+    const fnStart = src.indexOf("async function deactivateAll(");
+    const fnBody = src.slice(fnStart, fnStart + 2800);
     expect(fnBody).toContain("const hadWireSock = IS_WINDOWS && (await isWireSockActiveAsync());");
     expect(fnBody).toContain('withWireSockLifecycle("desativacao"');
     expect(fnBody).toMatch(/await killDiscord\(\);[\s\S]{0,300}await recoverWireSockNetwork\(\);[\s\S]{0,500}startDiscordAndConfirm\(installs, "desativacao"\)/);
     expect(fnBody).toContain("if (!recovery.ok)");
+  });
+
+  it("desativar pelo usuario mantem o Discord aberto no tunel e so derruba o WireSock quando ele fecha", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
+    const fnStart = src.indexOf("async function deactivateAll(");
+    const fnBody = src.slice(fnStart, fnStart + 2800);
+    expect(fnBody).toMatch(/options\.manterDiscordAberto && \(await discordIsRunningAsync\(\)\)\) \{[\s\S]{0,200}agendarDesativacaoAdiada\(\);[\s\S]{0,20}return;/);
+    expect(src).toContain("cancelarDesativacaoAdiada = whenProcessStops(discordProcessStateAsync,");
+    expect(src).toMatch(/async function activateBypass\(event: any\) \{\r?\n  pararDesativacaoAdiada\(\);/);
+    // O Sair do app limpa na hora: sem a GUI viva, ninguem derrubaria o tunel depois.
+    // Chamado direto, sem embrulhar na fila: o deactivateAll ja se serializa e a fila nao e reentrante.
+    expect(src).toContain("? deactivateAll()");
+    expect(src).not.toContain('withWireSockLifecycle("encerrar-windows"');
+    expect(src.split("deactivateAll({ manterDiscordAberto: true })").length - 1).toBe(2);
   });
 
   it("nao relanca o Discord enquanto a restauracao do WireSock ou da rede falhou", () => {
@@ -108,7 +122,9 @@ describe("guarda de ativacao duplicada", () => {
 
   it("inicia o túnel antes do cliente e observa a rota em segundo plano", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
-    expect(src).toContain('runScript(["--refresh-route"])');
+    // A troca de rota recarrega pelo script; desde o fallback de senha da GUI o
+    // spawn sai pelo runner da operacao (nao fixamos o nome de quem chama).
+    expect(src).toMatch(/\.run\(\["--refresh-route"\]/);
     expect(src).not.toContain('runScript(["--deactivate"]);\n        await runScript(["--activate"]);');
     expect(src).toContain('withWireSockLifecycle("troca-rota-proton"');
     expect(src).toContain('await killDiscord();');
@@ -130,7 +146,7 @@ describe("guarda de ativacao duplicada", () => {
     expect(readiness).toContain('"disconnected" : "unverified"');
 
     const ui = fs.readFileSync(path.resolve(process.cwd(), "index.html"), "utf8");
-    expect(ui).toContain("O Discord abre quando o túnel é iniciado");
+    expect(ui).toMatch(/abre o Discord de\s+novo, já dentro do túnel/);
   });
 
   it("usa uma fila unica para operacoes concorrentes do WireSock", () => {

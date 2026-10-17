@@ -4,6 +4,28 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.10] - 2026-10-17
+
+### Sincronização Upstream (GoLiveBypass 2.0.11 Estável)
+- **Plugin Vencord/Equicord:**
+  - Modo "Arquivo WireGuard personalizado": corrigido o problema de ativação onde a conf própria deixava de ativar; uso de arquivo próprio (`custom-wireguard.conf`, 0600) isolado do perfil Proton.
+  - O logout da conta Proton agora limpa exclusivamente artefatos Proton, preservando a configuração personalizada.
+  - Tratamento de sub-redes `AllowedIPs` divididas (`0.0.0.0/1` + `128.0.0.0/1`) como rota default válida.
+  - Updater do plugin: marcadores órfãos ou com falha de digest entram em quarentena limpa em vez de travar o journal indefinidamente.
+  - Criação automática e resiliente do arquivo de log na primeira escrita em novas instalações.
+- **Interface Gráfica (GUI):**
+  - Botão "Otimizar rota" adapta-se para exibir apenas o ícone em janelas compactas (até 640 px), evitando sobreposição e garantindo espaço ao seletor de rota.
+  - Novo card informativo "Como funciona" (`guideDialog`) com diagrama explicativo do roteamento isolado por aplicação.
+  - Novo card de estatísticas de tráfego (`trafficCard`) em tempo real (download, upload, bytes transferidos e ping) durante a sessão ativa do túnel.
+  - Botão de reiniciar bypass (`restartBypassBtn`) e checar atualizações com visibilidade contextual no Windows.
+  - Correção na pergunta de rota para não tratar `protonLastServer` vazio como rota utilizada.
+- **Melhorias no Cliente macOS:**
+  - Sincronização completa das melhorias da versão macOS 0.7.0 (rota manual/automática, teste de velocidade sem fechar Discord, temas Claro/Escuro/Sistema).
+- **Recursos Exclusivos do Fork PgLESv Preservados:**
+  - Preservada a identidade de publicação e releases de `PgLESv/GoLiveBypass`.
+  - Ausência de telemetria externa ou formulários de bug report legados para endpoints remotos, mantendo o diagnóstico e suporte locais focados nas issues do fork oficial.
+  - Foco exclusivo no canal estável padrão.
+
 ## [2.1.9] - 2026-10-16
 
 ### Modificado
@@ -254,7 +276,430 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 - Corrige a troca do executável portable no Windows para relançar com o nome da nova versão, em vez de manter o nome anterior.
 - Adiciona um toast interno na GUI quando uma atualização é baixada e fica pronta para reiniciar.
-- Reativa o cliente SSE na beta publicada e mantém a consulta de releases como fallback.
+
+## [2.0.11] - 2026-10-17
+
+### Plugin Vencord/Equicord: a conf WireGuard própria volta a carregar e a ativar (relatos beta)
+
+Três defeitos somados no modo **"Arquivo WireGuard personalizado"**:
+
+- a ativação reimportava a conf pela mesma fila serial que ela própria aguardava — a operação travava em "Preparando perfil e WireGuard" e a fila inteira ficava envenenada (restaurar/provedor nunca mais rodavam);
+- a cópia privada do usuário era gravada em `wireguard.conf`, o **mesmo arquivo** que a geração Proton escreve: depois de qualquer perfil Proton, o modo personalizado subia o túnel do servidor Proton apresentando-o como a conf do usuário;
+- o logout Proton apagava essa cópia quando o modo selecionado era Proton, e a ativação seguinte morria em "Arquivo WireGuard não encontrado.".
+
+A conf importada passou a ter arquivo próprio (`custom-wireguard.conf`, 0600), a importação interna não reentra na fila e o logout remove só os artefatos do perfil Proton. O layout antigo (conf apontando para o perfil Proton em uso, com o marcador da conta presente) é recusado com "Selecione o arquivo .conf novamente" em vez de subir o servidor errado, e o botão **"Testar .conf"** valida a conf configurada — nunca o perfil ativo do túnel. `AllowedIPs` escrito como as duas metades (`0.0.0.0/1` + `128.0.0.0/1`, usado por alguns provedores) passou a contar como rota padrão, e o erro de rota ausente diz qual rota falta.
+
+**Verificado:** 8 testes em `golive-gui/tests/plugin-custom-config.test.ts` mais a suíte da GUI, o harness real do plugin na VM Windows (`docs/testing/2026-10-17-plugin-conf-propria-e-updater-vm.md`) e o cliente real no Linux (`docs/testing/2026-10-17-plugin-linux-conf-e-updater.md`): conf Proton importada, ativação por polkit, Discord dentro do namespace, handshake confirmado (`wg show`) e saída pelo IP da VPN (205.147.22.22) em vez do IP local do host.
+
+### Plugin: updater sai do journal preso em vez de falhar para sempre
+
+"digest da árvore preparada não confere com a fonte atual" e "update baixado não tem mais a fonte em staging" ficavam no marcador ativo: toda consulta seguinte do painel lançava o mesmo erro antes de baixar e nenhum caminho do updater limpava o journal. Agora esses marcadores vão para quarentena (`plugin-update-pending.json.stale-source-*` / `.missing-staging-*`), o backup órfão do update descartado sai junto e a nova preparação é liberada; a fase `preparing` continua sendo resolvida pela recuperação da abertura.
+
+**Verificado:** 4 testes em `golive-gui/tests/plugin-update-journal.test.ts` e o ciclo real de update no Discord Linux (2.0.10 → 2.0.13 baixado, validado por SHA-256, trocado e recompilado na abertura seguinte, sem journal preso).
+
+### Plugin: o log nasce na primeira escrita (instalação nova)
+
+A poda da cauda do log lia o arquivo **antes** do append; numa instalação nova o `readFileSync` lançava, o `catch` de `persistPluginLogLine` engolia a linha e o `plugin-vpn.log` nunca era criado — o relato de bug de quem nunca teve log saía sem diagnóstico. A poda agora ignora a ausência do arquivo.
+
+**Verificado:** teste novo em `golive-gui/tests/plugin-update-journal.test.ts` (falha sem a correção) e o log real do cliente no Linux.
+
+### Interface: botão "Otimizar rota" vira só ícone em janela estreita
+
+Em janelas com até 640 px de largura o rótulo do botão tomava espaço do seletor de rota, justamente onde a linha é mais apertada (em 641 px o seletor ficava com 145 px). Abaixo desse ponto o botão vira um quadrado de 32 px só com o ícone — que já gira durante a medição — e `title` e `aria-label` continuam descrevendo a ação. O seletor ganha a largura de volta (191 px em 640 px). Na largura de abertura (720 px) nada muda.
+
+**Verificado:** medição em 9 larguras (360–720 px) sobre a folha de estilo do app e `npm test -- tests/proton-ui.test.ts`.
+
+## [macos-0.7.0] - 2026-10-17
+
+Paridade com a GUI Windows 2.0.10 onde a arquitetura do macOS permite (split por IP, helper root).
+
+### Adicionado
+
+- **Topo com Configurações, Como funciona e Checar atualizações.** O painel *Como funciona* explica o passo a passo do macOS, inclusive que a separação é por endereço e não por processo. *Checar atualizações* mostra o resultado no tooltip.
+- **Configurações:** tema (Sistema, Claro ou Escuro, pelo `nativeTheme.themeSource`, que troca também o vidro da janela), abrir ao iniciar a sessão (o app sobe só na barra de menu e religa o bypass se ele estava ativo), modo desenvolvedor (log na janela), rota automática ou manual, troca automática de servidor e o opt-in do Vencord, que sai do card Extras.
+- **Conexão em abas (Proton Otimizado | Arquivo .conf)** com o plano da conta (`-check-plan`, só pela sessão salva) e *Atualizar plano*.
+- **Escolha da rota:** lista do catálogo MX/US com ping. A rota manual valida o servidor com `-manual-probe` e fica mantida; a automática fica com o menor ping. Na primeira abertura no modo Proton, uma pergunta única pergunta qual das duas o usuário quer. A regra é a mesma da GUI (`src/main/proton/route-prompt.ts`).
+- **Otimizar rota:** `-speed-test` mede download e upload de verdade num túnel netstack do próprio `proton-confgen`. Por isso, ao contrário do Windows, o Discord **não** fecha durante a medição e as rotas do Mac não mudam. Medido neste Mac: 6 de 8 rotas medidas, ~16 Mbps de download e ~9 Mbps de upload. O `-require-discord` ficou de fora porque, com ele, nenhuma rota passava no macOS.
+- **Card de ping** com o bypass ativo: ping até `gateway.discord.gg`, que fica nos ranges tunelados, a cada 10 s. Sem download/upload: com o Discord parado eles ficavam em 0 quase o tempo todo. O helper não muda e não pede a senha de novo.
+- **Troca automática de servidor** (rota automática, conta Proton): três falhas seguidas da sonda pelo túnel (~45 s) geram o próximo melhor servidor, sem o atual, e trocam o túnel sem reiniciar o Discord.
+- **Reiniciar bypass:** derruba e sobe o túnel numa operação só e reinicia o Discord.
+- **Ícones com a rosa da GUI Windows:** no Dock, a rosa branca num quadrado grafite com brilho rosa; na barra de menu, a silhueta da rosa como imagem template, que segue o tema claro ou escuro. Gerados por `scripts/make-icons.swift` a partir de `golive-gui/build/icon.png`.
+- **Restaurar internet:** aparece depois de uma falha de ativação ou desativação e roda o `down` idempotente do helper.
+
+### Alterado
+
+- **Desativar não fecha mais o Discord.** Com o Discord aberto, o túnel fica no ar até ele fechar; o app confere a cada 10 s e então desliga o túnel e restaura a rede. Reativar cancela a espera, *Desativar agora* mantém o comportamento antigo e uma suspensão nessa espera não religa ao acordar. Como o split é por IP, enquanto a desativação estiver pendente outros sites nos mesmos ranges da Cloudflare também continuam no túnel.
+- **Janela redimensionável:** duas colunas quando larga, uma quando estreita, com o conteúdo rolando por dentro.
+- Animações leves (painéis, avisos, ponto de status), desligadas com `prefers-reduced-motion`.
+
+### Corrigido
+
+- **Sair nunca fica preso:** a limpeza tem prazo de 90 s (`QUIT_CLEANUP_TIMEOUT_MS`) e o app encerra mesmo que algum passo trave.
+
+### Verificado ponta a ponta (DMG universal instalado, macOS 26, conta Proton Free)
+
+- Pergunta de rota na primeira abertura, plano "Proton VPN Free" e ativação pela `utun5`.
+- **Troca automática com falha real:** o perfil salvo fechava o handshake mas não passava dados ("País indisponível", ping sem resposta). Três sondas depois, o app gerou `US-FREE#135`, trocou o túnel e a saída voltou (US) sem reiniciar o Discord.
+- Card de ping: 117 a 199 ms até o gateway do Discord pelo túnel.
+- Otimizar rota com o bypass ativo e o Discord aberto: `MX-FREE#16`, ↓ 22,7 / ↑ 8,7 Mbps. A ativação seguinte saiu pelo México.
+- Desativar com o Discord aberto: estado pendente, túnel no ar e mesmo PID do Discord. Ao fechar o Discord, o túnel caiu e a saída voltou para BR. Reativar na espera cancelou sem reiniciar o Discord.
+- Reiniciar bypass (Discord com PID novo, saída MX), Restaurar internet (zero rotas do túnel e zero rejeições IPv6) e Sair com o túnel ativo (1 s, rotas limpas). Ao reabrir, a reconexão automática voltou pelo México.
+## [macos-0.6.0] - 2026-10-08
+
+Primeira release do cliente macOS no repositório oficial (tag `macos-v0.6.0`).
+
+### Alterado
+
+- **Vencord/FakeNitro é opt-in:** a injeção só acontece com a opção **Extras › Instalar o Vencord com o plugin FakeNitro** ligada (desligada por padrão). O FakeNitro só é ligado se o usuário nunca escolheu nada para ele no Vencord, e o app do Discord só é tocado depois de a permissão de Gerenciamento de Apps estar confirmada (com o Vencord já injetado, o único ajuste é o FakeNitro, que fica num arquivo do próprio usuário).
+- **Releases não viram latest:** `golive-gui-mac/scripts/release-mac.mjs` (usado pelo workflow `release-macos.yml`) cria a release `macos-v<versão>` com `make_latest: false`, confere antes de publicar o DMG (versão, repositório de atualização e `proton-confgen` contra o manifesto) e, depois, os assets, o digest e que `/releases/latest` não mudou — se algo falhar, volta a release para draft, devolve a latest anterior e falha. Drafts são publicados com `acao=publicar-rascunho`, nunca pelo botão do GitHub (que marca latest por padrão).
+- **Atualização conferida:** o updater só oferece release com SHA-256 publicado (digest do GitHub ou sidecar `.sha256`), confere o DMG baixado antes de abrir e baixa só a release que o próprio app encontrou. Tags `macos-vX.Y.Z` são escolhidas pela maior versão, sem depender da ordem da API.
+- **`proton-confgen` da fonte:** compilado de `tools/proton-confgen` para darwin x64/arm64 com as flags determinísticas da GUI, juntado em universal e descrito em `proton-confgen-manifest.json` (commit da fonte, versão do Go e SHA-256). O app recusa rodar um binário que não confere com o manifesto; o binário deixou de ser commitado.
+- **Conf sem keepalive:** perfis sem `PersistentKeepalive` recebem `25`, para o handshake não depender de o Discord estar aberto.
+
+### Corrigido
+
+- Ícone da barra de menu (antes invisível) e ícone próprio do app e do DMG.
+- `ProtonFetcher` não fica mais preso em `busy`: falha ao iniciar o processo resolve na hora e cada etapa tem limite de 3 minutos.
+- Rotas IPv6 de rejeição que sobram de um crash são removidas ao abrir o app sem túnel ativo.
+- Reiniciar o Discord não deixa promessa pendente quando o `spawn` falha.
+- **Abertura não pode mais travar o botão Ativar:** a limpeza de rotas IPv6 do arranque roda dentro da operação do túnel e segura o estado `busy` sem emitir evento; um renderer que carregasse nessa janela ficava com o botão desabilitado até reiniciar o app. A limpeza agora devolve o estado ao terminar.
+- **Guarda de release falha fechada:** erro de API ao ler `/releases/latest` interrompe antes de publicar (antes era lido como "repositório sem latest" e deixava passar), digest ausente na resposta é erro em vez de conferência pulada, e a reversão para draft reporta a própria falha em vez de morrer no meio.
+- **Atualização a partir de build beta:** a comparação de versões do updater quebrava com sufixo de prerelease e nunca oferecia a versão estável seguinte.
+
+### Removido
+
+- Cópia não usada de `golivebypass.js` em `golive-gui-mac/resources/extra/bypass/`.
+
+### Infra
+
+- Workflow `macos-tests.yml`: typecheck, testes e build do `proton-confgen` em PRs e pushes que tocam o cliente macOS.
+## [2.0.10] - 2026-10-15
+
+### Windows: "Iniciar com o Windows" grava a Run key pelo Electron, sem abrir o `reg.exe add`
+
+O Microsoft Defender barrou, numa máquina de teste, o `reg.exe add HKCU...Run /v GoLiveBypass ... --hidden` que o app abria como processo filho, com a detecção `Trojan:Win32/Commando.A!ml` ([#361](https://github.com/bezumiya/GoLiveBypass/issues/361)). O app agora grava o valor com `app.setLoginItemSettings({ openAtLogin, path, args: ["--hidden"], name })`, que o Electron 43 aceita no Windows e executa dentro do próprio processo. O valor gravado é conferido (`"exe" --hidden`, exatamente); se não sair igual, o `reg.exe add` de antes entra como reserva, então o toggle não perde função. Desligar e ler o estado continuam como estavam. O log do app registra qual caminho gravou (`[autostart] run.gravado | via=electron` ou `via=reg.exe`), o que ajuda a diagnosticar numa máquina que acuse.
+
+**Verificado:** testes com o registro simulado (Electron grava certo, não grava e grava errado) e `tsc`. **Não verificado:** que o Defender deixe de acusar. Isso só dá pra saber na máquina que acusou, e uma gravação de persistência pode continuar sendo observada mesmo sem o `reg.exe`. A assinatura do `.exe` segue sendo o que resolve de vez.
+
+### Windows: Sair, Desativar e Restaurar internet sem UAC (o único pedido é o da ativação)
+
+O `wiresock-client` roda elevado e um app comum não consegue encerrá-lo, então parar o túnel exigia um UAC no Sair. Agora o worker elevado da **ativação** (que já pede o UAC) não termina depois de subir o túnel: ele fica vivo como **supervisor** e para o próprio túnel quando o app manda (arquivo de sinal em `wiresock-stop.flag`, na pasta do app) ou quando o app fecha, mesmo que tenha caído, com 3 checagens seguidas sem o PID (cerca de 1,5 s) pra não parar por engano. O app lê o resultado no mesmo formato da limpeza e só o aceita se nenhum WireSock continuar rodando.
+
+- **Mesma proteção:** o supervisor só para o túnel do perfil da GUI, com a mesma checagem de dono do script de limpeza (`WIRESOCK_EXTERNAL` e `WIRESOCK_INSPECTION_FAILED`, sem tocar em WireSock alheio). Se o túnel dele já tinha saído sozinho (por exemplo, uma nova ativação o trocou), o supervisor só encerra, para não derrubar o túnel novo, que usa o mesmo perfil.
+- **Reserva com um UAC:** sem supervisor (túnel de uma sessão antiga, ou supervisor que já morreu) ou se ele não responder em 20 s, o app volta a usar a limpeza elevada, que antes abria **dois** PowerShell elevados por operação (um só para inspecionar de quem era o `wiresock-client`, porque um app comum não lê a linha de comando de um processo elevado, e outro para limpar). O script elevado da limpeza já repete a mesma checagem de dono e falha fechada, então a inspeção elevada foi removida: sobra **um** UAC. Se nenhum WireSock estiver rodando, não pede UAC; WireSock externo ou misto que a leitura sem administrador já identifica continua recusado antes de qualquer UAC.
+- Se o UAC da limpeza for cancelado, ela continua sem ser confirmada e o processo fica como residual (antes ficava `processResidual: false`, o que escondia que o túnel seguia vivo). O primeiro passo do Reiniciar bypass pedia três UAC e cai para um quando precisa dessa reserva.
+- **Sem túnel órfão:** fechar o app à força também para o túnel, porque o supervisor percebe que o app sumiu.
+- Vale para Sair, desativação adiada, Restaurar internet e o primeiro passo do Reiniciar bypass.
+- **Escopo:** só a GUI no Windows. O plugin Vencord/Equicord e o standalone têm transporte próprio e seguem como estavam (um pedido de administrador por operação elevada); Linux e macOS não são afetados, porque o código novo é só do Windows.
+
+**Segurança, para o mantenedor revisar:** um PowerShell elevado fica vivo enquanto o túnel dura, e o app comum fala com ele por um arquivo de sinal numa pasta do usuário. Esse arquivo só dispara a parada do próprio túnel (não passa comando nem caminho); quem controla a pasta do usuário já pode encerrar o app e o processo de usuário, e a parada continua exigindo o mesmo perfil.
+
+**Verificado:** testes do script gerado (fica vivo, sinal, 3 checagens, dono, formato do resultado, não derruba túnel novo) e da parada no app (sinal e resultado, supervisor morto, resultado que não bate com o sistema, sem resposta no prazo), mais a análise sintática do PowerShell gerado. **Não verificado:** o supervisor com UAC de verdade no Windows de outra pessoa e o caso de PID reaproveitado (o supervisor só não pararia sozinho).
+
+### Windows: varredura do Discord 35x mais rápida, menos processos em segundo plano e melhorias na janela
+
+**Desempenho (medido no Windows 11, WireSock 3.4.8, Electron 43.4.1):**
+
+- **Varredura de instalações do Discord: 35,5 s → 0,98 s** (mediana de 5 execuções; saída idêntica à anterior, mesmos 6 processos e mesmas 2 entradas de registro). O script lia até 384 chaves de `Uninstall` pelo provider do PowerShell (`Get-ItemProperty`/`Get-Item`) e importava o módulo CIM. Agora usa `RegistryKey` (.NET) e `[wmisearcher]`, com o mesmo JSON (`schema = 1`) e os mesmos limites (64 processos, 128 chaves, sentinelas). Como o app desistia em 3 s, **toda varredura falhava** e caía no caminho alternativo (só as raízes), então o Discord de `app-x.y.z` registrado no registro nunca era visto. O runner assíncrono passa de 3 s para 8 s de limite (não trava a janela).
+- **"O Discord está aberto?": 7 `tasklist` por checagem (um por variante do Discord) → 1** (`/FO CSV`, parser com casamento exato do nome de imagem, sem casar por substring). ≈610 ms → ≈380 ms por checagem.
+- **Leitura de tráfego do `ProTUN`: PowerShell → `netsh`** (≈600 ms → ≈90 ms por leitura). A prontidão do túnel lia a cada 1 s e o monitor de failover a cada 3 s, e a chamada de PowerShell falhava sempre em instalações sem o adaptador. O PowerShell fica só de reserva se o `netsh` não rodar.
+- **Sonda periódica de rota (60 s) removida.** Ela copiava um `.exe` com nome aleatório (`.golive-route-probe-*.exe`) para a pasta do Discord a cada minuto, só para gravar log (`mode: log-only`). Com Controle de Aplicativo/Smart App Control ativos o Windows bloqueava a cópia e a Segurança do Windows exibia "Parte deste aplicativo foi bloqueado" repetidamente.
+- `reg.exe` (autostart) e `wg show` passam a rodar com `windowsHide`, sem abrir janela de console.
+- A janela principal abre **antes** da revalidação de sessão residual do boot (que fecha/reabre o Discord e leva dezenas de segundos).
+
+**Funcionalidades:**
+
+- **Desativar não fecha mais o Discord.** O Discord que já está aberto segue no túnel até ser fechado; nesse momento o app derruba o túnel e restaura a rede sozinho (vigia a cada 5 s, cancelada se o usuário reativar). "Sair" do app continua limpando tudo na hora.
+- **Reiniciar bypass** (botão sob a ação principal, só com o bypass ativo): refaz a ativação inteira sem desativar e ativar à mão. **Checar updates** (ícone ao lado de "Como funciona"), com o resultado no tooltip.
+- **Card de tráfego** com o bypass ativo: ping até o servidor da VPN (medido com `ping`) e, quando o adaptador `ProTUN` existe, velocidade atual, upload e download. No log do modo desenvolvedor, uma queda brusca de upload vira o aviso `queda.upload`.
+- **Modo desenvolvedor** disponível também no app empacotado (Configurações), com a janela de logs. **Iniciar com o Windows** foi para as Configurações.
+- **Janela redimensionável**: colunas empilham na vertical em largura estreita e o conteúdo rola por dentro. Depois que o usuário redimensiona, o app para de forçar a altura.
+- Painel **"Como funciona"** (ícone ao lado de Configurações) com o passo a passo, e os textos explicativos soltos saíram da tela principal. Travessões removidos dos textos da interface.
+- Animações suaves (fundo dos diálogos, troca de painéis, avisos, ponto de status), as de movimento são desligadas com `prefers-reduced-motion` (as transições suaves de cor continuam).
+
+**Limitações conhecidas:** sem o adaptador `ProTUN` (WireSock sem `-lac`) o card mostra só o ping (as células de upload e download ficam escondidas). O contador de bytes do WireSock (`wgb_get_tunnel_state`) só pode ser lido de dentro do processo `wiresock-client.exe`. Testamos `-lac` e revertemos: ele cria uma rota padrão na interface virtual. O tamanho da janela não é lembrado entre aberturas.
+
+**Testado e descartado:** direcionar só o gateway do Discord pelo túnel (`AllowedIPs = 162.159.128.0/20`) para a call e a stream saírem direto. Com a opção ligada, as streams ficaram pretas. Não faz parte desta mudança.
+
+Cobertura: `traffic-log.test.ts`, `qualidade-de-vida.test.ts`, `wait-condition.test.ts` (parser do `tasklist` e vigia do Discord), `windows-discord-discovery.test.ts` (limites e ausência dos cmdlets lentos) e ajustes em `ativacao-guard.test.ts`.
+
+### Windows: "Sair" que não travava mais, correção do CSS, menos processos em segundo plano e sem congelar na ativação
+
+**Correção: "Sair" com o bypass ativo travava para sempre (existe desde o 2.0.9).** O encerramento do app embrulhava o `deactivateAll()` na fila serial de operações (`withWireSockLifecycle("encerrar-windows", ...)`), e o `deactivateAll()` enfileira a si mesmo de novo na mesma fila (`"desativacao"`). A fila não é reentrante: a operação de dentro espera a de fora terminar, e a de fora espera a de dentro. O app nunca chegava a `app.quit()`, não restaurava a rede e deixava o `wiresock-client` rodando, e quem forçava o fechamento ficava com um túnel órfão (o que, na ativação seguinte, exigia a inspeção elevada e podia falhar com `spawn EPERM`). O sintoma no log é `inicio de operacao serializada | operation=encerrar-windows` sem o `fim` correspondente. Agora o "Sair" chama o `deactivateAll()` direto: a parte dele que mexe na rede já roda na fila `"desativacao"` (o preâmbulo corre fora dela, o que basta para o encerramento). A limpeza ganhou um prazo de 90 s (`QUIT_CLEANUP_TIMEOUT_MS`): se algum passo travar, por exemplo um pedido de administrador sem resposta, o app encerra mesmo assim em vez de ficar preso. O prazo vale em todas as plataformas, inclusive no encerramento do Linux. Reproduzido com uma cópia fiel da fila, que trava, e conferido na tag `v2.0.9`, na beta-5 e na beta-7. O teste novo prende o "Sair" sem a fila e com prazo.
+
+**Teste de fumaça do app empacotado** (`golive-gui/scripts/smoke-gui.mjs`): abre o executável gerado pelo `electron-builder --dir` com pastas de dados e de perfil vazias e temporárias, conecta pela porta de depuração do Chromium e confere a janela real (CSS carregado no nível de cima, os três ícones do topo na mesma linha, o painel "Como funciona" abrindo, versão na tela, nenhuma exceção de JavaScript na carga e o "iniciado" no `gui.log`). Não ativa o bypass: túnel, rede e o "Sair" com o bypass ativo continuam no teste manual. Uso: `node scripts/smoke-gui.mjs <executável> [--json <arquivo>]` (no Linux, dentro do `xvfb-run`).
+
+**Correção (regressão do PR anterior):** a fusão de um conflito em `src/style.css` deixou a regra `.manual-target-dialog__feedback` sem o `}` de fechamento. O navegador aninha tudo que vem depois dentro da regra aberta, então **todo o CSS adicionado no PR anterior deixava de valer**: o terceiro ícone do topo (atualizar) caía numa linha abaixo, e o card de tráfego, o painel "Como funciona", as animações e o layout estreito ficavam sem estilo. Corrigido, com um teste que reprova CSS de chaves desbalanceadas ou de regras aninhadas por engano.
+
+**Medição (Windows 11, bypass ativo, janela visível, 40 s):** o 2.0.9 original criava **97 processos filhos** (38 `tasklist`, 25 `cmd`, 19 `sc`, 14 `powershell` e a sonda de rota). Esta versão cria **33** (13 `tasklist`, 13 `netsh`, 4 `ping`, 2 `where`, **nenhum `powershell`**), medidos antes da última otimização do `netsh` do failover, que tira os 13 `netsh` quando não há adaptador `ProTUN`. Na ativação com um túnel órfão de uma sessão anterior foram **observados 3 PowerShell** abrindo. Pelo código, são a inspeção elevada do túnel antigo, a limpeza dele e o início do túnel novo (não conferi cada um); sem túnel órfão o esperado é só o do início, o que ainda não foi medido.
+
+**Menos processos filhos com o bypass ativo** (o app criava processos sem parar: o amostrador de failover roda a cada 3 s, o monitor do card a cada 2 s, e vários caminhos usavam `execSync`, que no Windows passa por um `cmd.exe` e dobra a contagem):
+
+- A **espera do processo do WireSock na ativação** deixa de ser síncrona. `isWireSockProcessPidAlive` rodava `execSync tasklist` até 13 vezes seguidas na thread principal, o que **congelava a janela por alguns segundos a cada ativação**. Agora é assíncrona (`tasklist /FO CSV`, comparando imagem e PID exatos por coluna).
+- O **amostrador de failover** faz um único `tasklist` com todos os processos e deriva dali "o Discord está aberto" e "o WireSock está vivo", em vez de um `tasklist` para cada pergunta; e lê o estado do WireSock **uma vez** por amostra, repassando a resposta ao status da CLI (`activeHint`) em vez de perguntar duas vezes em paralelo.
+- `isWireSockActiveAsync` consulta o processo (`tasklist`) **antes** dos dois `sc query`. O resultado é o mesmo "serviço rodando OU processo vivo"; com o túnel ativo, o processo responde no lugar de até três consultas.
+- A procura da CLI do WireSock (`findWireSockCli`) fica **em cache por 60 s**, inclusive o "não achei" (2 `where` síncronos por chamada).
+- O **monitor do card**: o ping passa de a cada 2 s para a cada 10 s, e sem o adaptador `ProTUN` o `netsh` só é revisto de 30 em 30 s (antes devolvia sempre nulo a cada 2 s).
+- O **amostrador de failover** também lembra por 30 s que o adaptador `ProTUN` não existe e pula o `netsh` nesse intervalo (a prontidão do túnel não faz isso, para ver na hora um adaptador que apareça depois do início).
+- A vigia da **desativação adiada** passa de 5 s para 10 s: o túnel cai até 10 s depois de fechar o Discord, com metade das consultas.
+- `execSync` virou `execFileSync` em `wiresock.ts` (`sc.exe`, `tasklist`, `where.exe`): sem a camada de `cmd.exe`, cada chamada cria um processo em vez de dois.
+
+**Interface:**
+
+- **Janela compacta** (Configurações, desligada por padrão): abre na largura mínima (360 px), com o layout em coluna, e **trava o tamanho**. Vale na hora ao ligar ou desligar, a altura continua seguindo o conteúdo, e a preferência fica em `janelaCompacta` no `settings.json`. Desligada, a janela segue redimensionável (mínimo 360 × 420 px).
+- O painel "Como funciona" ganhou uma **ilustração animada** (SVG inline): o Discord vai pelo túnel até o servidor VPN e os outros apps seguem direto pela internet. Usa as cores do tema, tem título e descrição para leitor de tela e fica parada com `prefers-reduced-motion`.
+- O card de tráfego mostra **só o ping**, sem células vazias, quando não há adaptador `ProTUN`.
+- Os textos de apoio das Configurações quebram em até 2 linhas em vez de serem cortados com reticências, e a largura mínima da janela sobe de 340 para 360 px (a 340 o botão "Proton Otimizado" estourava 2 px).
+- A leitura do `netsh` ignora diferença de maiúsculas no nome do adaptador.
+- "Checar updates" diz **"Já está procurando, aguarde"** quando já há uma verificação em andamento, em vez de responder "você está na versão mais nova" sem ter conferido (`checkWindowsUpdate` volta na hora nesse caso).
+
+**Limpeza:** código morto da sonda de rota removido de `electron/main.ts` (imports, `logRouteProbe` e as variáveis do vigia que só eram escritas). `route-diagnostics.ts` e `discord-scope-proof.ts` continuam no repositório, sem uso no `main.ts`.
+
+**Comportamentos que valem registrar:**
+
+- O modo desenvolvedor, quando ligado, **reabre a janela de logs sozinho ao iniciar o app** (a preferência fica no `localStorage`).
+- A desativação adiada pode terminar em `recovery_required` se a restauração da rede falhar quando o Discord fecha.
+- "Reiniciar bypass" zera a assinatura da última ativação, então ignora a guarda "já ativo com a mesma configuração".
+- A janela só é criada no boot se o app não iniciar oculto no login.
+
+**Fora do escopo (declarado):** o **plugin Vencord/Equicord**, o **standalone**, o **Linux** e o **macOS** não foram portados nem testados. Atenção: o renderer e o `electron/main.ts` são compartilhados, então a **janela redimensionável** e o **modo desenvolvedor no app empacotado** valem também no Linux e no macOS, sem teste nessas plataformas. Lendo o código do plugin: ele não usa a varredura de registro que levava 35 s (tem a própria detecção e já agrupa as consultas CIM em `vpn-windows.ts`), mas a taxa de processos dele não foi medida.
+
+### Plugin Vencord/Equicord: o #344 foi restaurado na linha (lock do updater, captcha e API de notificações)
+
+- O [#344](https://github.com/bezumiya/GoLiveBypass/pull/344) entrou na linha em 12/10 (`release/2.0.10-beta-4`), mas **não é ancestral da beta-10**: a beta-5 saiu de uma base anterior a ele e o conteúdo desapareceu dali em diante. A beta-4 tinha o fix, os dois testes e o workflow; da beta-5 até esta estável, não. Esta seção registra a restauração completa dele.
+- **Lock do updater:** `releasePluginUpdateLock` fechava de novo o descritor que a aquisição já havia fechado. Nesse intervalo o número pode pertencer ao SQLite, ao logger ou a um socket do Wayland/Chromium do próprio cliente, e o segundo `closeSync` derrubava recurso alheio. O lock passa a guardar só o token e a liberação apenas remove o arquivo. A linha registrou `Crashing due to FD ownership violation` no Chromium durante a beta-3 sem causa confirmada — esta é uma causa plausível, não uma confirmação.
+- **Ambiente do relançamento Linux:** `XAUTHORITY` entra na lista preservada (X11/XWayland); o `--env=CHAVE=valor` do `netns-launcher` já separava nome e valor nesta linha.
+- **CAPTCHA do login Proton:** `solveCaptcha` volta a entregar o resultado estruturado (`{ok:true, token}` / `{ok:false, code}`) ao controller, em vez de virar `null` no cancelamento; o cancelamento e o token deixam de se perder no caminho.
+- **API de notificações do cliente:** o objeto `Toasts` do Equicord atual só tem `show`/`pop` — `Toasts.Type` e `Toasts.Position` não existem mais, e o `showToast` é `(mensagem, tipo, opções)` com `position` numérico. As 17 chamadas de `Toasts.Type` e as 2 de `Toasts.Position` do renderer foram trocadas por `showToast(mensagem, "success"|"failure"|"custom", { position: 1 /* BOTTOM */ })`; sem isso, cada aviso do plugin (inclusive o de atualização pendente) lançava `TypeError` no cliente atual.
+- **Tipos e processo:** `managedConflict` declarado no status usado pelo renderer, `OpenDialogOptions` explícito no diálogo de importação e o `stdio` explícito removido do `execFile` assíncrono do snapshot do WireSock.
+- Cobertura: `tests/test-plugin-update-lock.mjs` (descritor reutilizado continua aberto depois da liberação, locks aninhados só removem o arquivo na última, lock de outro dono preservado), `tests/test-plugin-netns-environment.mjs` (parser do launcher com argv gravável, `XAUTHORITY` preservado, filtragem do ambiente e o binário embutido conferido por SHA-256) e `tests/test-plugin-runtime-compatibility.mjs` (executa o `reloadForPreparedPluginUpdate` real com a API atual de notificações e a ponte de CAPTCHA estruturada). O workflow `plugin-startup-regressions.yml` roda os três junto do contrato do archive a cada mudança em `goLiveBypass/`.
+- Pinos removidos, não re-apontados: `tests/test-plugin-update-notification.mjs` deixou de fixar `Toasts.Type.CUSTOM`/`Toasts.Position.BOTTOM` (a forma antiga da API); o contrato da chamada ficou no teste de runtime, que executa a função real.
+- Escopo: só o plugin Vencord/Equicord (Windows e Linux); a GUI e o standalone têm caminhos de atualização próprios e não usam esse lock nem essa API. Limites: o crash de FD não foi reproduzido ponta a ponta (a prova é comportamental); a fonte C do `netns-launcher` desta linha separa nome/valor no próprio `argv` (equivalente à troca do #341, que não foi copiada, e o binário embutido segue o contrato de SHA-256 da linha); e `tests/test-plugin-proton-audit.mjs`/`-proton-edge.mjs` falham por resolução de módulo antes e depois desta mudança (nenhum workflow os roda).
+
+## [2.0.10-beta-10] - 2026-10-14
+
+### Linux: a autorização do sudo passa a ser lembrada e a senha é pedida uma vez por operação
+
+- Relato (NixOS 26.05, mesmo host da #345): "o processo de fazer sudo está pedindo senha pra cada pequeno processo que exige sudo, ele não lembra da escalação" — a ativação (preparo + ativação) e a troca de rota abriam um diálogo por spawn interativo, e nenhuma operação seguinte reconhecia a autorização recém-concedida.
+- Causa 1 — **a validação matava o ticket**: o script validava a senha com `sudo -S -k -v`, e no sudo 1.9.17p2 o `-k` aceita a senha mas **não deixa credencial utilizável** (medido na VM `nixos-26.05`: `-S -k -v` retorna 0 e o `sudo -n` seguinte volta a exigir senha, inclusive no mesmo processo). Sem `-k`, a validação grava o ticket e o `sudo -n` seguinte funciona. O mesmo valia para o reenvio por comando (`-S -k -p ''`) e para o askpass (`-A -k -v`) — todos agora sem `-k`, com o arquivo da senha continuando como reserva quando o ticket não existe/expira. O `tee` (única chamada que recebe dados pelo stdin, usada no `resolv.conf` do namespace) passa a usar `-n` quando o ticket está vivo, porque a linha da senha iria junto para o arquivo de destino; sem ticket, o conteúdo original é anexado depois da senha como antes.
+- Causa 2 — **um prompt por spawn**: o sudo do NixOS usa `timestamp_type` por tty e, sem terminal (a GUI não tem), cai no processo pai — então o ticket **não cruza processos** da GUI (medido: mesmo processo reutiliza; subshell/processo separado/setsid não). Cada spawn interativo abria o próprio diálogo: zenity/kdialog no Linux do usuário, polkit via `pkexec` ou o modal da GUI quando não havia provedor. Agora a operação da GUI manda `GOLIVE_SUDO_UI=1`: o script não abre diálogo externo e sinaliza `prompt.unavailable reason=provider_missing`, a janela pergunta **uma vez** e o arquivo 0600 devolvido por ela cobre os demais spawns da mesma operação (preparo + ativação; troca de rota), sendo apagado no fim pelo `dispose()` da GUI.
+- Causa 3 — **o script apagava o arquivo da GUI**: adotado como `SUDO_PASS_FILE`, ele caía no `cleanup_sudo_pass` do fim de cada spawn e o próximo spawn da operação pedia a senha de novo. Agora o script distingue o arquivo que ele mesmo criou (mktemp, zenity/kdialog/askpass) do arquivo emprestado da janela (`SUDO_PASS_FILE_FROM_GUI`) e só remove o próprio.
+- Causa 4 — **troca de rota fora do fallback e recusa silenciosa**: `--refresh-route` era o único spawn elevado que não passava pelo fallback de senha, e a checagem `elevate ip netns exec … wg show … >/dev/null 2>&1` engolia os eventos de elevação (o `[elevation]` viaja no stderr) — sem provedor ela falhava **em silêncio** e a falha de autorização era reportada como "Interface WireGuard 'wg-discord' nao esta ativa", com a interface viva. Agora a troca de rota autoriza uma vez (eventos visíveis, como a ativação), checa `ip`/`wg`/namespace sem root antes de pedir senha, e o stderr da checagem permanece visível para explicar uma recusa real.
+- Evidência na VM `nixos-26.05` (Plasma 6/Wayland, sudo 1.9.17p2, script real + sudo real): com o script publicado, a validação deixava `ticket_apos_validacao=1` (escalação perdida) e ativação + troca de rota somavam 2 prompts (1 por spawn). Com a correção, `ticket_apos_validacao=0` (escalação lembrada), ativação completa com **1 prompt e 0 diálogos externos** (túnel `discord-vpn`/`wg-discord` ativo, peer Proton com handshake e tráfego, cliente rodando dentro do namespace) e troca de rota idempotente no mesmo formato.
+- Cobertura: o harness `linux-elevation.test.ts` ganhou um modelo do ticket do sudo (fiel ao medido: `-S -k -v` não deixa ticket; `-S -v` deixa) e casos para o ticket vivo após a validação, para o arquivo da janela sobrevivendo ao spawn, para o `tee` sem vazamento da senha e para a política `GOLIVE_SUDO_UI` (sem zenity/kdialog, `provider_missing` e aceitação pelo arquivo da janela); `linux-password-fallback.test.ts` extrai o fallback real do `main.ts` e prova o reúso por operação com `dispose()`. Os pins de texto do `tests/test-linux-sudo-resolver.sh` (que fixavam `-S -k -v`/`-A -k -v`) foram trocados pela invariante do resolvedor, não re-fixados, e o teste de integração do preflight voltou a apontar para o bloco real (`linuxActivateInner`). Suíte completa: 742 testes em 77 arquivos; `test-linux-sudo-resolver.sh` OK.
+- Lacuna anotada: a credencial da janela vale para a operação (não a sessão inteira) — trocar de rota depois de ativar pergunta de novo, como uma operação nova; e em execução da GUI (`GOLIVE_SUDO_UI=1`) o polkit deixa de ser o caminho de prompt (a janela responde; `pkexec`/askpass seguem valendo quando a GUI não controla a operação, caso do standalone e do plugin).
+
+## [2.0.10-beta-9] - 2026-10-12
+
+### Linux: senha do sudo pedida na janela da GUI quando o sistema não tem diálogo nem polkit
+
+- Sem zenity/kdialog e sem agente polkit alcançável (NixOS enxuto, spins mínimos), a ativação morria em "não há agente de autenticação polkit" sem alternativa — provado na VM NixOS com o clique real do usuário. Agora a GUI resolve sozinha: quando o script sinaliza `prompt.unavailable reason=provider_missing`, abre um modal próprio de senha e repete a operação com a credencial (provider `gui`), até 3 tentativas com aviso de "senha recusada" entre elas; cancelar mantém o erro original e o Discord intacto.
+- Contrato: `GOLIVE_SUDO_PASS_FILE` aponta um arquivo 0600 com a senha + newline, válido só com `GOLIVE_GUI=1`; vazio/ilegível/ausente cai no fluxo normal (zenity → kdialog → pkexec → askpass, ordem inalterada). A senha nunca entra em log, argv ou variável de ambiente — só no arquivo, apagado pelo trap EXIT do script e pelo `dispose()` da GUI em qualquer caminho (sucesso, erro, cancelamento). Com provider `gui`, senha incorreta falha na primeira tentativa (`reason=incorrect_password`, sem re-prompt interno): quem re-pergunta é a janela, com a mensagem de erro.
+- Fiação: `runScript` ganhou `extraEnv` opcional; `createLinuxPasswordFallback` envolve `--ensure-dependencies`, `--yes --cleanup-legacy` (ativação) e `--uninstall` (desativação) com reuso do arquivo dentro da operação; o parser de elevação aceita `provider=gui` e sinaliza `providerMissing`/`guiPasswordRejected` a partir dos eventos. Página `sudo-password.html` (script inline, sem bundle) registrada no `vite.config.ts`; IPC `sudo-password-response` validado por sender, limite de 1024 chars.
+- Prova na VM NixOS (sem kdialog/zenity, conta Proton do usuário, rota otimizada Proton): modal aberto, senha digitada, `sudo.validation provider=gui result=accepted`, `authorization result=authorized`, túnel `discord-vpn` com handshake vivo no peer Proton (`84.20.27.51`), Discord relançado no namespace (janela de login renderizando), host BR × netns com IP da rota, nenhum arquivo `/tmp/golive-sudo-*` residual.
+- Cobertura: 3 casos no harness `linux-elevation.test.ts` (aceitação sem providers externos, recusa única sem auto-retry, guards de arquivo vazio/ausente) + caso `provider=gui` no `linux-elevation-logger.test.ts` (persistência + flags, sem segredo no log). Suítes Linux: 100 testes em 6 arquivos. Nada muda em Windows, macOS, plugin ou proxy legado.
+- Lacunas anotadas, não resolvidas: `--refresh-route-from` (troca de rota com túnel ativo) continua sem fallback — se o timestamp sudo expirou e não há providers, a troca falha em vez de abrir o modal; `modulesInstalled:false` no NixOS segue falso-positivo (não bloqueia).
+
+### Linux: ativação ponta a ponta provada no NixOS real — launcher com `env`/`PATH` e identidade com argv reescrito
+
+- Prova executada numa VM KVM `nixos-26.05` (Plasma 6/Wayland, kernel 6.18.55), com Discord 1.0.159 e vesktop do nixpkgs via `environment.systemPackages` — o cenário exato do relato #345. SSH foi erguido por dentro (sshd + chave, sem `services.openssh`), e a ativação rodou sob PATH de GUI (sem `/run/wrappers/bin`, `sudo` do `systemPackages` sem setuid) com provider de senha e env gráfico da sessão real. Preflight `ok:true` com 2 Discords nix; elevação `result=accepted/authorized` pelo wrapper; túnel `wg-discord` com handshake vivo; host em `200.222.95.75` (BR) e namespace em `146.70.230.147` (US); `--status --json` com `running:"sim" inNamespace:"sim"`; `--uninstall` limpo (netns/interface/resolv removidos, zero resíduos).
+- Bug 1 — o Discord não nascia no NixOS: `run_user_systemd_command` chamava `env` relativo, resolvido com o PATH mínimo da unidade systemd, que não contém o coreutils do store — `sudo: env: comando não encontrado` no journal, ativação RC=1 com rollback. `ENV_BINARY` agora é resolvido uma vez no topo (cai para `/usr/bin/env` nas outras distros, sem mudança de comportamento) e todas as chamadas do launcher (systemd, netns direto, host-only, alvo manual) usam o caminho absoluto. O `PATH` do próprio script (onde o scan achou os clientes) passou a acompanhar o ambiente do Discord, sem o que o `sh -c` e alvos relativos (`vesktop`, `flatpak`, `snap`) não resolvem dentro do namespace.
+- Bug 2 — paralelos com Electron do sistema nunca eram detectados: o Chromium reescreve o argv na memória (espaços no lugar dos NULs, um NUL só no fim — confirmado por `od` no `/proc` do Discord e do vesktop, Electron 42/43). A igualdade por registro NUL de `parallel_process_belongs_to_resources` nunca casava; o vesktop ficava `running:"nao"`, o stop deixava um órfão no host e o relaunch não o preservava. A distinção agora é estrutural: cmdline normal (um NUL por argumento) mantém arg exato/prefixo `arrpc`; cmdline reescrito (NUL único) aceita o path como substring. Menção incidental dentro de argumento maior continua rejeitada — o teste existente cobre os dois separadores.
+- Com os dois fixes, o ciclo vesktop-only passou: vesktop aberto no host → ativação RC=0 → vesktop preservado dentro do `discord-vpn` (main no netns, janela de setup renderizando pelo túnel), provando também o `target_cmd` relativo resolvido pelo `PATH`. Reativação idempotente (RC=0) e segundo `--uninstall` limpo.
+- Cobertura: dois casos novos em `linux-launch-target.test.ts` — Electron com argv reescrito (argv0 colado via `spawn(argv0)`, cmdline de 1 NUL verificado em `/proc`, falha sem o fix) e launcher systemd com `env` absoluto + `PATH` (função real com `elevate` mockado, falha sem o fix). O teste de menção incidental continua passando sem alteração. Suítes Linux: 96 testes em 6 arquivos; `test-linux-sudo-resolver.sh` OK. Nada muda em Windows, macOS, plugin ou proxy legado.
+- Limites da prova: o peer foi o perfil padrão embutido (EUA), sem sessão Proton; a senha chegou por um `zenity` simulado (a VM não tem zenity/kdialog — o diálogo real não foi exercitado, só o caminho `sudo -S` após o prompt); nenhuma chamada de voz/vídeo foi feita (prova de rede: handshake, RX/TX, IP/loc, gateway HTTPS 404 pelo túnel, janelas renderizando). O `--probe`/`wg_stats` segue `tunnel_down`/`ok:false` sem timestamp sudo (sudo do NixOS usa `timestamp_type=tty`, como a maioria das distros — telemetria degradada por design, não regressão). `modulesInstalled:false` no NixOS é falso-positivo (`/lib/modules/<release>` não existe lá; módulos em `/run/booted-system/kernel-modules/`) — não bloqueia nada e ficou anotado, não corrigido. A GUI Electron/AppImage não foi executada na VM (só o motor `standalone` que ela invoca).
+
+## [2.0.10-beta-8] - 2026-10-12
+
+### Linux: no NixOS a elevação usa o `sudo` setuid em vez do binário do `systemPackages`
+
+- O relato seguinte no NixOS (mesmo host da #345) fechou em "o sudo recusou a autorizacao por um motivo nao identificado": a senha estava certa, o prompt do `zenity` funcionava e a recusa nao era da credencial. No NixOS o pacote entra no `environment.systemPackages` (`modules/security/sudo.nix`: `environment.systemPackages = [ cfg.package ]`) **sem** o bit setuid, e quem eleva de verdade e o wrapper `security.wrappers.sudo`, em `/run/wrappers/bin/sudo`. O `environment.extraInit` poem `/run/wrappers/bin` na frente do PATH apenas para o init do shell — uma GUI aberta por `.desktop`/`appimage-run` nao passa por esse init, resolve `/run/current-system/sw/bin/sudo` (alcancado tambem por `/usr/bin/sudo`) e toda operacao elevada morre com `must be owned by uid 0 and have the setuid bit set`, antes de qualquer senha. Esse texto caia no balde "outro" do classificador: daí a mensagem sem causa.
+- `sudo_bin_resolve()` escolhe, uma vez, o binario de elevacao: o `sudo` do PATH quando tem o bit setuid (nenhuma mudanca em outra distro), senao o primeiro com setuid no resto do PATH e por fim `/run/wrappers/bin/sudo`. Todas as chamadas de elevacao passaram a usar `"$SUDO_BIN"`: `-S -k -v` da senha, `-A` do askpass, `-S -k -p ''` do reenvio por comando (inclusive o `tee`), `-n` do `elevate`/`elevate_readonly`, os probes `-n true` (telemetria do `wg` e `--status`), a troca de usuario do Discord (`sudo -u`) e o caminho legado do Tor. Sem setuid em lugar nenhum, o fluxo segue como antes e a mensagem explica.
+- O classificador ganhou `suid_missing` ("must be owned by uid 0 and have the setuid bit set" / "setuid") com mensagem propria que nomeia o wrapper e o binario do `systemPackages`, e `account_blocked` passou a reconhecer conta travada ("account validation failure, is your account locked?"). Whitelist de motivos atualizada no script e no parser da GUI.
+- Cobertura: dois casos em `linux-elevation.test.ts` — preferencia pelo wrapper setuid (bit `4755` no fixture, PATH com o sudo sem setuid na frente) e classificacao `suid_missing` sem re-perguntar a senha. Os quatro pins de texto-fonte de `linux-sudo.test.ts` que fixavam o comando literal do `sudo` foram removidos, nao repinados; a invariante do `tee` (stdin preservado depois da senha reenviada) virou teste comportamental no harness. `tests/test-linux-sudo-resolver.sh` cobre o resolvedor no shell, como `test-linux-system-binary.sh` faz para o `resolve_binary`.
+- Evidencia fora da suíte: com o `sudo` do PATH sem setuid e um wrapper setuid disponivel, o fluxo real `authorize_install_elevation` extraido do script autoriza pelo wrapper (`wrapper-sudo -S -k -v`, `result=authorized`); sem nenhum setuid, sai `reason=suid_missing` com o caminho encontrado e uma unica tentativa. Prova no NixOS real continua pendente — a maquina de build e CachyOS.
+
+## [2.0.10-beta-7] - 2026-10-12
+
+### Linux: fallback de alvo manual quando a varredura não reconhece a instalação
+
+- O usuário que **tem** o Discord instalado continuava vendo "Nenhuma instalação do Discord foi encontrada.": `discord_dirs` é uma lista de raízes e padrões (bootstrap em `~/.config`, nativo, paralelos, snap, Nix, flatpaks conhecidos), e o que escapa dela deixa o preflight `ok:false` — com `linuxPreflightRepairable` exigindo `discord.found`, a ativação ficava barrada mesmo com o WireGuard pronto. Faltava descobrir **o que** lançar dentro do namespace, não o túnel.
+- Quando `discord.count === 0`, o cartão de status troca a mensagem por um botão "Escolher programa…". Ele abre um dialog com os **programas abertos** do usuário atual (uma linha por app: os processos auxiliares de um Electron são agrupados pela identidade de lançamento) e a escolha **apenas registra** o alvo em `$INSTALL_DIR/manual-target.conf`. Quem aplica continua sendo o botão de ativação: fecha o app escolhido e o relança dentro do `discord-vpn`, como já faz com os flavours reconhecidos — não existe mover processo vivo para dentro de um namespace, e não foi tentado `ptrace`/`setns`.
+- O alvo entra no `$FOUND` como mais uma linha no formato que o script já consome (`resources|manual|manual[|flatpak_id]`), então ativação, boot seguinte, `--status --json`, `stop_discord`, rollback host-only, `--uninstall` e a linha do cartão tratam o app escolhido como um flavour — inclusive a identidade por `/proc` (escopo `app-flatpak-*` no cgroup, `APPIMAGE`/`SNAP_NAME` no ambiente, `readlink /proc/<pid>/exe`). `select_launch_target` passa a preferir a escolha explícita do usuário, e a linha continua no `$FOUND` para o status e a parada a cobrirem.
+- **Segurança do lançamento:** o renderer manda só uma `key` opaca; o processo principal a resolve numa varredura nova de `/proc` (payload com `argv`/`resources` forjados é ignorado) e o script **revalida cada argumento** do arquivo antes de virar linha de alvo — formas fechadas por kind (`flatpak run <app-id>`, `snap run <nome>`, caminho absoluto regular e executável) e recusa silenciosa do resto. O ramo manual usa argv posicional (`sh -c 'exec "$@"' sh "$@"`) em vez da string `target_cmd` dividida, o que também corrige caminho com espaço (`.AppImage` em `~/Apps/Minha Pasta/`). O caminho manual não toca em `app.asar` e herda `asar_is_ours`: pasta desconhecida nunca é apagada. Alvo morto é ignorado pelo script (`discord.manual.valid=false`) e a GUI mostra "Escolher programa…" e a remoção juntas.
+- O preflight ganha `discord.manual.present/valid` (aditivo; script antigo → ausente = sem alvo) e o `get-linux-preflight` passa a mandar `discordMissing`/`manualTarget`, para o renderer decidir sem casar texto de mensagem. O marcador de sessão passa a exigir caminho não-vazio: flatpak, snap e AppImage não têm `resources` no host, e um marcador vazio apontaria para lugar nenhum no boot seguinte.
+- Nada muda em Windows, macOS, plugin Vencord/Equicord ou no caminho legado de proxy/injeção. Sem arquivo de alvo, `$FOUND` e o comportamento observável são exatamente os de antes.
+- Cobertura: `linux-running-apps.test.ts` (13), `linux-manual-target.test.ts` (10), `linux-manual-target-ipc.test.ts` (6), `linux-proc-seams.test.ts` (6), `linux-session-marker.test.ts` (3), `manual-target-selection.test.ts` (4) e os dois casos novos em `linux-preflight.test.ts` (28 no arquivo, um deles rodando `--preflight --json` de verdade); shell `tests/test-manual-target.sh` com 33 casos (leitura/validação/linha/dedupe/JSON, identidade por `/proc` real, `discord_running`, `stop_discord`, `select_launch_target` e o ramo manual de `start_discord` com caminho contendo espaço). Suíte completa: 729 testes em 77 arquivos.
+- Evidência real no host: com um alvo vivo registrado, `--status --json` devolve a linha `flavour:"manual"`, `detected_by:"manual"`, `running:"sim"` e o `pid` correto **junto** da instalação reconhecida pela varredura, e o `--preflight --json` reporta `manual:{present:true,valid:true}` com `count` incluindo o alvo. A GUI renderizada (build servido, API simulada) mostra o botão no lugar da mensagem, o dialog com os apps abertos, a linha "Túnel aplicado em …" com Trocar/Remover e o estado "alvo indisponível" com as duas ações.
+- **Prova de ponta a ponta no host (executada nesta sessão):** com um alvo manual registrado (o binário do próprio Discord em `~/.config/discord/app-1.0.161/Discord`, layout bootstrap), a ativação criou o namespace `discord-vpn` e o `wg-discord`, lançou o alvo pelo ramo manual (`launch=manual kind=exec` no log) e o `--status --json` passou a devolver **duas** linhas com `running:"sim"` e **`inNamespace:"sim"`**, uma da varredura e outra `flavour:"manual"`. `ip netns pids discord-vpn` listou **9 processos** do cliente dentro do namespace, o `wg show` mostrou `latest handshake: 9 seconds ago` com `transfer: 761.10 KiB received / 162.63 KiB sent`, e o `curl` dentro do namespace devolveu `ip=146.70.230.147 loc=US` contra `loc=BR` no host — ou seja, o tráfego do app realmente sai pelo túnel. O `--uninstall` fechou o alvo, removeu o namespace e a interface, e a rede do host voltou ao normal (mesmo IP público).
+- Limites da prova: o peer usado foi o **perfil padrão embutido** do script (EUA), porque a máquina não tinha `wireguard.conf` nem sessão Proton — a rota é a do produto, mas não um servidor escolhido pelo usuário. O `wireguard-tools` faltava na máquina e foi instalado pelo próprio `--ensure-dependencies` (caminho do produto, também `openresolv`); o `compile` segue sem fechar por ausência do toolchain Go (`build:proton`), limitação de ambiente anterior a esta mudança. Um alvo que delega para instância já aberta (testado com `dolphin`) é confirmado no namespace e depois pode sair sozinho: a identidade continua válida, mas o app não permanece — caso do app, não do mecanismo. O caso positivo de identidade flatpak por cgroup ficou como `[SKIP]` no teste shell (exige um flatpak rodando de verdade).
+
+### GUI (modo Proton): pergunta única de rota automática ou manual na primeira abertura
+
+- **GUI (modo Proton):** na primeira abertura, quem ainda não escolheu como lidar com a rota vê uma pergunta única — "Automática (recomendado)" ou "Manual" — com "Decidir depois" e Esc como saída. A resposta usa a preferência `protonRoutePreference` que já existia (a mesma de Configurações); responder ou dispensar grava `protonRoutePreferencePrompted` e a pergunta não volta, nem depois de sair da conta ou importar um `.conf`. Não aparece no modo `.conf` personalizado, nem para quem já tem preferência salva ou usou uma rota antes. A regra fica em `electron/route-preference-prompt.ts`.
+
+## [2.0.10-beta-6] - 2026-10-12
+
+### Linux: senha do sudo recusada re-pergunta e explica a causa (#345)
+
+## [2.0.10-beta-5] - 2026-10-11
+
+### Linux: Discord do nixpkgs (NixOS/nix) e dos modos paralelos passam a ser descobertos
+
+- O scan Linux delega a detecção ao `discord_dirs` do standalone, que só conhecia o bootstrap em `~/.config`, caminhos nativos (`/usr/share`, `/opt`, `~/.local/share`), snap e flatpak. O pacote do nixpkgs não copia nada nesses lugares: o app vive no `/nix/store` e só aparece pelos perfis do Nix. Com Discord instalado por `environment.systemPackages`, `nix profile` ou home-manager, a GUI reportava "Discord não encontrado".
+- `discord_nix_dirs` varre `~/.nix-profile`, `/etc/profiles`, `/run/current-system/sw` (system profile do NixOS), os perfis do home-manager (`/etc/profiles/per-user/<usuário>` e `${XDG_STATE_HOME:~/.local/state}/nix/profiles/profile`) e o default do nix single-user. Cada `bin/<cliente>` é resolvido elo a elo com `readlink`: o link dentro do perfil não é raiz de pacote (o perfil só reexporta paths e o seu path muda a cada instalação), mas a segunda volta em diante gera as raízes — três pais por volta cobrem o `bin/<cliente>` dos modos e o `opt/<cliente>/<cliente>` do Discord sem FHS.
+- O Discord oficial no modo FHS, hoje o padrão, exigiu prova em Nix real: o `out` do pacote aponta `bin/<cliente>` para um wrapper solto em `/nix/store` que executa `bwrap` com um `container-init` e **não menciona o app no texto**. A ponte é o symlink de saída `<out>/share` → `<unwrapped>/share`: dois pais do alvo resolvido alcançam `<unwrapped>/opt/Discord/resources`. Só symlink conta — um `share` mesclado de perfil é diretório comum e não leva a pacote nenhum. Wrapper script ainda tem os caminhos absolutos varridos, o que cobre o `makeWrapper` de vesktop/equibop/legcord.
+- Clientes cobertos: oficiais Discord/PTB/Canary (`opt/<Discord|DiscordPTB|DiscordCanary>`) e paralelos Vesktop/Equibop (`opt/<Vesktop|Equibop>`) e Legcord (`share/lib/legcord`). O `/nix/store` somente-leitura não bloqueia a ativação: desde a migração para o WireGuard por aplicativo, o bypass não injeta mais no `app.asar` — o túnel envelopa o processo.
+- Perfis que linkam o mesmo pacote por comandos diferentes (`Discord`/`discord`) e paths de store órfãos, fora de qualquer perfil, não geram linhas duplicadas nem instalação fantasma: o dedupe por inode existente e a derivação exclusiva pelos perfis descartam os dois casos.
+- Cobertura: `golive-gui/tests/linux-nix-discovery.test.ts` com dez casos — FHS encadeado, FHS por wrapper `bwrap` sem menção ao app (regressão da descoberta real), sem FHS, Canary, três modos paralelos, duplicidade de comandos, pacote sem resources, órfão — passou junto das suítes Linux (85 testes). Container `nixos/nix` com `discord`, `discord-ptb`/`discord-canary` barrados pela licença unfree, `vesktop`, `equibop` e `legcord` reais: o scan achou os quatro e o `--preflight --json` rodou como uid 1000 com `count:4` e `firstPath` do Legcord. Limite: PTB/Canary em Nix real não foram exercitados (barreira unfree) e ficam cobertos sinteticamente; `/run/current-system/sw` e `/etc/profiles` só existem em NixOS completo, validados apenas por caminho.
+- Paralelos provados no mesmo container com pacotes reais (`vesktop`, `equibop`, `legcord` do cache, Electron 43 do store): `--status --json` listou os três instalados e, com os três rodando ao mesmo tempo sob Xvfb, reportou `running` e `pid` corretos para cada um, `discord_running` positivo e `select_launch_target` preservando o cliente já em execução. `kill_parallel_by_path` com apenas o vesktop no `FOUND` encerrou o vesktop e deixou equibop e legcord intactos — a identidade pelo path do store não cruza clientes. Cada cliente exigiu FontConfig no container; sem fontes, vesktop e equibop morrem por `SkFontMgr_FontConfigInterface Not implemented`, o que é ambiente, não do produto.
+- Requisito de runtime observado no container: a identidade de processo usa `awk` (captura em `/proc` e conferência do cmdline). Container do Nix mínimo sem `gawk` reportava `running:"nao"` com o Discord rodando — a descoberta acertava, o status degradava em silêncio. Em NixOS enxuto, instale `gawk`; o preflight não declara `awk` e por isso a falta não vira mensagem acionável.
+- Ciclo completo (netns `discord-vpn`, WireGuard, relançamento do Discord dentro do namespace e encerramento pelo path do store) **não** foi exercitado no container: a elevação `sudo`/`pkexec` e `CAP_SYS_ADMIN` efetiva para uid não-root não se traduzem sem hacks (PAM ausente na imagem; caps ambient não sobrevivem ao `execve`). Evidência recolhida até o alvo de lançamento: `target_can_launch` com o `resources` do nix encontrou o binário em `<pkg>/opt/Discord` e `select_launch_target` preferiu a instalação nix; o subsistema de namespace tem E2E próprio no host.
+- **Elevação Linux (GUI):** a senha do sudo recusada voltava a cancelar a ativação sem nova tentativa e sem distinguir a causa. Agora a mensagem do `sudo` é lida apenas para classificar (`sudo_classify_failure`) e nunca é registrada: senha incorreta re-pergunta até 3 vezes; usuário sem sudoers, política `requiretty`, conta expirada/bloqueada e falha de PAM param na primeira recusa com mensagem própria e acionável. O caminho `sudo -A` (askpass, último recurso sem zenity/kdialog/pkexec) classifica o mesmo motivo e informa, sem re-perguntar. `cleanup_sudo_pass` passou a usar `${VAR:-}` porque o askpass faz `unset` dessas variáveis e a limpeza roda no trap de saída sob `set -eu`. O motivo entra no evento `sudo.validation` (`reason=incorrect_password|not_in_sudoers|tty_required|account_blocked|pam_error|other`), campo final opcional na whitelist do parser da GUI. Relacionado à issue #345.
+
+## [2.0.10-beta-4] - 2026-10-11
+
+### Windows: "Iniciar com o Windows" desliga de verdade
+
+- Desligar o toggle apagava só a entrada canônica `GoLiveBypass` da Run key e ainda reportava sucesso sem conferir: entradas legadas do mesmo app sob outros nomes (versões antigas gravavam o nome do app do Electron ou do exe portátil renomeado) sobreviviam e o app continuava subindo no login com o checkbox desligado. Agora o toggle gerencia **todas** as entradas cujo alvo é o exe do GoLiveBypass, apaga todas ao desligar, confere o registro depois e devolve erro honesto (com os nomes das entradas remanescentes) quando o Windows não obedece. Ao ligar, normaliza para uma única entrada canônica. Valores de terceiros e o `GoLiveBypassTor` do standalone não são tocados.
+- O checkbox passa a refletir qualquer entrada do app (inclusive legadas), não só a canônica; a limpeza também acontece ao abrir o app com o autostart ativo (sync da entrada).
+- Testes: `golive-gui/tests/startup-registry.test.ts` — 5 cenários de registro contra `reg.exe` falso, incluindo o de regressão "desligar reporta falha quando o Windows mantém a entrada".
+
+### Documentação: report de bugs aponta para o endpoint atual
+
+- O README ainda citava o domínio antigo da API em "Reportar um bug"; passa a `https://bugs.golivebypass.dev/bugs/v1/reports` — a migração dos clientes já tinha sido feita na 2.0.10-beta-2 e este é o rescaldo documental (issue #336).
+
+### Windows: UI honesta da rota, restauração manual e órfãos de boot no WireSock
+
+- A UI deixava de exibir "ligado" quando a inspeção não confirmava a sessão: com a rota iniciada e a prontidão refutada o estado vai para `recovery_required`, com o motivo e a ação Restaurar rede (`windowsRouteStatus`). Só apresentação — nenhuma leitura de diagnóstico para ou destrói o túnel (#309). Cobertura: `golive-gui/tests/wiresock-ui-status.test.ts`.
+- "Restaurar rede" passou a executar a limpeza mesmo sem ownership comprovado, porque é ação manual explícita do usuário; boot, watchdog, otimização, troca de rota e desativação em segundo plano continuam fail-closed e não interrompem VPN sem prova de ownership (#306). Cobertura: `golive-gui/tests/plugin-vpn-manual-recovery.test.ts`.
+- No boot, um serviço WireSock próprio sobrevivente sem `owner.lock` (sintoma de quit forçado/reboot) é reconhecido como órfão e parado usando a configuração própria já comprovada na inspeção; falha nessa parada devolve `recovery_required` em modo diagnóstico-only; com `owner.lock` a sessão é re-adotada e gerida normalmente (#281).
+- Leitura vazia transitória logo após a ativação de sessão própria com `owner.lock` passou a ser re-adotada por inspeção fresca, em vez de derrubar o estado do plugin (#331).
+
+### Plugin: onboarding com skip explícito e escolha de modo no assistente
+
+- Fechar o assistente sem concluir grava `onboardingSkipped` de forma explícita e persistente: o onboarding não reabre sozinho, e o painel e o updater continuam acessíveis para configurar depois pela toolbox (#334).
+- Trocar de modo (`proton`/`custom`) no meio do assistente re-renderiza a página de conta com o fluxo escolhido, sem fechar nem perder progresso; a ação "Configurar depois" adia sem concluir onboarding nem liberar ativação automática. Cobertura: `tests/test-plugin-onboarding.mjs` (18 casos) e `tests/test-plugin-owner-concurrency.mjs`.
+
+### Plugin: diagnóstico da verificação rápida separa as etapas da falha
+
+- Quando a verificação rápida descartava as doze finalistas, o helper só devolvia o erro agregado ("nenhum candidato respondeu pelo túnel") — igual para falha de handshake, DNS, TLS ou HTTP. Agora a primeira finalista sondada recebe uma sonda estendida e a etapa que falhou é anexada à mensagem, em vez de virar um descarte silencioso de todas as rotas (#331). Cobertura: `golive-gui/tests/plugin-proton-runtime.test.ts` e `plugin-v2-regression.test.ts`.
+
+### Linux: fechamento Flatpak pelo ID antes do kill -9 e falha acionável
+
+- `stop_discord` passou a encerrar primeiro os Flatpaks em execução (`flatpak kill` pelo application ID exato, incluindo clientes de túnel sem asar como o Serein): a sessão fica registrada no `flatpak ps` e `pkill` por nome no host não a derruba — sem isso a reabertura reativava a instância velha fora do namespace (#327).
+- A escalada final reenvia o TERM pelo gerenciador de instância antes de qualquer `kill -9`, e a falha definitiva nomeia o ID que sobrou com o comando exato (`flatpak kill $id`) em vez de uma mensagem genérica; o log do launcher da última abertura (`START_DISCORD_LOG`) passa a ser citado pela falha da ativação.
+- Cobertura: `tests/test-linux-flatpak-close.sh` (sessão imortal termina em falha acionável, sobrevivente nativo leva `pkill` concreto, nenhum `flatpak kill` quando não há sessão Flatpak) e `golive-gui/tests/linux-preflight.test.ts`. Limite: a escalada sinaliza apenas o PID principal; se processos auxiliares mantiverem a sessão ativa, a confirmação reprova e o rollback segue, sem sinais amplos. Não substitui reprodução nativa em Bazzite/Flatpak.
+
+### Publicação e reconstrução da árvore
+
+- `v2.0.10-beta-4` publicada em `bezumiya/GoLiveBypass` como prerelease (canal beta), 12 assets, canal estável em `v2.0.9`; CI (run 38161289217) verde em windows, linux, release-assets e proton-runtime-assets.
+- Os commits locais originais desta branch foram perdidos do object store; a árvore foi reconstruída dos arquivos do worktree de 2026-10-08 e o reflog preservou o histórico. As notas das correções sem changelog foram registradas após a publicação, com base nos diffs da tag.
+
+## [2.0.10-beta-3] - 2026-09-29
+
+### Validação e consistência da beta
+
+- GUI, manifest e os constants internos do plugin usam `2.0.10-beta-3`; a classificação de publicação é prerelease, sem promover o canal estável.
+- E2E local exercitou boot/ativação/restauração da GUI Windows em modo WireSock direto, preservando o serviço externo do plugin. No Linux, confirmou Discord no namespace, host direto, otimização, seleção manual US#51, asar vanilla e remoção do namespace na desativação; também abriu Vesktop nativo pelo launcher embutido corrigido e confirmou o processo além do antigo timeout.
+- A suíte final passou com 666 testes em 70 arquivos. Fixtures de capacidade Linux foram isoladas do módulo carregado no host; testes que fixavam versão, comentários ou argv internos foram removidos, não repinados. Gate do ZIP protege `bug-report.ts` e `vpn-snapshot-worker.ts` para clientes beta16.
+- Limites: a rodada foi explicitamente restrita a cliente/rede/restauração, sem mídia. Probes Windows tiveram resultados mistos por cliente; sessões Proton salvas na VM estavam inválidas. Bazzite/Flatpak, recovery do plugin Windows, force-close/boot e a falha de benchmark da #331 não foram declarados resolvidos.
+
+### Windows: ativação e limpeza da GUI preservam WireSock externo
+
+- A auditoria da #309 reproduziu um risco independente do relato de fechamento forçado: a GUI parava serviços e processos WireSock por nome, sem conferir o perfil. Ativação direta, fallback de serviço e limpeza agora exigem a configuração exata da GUI, consultas CIM completas e revalidação dos PIDs no worker elevado. Configuração externa/mista ou estado desconhecido recusam a operação; um registro externo parado também não é retargetado.
+- A identificação interpreta apenas o argumento único de `-config`/`--config`. Caminhos mencionados em logs, flags ambíguas, aspas escapadas e argumento vazio não estabelecem ownership. Processos elevados sem `CommandLine` recebem nova inspeção sob UAC antes da limpeza; não são assumidos pelo nome do executável.
+- A parada solicita `sc.exe stop` e verifica estado/PIDs com prazo limitado, evitando a espera sem limite e a parada de serviços dependentes de `Stop-Service -Force`.
+- Perfis atuais da GUI e do plugin omitem DNS e usam `network-lock disabled`. Foram retirados resets globais de network-lock e DNS de adaptadores tanto da ativação quanto da limpeza onde eram chamados; o perfil/PID próprio não comprova a origem desses recursos globais. O cache DNS pode ser limpo após a parada própria confirmada. As flags de reset ficam falsas como diagnóstico, sem impedir uma parada confirmada.
+- Cobertura: regressões da GUI e do plugin verificam recusa de recursos externos/desconhecidos, mudanças entre inspeções, parsing e ausência de resets globais. Não houve execução do worker PowerShell nem prova de roteamento no Windows. Resíduos de versões antigas exigem investigação específica; force-close nas #281/#309 continua sem garantia de limpeza automática. Linux e standalone não usam estes workers.
+
+### Plugin: catálogo e seleção manual de rotas Proton chegam à ponte nativa
+
+- Causa confirmada da lista ausente da #331: a tela chamava cinco operações de catálogo/seleção, mas `native.ts` não as exportava. A guarda de disponibilidade saía antes de iniciar a descoberta. A ponte agora entrega descoberta, status, cancelamento e seleção ao controller existente, mantendo a validação nativa de sessão e medição.
+- O hook troca a lista junto com a identidade da medição, inclusive quando a descoberta termina antes do primeiro polling. Status de outra conta/filtro não é adotado; medição expirada limpa lista e referência; resultado atrasado não ressuscita a geração anterior. O status devolve apenas se o contexto esperado coincide, sem expor a conta da medição.
+- Cobertura: regressões executam o hook e os exports nativos reais com dependências controladas; os entrypoints do plugin também foram empacotados com esbuild. A falha das candidatas pelo túnel na #331 permanece sem causa confirmada; o catálogo manual corrigido não prova benchmark nem mídia real. GUI e standalone não usam esta ponte.
+
+### Linux: seleção e status respeitam a instalação do Discord
+
+- No cenário da #330, o bootstrap encontrado antes na lista podia ser selecionado porque `running_flav` aceitava o nome de outro Discord em execução. A identificação nativa agora verifica a instalação exata; para Flatpak, exige o app ID informado e não usa o PID de outro cliente quando esse app está fechado.
+- Clientes oficiais e paralelos com Electron compartilhado continuam reconhecidos, monitorados e encerrados pelo argumento exato do próprio `app.asar`/`arrpc`, com fronteiras NUL preservadas e revalidação antes do sinal. Texto que apenas menciona o caminho em outro argumento, inclusive multiline, não estabelece identidade.
+- A captura dos executáveis em `/proc` evita um `readlink` por processo alheio, mantendo fallback quando `find -printf` não está disponível e revalidação de cada candidato. O sufixo ` (deleted)` após atualizar um executável é normalizado. Com 457 processos, a consulta medida caiu de 0,766–1,177 s para 0,050–0,058 s.
+- Cobertura: `linux-launch-target.test.ts` reproduziu a seleção errada, o PID de outro cliente e os casos de runtime compartilhado. Isso complementa a correção anterior de ELF nativo e de escalada Flatpak, sem afirmar reprodução completa no Bazzite. GUI e standalone compartilham estas funções; o plugin tem launcher próprio.
+- Instalações com `app.asar` diretamente na raiz (como `/usr/lib/equibop`) não ampliam mais a identidade para o diretório pai. A varredura e a revalidação antes do sinal usam a mesma resolução: só uma subpasta `resources` sobe um nível. O status real havia atribuído o `flatpak-session-helper` ao Equibop; esse falso positivo também podia atingir processos alheios durante o fechamento.
+- Evidência da continuação: o `--status --json` real passou a indicar Equibop parado, preservando Discord e `flatpak-session-helper`. Duas regressões com executáveis descartáveis irmãos verificam descoberta e encerramento restritos, com e sem GNU `find`; a rodada de identidade/encerramento passou com 15 testes. Não comprova relaunch completo, Bazzite/Flatpak ou mídia; o plugin usa identificação própria e não recebe esta alteração.
+
+### Linux GUI/standalone: fechamento e identificação de clientes por app
+
+- #327–330 repetem a falha no fechamento em Bazzite. No caminho Linux compartilhado pela GUI e pelo standalone, `flatpak kill` envia TERM, mas a escalada SIGKILL só consultava processos visíveis no host por nome/cmdline. Agora usa o `child-pid` exposto para o application ID exato, normaliza PID decimal e rejeita zero/zeros isolados, reconsulta o mesmo app ID antes de sinalizar e mantém a confirmação de encerramento. Limite: a escalada Flatpak sinaliza apenas esse PID principal; se processos auxiliares mantiverem a sessão ativa, a confirmação reprova e o rollback segue, sem sinais amplos. Os trechos recebidos não identificam o PID persistente; a falha é compatível com o caminho atual, mas não confirmada individualmente nos quatro ambientes.
+- A #330 também informa falha em iniciar o cliente após WireGuard pronto. O rollback permanece fail-closed; sem log de execução do launcher que identifique uma causa adicional, esse sintoma não é atribuído ao fechamento nem mascarado.
+- Na #332, Vesktop ELF nativo podia omitir `app.asar`/`arrpc` de cmdline. A descoberta e o encerramento agora enumeram os processos com `/proc/PID/exe` sob a raiz exata da instalação e revalidam a raiz antes de sinalizar; a confirmação/status continuam usando um PID principal dessa mesma instalação. Não há fallback `pgrep -x` genérico.
+- Cobertura comportamental: `golive-gui/tests/linux-preflight.test.ts` executa dois processos ELF sintéticos da mesma instalação, preserva um processo alheio, confirma PID Flatpak positivo e que `0`/`000` não geram sinal; também cobre normalização de `00042`. Não substitui reprodução nativa em Bazzite ou CachyOS.
+
+### Plugin Linux: relaunch preserva o ambiente gráfico/áudio
+
+- Causa confirmada do `EINVAL` em `netns-launcher`: o parser validava `--env=CHAVE=valor`, mas passava `CHAVE=valor` inteiro como nome para `setenv()`. POSIX rejeita nomes que contenham `=`, então qualquer ambiente explícito (por exemplo `WAYLAND_DISPLAY`) abortava o relaunch depois de a rede entrar em estado ready.
+- Correção no helper do plugin: separar temporariamente nome e valor ao chamar `setenv()`, preservando o ambiente explícito selecionado, o namespace, o escopo do Discord e o ciclo de confirmação/cleanup. Não há fallback para iniciar fora do namespace.
+- Cobertura: `tests/test-netns-launcher.sh` exercita `WAYLAND_DISPLAY=wayland-0` na função real do launcher. Não comprova tráfego/rota real nem foi executado dentro do Discord.
+- A auditoria da #318 também confirmou o defeito no ELF ainda embutido em `vpn-proton.ts`: corrigir somente a fonte C não trocava o executável entregue. O asset foi regenerado, mantendo o helper Proton intacto. SHA-256 do novo launcher: `df2d1496a59de778e5dda7fbf6be9f2c80ae9fe15cf03cd8e2485466e526e8c3`. `plugin-linux-asset.test.ts` executa o ELF real em processo descartável, simulando apenas as operações privilegiadas, e verifica ambiente explícito/valor vazio/confirmação; o asset antigo falhou com `EINVAL` e o novo passou.
+
+### Linux: ativação deixa de depender do módulo WireGuard do kernel (wireguard-go)
+
+- Causa do relato (2026-09-24, CachyOS): o kernel em execução (7.2.6-1) ficou **sem árvore de módulos** depois de o gerenciador instalar o 7.2.7-1 (`/lib/modules/7.2.6-1-cachyos` é apagado no upgrade, sem reiniciar). Nesse estado `modprobe wireguard` falha, `ip link add type wireguard` responde `Unknown device type` e nenhuma ativação tem saída: a GUI dizia "ambiente pronto", pedia a senha do sudo e só falhava em `ensure_wireguard_module` ("nao foi possivel carregar o modulo WireGuard"), já depois de mexer no namespace.
+- Correção: o motor Linux passa a **escolher o device**. Com o módulo carregado, o caminho é o de sempre. Sem módulo, um WireGuard de usuário (`wireguard-go`) cria o mesmo device TUN no namespace, configurado pelo socket UAPI (`wg setconf`/`wg show` seguem iguais, então rota, DNS, telemetria e troca de rota não mudaram). Requisito do modo de usuário: `/dev/net/tun` com o driver `tun` no kernel — nada é carregado no kernel do host.
+- O binário viaja no AppImage (`extraResources` → `resources/extra/wireguard-go`), compilado por `npm run build:wireguard-go` (pinned por pseudo-versão em `golive-gui/scripts/build-wireguard-go.mjs`, GOOS=linux, sem CGO). Resolução no script: `--wireguard-go`/`GOLIVE_WIREGUARD_GO` (override explícito e autoritativo) → embutido ao lado do script → `tools/wireguard-go/build` (árvore de dev) → `wireguard-go` no PATH.
+- Ciclo de vida: o daemon mantém o socket UDP no uplink original e move somente o device TUN para `discord-vpn`, evitando que o tráfego encapsulado tente sair pelo próprio túnel. PID e log ficam em `wireguard-go.pid` e `logs/wireguard-go.log`; `teardown_wireguard_netns` encerra o processo antes de remover o namespace, sem daemon/socket órfãos.
+- Preflight: `kernel.wireguard` agora vem com `running` (`uname -r`), `modulesInstalled` (`/lib/modules/<release>` existe?) e `userspace` (há wireguard-go + tun). O `ok` reprova **somente** quando não há módulo nem modo de usuário; a mensagem pede reiniciar/instalar módulos **ou instalar o wireguard-go**, em vez de deixar a ativação seguir para falhar no sudo. O painel Linux mostra "Pronto (usuário)" quando o túnel será de usuário.
+- Compatibilidade: script antigo, sem os campos novos, é lido como `running=""`, `modulesInstalled=true` e `userspace=false` (ausência de campo nunca vira "sem módulos" nem "modo de usuário").
+- Evidência (2026-09-24, host do relato, kernel sem módulo): `golive-gui/tests/linux-preflight.test.ts` executa o `--preflight --json` real com `modinfo`/`uname` falsos (reprova sem usuário; aprova com `GOLIVE_WIREGUARD_GO` válido) e roda o ciclo start/stop do daemon com pidfile; `tests/test-linux-wireguard-userspace.sh` executa em `unshare -Urnm` um device de usuário completo — interface TUN criada sem `ip link add type wireguard`, `wg setconf` pelo socket UAPI, handshake de 148 B saindo (`transfer: ... B sent`) e a sequência da ativação dentro de um namespace nomeado (daemon via `ip netns exec`, endereço, default route e telemetria).
+- Na validação de 29/09, a regressão real em namespaces descartáveis usou dois peers `wireguard-go`: confirmou handshake, download HTTP, upload de 262.144 bytes, PID vivo no uplink original, TUN isolado e teardown sem pidfile/socket/namespace residual, preservando as rotas do ambiente de saída.
+- Lacuna conhecida: o plugin Vencord/Equicord continua só com o módulo do kernel (`formatLinuxWireGuardModuleIssue`) — portar o modo de usuário para lá é trabalho separado, e o plugin não compartilha este motor.
+
+## [2.0.10-beta-2] - 2026-09-21
+
+### Hotfix de endpoint da API
+
+- A GUI, o plugin e o standalone passam a usar `https://bugs.golivebypass.dev/bugs` no lugar do domínio anterior para reports, status e pulso de atualização. O host antigo (`api.golivebypass.dev`) não existe no DNS — os botões de report falhavam em silêncio.
+- Servidor: vhost dedicado `bugs.golivebypass.dev` criado no OpenLiteSpeed com `context /bugs` para o `extprocessor golivebugapi` existente e certificado Let's Encrypt emitido via acme.sh (renovação pelo cron do painel). Validado em 2026-09-22: `healthz` 200, sem token 401, rajada autenticada 429+`Retry-After`, catálogo/SSE e o POST de criação de issue no host novo; `api.skyplaceia.com/bugs` (contingência) e o site sem regressão.
+- Dependência registrada: o webhook de Release no GitHub ainda aponta para o host morto e sua edição exige admin em `bezumiya/GoLiveBypass` (pdl-clay não tem). Até o dono atualizar, o pulso de atualização fica no fallback de consulta direta ao GitHub (boot + 1 h) — comportamento já existente.
+
+### Linux: trocar de rota não deixa mais o cliente sem internet dentro do namespace
+
+- Causa: `refresh_wireguard_route` (usado pela otimização, pela seleção manual e pelo failover) reaplica o peer com `wg setconf` e, como a reserva pode ter outro endereço interno, faz `ip addr flush` + re-adiciona os endereços. O kernel derruba junto a **rota default do namespace** quando o endereço que a originou sai — e o cliente ficava sem caminho de saída: DNS/TCP/TLS morriam com "Could not connect" mesmo com o handshake WireGuard de pé. É o sintoma de upload/stream que para logo depois de otimizar ou trocar de rota.
+- Correção: o refresh restaura `default dev wg-discord` (idempotente, via `route replace`) depois de reaplicar os endereços; sem ela a troca falha em vez de deixar o cliente mudo.
+- Evidência (2026-09-22, host CachyOS, rotas free Proton): com a sequência antiga a tabela de rotas do namespace ficou vazia e o `curl` de dentro do namespace falhava em ~50 ms; com a função corrigida (código extraído do script, executado no namespace real) a default voltou e o egress respondeu (`ipify` 205.147.22.29, `gateway.discord.gg` HTTP 404 = TCP/TLS ok).
+- Cobertura: `golive-gui/tests/linux-sudo.test.ts` fixa a ordem (`addr flush` antes do `route replace default`) e a presença da restauração.
+
+### Plugin: a seleção manual de rotas permanece visível com a sessão travada
+
+- Causa: `useProtonRouteSelection` zerava catálogo e rota aplicada em toda re-execução do efeito — inclusive quando `active` caía por falha **temporária** da verificação de sessão — e o bloco de trava (`lockedReason`) renderizava só o aviso, escondendo as rotas já medidas. O resultado era o relato "a seleção manual sumiu / só aparecem 3 itens".
+- Correção: o catálogo agora só é descartado quando a chave de contexto muda (conta|país|freeOnly|autoPing); sob trava, a lista medida continua renderizada com os controles desabilitados, e a rota em uso/preparada permanece no bloco de estado. Nenhuma seleção é enviada sem sessão válida (recusa também revalidada no lado nativo).
+- Cobertura: `tests/test-plugin-onboarding.mjs` (16 asserts, incluindo "efeito não limpa quando `!active`" e "lista renderiza sob `lockedReason`").
+
+### GUI: Serein (cliente Discord nativo) entra no túnel por aplicativo — Windows e Linux
+
+- O Serein (`cz.viceverse.serein`) é nativo em Rust, sem Electron e sem `app.asar`: toda a descoberta antiga exigia asar e não o via. Suporte **túnel-only** (sem injeção de plugin, que ele não hospeda):
+  - Linux (motor standalone): novos `FLATPAK_TUNEL_IDS` + bloco `flatpak-nativo` em `discord_dirs()` (dedupe pelo diretório de deploy, sem exigir asar), `flatpak_app_id`/`discord_running`/`flatpak ps` reconhecem `cz.viceverse.*`, `--status --json` expõe `flavour":"serein"` com prova de sessão pelo `child-pid`, e o aviso de "flatpak update desfaz a injeção" agora só vale para registros que têm injeção.
+  - Windows (GUI): flavour `Serein` na discovery (raiz `%LOCALAPPDATA%\Programs\Serein`, processo `serein.exe`, registry de desinstalação), `tasklist`/`taskkill`/status/reabertura e `AllowedApps` cobrem o exe; clientes não-Electron são dispensados da exigência da pasta `resources/` ao validar processo. O kill do `Update.exe` (Squirrel) continua restrito ao Discord.
+- Cobertura: `tests/test-linux-serein.sh` (3 verificações herméticas com HOME/flatpak fake) e `golive-gui/tests/windows-discord-discovery.test.ts` (+2 casos Serein).
+- Lacuna: ativação real do Serein no namespace (Linux) e o E2E Windows na VM estão registrados para a rodada de validação; nada aqui prova upload por rota.
+
+## [2.0.10-beta-1] - 2026-09-21
+
+### v2: correções e limites validados
+
+- O launcher Linux on-disk agora rejeita binários stale/incompatíveis pelo contrato e SHA-256 do asset embutido; quando necessário, o fluxo materializa novamente o `netns-launcher` distribuído.
+- O tee de console da GUI protege `log`, `info`, `warn` e `error` contra falhas EIO/EPIPE. O registro no ring/file continua best-effort mesmo quando o destino de arquivo falha.
+- A descoberta Windows preserva diagnóstico limitado para timeout (`POWERSHELL_TIMEOUT`), spawn e saída não-zero, mantém candidatos de filesystem quando uma fonte falha e não reemite raízes em cache-hit dentro da janela de dedupe.
+- A inspeção WireSock usa retry limitado e recuperação fail-closed: somente `owner.lock`/configuração do plugin comprovados autorizam limpeza própria; recurso externo é preservado. Estado desconhecido permanece em recuperação manual e nunca vira `active` por inferência.
+- Regressões executadas: `npm test -- tests/proton-ui.test.ts tests/plugin-update-ui.test.ts` em `golive-gui/` — 2 arquivos, 26 testes aprovados; `node tests/test-plugin-autostart-loop.mjs` na raiz — 4 testes aprovados, 0 falhas.
+- A #277 permanece aberta/inconclusiva: não há reprodução causal v2 para mídia, não foi adicionado reload automático e probes de rota/handshake continuam diagnósticos; estes testes não provam geografia de egress nem mídia real.
+- A #307 é um relato da arquitetura legada e não tem suporte no v2; não houve portabilidade do caminho legado.
+
+### Plugin Windows: a otimização não bloqueia pela prova HTTP do Discord
+
+- Correção da #325: a otimização automática do plugin colocava `-require-discord` no helper apenas no Windows. Cada candidata que já havia formado o túnel e respondido ao endpoint de medição também precisava alcançar `https://discord.com/api/v9/gateway` em até 6 s; uma falha transitória desse probe descartava a rota e podia reprovar as doze finalistas como “nenhum candidato respondeu pelo túnel”.
+- Agora o plugin mantém o preflight genérico de WireGuard + HTTPS e a medição de download/upload como critérios da rota. A prova HTTP específica do Discord permanece diagnóstica, portanto não impede a otimização nem a seleção manual.
+- Cobertura: `golive-gui/tests/plugin-proton-runtime.test.ts` executa o runtime como Windows e confirma que a chamada de speed test não envia `-require-discord`. A GUI já usava o preflight genérico; o standalone permanece pausado e não participa deste fluxo.
 
 ## [2.0.9] - 2026-09-19
 

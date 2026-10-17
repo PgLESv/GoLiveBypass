@@ -15,7 +15,7 @@ import { useAwaiter } from "@utils/react";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import type { RenderModalProps } from "@vencord/discord-types";
 import { findStoreLazy } from "@webpack";
-import { Button, closeModal as closeDiscordModal, Constants, MaskedLink, Modal, openModal, React, RestAPI, SearchableSelect, showToast, TextArea, TextInput, Toasts, useEffect, UserStore, useState } from "@webpack/common";
+import { Button, closeModal as closeDiscordModal, Constants, MaskedLink, Modal, openModal, React, RestAPI, SearchableSelect, showToast, TextArea, TextInput, useEffect, UserStore, useState } from "@webpack/common";
 
 import {
     formatProtonRoutePing,
@@ -85,7 +85,8 @@ interface PluginUpdateNative {
     restartDiscord?: () => Promise<{ success: boolean; error?: string }>;
 }
 
-const Native = VencordNative?.pluginHelpers?.GoLiveBypass as unknown as (PluginNative<typeof import("./native")> & PluginUpdateNative) | undefined;
+type PluginIpcExports = Omit<typeof import("./native"), "findLinuxNetnsLauncher">;
+const Native = VencordNative?.pluginHelpers?.GoLiveBypass as unknown as (PluginNative<PluginIpcExports> & PluginUpdateNative) | undefined;
 
 const logger = new Logger("GoLiveBypass");
 
@@ -126,7 +127,7 @@ const RTCConnectionStore: DiagnosticStore = findStoreLazy("RTCConnectionStore");
 
 const VIDEO_GUARD = "2026-08-video-guard";
 
-const PLUGIN_VERSION = "2.0.9";
+const PLUGIN_VERSION = "2.0.11";
 const PLUGIN_UPDATE_STATUS_POLL_INTERVAL_MS = 15_000;
 const PLUGIN_UPDATE_STATUS_TIMEOUT_MS = 10_000;
 const PLUGIN_UPDATE_CHECK_TIMEOUT_MS = 2 * 60_000 + 15_000;
@@ -233,15 +234,15 @@ function dismissPluginUpdateToast(version: string): void {
 function reloadForPreparedPluginUpdate(): void {
     const restart = Native?.restartDiscord;
     if (typeof restart !== "function") {
-        showToast("Reinicie o Discord manualmente para aplicar a atualização do GoLiveBypass.", Toasts.Type.FAILURE);
+        showToast("Reinicie o Discord manualmente para aplicar a atualização do GoLiveBypass.", "failure");
         return;
     }
     void restart().then(result => {
         if (result?.success === false) {
-            showToast(`GoLiveBypass não conseguiu reiniciar o Discord: ${result.error || "veja o log"}`, Toasts.Type.FAILURE);
+            showToast(`GoLiveBypass não conseguiu reiniciar o Discord: ${result.error || "veja o log"}`, "failure");
         }
     }).catch(error => {
-        showToast(`GoLiveBypass não conseguiu reiniciar o Discord: ${error instanceof Error ? error.message : String(error)}`, Toasts.Type.FAILURE);
+        showToast(`GoLiveBypass não conseguiu reiniciar o Discord: ${error instanceof Error ? error.message : String(error)}`, "failure");
     });
 }
 
@@ -346,8 +347,8 @@ function notifyPluginUpdateFailure(current: unknown, channel: unknown, error: un
     lastSuppressedUpdateErrorKey = null;
     if (context.key === lastNotifiedUpdateErrorKey) return;
     lastNotifiedUpdateErrorKey = context.key;
-    showToast("Atualização do GoLiveBypass", Toasts.Type.CUSTOM, {
-        position: Toasts.Position.BOTTOM,
+    showToast("Atualização do GoLiveBypass", "custom", {
+        position: 1 /* Discord ToastPosition.BOTTOM */,
         duration: 15_000,
         component: <PluginUpdateFailureToast currentVersion={context.currentVersion} channel={context.channel} error={context.detail} lifecycleGeneration={pluginLifecycleGeneration} />,
     });
@@ -361,8 +362,8 @@ function notifyPendingPluginUpdate(current: unknown, version: unknown, channel: 
     const deferredUntil = Number(settings.store.updateDeferredUntil);
     if (deferredVersion === version && Number.isFinite(deferredUntil) && deferredUntil > Date.now()) return;
     lastNotifiedPendingVersion = version;
-    showToast("Atualização do GoLiveBypass", Toasts.Type.CUSTOM, {
-        position: Toasts.Position.BOTTOM,
+    showToast("Atualização do GoLiveBypass", "custom", {
+        position: 1 /* Discord ToastPosition.BOTTOM */,
         duration: 15_000,
         component: <PluginUpdateToast currentVersion={currentVersion} availableVersion={version} channel={normalizedChannel} lifecycleGeneration={pluginLifecycleGeneration} />,
     });
@@ -518,6 +519,7 @@ interface PluginRouteDiscoverySnapshot {
     routes: ProtonRouteCatalogEntry[];
     error?: string;
     updatedAt: number | null;
+    contextMatches?: boolean;
 }
 
 interface PluginRouteDiscoveryResult {
@@ -635,6 +637,7 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
     // A conta e os filtros fazem parte da chave: trocar qualquer um deles
     // invalida a medição anterior em vez de aplicar uma rota de outro contexto.
     const filtersKey = `${account}|${country}|${freeOnly ? "free" : "all"}|${autoPing ? "ping" : "noping"}`;
+    const filtersKeyRef = React.useRef(filtersKey);
 
     React.useEffect(() => {
         mountedRef.current = true;
@@ -643,19 +646,20 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
 
     const applySnapshot = React.useCallback((snapshot: PluginRouteDiscoverySnapshot | null) => {
         if (!snapshot) return;
-        const routes = Array.isArray(snapshot.routes) ? snapshot.routes : [];
-        const incomingMeasurementId = snapshot.measurementId ?? null;
-        const measurementChanged = Boolean(incomingMeasurementId && incomingMeasurementId !== measurementIdRef.current);
+        const compatible = snapshot.contextMatches !== false;
+        const incomingMeasurementId = compatible ? snapshot.measurementId ?? null : null;
+        const routes = incomingMeasurementId && Array.isArray(snapshot.routes) ? snapshot.routes : [];
+        const measurementChanged = incomingMeasurementId !== measurementIdRef.current;
         const signature = `${incomingMeasurementId ?? ""}|${snapshot.active === true}|${snapshot.phase ?? ""}|${snapshot.error ?? ""}|${snapshot.updatedAt ?? 0}|${routes.length}`;
-        if (incomingMeasurementId) measurementIdRef.current = incomingMeasurementId;
+        measurementIdRef.current = incomingMeasurementId;
         if (signature === statusSignatureRef.current) return;
         statusSignatureRef.current = signature;
         setCandidates(current => mergeProtonRouteCatalog(measurementChanged ? new Map() : current, routes));
         if (measurementChanged) setAppliedServer(null);
         setDiscovery({
-            active: snapshot.active === true,
-            phase: snapshot.phase ?? null,
-            error: snapshot.error ? safeDiagnosticDetail(snapshot.error, 240) : null,
+            active: compatible && snapshot.active === true,
+            phase: compatible ? snapshot.phase ?? null : null,
+            error: compatible && snapshot.error ? safeDiagnosticDetail(snapshot.error, 240) : null,
         });
     }, []);
 
@@ -663,20 +667,31 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
         const read = Native?.getProtonRouteDiscoveryStatus;
         if (typeof read !== "function") return null;
         try {
-            return await read() as PluginRouteDiscoverySnapshot;
+            const snapshot = await read({ username: account, country, freeOnly, autoPing }) as PluginRouteDiscoverySnapshot;
+            if (!mountedRef.current || filtersKeyRef.current !== filtersKey) return null;
+            return snapshot;
         } catch (error) {
             recordRendererError("Falha ao consultar a descoberta de rotas Proton", error);
             return null;
         }
-    }, []);
+    }, [account, country, freeOnly, autoPing, filtersKey]);
 
     React.useEffect(() => {
         const previousRequestId = requestRef.current;
         requestRef.current = null;
-        measurementIdRef.current = null;
-        statusSignatureRef.current = "";
-        setCandidates(new Map());
-        setAppliedServer(null);
+        // O catálogo pertence ao contexto (conta|país|freeOnly|autoPing): só uma
+        // mudança real dele invalida as rotas medidas. `active=false` (sessão
+        // inválida ou verificação temporariamente indisponível) derruba apenas a
+        // requisição em voo — esconder a lista foi o relato "sumiu a seleção
+        // manual": o usuário fica sem nenhuma saída visual.
+        const contextChanged = filtersKeyRef.current !== filtersKey;
+        filtersKeyRef.current = filtersKey;
+        if (contextChanged) {
+            measurementIdRef.current = null;
+            statusSignatureRef.current = "";
+            setCandidates(new Map());
+            setAppliedServer(null);
+        }
         setSelectionError(null);
         if (previousRequestId && typeof Native?.cancelProtonRouteDiscovery === "function") {
             void Promise.resolve(Native.cancelProtonRouteDiscovery(previousRequestId))
@@ -698,7 +713,7 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
             const snapshot = await readSnapshot();
             if (disposed || !snapshot) return;
             // Evento de outra geração: descarta sem tocar na lista atual.
-            if (snapshot.active && snapshot.requestId && requestRef.current && snapshot.requestId !== requestRef.current) return;
+            if (snapshot.requestId && requestRef.current && snapshot.requestId !== requestRef.current) return;
             applySnapshot(snapshot);
             if (!snapshot.active) stopTimer();
         };
@@ -706,7 +721,7 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
         const start = async () => {
             const snapshot = await readSnapshot();
             if (disposed) return;
-            if (snapshot?.active) {
+            if (snapshot?.active && snapshot.contextMatches !== false) {
                 // Remount com descoberta em andamento: adota a sessão nativa em
                 // vez de abrir uma segunda e perder o progresso já recebido.
                 applySnapshot(snapshot);
@@ -715,34 +730,56 @@ function useProtonRouteSelection({ active, account, country, freeOnly, autoPing 
                 return;
             }
             if (snapshot) applySnapshot(snapshot);
+            if (snapshot?.active && snapshot.contextMatches === false && typeof Native.cancelProtonRouteDiscovery === "function") {
+                await Native.cancelProtonRouteDiscovery(snapshot.requestId ?? undefined);
+                if (disposed) return;
+            }
             const requestId = `plugin-route-catalog-${Date.now()}-${Math.random().toString(16).slice(2)}`;
             requestRef.current = requestId;
             setDiscovery({ active: true, phase: "catalog", error: null });
             timer = setInterval(() => void poll(), PROTON_ROUTE_DISCOVERY_POLL_INTERVAL_MS);
+            let keepPolling = false;
             try {
                 const result = await Native.discoverProtonRoutes({ requestId, country, freeOnly, autoPing }) as PluginRouteDiscoveryResult;
                 if (disposed) return;
-                if (result?.measurementId) measurementIdRef.current = result.measurementId;
-                if (Array.isArray(result?.routes) && result.routes.length > 0) {
-                    const routes = result.routes;
-                    setCandidates(current => mergeProtonRouteCatalog(current, routes));
-                }
                 const failed = result?.success !== true;
-                setDiscovery({
+                const completed = {
                     active: false,
-                    phase: result?.cancelled ? "cancelled" : failed ? "failed" : "completed",
+                    phase: result?.cancelled ? "cancelled" as const : failed ? "failed" as const : "completed" as const,
                     error: failed ? safeDiagnosticDetail(result?.error || "Não foi possível listar as rotas Proton.", 240) : null,
-                });
+                };
+                if (result?.measurementId) {
+                    const current = await readSnapshot();
+                    if (disposed) return;
+                    // O resultado pode chegar antes do primeiro polling: usa a
+                    // mesma troca de geração. Se outro componente já substituiu
+                    // a operação, o snapshot atual prevalece sobre o retorno.
+                    applySnapshot(current ?? {
+                        ...completed,
+                        error: completed.error ?? undefined,
+                        requestId,
+                        measurementId: result.measurementId,
+                        routes: Array.isArray(result.routes) ? result.routes : [],
+                        updatedAt: Date.now(),
+                        contextMatches: true,
+                    });
+                    if (current?.active && current.contextMatches !== false) {
+                        requestRef.current = current.requestId;
+                        keepPolling = true;
+                    }
+                } else setDiscovery(completed);
             } catch (error) {
                 if (!disposed) {
                     setDiscovery({ active: false, phase: "failed", error: safeDiagnosticDetail(error || "Não foi possível listar as rotas Proton.", 240) });
                 }
             } finally {
-                stopTimer();
+                if (!keepPolling) stopTimer();
             }
         };
 
-        void start();
+        void start().catch(error => {
+            if (!disposed) setDiscovery({ active: false, phase: "failed", error: safeDiagnosticDetail(error, 240) });
+        });
         return () => {
             disposed = true;
             stopTimer();
@@ -847,6 +884,41 @@ function ProtonRouteSelection({
     const heading = ordered.length > 0
         ? `Escolha uma rota Proton — ${measuredCount} de ${ordered.length} rotas com ping`
         : "Escolha uma rota Proton";
+    const routeList = (
+        <ul aria-label="Rotas Proton disponíveis" tabIndex={0} style={protonRouteListStyle}>
+            {ordered.map(candidate => {
+                const selectable = isProtonRouteSelectable(candidate);
+                const stateLabel = protonRouteStateLabel(candidate, { discoveryActive: discovery.active });
+                const applying = applyingServer === candidate.server;
+                const location = protonRouteLocation(candidate);
+                const tier = protonRouteTierLabel(candidate);
+                return (
+                    <li key={candidate.server} style={protonRouteRowStyle}>
+                        <div style={protonRouteRowTopStyle}>
+                            <span>
+                                <strong>{candidate.server}</strong>
+                                {candidate.server === recommendedServer && <span style={protonRouteBadgeStyle}>Recomendada</span>}
+                            </span>
+                            <span>{formatProtonRoutePing(candidate.pingMs)}</span>
+                        </div>
+                        {location && <span style={protonRouteMetaStyle}>{location}</span>}
+                        {tier && <span style={protonRouteMetaStyle}>{tier}</span>}
+                        <div style={protonRouteRowTopStyle}>
+                            <span style={protonRouteMetaStyle}>{applying ? `Aplicando rota ${candidate.server}…` : stateLabel}</span>
+                            <Button
+                                onClick={() => applying ? onCancelSelection() : onSelect(candidate.server)}
+                                disabled={applying ? false : (!selectable || exclusive || Boolean(lockedReason))}
+                                aria-label={applying ? `Cancelar aplicação da rota ${candidate.server}` : `Selecionar rota ${candidate.server}`}
+                                title={applying ? "Cancelar aplicação" : (selectable ? undefined : (stateLabel || "Rota indisponível"))}
+                            >
+                                {applying ? "Cancelar" : "Selecionar rota"}
+                            </Button>
+                        </div>
+                    </li>
+                );
+            })}
+        </ul>
+    );
 
     return (
         <section aria-label="Seleção manual de rota Proton" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -891,7 +963,14 @@ function ProtonRouteSelection({
                 </Paragraph>
             )}
             {lockedReason ? (
-                <Paragraph role="status" aria-live="polite">{lockedReason}</Paragraph>
+                <>
+                    <Paragraph role="status" aria-live="polite">{lockedReason}</Paragraph>
+                    {/* Sessão travada não apaga o catálogo: a lista medida da mesma
+                        conta continua visível (com os controles desabilitados pela
+                        trava) para o usuário ver onde está e o que vai voltar a
+                        funcionar quando a sessão for revalidada. */}
+                    {ordered.length > 0 && routeList}
+                </>
             ) : (
                 <>
                     {discovery.error && (
@@ -910,41 +989,7 @@ function ProtonRouteSelection({
                                     : emptyMessage}
                             </Paragraph>
                         )
-                    ) : (
-                        <ul aria-label="Rotas Proton disponíveis" tabIndex={0} style={protonRouteListStyle}>
-                            {ordered.map(candidate => {
-                                const selectable = isProtonRouteSelectable(candidate);
-                                const stateLabel = protonRouteStateLabel(candidate, { discoveryActive: discovery.active });
-                                const applying = applyingServer === candidate.server;
-                                const location = protonRouteLocation(candidate);
-                                const tier = protonRouteTierLabel(candidate);
-                                return (
-                                    <li key={candidate.server} style={protonRouteRowStyle}>
-                                        <div style={protonRouteRowTopStyle}>
-                                            <span>
-                                                <strong>{candidate.server}</strong>
-                                                {candidate.server === recommendedServer && <span style={protonRouteBadgeStyle}>Recomendada</span>}
-                                            </span>
-                                            <span>{formatProtonRoutePing(candidate.pingMs)}</span>
-                                        </div>
-                                        {location && <span style={protonRouteMetaStyle}>{location}</span>}
-                                        {tier && <span style={protonRouteMetaStyle}>{tier}</span>}
-                                        <div style={protonRouteRowTopStyle}>
-                                            <span style={protonRouteMetaStyle}>{applying ? `Aplicando rota ${candidate.server}…` : stateLabel}</span>
-                                            <Button
-                                                onClick={() => applying ? onCancelSelection() : onSelect(candidate.server)}
-                                                disabled={applying ? false : (!selectable || exclusive || Boolean(lockedReason))}
-                                                aria-label={applying ? `Cancelar aplicação da rota ${candidate.server}` : `Selecionar rota ${candidate.server}`}
-                                                title={applying ? "Cancelar aplicação" : (selectable ? undefined : (stateLabel || "Rota indisponível"))}
-                                            >
-                                                {applying ? "Cancelar" : "Selecionar rota"}
-                                            </Button>
-                                        </div>
-                                    </li>
-                                );
-                            })}
-                        </ul>
-                    )}
+                    ) : routeList}
                 </>
             )}
             {selectionError && <Paragraph role="alert" aria-live="assertive"><strong>{selectionError}</strong></Paragraph>}
@@ -984,8 +1029,10 @@ function OnboardingSteps({ page, customMode }: { page: OnboardingPage; customMod
 }
 
 function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderModalProps; onClosed: () => void }) {
-    const customMode = settings.store.vpnMode === "custom";
-    const { protonCountry, protonFreeOnly, protonAutoPing } = settings.use(["protonCountry", "protonFreeOnly", "protonAutoPing"]);
+    const { protonCountry, protonFreeOnly, protonAutoPing, vpnMode } = settings.use(["vpnMode", "protonCountry", "protonFreeOnly", "protonAutoPing"]);
+    // Inscrito em `vpnMode`: trocar de modo no meio do assistente re-renderiza a
+    // página de conta com o fluxo escolhido, sem fechar nem perder o progresso.
+    const customMode = vpnMode === "custom";
     const requiredOnOpen = Boolean(Native && settings.store.onboardingCompleted !== true);
     const [page, setPage] = useState<OnboardingPage>("account");
     const [username, setUsername] = useState("");
@@ -1087,7 +1134,11 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
 
     const closeModal = () => {
         if (closedRef.current) return;
-        if (requiredOnOpen && settings.store.onboardingCompleted !== true && page !== "ready") return;
+        // Fechar sem concluir é um skip explícito e persistente: o assistente não
+        // reabre sozinho (o X não trava mais o usuário — #334), o painel e o
+        // updater continuam acessíveis e dá para configurar depois pela toolbox.
+        // Sem ponte nativa não há estado a gravar.
+        if (requiredOnOpen && settings.store.onboardingCompleted !== true) settings.store.onboardingSkipped = true;
         closedRef.current = true;
         if (page === "account" && busy) cancelActiveLogin();
         if (page === "route" && busy) cancelActiveOptimization();
@@ -1100,6 +1151,7 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
 
     const complete = () => {
         settings.store.onboardingCompleted = true;
+        settings.store.onboardingSkipped = false;
         closeModal();
         if (typeof Native?.enable !== "function") return;
         // Concluir a configuração precisa deixar o Discord já roteado: o túnel
@@ -1109,7 +1161,7 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
             if (result && result.success === false) {
                 showToast(
                     `GoLiveBypass não conseguiu ativar a VPN: ${result.error || result.message || "veja o log"}`,
-                    Toasts.Type.FAILURE
+                    "failure"
                 );
             }
         }).catch(activationError => {
@@ -1265,6 +1317,12 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
         }
     };
 
+    const switchVpnMode = (mode: "proton" | "custom") => {
+        if (busy) return;
+        settings.store.vpnMode = mode;
+        setPage("account");
+        setError(null);
+    };
 
     const continueToRoute = async () => {
         if (!Native || busy || sessionLoading || (!customMode && !username.trim())) return;
@@ -1484,6 +1542,9 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
     const actions = page === "account" ? [
         { text: busy ? (customMode ? "Validando…" : "Entrando…") : customMode ? "Continuar para rota real" : "Continuar para rota real", variant: "primary" as const, onClick: () => void continueToRoute(), disabled: busy || sessionLoading || (!customMode && !username.trim()) },
         ...(busy && !customMode ? [{ text: loginCancelRequested ? "Cancelando…" : "Cancelar login", variant: "danger" as const, onClick: cancelActiveLogin, disabled: loginCancelRequested }] : []),
+        // Adiar é fechar e gravar o skip (closeModal); não conclui o onboarding
+        // nem libera ativação automática — só destrava o painel para configurar depois.
+        { text: "Configurar depois", variant: "secondary" as const, onClick: closeModal },
     ] : page === "route" ? (customMode ? [
         { text: "Voltar", variant: "secondary" as const, onClick: () => { if (!busy) setPage("account"); }, disabled: busy },
         busy
@@ -1538,6 +1599,9 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
                             <div style={onboardingBoxStyle} role="status" aria-live="polite" aria-busy={busy}>
                                 <Paragraph>{customConfigPath.trim() ? "Arquivo WireGuard importado para a pasta privada do plugin." : "Nenhum arquivo WireGuard personalizado foi configurado ainda."}</Paragraph>
                             </div>
+                            <Button onClick={() => switchVpnMode("proton")} disabled={busy}>
+                                Usar a VPN Proton do plugin
+                            </Button>
                             {error && <Paragraph role="alert" aria-live="assertive"><strong>{error}</strong></Paragraph>}
                         </>
                     ) : (
@@ -1583,6 +1647,10 @@ function PluginOnboardingModal({ modalProps, onClosed }: { modalProps: RenderMod
                             {!sessionLoading && session && !session.valid && <Paragraph><strong>{protonSessionStatusTitle(session.code)}</strong>{session.error ? ` · ${session.error}` : ""}</Paragraph>}
                             {error && <Paragraph role="alert" aria-live="assertive"><strong>{error}</strong></Paragraph>}
                             {!!username.trim() && !sessionLoading && <Button onClick={() => void checkSession(username)} disabled={busy}>Verificar sessão novamente</Button>}
+                            <Button onClick={() => switchVpnMode("custom")} disabled={busy || sessionLoading}>
+                                Usar minha própria VPN (Mullvad ou outro WireGuard)
+                            </Button>
+                            <Paragraph>Tem Mullvad ou outra VPN com arquivo .conf? Troque o modo agora e importe o arquivo na próxima etapa, sem login Proton.</Paragraph>
                         </>
                     )}
                     </div>
@@ -1895,7 +1963,7 @@ function PluginUpdateSettings() {
                     failureContext?.detail || detail,
                 );
                 setState({ label: `v${currentVersion} · atualização falhou`, tone: "warning", available: false });
-                showToast(`GoLiveBypass não conseguiu atualizar: ${detail}`, Toasts.Type.FAILURE);
+                showToast(`GoLiveBypass não conseguiu atualizar: ${detail}`, "failure");
             }
         } finally {
             if (operationId === operationIdRef.current) operationBusyRef.current = false;
@@ -1978,6 +2046,12 @@ const settings = definePluginSettings({
         default: false,
         hidden: true,
     },
+    onboardingSkipped: {
+        type: OptionType.BOOLEAN,
+        description: "Registra que o assistente inicial foi adiado pelo usuário; o painel pode configurar o VPN depois.",
+        default: false,
+        hidden: true,
+    },
     vpnMode: {
         type: OptionType.SELECT,
         description: "Rota WireGuard isolada para este Discord. O restante do computador continua usando a rede normal.",
@@ -2017,6 +2091,7 @@ const settings = definePluginSettings({
 
 interface PluginVpnStatus {
     state: VpnState | string;
+    managedConflict?: boolean;
     platform?: VpnPlatform | string;
     architecture?: string;
     owned?: boolean;
@@ -2139,10 +2214,10 @@ function VpnPanel() {
             const result = await operation() as { success?: boolean; error?: string; message?: string };
             if (!mountedRef.current) return;
             if (result.success === false) throw new Error(result.error || result.message || "Operação VPN recusada.");
-            if (successMessage) showToast(successMessage, Toasts.Type.SUCCESS);
+            if (successMessage) showToast(successMessage, "success");
             await refresh();
         } catch (error) {
-            if (mountedRef.current) showToast(`GoLiveBypass: ${error instanceof Error ? error.message : String(error)}`, Toasts.Type.FAILURE);
+            if (mountedRef.current) showToast(`GoLiveBypass: ${error instanceof Error ? error.message : String(error)}`, "failure");
         } finally {
             if (mountedRef.current) setBusy(false);
         }
@@ -2162,10 +2237,10 @@ function VpnPanel() {
                 throw new Error(result.error || "Não foi possível importar a configuração WireGuard.");
             }
             settings.store.customConfigPath = result.path;
-            showToast("Configuração WireGuard importada.", Toasts.Type.SUCCESS);
+            showToast("Configuração WireGuard importada.", "success");
             await refresh();
         } catch (error) {
-            if (mountedRef.current) showToast(`GoLiveBypass: ${error instanceof Error ? error.message : String(error)}`, Toasts.Type.FAILURE);
+            if (mountedRef.current) showToast(`GoLiveBypass: ${error instanceof Error ? error.message : String(error)}`, "failure");
         } finally {
             if (mountedRef.current) setBusy(false);
         }
@@ -2199,7 +2274,7 @@ function VpnPanel() {
                 result.persisted === false
                     ? "Sessão Proton ativa nesta execução do Discord; esta máquina não guarda a sessão e o login será pedido de novo ao reiniciar."
                     : "Sessão Proton salva na pasta privada do plugin.",
-                Toasts.Type.SUCCESS
+                "success"
             );
             await refresh();
         } catch (error) {
@@ -2240,8 +2315,9 @@ function VpnPanel() {
             if (!mountedRef.current) return;
             if (!result.success) {
                 // A falha fica junto da ação automática; a lista manual continua
-                // disponível logo abaixo, sem esconder as rotas já medidas.
-                setOptimizationError(safeDiagnosticDetail(result.error || "Não foi possível otimizar a rota Proton.", 240));
+                // disponível logo abaixo, sem esconder as rotas já medidas. O
+                // orçamento cobre a sonda estendida anexada pelo helper.
+                setOptimizationError(safeDiagnosticDetail(result.error || "Não foi possível otimizar a rota Proton.", 500));
                 setOptimizationNotice("otimização falhou; escolha uma rota na lista");
                 routeSelection.measureCatalogIfEmpty();
                 return;
@@ -2251,7 +2327,7 @@ function VpnPanel() {
                 status?.active
                     ? "Rota Proton preparada e aplicada na sessão ativa do Discord."
                     : "Rota Proton preparada. Use \"Ativar agora\" para aplicar a rota; o Discord será reiniciado.",
-                Toasts.Type.SUCCESS
+                "success"
             );
             await refresh();
             await routeSelection.refresh();
@@ -2268,7 +2344,7 @@ function VpnPanel() {
 
     useEffect(() => {
         if (!routeSelection.appliedServer) return;
-        showToast(`Rota Proton aplicada: ${routeSelection.appliedServer}.`, Toasts.Type.SUCCESS);
+        showToast(`Rota Proton aplicada: ${routeSelection.appliedServer}.`, "success");
         void refresh();
     }, [routeSelection.appliedServer]);
 
@@ -2479,7 +2555,7 @@ function forceRegion() {
     if (typeof store.getPreferredRegion !== "function"
         || typeof store.getPreferredRegions !== "function"
         || typeof store.shouldIncludePreferredRegion !== "function") {
-        showToast("GoLiveBypass could not find Discord's region picker, so your call region is untouched.", Toasts.Type.FAILURE);
+        showToast("GoLiveBypass could not find Discord's region picker, so your call region is untouched.", "failure");
         return;
     }
 
@@ -2695,7 +2771,7 @@ function pollStreamClaimOnce() {
         record("stream.guard | UI afirma transmissao, mas nenhuma conexao nativa apareceu em 30s; possivel erro 2001, sem acao automatica");
         showToast(
             "GoLiveBypass: Discord says you're streaming, but no native Live connection appeared (possible error 2001). Stop the false Live, reload with Ctrl+R, then start it again.",
-            Toasts.Type.FAILURE
+            "failure"
         );
     } else if (previousStatus.startsWith("failed") && decision.status === "healthy") {
         record("stream.guard | conexao nativa apareceu depois do aviso; estado recuperado");
@@ -3018,10 +3094,14 @@ export default definePlugin({
         startStreamClaimWatch();
 
         const onboardingRequired = Native && settings.store.onboardingCompleted !== true;
-        if (onboardingTimer !== null) clearTimeout(onboardingTimer);
-        if (onboardingRequired) {
+        if (onboardingTimer !== null) {
+            clearTimeout(onboardingTimer);
+            onboardingTimer = null;
+        }
+        if (onboardingRequired && settings.store.onboardingSkipped !== true) {
             onboardingTimer = setTimeout(() => {
                 onboardingTimer = null;
+                if (settings.store.onboardingSkipped === true) return;
                 if (isLifecycleCurrent() && settings.store.onboardingCompleted !== true) openPluginOnboarding();
             }, 2_500);
         }
@@ -3053,7 +3133,7 @@ export default definePlugin({
             void Native.enableAutomatic().then(result => {
                 if (!isLifecycleCurrent()) return;
                 if (result?.success === false && !result.suppressed)
-                    showToast(`GoLiveBypass não conseguiu ativar a VPN: ${result.error || result.message || "veja o log"}`, Toasts.Type.FAILURE);
+                    showToast(`GoLiveBypass não conseguiu ativar a VPN: ${result.error || result.message || "veja o log"}`, "failure");
             }).catch(error => {
                 if (isLifecycleCurrent()) recordRendererError("Failed to reach the desktop process", error);
             });

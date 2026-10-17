@@ -24,8 +24,6 @@ describe("card de atualização na GUI", () => {
     expect(renderer).toContain("applyUpdateFromCard");
     expect(renderer).not.toContain("setTimeout(hideUpdateToast, 5000)");
     expect(renderer).toContain("hideUpdateCard();");
-    expect(renderer).toContain("import.meta.env.DEV");
-    expect(renderer).toContain("2.0.5-beta-10");
   });
 
   it("envia o aviso quando o updater termina de preparar o update", () => {

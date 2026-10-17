@@ -71,9 +71,11 @@ public class Fake { public static int Main(string[] args) {
   // three-second liveness check, result writer and exit handling run unchanged.
   // Tripwires prevent accidental service/process mutation if production changes.
   const isolation = `
+function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) if ($ClassName -notin @('Win32_Service', 'Win32_Process')) { throw 'Unexpected CIM query' }; return }
 function Get-Service { param($Name, $ErrorAction) return $null }
 function Get-Process { param($Name, $ErrorAction) if ($Name -ne 'wiresock-client') { throw 'Unexpected process query' }; return }
 function Stop-Service { throw 'CONTRACT SAFETY: Stop-Service forbidden' }
+function sc.exe { throw 'CONTRACT SAFETY: sc service mutation forbidden' }
 function Start-Service { throw 'CONTRACT SAFETY: Start-Service forbidden' }
 function Stop-Process { process { throw 'CONTRACT SAFETY: Stop-Process forbidden' } }
 `;
