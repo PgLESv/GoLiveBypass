@@ -4,6 +4,21 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.11] - 2026-10-21
+
+### Sincronização Upstream (GoLiveBypass 2.0.12 e 2.0.13 Estáveis)
+- **Instalação do WireSock (GUI e plugin, Windows):**
+  - Instalação pela metade detectada antes de instalar: desinstala primeiro, espera a instalação assentar e cai no reparo (`/repair`) se o par compatível não aparecer.
+  - Todo setup tem tempo-limite e a árvore de processos é encerrada no estouro.
+  - Nenhuma falha de instalação sai sem tentar restaurar a rede (`reset-network-lock`, rota default órfã e flush de DNS); "Restaurar internet" força a restauração mesmo sem túnel ativo.
+  - Serviço de kernel do filtro corrigido para `ndiswgc`.
+- **Interface Gráfica (GUI):**
+  - Saúde do túnel WireSock lida do log do próprio `wiresock-client` (leitura limitada ao início e fim do arquivo) e registrada nos logs locais.
+  - Deduplicação de 10 minutos para varreduras repetidas do Discord e avisos de estatística indisponível.
+- **Recursos Exclusivos do Fork PgLESv Preservados:**
+  - Bug report remoto continua removido; os novos campos de diagnóstico ficam apenas nos logs locais.
+  - Foco exclusivo no canal estável padrão.
+
 ## [2.1.10] - 2026-10-17
 
 ### Sincronização Upstream (GoLiveBypass 2.0.11 Estável)
@@ -276,6 +291,54 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 - Corrige a troca do executável portable no Windows para relançar com o nome da nova versão, em vez de manter o nome anterior.
 - Adiciona um toast interno na GUI quando uma atualização é baixada e fica pronta para reiniciar.
+
+## [2.0.13] - 2026-10-19
+
+### Alterado
+
+- **Relatório de bug: a saúde do túnel agora vem do log do próprio WireSock (GUI Windows, modo direto).** Sem o `wg.exe` (o normal nesse modo), todo relatório trazia "handshake: indisponível" e uma queda do túnel passava invisível. O `wiresock-client` já grava no arquivo da ativação (`direct-result.txt.stdout`) cada resposta de handshake (a cada ~2 min) e cada keepalive (a cada 10 s), e a GUI só o lia nos 3 primeiros segundos. Agora o watchdog lê o trecho recente a cada 45 s e registra `tunel.saude` (a cada 5 min) ou um aviso: `wiresock.log_parado` (sem linha nova há mais de 60 s), `handshake.velho` (resposta há mais de 180 s), `handshake.sem_resposta` (dois ou mais handshakes enviados sem resposta, sinal de perda até o servidor), `keepalive.intervalo` (mais de 30 s entre keepalives) e `wiresock.avisos`. O relatório ganha `wiresock_tunel_ativo_ha_s`, `wiresock_handshake_ha_s`, `wiresock_handshakes_10min` (enviados/respondidos), `wiresock_sem_resposta`, `wiresock_keepalive_maior_intervalo_s`, `wiresock_ultima_linha_ha_s` e `wiresock_perfil_ipv6` (o perfil ativo tem endereço IPv6?, só sim/não). Nenhum IP, chave ou caminho sai nesses campos.
+
+  **O que isso mostra e o que não mostra:** separa "túnel vivo" de "túnel morto ou perdendo pacotes". Um servidor que fica lento mas continua respondendo keepalive parece saudável nesses dados, e o "success" do keepalive só diz que o envio local funcionou. Não é prova de que o Discord esteja transferindo bem. Linux, plugin e macOS não ganham esses campos (o Linux já lê o handshake pelo `wg`, e os outros têm motor próprio); só o aviso "indisponível" repetido passa a sair no máximo a cada 10 minutos em qualquer plataforma.
+- **Menos ruído no log, para o relatório não ser cortado no meio.** A varredura de pastas do Discord (`scan.inicio`, `scan.raiz`, `scan.candidato`, `scan.install`, `scan.resultado`) e o `running.tasklist` repetiam a mesma foto do disco a cada leitura de status: no relatório #370, 481 das 571 linhas (84%) eram isso, o limite de tamanho cortou o miolo da sessão (a troca de rota) e o aviso de `wg.exe` indisponível aparecia a cada 45 s. Cada linha idêntica agora só é registrada de novo depois de 10 minutos (o que mantém uma varredura recente em todo relatório), e o aviso de estatística indisponível sai no máximo a cada 10 minutos. Se algo muda (um install novo, outro total), a linha nova entra na hora.
+
+## [2.0.12] - 2026-10-18
+
+### Corrigido
+
+- **Instalar o WireSock por cima de uma instalação pela metade não deixa mais a máquina sem internet.** Com um WireSock antigo ou quebrado registrado no Windows (a entrada em Programas e Recursos existe, mas não há `wiresock-client.exe` + `wgbooster.dll` utilizáveis), o setup fixado rodava com `/quiet` e não instalava nada. O sintoma era duplo: o app reclamava "O instalador oficial terminou, mas não deixou um par WireSock SDK compatível" e o Windows ficava sem saída, exatamente o estado que o *Reparo* manual desfez apontando o driver em `C:\Program Files\WireSock Secure Connect\drivers`.
+
+  **Reproduzido e medido na VM Windows 11 (WireSock 3.4.8.1, instalador oficial com SHA-256 fixado):**
+
+  - `/quiet /norestart` sobre a instalação registrada **devolve 0 em 3 s e não escreve um arquivo** — o par continua ausente mesmo 240 s depois. É a origem do erro de popup;
+  - `/repair /quiet /norestart` no mesmo estado **restaura o par em 21 s** (3.4.8.1), ou seja, o *Reparo* manual do relato agora roda sozinho;
+  - `/uninstall /quiet /norestart` seguido de `/quiet /norestart` **reinstala do zero**;
+  - `wiresock-client.exe reset-network-lock` existe e responde 0 ("Network lock has been successfully reset");
+  - o serviço de kernel do filtro nesta versão é **`ndiswgc`**, não `ndiswg` — o nome que o código assumia desde sempre, e por isso a checagem de driver nunca via nada em máquina com o SDK atual;
+  - o setup pode devolver **antes** da transação do Windows Installer: o `msiexec` continuou rodando depois do `/quiet` e o par só apareceu minutos mais tarde.
+
+  O caminho de instalação (`golive-gui/electron/wiresock.ts`) ficou:
+
+  - **classifica a instalação pela metade antes de instalar** (`classifyWireSockInstallState`: pasta do pacote, registro do Windows ou driver carregado sem par compatível) e, nesse estado, **desinstala primeiro** (`/uninstall`, tolerando 1605/1614) antes de instalar;
+  - **espera a instalação assentar** (`waitForCompatibleWireSock`, 90 s) em vez de olhar o par no instante em que o setup devolveu — sem isso a medição acima produzia falso negativo;
+  - se ainda assim não houver par, **repara** (`/repair`), o caminho que o usuário precisou fazer na mão;
+  - **todo setup tem teto** (5 min instalar, 3 min desinstalar) e a árvore de processos é morta no estouro: um instalador interativo não deixa o app preso em "Iniciando túnel…" nem escrevendo no WireSock depois de o app desistir;
+  - **nenhuma falha de instalação sai sem tentar restaurar a rede.** `restoreWireSockNetwork` roda elevada e usa a recuperação oficial do fornecedor (`wiresock-client.exe reset-network-lock`), apaga rota default órfã no adaptador virtual (`0.0.0.0/0` e `::/0` em ProTUN/WireSock) e faz `ipconfig /flushdns`. O script **recusa** quando há `wiresock-client` em execução, para não derrubar o túnel de outro controlador. O popup passa a dizer se a rede voltou — e só afirma isso depois de a sonda confirmar saída.
+
+  **Restaurar internet** também mudou: ele sonda a rede e, sem saída, força a restauração do fornecedor mesmo quando não existe túnel da GUI para parar — antes ele não fazia nada nesse estado. Máquina saudável não paga UAC a mais: uma checagem barata de resíduo (rota default órfã, ou driver sem cliente) decide. Reboot pedido (3010/1641) e cancelamento do usuário continuam saindo limpos, sem tocar na rede.
+
+  **Verificado:** 45 testes em `golive-gui/tests/wiresock-installation.test.ts` (ordem `uninstall` → `install` → `repair` extraída do corpo real de `installOfficialWireSock`, espera de assentamento com prazo, restauração forçada na falha, cancelamento sem mexer na rede, resíduo de rota e `recoverWireSockNetwork`), o guard de ativação, a suíte da GUI (`890` testes) e a execução real na VM Windows 11 do script de recuperação gerado pelo código — que devolveu `{"ok":true,"networkLockReset":true,"dnsFlushed":true,"adapterRoutesCleared":false,"residual":[]}` sem WireSock rodando e `WIRESOCK_RUNNING` (recusa, sem tocar no lock) com um `wiresock-client.exe` vivo.
+
+### Não portado
+
+- **Standalone legado** (`standalone/`): pausado por bloqueio próprio, sem caminho de instalação do WireSock equivalente.
+
+### Plugin Vencord/Equicord: instalar por cima de um WireSock pela metade também sai com a rede restaurada
+
+O plugin tinha o mesmo defeito da GUI (`goLiveBypass/vpn-windows.ts`): instalador concluído sem par compatível, sem remover a instalação anterior e sem restauração. Agora o caminho classifica a instalação pela metade (registro do Windows, pasta do pacote ou driver sem cliente), **desinstala antes de instalar** (`/uninstall /quiet /norestart`), **espera a instalação assentar** antes de desistir, cai no **reparo** (`/repair /quiet /norestart`) se o setup continuar sem instalar, e nenhuma falha sai sem rodar `wiresock-client.exe reset-network-lock` mais rota default órfã e DNS (recusando se houver `wiresock-client` em execução). Todo setup tem teto de 5 min e a árvore de processos é morta no estouro. A mensagem do painel passou a dizer o que aconteceu com a rede. Cancelamento do usuário continua sem tocar na rede.
+
+O **Restaurar rede** do painel não mudou: ali existe uma instância gerenciada em jogo e o plugin segue preservando o lock global que não consegue comprovar como próprio — a regra de dono do plugin continua valendo.
+
+**Verificado:** 16 testes em `golive-gui/tests/plugin-wiresock-install.test.ts` e a suíte completa da GUI. O comportamento dos switches é o medido na VM acima: o plugin reusa a mesma política.
 
 ## [2.0.11] - 2026-10-17
 
