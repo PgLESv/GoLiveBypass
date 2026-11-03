@@ -459,6 +459,111 @@ try {
     . $tempStandalone
 }
 
+Write-Host "`n-- 2.9 Build do mod: pre-requisitos de git e falha diagnosticavel --" -ForegroundColor Yellow
+# Causa real do relato "pnpm build falhou" sem detalhe (VM, 2026-10): o build do mod roda
+# "git rev-parse" em scripts/build/common.mjs e morre com exit 1 quando o Git nao esta no
+# PATH ou o checkout veio de zip (sem .git); o relato anterior so dizia "pnpm build falhou".
+$buildRoot = Join-Path ([System.IO.Path]::GetTempPath()) "GoLiveBypassBuild_$([Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path (Join-Path $buildRoot 'node_modules') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $buildRoot '.git') -Force | Out-Null
+$originalInvokePnpmBuild = ${function:Invoke-Pnpm}
+$originalFindGitApplication = ${function:Find-GitApplication}
+$originalTestGitComandoOk = ${function:Test-GitComandoOk}
+$origLogDirBuild = $env:GLB_INSTALLER_LOG_DIR
+try {
+    $env:GLB_INSTALLER_LOG_DIR = Join-Path $buildRoot 'logs'
+
+    # git e checkout ok, mas o pnpm falha: a mensagem tem que carregar o FIM da saida.
+    function Find-GitApplication { return [pscustomobject]@{ Source = 'git-stub' } }
+    function Test-GitComandoOk([string]$GitSource, [string[]]$GitArgs) { return $true }
+    function Invoke-Pnpm([string[]]$Arguments) {
+        $script:PnpmExitCode = 1
+        1..12 | ForEach-Object { Write-Output ("linha-de-enchimento-$_") }
+        Write-Output 'Error: Command failed: git rev-parse HEAD'
+        Write-Output '[ELIFECYCLE] Command failed with exit code 1.'
+        return
+    }
+    try {
+        Build-Mod $buildRoot
+        Assert-Equal $false $true "Build-Mod com pnpm exit=1 deveria falhar"
+    } catch {
+        $msg = $_.Exception.Message
+        Assert-Equal ($msg -match 'pnpm build falhou') $true "falha do build mantem a mensagem original"
+        Assert-Equal ($msg -match 'exit=1') $true "falha do build informa o codigo de saida"
+        Assert-Equal ($msg -match 'ELIFECYCLE') $true "falha do build traz o fim da saida do pnpm"
+        Assert-Equal ($msg -match 'linha-de-enchimento-1 ') $false "falha do build nao carrega a saida inteira"
+    }
+
+    # Git ausente do PATH: falha antes do build, com o que instalar.
+    Set-Item -Path Function:Find-GitApplication { return $null }
+    try {
+        Build-Mod $buildRoot
+        Assert-Equal $false $true "Build-Mod sem git deveria falhar antes do build"
+    } catch {
+        Assert-Equal ($_.Exception.Message -match 'Instale o Git') $true "sem git a mensagem pede a instalacao dele"
+    }
+
+    # Git presente, checkout sem historico (zip do GitHub): pede git clone.
+    Set-Item -Path Function:Find-GitApplication { return [pscustomobject]@{ Source = 'git-stub' } }
+    $rootSemGit = Join-Path ([System.IO.Path]::GetTempPath()) "GoLiveBypassBuildSemGit_$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $rootSemGit -Force | Out-Null
+    try {
+        Build-Mod $rootSemGit
+        Assert-Equal $false $true "Build-Mod em checkout sem .git deveria falhar"
+    } catch {
+        Assert-Equal ($_.Exception.Message -match 'git clone') $true "checkout sem .git pede git clone"
+    }
+    Remove-Item -LiteralPath $rootSemGit -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Repositorio quebrado: rev-parse falha e o pre-check nao deixa o build comecar.
+    Set-Item -Path Function:Test-GitComandoOk {
+        param([string]$GitSource, [string[]]$GitArgs)
+        return (@($GitArgs) -notcontains 'rev-parse')
+    }
+    try {
+        Build-Mod $buildRoot
+        Assert-Equal $false $true "Build-Mod com repositorio quebrado deveria falhar"
+    } catch {
+        Assert-Equal ($_.Exception.Message -match 'repositorio Git quebrado') $true "repositorio quebrado tem mensagem propria"
+    }
+
+    # Sem remote origin (git init seco): o git-remote-plugin do build precisa dele.
+    Set-Item -Path Function:Test-GitComandoOk {
+        param([string]$GitSource, [string[]]$GitArgs)
+        return (@($GitArgs) -notcontains 'remote')
+    }
+    try {
+        Build-Mod $buildRoot
+        Assert-Equal $false $true "Build-Mod sem remote origin deveria falhar"
+    } catch {
+        Assert-Equal ($_.Exception.Message -match "remote 'origin'") $true "checkout sem remote origin tem mensagem propria"
+    }
+
+    # Caminho feliz: node_modules presente pula o install e roda so o build.
+    Set-Item -Path Function:Test-GitComandoOk { param([string]$GitSource, [string[]]$GitArgs) return $true }
+    $script:mockBuildPnpmArgs = @()
+    Set-Item -Path Function:Invoke-Pnpm {
+        param([string[]]$Arguments)
+        $script:mockBuildPnpmArgs = @($Arguments)
+        $script:PnpmExitCode = 0
+        return
+    }
+    Build-Mod $buildRoot
+    Assert-Equal (($script:mockBuildPnpmArgs -join '|') -eq 'build') $true "node_modules presente pula o install e roda so o build"
+
+    # Detalhe sanitizado: mantem o fim, limita o tamanho e nao vaza credencial.
+    $detalhe = Format-PnpmDetail @('preambulo', 'Authorization: Bearer secret-token', 'https://alice:secret@example.test/x', 'fim-importante')
+    Assert-Equal ($detalhe -match 'fim-importante') $true "detalhe do build mantem o fim da saida"
+    Assert-Equal ($detalhe -notmatch 'secret-token|alice:secret') $true "detalhe do build nao vaza credencial"
+    Assert-Equal ((Format-PnpmDetail @(('x' * 900))).Length -le 600) $true "detalhe do build e limitado"
+} finally {
+    $env:GLB_INSTALLER_LOG_DIR = $origLogDirBuild
+    Set-Item -Path Function:Invoke-Pnpm -Value $originalInvokePnpmBuild
+    Set-Item -Path Function:Find-GitApplication -Value $originalFindGitApplication
+    Set-Item -Path Function:Test-GitComandoOk -Value $originalTestGitComandoOk
+    Remove-Item -LiteralPath $buildRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "`n========================================================" -ForegroundColor Cyan
 Write-Host " 3. Wait-AntesDeFechar / Test-JanelaTransitoria" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan

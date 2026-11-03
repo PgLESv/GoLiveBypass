@@ -4,6 +4,25 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [2.1.12] - 2026-11-03
+
+### Sincronização Upstream (GoLiveBypass 2.0.14 e 2.0.15 Estáveis)
+- **GUI e plugin (Windows):**
+  - Escolha automática deixa de usar rotas grátis do México (anexo que "carrega e some"); opção **Evitar rotas grátis do México** em Configurações, ligada por padrão.
+  - `AllowedApps` só com caminhos do Discord (sem `Update.exe` solto) e sempre escrito dentro de `[Peer]`, preservando o isolamento por aplicativo.
+  - Vigia do túnel registra contadores de fragmentação IP do Windows nos logs locais.
+  - Experimento desligado por padrão para abrir o Discord com `--disable-quic`.
+- **`proton-confgen`:** medição de velocidade não vira `+Inf` no Windows (piso de 1 ms).
+- **Linux:** saída do script decodifica UTF-8 entre leituras do pipe; relaunch do plugin não herda pipe do processo atual.
+- **Logs:** taxa do túnel usa o tempo real entre leituras e repetições são agrupadas pelo conteúdo.
+
+### Adicionado (Fork PgLESv)
+- **Contas Proton pagas (Plus/Unlimited/Family):** a busca automática (ping, teste de velocidade e reservas de rota) mede apenas servidores das Américas (`PAID_AUTO_COUNTRIES`), em vez do mundo todo. País escolhido manualmente continua valendo e a lista de rotas sem medição segue completa. Perfil medido fora das Américas não é reaproveitado. Vale para GUI e plugin.
+
+### Recursos Exclusivos do Fork PgLESv Preservados
+- Bug report remoto continua removido (`bugreport.ts` e seu teste descartados); diagnósticos novos ficam só nos logs locais.
+- Canal beta continua fora da interface; foco no canal estável.
+
 ## [2.1.11] - 2026-10-21
 
 ### Sincronização Upstream (GoLiveBypass 2.0.12 e 2.0.13 Estáveis)
@@ -292,6 +311,58 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - Corrige a troca do executável portable no Windows para relançar com o nome da nova versão, em vez de manter o nome anterior.
 - Adiciona um toast interno na GUI quando uma atualização é baixada e fica pronta para reiniciar.
 
+## [2.0.15] - 2026-11-02
+
+### Adicionado
+
+- **GUI Windows: o relatório de bug e o log mostram se a rota estava fragmentando pacotes.** O anexo que "carrega e some" nas rotas grátis do México (2.0.14) vinha de pacotes que chegam fragmentados em IP por dentro do túnel, e o defeito continua no WireSock: outra rota pode fragmentar também, e os relatos de outras rotas (vídeo que não carrega, imagem que não sobe) não diziam se era o caso. Agora o vigia do túnel lê, a cada 45 s, os contadores de remontagem do próprio Windows (`netstat -s -p ip` e `-p ipv6`, pela posição e não pela legenda, que muda com o idioma) e grava no log, a cada 5 minutos, uma linha `fragmentos.ip` com o total do período e a maior leitura. O relatório ganha `fragmentos_v4_15min`, `fragmentos_serie` (uma contagem por leitura), `fragmentos_v4_desde_tunel` e a idade da última leitura, com o estado em `fragmentos_ip` (`ok`, `sem_amostras` ou `indisponivel`). São só contagens: nada é decidido nem mostrado na tela, e a ativação não espera essa leitura.
+
+  **Medido em 02/11, Windows, WireSock 3.4.8.1, com o envio de imagem funcionando nas três rotas:** durante os envios, o contador subiu 28 e 14 em MX-FREE#10 e ficou parado em MX-FREE#14 e US-FREE#38. Sem nenhum envio, ele subiu cerca de 1000 em algumas horas.
+
+  **Limites:** o contador é da máquina inteira (jogo, outro programa e o próprio tráfego de fora do túnel também contam), então um número alto não prova sozinho que a rota fragmenta; o que ajuda é a série na hora do problema. Ele também não diz se o checksum veio errado, o que exige captura com administrador. Só a GUI Windows muda: plugin, Linux e macOS ficam como estão.
+
+## [2.0.14] - 2026-11-02
+
+### Adicionado
+
+- **Experimento (desligado por padrão): abrir o Discord com `--disable-quic` no Windows.** Para separar uma das hipóteses do envio de arquivo que "carrega e some" (#368, #369, #370, #373), que aparece em rotas do México e some ao trocar de rota enquanto o log do WireSock mostra o túnel saudável. Com `"experimentalDesativarQuic": true` no `settings.json` (`%LOCALAPPDATA%\GoLiveBypass\settings.json`), a GUI passa `--disable-quic` ao Discord em toda abertura (ativação, troca de rota, reinício), forçando HTTP/2 sobre TCP em vez de HTTP/3 sobre UDP. Sem a chave, o Discord abre exatamente como antes. A lista de argumentos é fechada: só esse parâmetro, e só com o valor booleano `true` (nem `"true"`, nem `1`); nenhuma outra chave do `settings.json` vira argumento. O relatório ganha `discord_quic` (`padrao` ou `desativado_experimental`) para saber em qual condição cada relato foi gerado. Não é uma correção: é um teste para quem reproduz o travamento. Só vale onde a GUI abre o Discord pelo executável (Windows).
+
+### Corrigido
+
+- **Windows: imagem e arquivo que "carregam e somem" nas rotas gratuitas do México (#369, #370, #373, #400).** Cerca de 1 min depois de o túnel começar a trafegar, o maior pacote que chega por dentro dele cai de 1400 para 1000 bytes. Em US-FREE#54 a resposta já chega em pacotes de até 1000 bytes. Em MX-FREE#17, o pacote de 1400 chega fragmentado em IP (996 + 424), e o WireSock grava o checksum TCP calculado só sobre o primeiro fragmento. O Windows descarta o pacote remontado, o servidor retransmite sem receber confirmação e a conexão nova não termina o TLS. O texto continua saindo pela conexão já aberta, e o anexo, que precisa de uma conexão nova com o armazenamento do Discord, morre em `ERR_TIMED_OUT` no `OPTIONS` do envio. Agora a escolha automática de rota da GUI e do plugin deixa de usar México no plano gratuito do Windows, e a GUI também ignora reservas MX já salvas. Quem está numa rota automática do México sai dela na próxima medição da GUI ou na próxima ativação do plugin. A exclusão é opcional: **Evitar rotas grátis do México** em Configurações na GUI e nas opções do plugin, ligada por padrão.
+
+  **Medido em 30/10, Windows, conta Proton gratuita:** em todos os 51 pacotes fragmentados capturados no WireSock 3.4.8.1 e nos 53 do 3.8.1.1, o checksum gravado é o do primeiro fragmento e não o do pacote inteiro; os 2345 pacotes inteiros da captura do 3.4.8.1 tinham checksum válido. MX-FREE#17, #3, #7 e #11 degradaram aos 73 s na mesma bateria, enquanto US-FREE#54, CA-FREE#29 e NL-FREE#102 ficaram estáveis por 210 s. No Discord real, com o túnel já degradado, a captura de tela travou e sumiu em MX-FREE#17 e foi enviada em ~2 s em US-FREE#54.
+
+  **Por que não `MTU = 1000`:** ele resolve o anexo, porque o MSS cai para 960 e nada mais fragmenta, mas estraga o Go Live. Na mesma rota US-FREE#54, o vídeo ficou bom sem ele e travado com ele (cerca de 2200 kbit/s contra 150 kbit/s enviados), já que o vídeo usa pacotes de cerca de 1140 a 1340 bytes por dentro do túnel. O WireSock não oferece limitar só o TCP. IPv6 no perfil, keepalive, VPN Accelerator e as reservas de rota não mudaram o resultado, e atualizar para o WireSock 3.8.1.1 também não.
+
+  **Limites:** esta é uma forma de evitar o problema, não a correção do defeito, que está no tratamento de fragmentos do WireSock. Não sei o que faz o limite cair para 1000 bytes. Só o MX-FREE#17 e o US-FREE#54 tiveram os cabeçalhos inspecionados. Quem escolhe México à mão, por rota ou por país, continua nele e segue sujeito ao problema. Rota paga, Linux, macOS e o perfil embutido MX-FREE#16 não foram medidos e não mudam. Go Live em rota do México sem `MTU` não foi testado. O standalone não usa esta seleção.
+
+- **`proton-confgen`: a medição de velocidade não dá mais "infinito" no Windows.** A taxa de download e de upload era `bytes / duração`, e no Windows o relógio monotônico do Go tem resolução grossa: uma transferência rápida media 0 s e virava `+Inf` Mbps, que a seleção descarta como capacidade 0, ou seja, servidor inutilizável. Com servidor real isso é raro, mas acontecia sempre no teste local. As durações agora têm o mesmo piso de 1 ms que a latência já usava. Vale para GUI, plugin e macOS, que usam o mesmo helper.
+
+- **GUI Linux: acentos na saída do script não viram mais `�`.** A GUI lê a saída do script elevado (`--status --json`, `--probe`, ativação) convertendo cada pedaço do pipe para texto separadamente. Uma letra acentuada ocupa 2 bytes e, quando o pipe entregava esses bytes em leituras diferentes, cada metade virava `�`: um caminho como `/home/joão/.config` chegava como `/home/jo��o/.config`. O JSON continua válido, mas o caminho fica errado (ele vai, por exemplo, para o marcador de sessão usado na reversão da injeção), e as mensagens de progresso da ativação apareciam corrompidas. A leitura agora junta os bytes de um caractere entre leituras. A divisão depende de como o sistema entrega o pipe e é mais provável com saída grande ou com a GUI ocupada.
+
+- **Relatório de bug da GUI: um erro repetido não expulsa mais o contexto do log.** O buffer em memória (as 1000 linhas mais recentes, que vão no relatório) deveria juntar repetições seguidas numa linha `(xN)`, mas comparava a linha inteira, que começa pela hora: só juntava o que caía no mesmo segundo. Um erro repetido a cada poucos segundos ocupava uma linha por ocorrência e, em alguns minutos, empurrava para fora tudo o que tinha acontecido antes. A comparação agora ignora a hora, e a linha agrupada mostra a primeira e a última ocorrência: `[12:00:00] [error][net] socks.falha (x120, ate 12:01:59)`. O arquivo `gui.log` continua com todas as linhas.
+
+- **Relatório de bug da GUI: a sessão não aparece mais duas vezes no log anexado.** O relatório junta o buffer em memória com o trecho do `gui.log` anterior a ele, procurando no arquivo a primeira linha do buffer. Quando essa linha estava agrupada, o sufixo `(xN)` não existe no arquivo, a busca falhava e o relatório anexava o arquivo inteiro depois da sessão, repetindo tudo. O sufixo agora é ignorado nessa busca.
+
+- **Log da GUI: a taxa do túnel (`rx_taxa_kbps`/`tx_taxa_kbps`) não sai mais dobrada nem negativa.** O diagnóstico lê os contadores do WireGuard a cada 45 s e dividia a diferença sempre por 45 s. Quando uma leitura falha ou é pulada porque a anterior ainda não terminou (comum no Linux, onde a leitura passa pelo script elevado), a diferença cobre 90 s e a taxa saía dobrada; com o túnel reiniciado no meio, os contadores voltam a zero e a taxa saía negativa. Isso enganava a leitura dos relatos ("o upload dobrou", "o upload caiu"). A taxa agora usa o tempo real entre as duas leituras, e uma leitura com contador menor que o anterior sai sem taxa (os totais continuam no log). Só o diagnóstico muda; o túnel não é afetado.
+
+- **API de relatos: título e descrição com acento não são mais recusados perto do limite.** Os formulários da GUI e do plugin limitam o título a 200 e a descrição a 8192 *caracteres*, mas a API conferia os mesmos números em *bytes*. Cada letra acentuada ocupa 2 bytes e um emoji 4, então um título de 200 caracteres em português tinha de 356 a 400 bytes: o relato passava no formulário e voltava com HTTP 400 ("title deve ter no maximo 200 caracteres"), e a pessoa perdia justamente o relato mais detalhado. A API agora conta caracteres, e tudo o que o formulário aceita a API aceita. O limite de 64 KB do corpo da issue continua em bytes.
+
+- **API de relatos: o log anexado não escapa mais do bloco de código da issue.** O log vai dentro de uma cerca de crases e, para não fechá-la, a API trocava toda sequência de 4 crases por 3. Isso não cobria sequências maiores: uma linha com 5 crases virava 4 e fechava a cerca no meio do log, e o resto (links, imagens, títulos) passava a ser renderizado como Markdown na issue pública; 8 crases viravam 6, com o mesmo efeito. A cerca agora tem uma crase a mais que a maior sequência do log (no mínimo 4) e o log é publicado sem alteração.
+
+- **API de relatos: o campo `meta` ganhou teto, e a issue sempre cabe no limite do GitHub.** A validação limitava título, descrição e log, mas não o `meta`, e a rota aceita até 512 KB por requisição. Para caber nos 64 KB do GitHub o corpo só cortava o log, então um `meta` grande deixava a issue acima do limite: com 100 KB de `meta` o corpo saía com 102 KB, o GitHub recusava e a pessoa recebia "falha ao criar a issue no GitHub" (HTTP 502). Agora o `meta` aceita no máximo 64 campos e 8 KB somando chaves e valores; acima disso a API responde 400 com o motivo. Os clientes atuais mandam de 11 (plugin) a cerca de 35 (GUI) campos curtos, de 1 a 2 KB, e não são afetados.
+
+- **Standalone Linux (caminho legado do Tor): baixar o Tor não desliga mais a limpeza na saída do script.** A função que baixa o Tor registrava a própria limpeza de saída (`trap ... EXIT`) para apagar o download, e isso substituía a limpeza geral do script. A partir do primeiro download do Tor, encerrar o script deixava de apagar o arquivo temporário com a senha do sudo e os auxiliares de askpass, e de desfazer uma ativação que falhasse (namespace parcial, Discord fechado). A limpeza do download agora fica isolada na própria função e a geral continua valendo. A GUI, o plugin e o caminho WireGuard não passam por essa função.
+
+- **GUI Windows: o túnel não pega mais atualizadores de outros programas.** O filtro por aplicativo (`AllowedApps`) recebia, além dos caminhos do Discord, a entrada `Update.exe` sem caminho em toda ativação, e o perfil sem instalação descoberta usava `Discord, Discord.exe, Update.exe`. Para o WireSock, uma entrada sem barra é nome de processo e casa por trecho do nome: `Update.exe` pegava o atualizador Squirrel do Slack, Teams e GitHub Desktop e também `MicrosoftEdgeUpdate.exe` e `GoogleUpdate.exe`, que passavam a sair pela VPN. A entrada solta saiu; o `Update.exe` do Discord continua no túnel pelo caminho completo da instalação. Conferido no WireSock 3.4.8.1 (a versão que a GUI instala), num túnel para um endereço que não responde: com a regra antiga, cópias do `curl` chamadas `Slack\Update.exe` e `MicrosoftEdgeUpdate.exe` ficavam sem rede, ou seja, dentro do túnel; com a nova, só o `Update.exe` no caminho do Discord fica dentro. O plugin já usava só o caminho completo. O standalone PowerShell (pausado) ainda grava a lista fixa com `Update.exe`, porque não conhece o caminho da instalação.
+
+- **GUI Windows: o filtro do túnel não aponta mais para um `Update.exe` fora da pasta do Discord.** O `Update.exe` de cada instalação era calculado como "a pasta acima da pasta do executável". Para `Discord\app-<versão>\Discord.exe` isso dá `Discord\Update.exe`, o atualizador certo, mas para o iniciador de primeiro nível, `%LOCALAPPDATA%\Discord\Discord.exe`, que a descoberta também encontra, o resultado era `%LOCALAPPDATA%\Update.exe`: um caminho que não é do Discord e que qualquer programa sem privilégio poderia criar para entrar no túnel. O cálculo agora só sobe um nível quando a pasta é `app-*`.
+
+- **GUI e plugin no Windows: um `.conf` importado não pode mais pôr o computador inteiro na VPN.** O WireSock só lê a regra `#@ws:AllowedApps` dentro da seção `[Peer]`; em `[Interface]` ela é ignorada e o túnel vale para todos os programas. A GUI e o plugin substituíam no mesmo lugar uma regra que já viesse no arquivo e, sem ela, acrescentavam a regra no fim. Um perfil importado com `AllowedApps` em `[Interface]`, ou com `[Peer]` antes de `[Interface]` (ordem que o WireGuard aceita), terminava com a regra em `[Interface]`: o isolamento por aplicativo sumia sem aviso e todo o tráfego do PC passava a sair pela VPN. Agora qualquer `AllowedApps` do arquivo é descartado e a regra é escrita uma vez, no fim da primeira seção `[Peer]`. Conferido no WireSock 3.4.8.1 com um perfil que começa por `[Peer]`: com a configuração gerada pelo código antigo até um `curl` fora da regra entrou no túnel; com a nova, só o executável listado.
+
+- **Plugin: reiniciar o Discord pelo painel não derruba mais o cliente novo com "A JavaScript error occurred in the main process".** O relançamento Linux (netns via `pkexec` e Flatpak) entregava ao processo novo o `stderr` ligado a um pipe do processo atual. Assim que o atual saía (`app.exit`), o pipe quebrava e o primeiro aviso do Discord novo virava `EPIPE` não tratado — relato #367 (Arch/Hyprland). O `stderr` do relançamento agora vai para um arquivo temporário, lido para o diagnóstico de falha e removido depois da confirmação (o cliente mantém o descritor, já sem nome). A GUI já abria o Discord sem pipe (`startDiscord`); o caminho do plugin ficou igual.
+
 ## [2.0.13] - 2026-10-19
 
 ### Alterado
@@ -371,6 +442,63 @@ A poda da cauda do log lia o arquivo **antes** do append; numa instalação nova
 Em janelas com até 640 px de largura o rótulo do botão tomava espaço do seletor de rota, justamente onde a linha é mais apertada (em 641 px o seletor ficava com 145 px). Abaixo desse ponto o botão vira um quadrado de 32 px só com o ícone — que já gira durante a medição — e `title` e `aria-label` continuam descrevendo a ação. O seletor ganha a largura de volta (191 px em 640 px). Na largura de abertura (720 px) nada muda.
 
 **Verificado:** medição em 9 larguras (360–720 px) sobre a folha de estilo do app e `npm test -- tests/proton-ui.test.ts`.
+
+## [macos-0.8.0] - 2026-10-21
+
+### Adicionado
+
+- **Usar no celular (iPhone e Android).** Um ícone novo no topo abre um painel que gera uma conf WireGuard só para o celular, com a sessão Proton já salva, para o app oficial do **WireGuard** (App Store e Play Store). Não há app próprio no celular. Depois de importada, a conf funciona sem o Mac.
+  - **Uma conf para iPhone e Android:** só os ranges do Discord vão pela VPN (`162.159.0.0/16`, `104.16.0.0/12`), como no Mac. Os ranges IPv6 da Cloudflare entram nos `AllowedIPs` como buraco negro (a conf Free não tem IPv6), para o Discord cair no IPv4 tunelado. Sem `DNS`: o celular mantém o dele.
+  - **Chave própria por geração:** cada geração cria um par de chaves novo e uma conf persistente no Proton (`GoLiveBypass-Celular`), revogável no painel do Proton VPN e válida por 365 dias. Antes de entregar, a chave nova passa pelo `-manual-probe`; se o servidor falhar, o app tenta o próximo por ping, até 3.
+  - **Duas entregas:** **QR code**, gerado localmente com `qrcode-generator` (a primeira dependência de runtime do app), e **Arquivo, sem câmera**, mais seguro: a conf nunca aparece na tela, o `.conf` é salvo com `0600` (destino sugerido em Downloads, que o iCloud não sincroniza), o app recusa pastas sincronizadas pelo iCloud (iCloud Drive, e Mesa/Documentos quando "Mesa e Documentos" está ligado, seguindo symlinks) e lembra de todos os arquivos salvos ao fechar o painel, com opção de apagar. Os passos indicam AirDrop para o iPhone e cabo USB para o Android, e desaconselham e-mail, apps de mensagem e nuvem.
+  - **A chave privada fica só em memória:** o QR some ao fechar o painel, depois de 5 minutos ou em "Pronto, escaneei". Ela nunca vai para o `golive.conf`, o log, as configurações ou a janela como texto. O Mac não muda: `golive.conf`, modo de conexão, servidor e túnel ficam como estavam.
+
+### Corrigido
+
+- **Uma busca Proton por vez.** A troca automática de servidor não respeitava o bloqueio da busca da janela, e as duas podiam gravar o `golive.conf` ao mesmo tempo. Agora busca da janela, troca automática e geração do celular usam o mesmo bloqueio.
+
+### Verificado neste Mac
+
+- Conf do iPhone gerada por QR (`US-FREE#51`, válida até 21/10/2027). O QR foi decodificado pelo leitor de QR do macOS (CoreImage) com os `AllowedIPs` esperados e sem `DNS`. A página não continha `PrivateKey` em nenhum momento, e fechar o painel limpou o QR.
+- Conf gerada por arquivo (`MX-FREE#12`) e salva com `-rw-------` em Downloads. Apagar pelo app removeu o arquivo; fechar o painel com o arquivo salvo mostrou o lembrete.
+- **Android real:** conf importada pelo QR no WireGuard, live no Discord com câmera funcionando.
+- **iPhone real:** testado por outra pessoa com o DMG universal 0.8.0, funcionando.
+- Uma das gerações de teste falhou de verdade no `-manual-probe` (preflight da Cloudflare estourou o prazo), o que levou à nova tentativa com o próximo servidor.
+- `golive.conf` com o mesmo SHA-256 antes e depois, e `protonServer` do Mac inalterado.
+
+### Falta validar com os aparelhos
+
+- Mac e celular conectados ao mesmo tempo no Proton Free.
+- O nome do dispositivo no painel do Proton.
+- A recusa ao iCloud Drive num Mac com iCloud Drive ligado.
+
+### Fora desta versão
+
+- Renovar a conf do celular sem escanear de novo. Exige `serialNumber` no JSON da geração e saída JSON no `-renew-serial` do `proton-confgen`.
+- Listar ou revogar as confs do celular pelo app, e a mesma função na GUI Windows/Linux.
+
+## [macos-0.7.1] - 2026-10-17
+
+Ajustes da revisão da 0.7.0.
+
+### Corrigido
+
+- **Restaurar internet também na desativação automática.** Se o túnel não cai depois de o Discord fechar, o erro vai junto no estado do túnel e o botão aparece com um aviso próprio ("Não deu para desligar o túnel. Use Restaurar internet."), que o IP de saída não sobrescreve, como o texto da 0.7.0 prometia.
+- **Desativação pendente sobrevive a um encerramento abrupto.** Se o app morrer na espera e o túnel ficar de pé, no boot ele retoma a espera (Discord aberto) ou derruba o túnel (Discord fechado), em vez de deixar o túnel órfão com a preferência "inativo".
+- **Mensagens de erro sem "veja o log" escondido.** Com o log desligado por padrão, elas agora mandam ligar o Modo desenvolvedor em Configurações. O Otimizar rota sem velocidades medidas diz "A medição não retornou velocidades válidas de download e upload.", como a GUI.
+- **Checar atualizações** responde "Já está procurando, aguarde…" no clique repetido durante a busca.
+- **Desligar não exige o helper desta versão.** Se o helper instalado não bate com os binários do app (atualização que trocou o helper, bundle alterado), desativar, Restaurar internet e a limpeza do boot tentam antes o `sudo -n helper down` do helper instalado, que usa os binários da pasta root dele. Só se isso falhar o app reinstala o helper e pede a senha. Antes, cancelar essa senha deixava o túnel de pé e o Restaurar internet sem efeito. Ativar continua exigindo o helper desta versão. Mesma regra da 2.0.12: nenhuma falha sai sem tentar restaurar a rede.
+- **Restaurar internet confere a saída.** Depois de limpar o túnel, o app testa se o Discord responde direto e mostra "Internet restaurada." ou, sem resposta, mantém o botão com "o Discord ainda não responde, confira o Wi-Fi".
+- **Pergunta de rota:** uma rota salva vazia (`{}`) não conta mais como rota usada, mesma correção da GUI na 2.0.12.
+
+### Interface
+
+- **Otimizar rota vira só ícone quando a linha da rota é estreita** (como a GUI 2.0.11). Por container query, vale tanto na janela de 420 px quanto na coluna da direita do layout em duas colunas. Medido em 420 px: a seleção passou de 220 para 306 px e mostra servidor e cidade inteiros.
+
+### Testes e docs
+
+- Testes com um `proton-confgen` falso cobrem os modos manual (`-manual-probe`) e speed (`-speed-test`, `-exclude-servers`, sem `-require-discord`) e a exigência de download e upload medidos.
+- `docs/acceptance-macos.md` ganhou os fluxos da 0.7.0: desativação adiada, rotas Proton, troca automática, tema, ícones e abrir ao iniciar a sessão.
 
 ## [macos-0.7.0] - 2026-10-17
 

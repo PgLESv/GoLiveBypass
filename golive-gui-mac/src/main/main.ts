@@ -25,6 +25,8 @@ import { pingThroughTunnel } from './tunnel/traffic';
 import { readSavedAccount, clearSavedAccount } from './proton/account';
 import { checkForUpdate, downloadAndInstall, type UpdateInfo, type PendingUpdate } from './updater';
 import type { AppSettings, UiSettings, ThemeChoice } from '../shared/types';
+import { PhoneConfService } from './phone/service';
+import { isCloudSyncedPath } from './phone/cloud';
 
 const home   = os.homedir();
 const user   = os.userInfo().username;
@@ -92,9 +94,10 @@ function currentUiState(): TunnelUiState {
   return deferredOff.pending ? 'pending' : 'active';
 }
 
-function pushState(state?: TunnelUiState) {
+/** `error` revela o Restaurar internet quando a falha não veio de um clique. */
+function pushState(state?: TunnelUiState, error?: string) {
   const s = state ?? currentUiState();
-  sendToWindow('tunnel:state', { state: s });
+  sendToWindow('tunnel:state', error ? { state: s, error } : { state: s });
   syncMonitors(s);
 }
 
@@ -140,10 +143,17 @@ function syncMonitors(s: TunnelUiState) {
 async function switchRoute(): Promise<void> {
   const account = readSavedAccount(sessionDir(home));
   if (!account) return;
+  // Uma busca Proton por vez: a da janela e a do celular também gravam a sessão
+  if (protonFetching || phone.generating) return;
+  protonFetching = true;
+  try { await switchRouteInner(account.username); } finally { protonFetching = false; }
+}
+
+async function switchRouteInner(username: string): Promise<void> {
   const current = loadSettings().protonServer?.server;
   sendToWindow('log', `A rota ${current ?? 'atual'} parou de responder; procurando outra…`);
   await exclusive(async () => {
-    const r = await runFetch({ username: account.username, mode: 'auto', exclude: current ? [current] : [] });
+    const r = await runFetch({ username, mode: 'auto', exclude: current ? [current] : [] });
     if (!r.ok) { sendToWindow('log', `Troca de rota falhou: ${r.error}${r.detail ? ` — ${r.detail}` : ''}`); return; }
     pushState('activating');
     const opts = await activationOpts();
@@ -168,14 +178,16 @@ const deferredOff = new DeferredDeactivation({
     const r = await exclusive(async () => {
       pushState('deactivating');
       const d = await runDeactivation(await activationOpts());
+      let failure: string | undefined;
       if (d.ok) {
         tunnelActive = false;
         sendToWindow('log', 'Discord fechado: túnel desligado e rede restaurada.');
       } else {
-        sendToWindow('log', `Falha ao desligar o túnel depois de o Discord fechar: ${d.error}${d.detail ? ` — ${d.detail}` : ''}`);
+        failure = `Falha ao desligar o túnel depois de o Discord fechar: ${d.error}${d.detail ? ` — ${d.detail}` : ''}`;
+        sendToWindow('log', failure);
       }
       updateTray();
-      pushState();
+      pushState(undefined, failure);
     });
     // Outra operação no meio: tenta de novo na próxima volta
     if (r && typeof r === 'object' && 'error' in r && r.error === 'busy' && tunnelActive) deferredOff.start();
@@ -223,6 +235,10 @@ async function shutdown(): Promise<void> {
     if (await withDeadline(deactivateBeforeQuit()) === 'timeout') console.error('Limpeza do Sair passou do prazo; encerrando mesmo assim.');
   } finally { app.exit(0); }
 }
+
+/** Qualquer resposta HTTP do Discord prova que os ranges dele voltaram a sair direto. */
+const discordReachable = () =>
+  net.fetch('https://discord.com/api/v9/gateway', { signal: AbortSignal.timeout(8000) }).then(() => true, () => false);
 
 async function waitForNetwork(timeoutMs: number): Promise<void> {
   const until = Date.now() + timeoutMs;
@@ -384,6 +400,36 @@ function runFetch(o: Omit<ProtonFetchOpts, 'binDir' | 'sessDir' | 'confOut'>, on
   });
 }
 
+/** Conf do celular: sessão Proton salva, sem tocar no golive.conf nem no túnel do Mac. */
+const phone = new PhoneConfService({
+  fetch: o => new Promise(resolve => {
+    const f = new ProtonFetcher();
+    f.once('done', resolve);
+    void f.fetch({ ...o, username: readSavedAccount(sessionDir(home))?.username ?? '', binDir, sessDir: sessionDir(home) });
+  }),
+  tmpPath: () => {
+    fs.mkdirSync(appDataDir(home), { recursive: true, mode: 0o700 });
+    return path.join(appDataDir(home), `phone-raw-${process.pid}-${Date.now()}.conf`);
+  },
+  readFile: p => fs.readFileSync(p, 'utf8'),
+  // writeFileSync só aplica o modo ao criar: o chmod cobre um arquivo que já existia
+  writeFile: (p, data, mode) => { fs.writeFileSync(p, data, { mode }); fs.chmodSync(p, mode); },
+  rm: p => fs.rmSync(p, { force: true }),
+  exists: p => fs.existsSync(p),
+  saveMeta: m => saveSettings({ phoneConf: m }),
+  now: () => new Date(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: h => clearTimeout(h as NodeJS.Timeout),
+  isBusy: () => protonFetching,
+  isCloudSynced: p => isCloudSyncedPath(p, {
+    home: os.homedir(),
+    desktopDocumentsSynced: () => fs.existsSync(path.join(os.homedir(), 'Library', 'Mobile Documents', 'com~apple~CloudDocs', 'Desktop')),
+    realDir: d => { try { return fs.realpathSync(d); } catch { return d; } },
+  }),
+});
+
+const phoneEligible = () => (loadSettings().connectionMode ?? 'proton') === 'proton' && !!readSavedAccount(sessionDir(home));
+
 const planFetcher = new ProtonFetcher();
 let planCache: { username: string; plan: ProtonPlan | null; at: number } | null = null;
 
@@ -507,22 +553,24 @@ const handlers = {
       deferredOff.cancel();
       pushState('deactivating');
       const r = await runDeactivation(await activationOpts());
+      let online = false;
       if (r.ok) {
         tunnelActive = false;
         resumeTunnel = false;
         saveSettings({ lastTunnelState: 'inactive' });
-        sendToWindow('log', 'Rede restaurada.');
+        online = await discordReachable();
+        sendToWindow('log', online ? 'Rede restaurada: o Discord responde direto.' : 'Túnel limpo, mas o Discord ainda não responde.');
       } else {
         sendToWindow('log', `Falha ao restaurar a rede: ${r.error}${r.detail ? ` — ${r.detail}` : ''}`);
       }
       updateTray();
       pushState();
-      return r.ok ? { ok: true } : { ok: false, error: r.error, detail: r.detail };
+      return r.ok ? { ok: true, online } : { ok: false, error: r.error, detail: r.detail };
     });
   },
 
   async fetchProton({ username, password, mode, server }: { username: string; password?: string; mode?: FetchMode; server?: string }) {
-    if (protonFetching) return { ok: false, error: 'busy' };
+    if (protonFetching || phone.generating) return { ok: false, error: 'busy' };
     protonFetching = true;
     try {
       const r = await runFetch({ username, password, mode, server }, m => sendToWindow('proton:progress', m));
@@ -531,6 +579,37 @@ const handlers = {
     } finally {
       protonFetching = false;
     }
+  },
+
+  async phoneStatus() {
+    return { eligible: phoneEligible(), meta: loadSettings().phoneConf ?? null, savedPaths: phone.savedPaths().filter(p => fs.existsSync(p)) };
+  },
+
+  async phoneGenerate({ delivery }: { delivery?: 'qr' | 'file' }) {
+    if (!delivery) return { ok: false, error: 'unknown' };
+    if (!phoneEligible()) return { ok: false, error: 'not_eligible' };
+    const r = await phone.generate(delivery);
+    sendToWindow('log', r.ok
+      ? `Conf do celular gerada: ${r.meta.server}`
+      : `Falha ao gerar a conf do celular: ${r.error}`);
+    return r;
+  },
+
+  async phoneSave() {
+    const opts = { defaultPath: path.join(os.homedir(), 'Downloads', 'GoLiveBypass.conf'), filters: [{ name: 'WireGuard', extensions: ['conf'] }] };
+    const pick = mainWindow ? await dialog.showSaveDialog(mainWindow, opts) : await dialog.showSaveDialog(opts);
+    if (pick.canceled || !pick.filePath) return { ok: false, error: 'cancelled' };
+    const r = phone.saveTo(pick.filePath);
+    return r.ok ? { ok: true, path: pick.filePath } : r;
+  },
+
+  async phoneDeleteSaved() {
+    return { ok: phone.deleteSaved() };
+  },
+
+  async phoneClear() {
+    phone.clear();
+    return { ok: true };
   },
 
   async protonRoutes() {
@@ -714,8 +793,30 @@ app.whenReady().then(async () => {
     // Dentro do exclusive: um Ativar no meio receberia 'busy' em vez de ter o túnel novo derrubado
     void exclusive(async () => {
       try {
-        if (deriveStateFromRoute(await readDefaultRoute()) === 'active') return;
-        if (await cleanupStaleV6Rejects(binDir)) sendToWindow('log', 'Rotas IPv6 de uma sessão anterior removidas.');
+        if (deriveStateFromRoute(await readDefaultRoute()) === 'active') {
+          if (lastTunnelState === 'active') return;
+          // Túnel ativo com preferência inativa: o app morreu com a desativação pendente.
+          tunnelActive = true;
+          if (await isDiscordRunning()) {
+            deferredOff.start();
+            sendToWindow('log', 'Desativação pendente retomada: o túnel desliga quando você fechar o Discord.');
+          } else {
+            const d = await runDeactivation(await activationOpts());
+            if (d.ok) {
+              tunnelActive = false;
+              sendToWindow('log', 'Túnel de uma sessão anterior desligado.');
+            } else {
+              const failure = `Falha ao desligar o túnel de uma sessão anterior: ${d.error}${d.detail ? ` — ${d.detail}` : ''}`;
+              sendToWindow('log', failure);
+              updateTray();
+              pushState(undefined, failure);
+              return;
+            }
+          }
+          updateTray();
+          return;
+        }
+        if (await cleanupStaleV6Rejects()) sendToWindow('log', 'Rotas IPv6 de uma sessão anterior removidas.');
       } finally {
         // O renderer que carregou no meio da limpeza recebeu busy=true e não tem
         // como sair: só um tunnel:state devolve o botão Ativar.

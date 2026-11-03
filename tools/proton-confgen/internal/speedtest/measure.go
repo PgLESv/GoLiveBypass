@@ -157,9 +157,10 @@ func measureHTTP(ctx context.Context, client *http.Client, base string, downByte
 	if err != nil {
 		return Measurement{}, err
 	}
-	downSec := max(down, time.Microsecond).Seconds()
-	upSec := max(up, time.Microsecond).Seconds()
-	return Measurement{DownloadMbps: float64(downBytes) * 8 / downSec / 1e6, UploadMbps: float64(upBytes) * 8 / upSec / 1e6, LatencyMs: latencies[1]}, nil
+	// Mesmo piso de 1 ms da latencia: no Windows o relogio monotonico do Go tem resolucao
+	// grossa e uma transferencia rapida media 0, virando +Inf Mbps (capacity() = 0).
+	down, up = max(down, time.Millisecond), max(up, time.Millisecond)
+	return Measurement{DownloadMbps: float64(downBytes) * 8 / down.Seconds() / 1e6, UploadMbps: float64(upBytes) * 8 / up.Seconds() / 1e6, LatencyMs: latencies[1]}, nil
 }
 
 func capacity(m Measurement) float64 {

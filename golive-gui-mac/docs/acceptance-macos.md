@@ -30,3 +30,37 @@
 ### Auto-reconexão
 - [ ] Fechar e reabrir o app com bypass previamente ativo → reconecta automaticamente
 - [ ] Estado correto mostrado na UI após reconexão
+- [ ] Abrir ao iniciar a sessão ligado: depois de um logout real o app sobe só na barra de menu e religa o bypass
+
+### Desativação adiada
+- [ ] Desativar com o Discord aberto deixa o estado pendente; o túnel cai quando o Discord fecha
+- [ ] Ativar durante a espera cancela a desativação sem reiniciar o Discord
+- [ ] Desativar agora derruba na hora
+- [ ] Matar o app durante a espera (`kill -9`) e reabrir: com o Discord aberto a espera volta; com ele fechado o túnel cai no boot
+- [ ] Se o `down` falhar depois de o Discord fechar, aparece Restaurar internet
+
+### Rotas Proton
+- [ ] Entrar e buscar rota mostra o plano e a lista MX/US com ping
+- [ ] Rota manual: escolher um servidor na lista valida com `-manual-probe` e mantém a escolha após reativar
+- [ ] Otimizar rota com o bypass ativo não fecha o Discord e mostra ↓/↑ medidos
+- [ ] Troca automática: com a rota caída, três sondas depois o app troca de servidor sem reiniciar o Discord
+
+### Interface
+- [ ] Reiniciar bypass e Restaurar internet funcionam com o túnel ativo
+- [ ] Card de ping mostra a latência até o Discord pelo túnel
+- [ ] Tema Sistema, Claro e Escuro trocam a janela na hora
+- [ ] Checar atualizações responde mesmo com clique repetido durante a busca
+- [ ] Ícone do Dock e da barra de menu com a rosa; o da barra segue o tema
+
+### Celular (Usar no celular)
+- [ ] Sem conta Proton salva (ou no modo .conf), o painel só mostra "Entre na sua conta Proton…"
+- [ ] iPhone por QR: importar no WireGuard, ligar; no Safari, `https://www.cloudflare.com/cdn-cgi/trace` mostra `loc=MX`/`US`, e um site fora da Cloudflare mostra o IP de sempre
+- [ ] iPhone por AirDrop: o `.conf` abre no WireGuard e funciona igual
+- [x] Android por QR: importado no WireGuard, live no Discord com câmera (2026-10-21)
+- [ ] Android por cabo: o `.conf` importa por "Importar de arquivo"; no Chrome o trace mostra `loc=MX`/`US`
+- [x] Go Live funciona no Discord do iPhone e do Android (2026-10-21)
+- [ ] Mac e celular ligados ao mesmo tempo no Proton Free: os dois passam tráfego (senão, avisar "um aparelho por vez")
+- [ ] `GoLiveBypass-Celular` aparece nas configurações WireGuard do painel do Proton
+- [ ] Fechar o painel, "Pronto, escaneei" ou esperar 5 min tira o QR da tela
+- [ ] Salvar numa pasta do iCloud Drive é recusado; o arquivo salvo tem `-rw-------`
+- [ ] `golive.conf` e o túnel do Mac não mudam ao gerar

@@ -119,6 +119,30 @@ export interface ConfgenResult {
     json?: Record<string, unknown>;
 }
 
+// Contas pagas liberam o mundo todo, mas a partir do Brasil só as Américas dão latência útil:
+// a busca automática mede apenas elas. País escolhido prevalece. Mesma lista da GUI (proton.ts).
+export const PAID_AUTO_COUNTRIES = "US,CA,MX,AR,CL,CO,PE,CR,EC,PA,PR,UY,VE,BO,PY,GT,HN,SV,NI,DO,JM,BS,BZ,TT";
+
+export function automaticCountries(options: { country?: string; freeOnly?: boolean; }): string {
+    const explicit = options.country?.trim() ?? "";
+    return explicit || options.freeOnly !== false ? explicit : PAID_AUTO_COUNTRIES;
+}
+
+// Países fora da escolha automática. Cerca de 1 min depois de ligado, o túnel passa a limitar o
+// pacote interno a 1000 B. Nas rotas gratuitas do México isso chega como IP fragmentado, e o
+// WireSock grava o checksum TCP calculado só sobre o primeiro fragmento: o Windows descarta o
+// pacote e o anexo "carrega e some" (#373, #400). A preferência protonAvoidFreeMexico desliga a
+// exclusão. Só o que foi medido: rota paga e Linux ficam como estão, e pedir México explicitamente
+// continua valendo.
+export function automaticExcludedCountries(
+    options: { country?: string; freeOnly?: boolean; avoidFreeMexico?: boolean; },
+    platform: NodeJS.Platform = process.platform,
+): string {
+    if (platform !== "win32" || options.freeOnly === false || options.avoidFreeMexico === false) return "BR";
+    const requested = (options.country ?? "").split(",").map(item => item.trim().toUpperCase());
+    return requested.includes("MX") ? "BR" : "BR,MX";
+}
+
 export const MEASUREMENT_CRITERION_VERSION = 6;
 const MAX_STDOUT_BYTES = 512 * 1024;
 const MAX_STDERR_BYTES = 512 * 1024;
@@ -1338,6 +1362,7 @@ export async function generateOptimalProtonConfig(
         country?: string;
         freeOnly?: boolean;
         autoPing?: boolean;
+        avoidFreeMexico?: boolean;
         speedTest?: boolean;
         signal?: AbortSignal;
         onProgress?: (progress: ProtonOptimizationProgress) => void;
@@ -1362,14 +1387,15 @@ export async function generateOptimalProtonConfig(
     const runGeneration = async (sessionFileToUse: string, commitIfUpdated?: () => void): Promise<ProtonOptimizationResult> => {
         const output = path.join(dataDir, "wireguard.conf");
         const staging = path.join(dataDir, `.wireguard.conf.${randomUUID()}.tmp`);
-        const args = ["-username", requestedUsername, "-session-file", sessionFileToUse, "-output", staging, "-json", "-ipv6", "-exclude-countries", "BR"];
+        const args = ["-username", requestedUsername, "-session-file", sessionFileToUse, "-output", staging, "-json", "-ipv6", "-exclude-countries", automaticExcludedCountries(options)];
         if (options.autoPing !== false) args.push("-auto-ping");
         if (options.speedTest) {
             // A prova HTTPS do Discord é diagnóstica: não pode reprovar uma rota que já formou o túnel e mediu tráfego.
             args.push("-speed-test", "-progress-json");
         }
         if (options.freeOnly !== false) args.push("-free-only");
-        if (options.country?.trim()) args.push("-countries", options.country.trim());
+        const countries = automaticCountries(options);
+        if (countries) args.push("-countries", countries);
 
         try {
             // Os eventos "preparing" da verificação rápida nomeiam cada finalista
@@ -1601,7 +1627,8 @@ export async function generateProtonRouteCatalog(
         const args = ["-username", requestedUsername, "-session-file", sessionFileToUse, "-route-catalog", "-json", "-exclude-countries", "BR"];
         if (options.autoPing !== false) args.push("-auto-ping");
         if (options.onProgress) args.push("-progress-json");
-        if (options.country?.trim()) args.push("-countries", options.country.trim());
+        const countries = options.autoPing !== false ? automaticCountries(options) : options.country?.trim();
+        if (countries) args.push("-countries", countries);
         if (options.freeOnly !== false) args.push("-free-only");
         try {
             const result = await runConfgen({ args, timeoutMs: 60_000, signal: options.signal, runtimeDirectory: dataDir, onProgress: options.onProgress, log: options.log });

@@ -1659,21 +1659,76 @@ function Install-PluginSource($root) {
     Write-Step "Instalando o plugin da release $($release.Version) (canal $script:SelectedChannel)"
     Invoke-UpdateFromZip $root $release.AssetUrl $release.Version $release.ShaUrl
 }
+# O script de build do Vencord/Equicord depende do Git por dentro: "git rev-parse HEAD"
+# (common.mjs) e "git remote get-url origin" (git-remote-plugin do UserAgent) rodam no
+# meio do build e o Node explode com um stack criptico quando o Git nao esta no PATH, o
+# checkout nao tem historico, o repositorio esta quebrado ou veio de zip do GitHub (que
+# nao traz nada disso). Rodar os dois comandos aqui custa milissegundos e troca um muro
+# de stack trace por uma frase do que fazer.
+function Find-GitApplication {
+    return (Get-Command 'git' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
+# Costura do teste: roda um comando git sem deixar o stderr dele virar erro terminativo
+# (o mesmo caso do Invoke-Pnpm) e devolve se o codigo de saida foi zero.
+function Test-GitComandoOk([string]$GitSource, [string[]]$GitArgs) {
+    $anterior = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $GitSource @GitArgs 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $anterior
+    }
+}
+
+function Assert-CheckoutBuildPreReqs($root) {
+    $git = Find-GitApplication
+    if (-not $git) {
+        throw "Para compilar o mod, o Git precisa estar instalado e no PATH: o build dele roda 'git rev-parse' e 'git remote get-url origin'. Instale o Git (https://git-scm.com/download/win), abra uma janela nova do instalador e tente de novo."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $root '.git'))) {
+        throw "O checkout do mod em $root nao tem historico do Git (.git ausente) e o build dele roda 'git rev-parse' e 'git remote get-url origin', que falham sem isso. Baixe o checkout com 'git clone' (ou pelo GitHub Desktop) e selecione essa pasta."
+    }
+    if (-not (Test-GitComandoOk $git.Source @('-C', $root, 'rev-parse', 'HEAD'))) {
+        throw "O checkout do mod em $root e um repositorio Git quebrado ('git rev-parse HEAD' falhou). Faca um 'git clone' novo e selecione essa pasta."
+    }
+    if (-not (Test-GitComandoOk $git.Source @('-C', $root, 'remote', 'get-url', 'origin'))) {
+        throw "O checkout do mod em $root nao tem o remote 'origin' ('git remote get-url origin' falhou) e o build dele precisa dele. Faca um 'git clone' novo e selecione essa pasta."
+    }
+}
+
+# O build/install falha por motivo do proprio checkout (git ausente, entrypoint quebrado
+# do pnpm, erro do esbuild) e o relato dizia apenas "pnpm build falhou", sem nenhuma linha
+# do erro real. Manda junto o fim da saida do pnpm, sanitizado como o detalhe da injecao.
+function Format-PnpmDetail($saida) {
+    $ansi = [char]27 + '\[[0-9;]*[A-Za-z]'
+    $linhas = @(@($saida) |
+        ForEach-Object { ([string]$_) -replace $ansi, '' } |
+        Where-Object { ($_ -replace '\s+', ' ').Trim() } |
+        Select-Object -Last 10)
+    $text = ($linhas -join ' | ') -replace '\s+', ' '
+    return ConvertTo-InstallerSafeText $text.Trim() 600
+}
+
 function Build-Mod($root) {
     if (-not $root) { throw 'Caminho do checkout invalido para compilar o mod.' }
     $script:InstallerPhase = 'build'
     Write-InstallerEvent 'info' 'installer.build' 'build' @{ mod_kind = (Get-CheckoutMod $root) }
+    Assert-CheckoutBuildPreReqs $root
     Push-Location -LiteralPath $root
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $root 'node_modules'))) {
             Write-Step 'Instalando dependencias (na primeira vez demora alguns minutos)'
-            Invoke-Pnpm @('install') | Out-Host
-            if ($script:PnpmExitCode -ne 0) { throw 'pnpm install falhou' }
+            $saidaInstall = @()
+            Invoke-Pnpm @('install') | Tee-Object -Variable saidaInstall | Out-Host
+            if ($script:PnpmExitCode -ne 0) { throw "pnpm install falhou (exit=$($script:PnpmExitCode)): $(Format-PnpmDetail $saidaInstall)" }
         }
 
         Write-Step 'Compilando'
-        Invoke-Pnpm @('build') | Out-Host
-        if ($script:PnpmExitCode -ne 0) { throw 'pnpm build falhou' }
+        $saidaBuild = @()
+        Invoke-Pnpm @('build') | Tee-Object -Variable saidaBuild | Out-Host
+        if ($script:PnpmExitCode -ne 0) { throw "pnpm build falhou (exit=$($script:PnpmExitCode)): $(Format-PnpmDetail $saidaBuild)" }
     } finally {
         Pop-Location
     }
@@ -1685,8 +1740,9 @@ function Remove-PluginSource($root) {
     Remove-CaminhoSilencioso $target
     Push-Location -LiteralPath $root
     try {
-        Invoke-Pnpm @('build') | Out-Host
-        if ($script:PnpmExitCode -ne 0) { Write-Warn 'Nao consegui recompilar o mod sem o GoLiveBypass.' }
+        $saidaBuild = @()
+        Invoke-Pnpm @('build') | Tee-Object -Variable saidaBuild | Out-Host
+        if ($script:PnpmExitCode -ne 0) { Write-Warn "Nao consegui recompilar o mod sem o GoLiveBypass (exit=$($script:PnpmExitCode)): $(Format-PnpmDetail $saidaBuild)" }
     } finally {
         Pop-Location
     }

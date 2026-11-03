@@ -8,7 +8,7 @@ import * as logger from './logger';
 import { randomUUID } from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import type { RouteProbeResult } from './route-proof';
-import type { ProtonRouteMetadata } from './route-failover';
+import { automaticExcludedCountries, type ProtonRouteMetadata } from './route-failover';
 import {
   ensureProtonConfgen as ensureProtonConfgenRuntime,
   findProtonConfgenPath,
@@ -767,6 +767,15 @@ function structuredProtonError(code: string): { message: string; retryable: bool
   }
 }
 
+// Contas pagas (Plus/Unlimited/Family) liberam o mundo todo, mas a partir do Brasil
+// só as Américas dão latência útil: a busca automática mede apenas elas. País escolhido prevalece.
+export const PAID_AUTO_COUNTRIES = 'US,CA,MX,AR,CL,CO,PE,CR,EC,PA,PR,UY,VE,BO,PY,GT,HN,SV,NI,DO,JM,BS,BZ,TT';
+
+export function automaticCountries(options: { countries?: string; freeOnly?: boolean }): string {
+  const explicit = options.countries?.trim() ?? '';
+  return explicit || options.freeOnly !== false ? explicit : PAID_AUTO_COUNTRIES;
+}
+
 export async function generateOptimalProtonConfig(
   installDir: string,
   options: {
@@ -774,6 +783,7 @@ export async function generateOptimalProtonConfig(
     countries?: string;
     freeOnly?: boolean;
     autoPing?: boolean;
+    avoidFreeMexico?: boolean;
     speedTest?: boolean;
     signal?: AbortSignal;
     onProgress?: (progress: ProtonOptimizationProgress) => void;
@@ -816,7 +826,7 @@ export async function generateOptimalProtonConfig(
     '-json',
     '-ipv6',
     '-exclude-countries',
-    'BR',
+    automaticExcludedCountries(options),
   ];
 
   if (options.autoPing !== false) {
@@ -829,9 +839,8 @@ export async function generateOptimalProtonConfig(
     args.push('-free-only');
   }
 
-  if (options.countries && options.countries.trim()) {
-    args.push('-countries', options.countries.trim());
-  }
+  const countries = automaticCountries(options);
+  if (countries) args.push('-countries', countries);
 
   logger.info('proton', 'gerando configuração ótima WireGuard ProtonVPN', {
     country: options.countries || 'AUTO',
@@ -1125,7 +1134,8 @@ export async function generateProtonRouteCatalog(
   ];
   if (options.measurePing) args.push('-auto-ping');
   if (options.onProgress) args.push('-progress-json');
-  if (options.countries && options.countries.trim()) args.push('-countries', options.countries.trim());
+  const countries = options.measurePing ? automaticCountries(options) : options.countries?.trim();
+  if (countries) args.push('-countries', countries);
   if (options.freeOnly !== false) args.push('-free-only');
   const excluded = (options.excludeServers ?? []).map((item) => item.trim()).filter(Boolean);
   if (excluded.length > 0) args.push('-exclude-servers', excluded.join(','));
@@ -1194,6 +1204,7 @@ export async function generateProtonRoutePool(
     countries?: string;
     freeOnly?: boolean;
     autoPing?: boolean;
+    avoidFreeMexico?: boolean;
     size: number;
     excludeServers?: string[];
     signal?: AbortSignal;
@@ -1219,11 +1230,12 @@ export async function generateProtonRoutePool(
     '-no-save',
     '-json',
     '-ipv6',
-    '-exclude-countries', 'BR',
+    '-exclude-countries', automaticExcludedCountries(options),
     '-auto-ping',
   ];
   if (options.onProgress) args.push('-progress-json');
-  if (options.countries && options.countries.trim()) args.push('-countries', options.countries.trim());
+  const countries = automaticCountries(options);
+  if (countries) args.push('-countries', countries);
   if (options.freeOnly !== false) args.push('-free-only');
   const excluded = (options.excludeServers ?? []).map((item) => item.trim()).filter(Boolean);
   if (excluded.length > 0) args.push('-exclude-servers', excluded.join(','));
@@ -1299,9 +1311,12 @@ function finitePositive(value: unknown): value is number {
 export function canReuseMeasuredProfile(
   installDir: string,
   previous: any,
-  filter: { username: string; country?: string; freeOnly?: boolean; autoPing?: boolean },
+  filter: { username: string; country?: string; freeOnly?: boolean; autoPing?: boolean; avoidFreeMexico?: boolean },
 ): boolean {
   if (!previous || previous.measurementVersion !== MEASUREMENT_CRITERION_VERSION) return false;
+  // Um perfil medido antes da exclusão não pode manter o usuário numa rota que ela tiraria.
+  if (automaticExcludedCountries({ countries: filter.country, freeOnly: filter.freeOnly, avoidFreeMexico: filter.avoidFreeMexico }).split(',').includes(String(previous.country ?? ''))) return false;
+  if (!filter.country && filter.freeOnly === false && !PAID_AUTO_COUNTRIES.split(',').includes(String(previous.country ?? '').toUpperCase())) return false;
   if (!protonIdentityMatches(String(previous.measurementUsername || ''), filter.username)) return false;
   if (String(previous.measurementCountry || '') !== String(filter.country || '')) return false;
   if (previous.measurementFreeOnly !== (filter.freeOnly !== false) || previous.measurementAutoPing !== (filter.autoPing !== false)) return false;

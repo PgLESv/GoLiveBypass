@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld('golive', {
   deactivate:     (now = false) => ipcRenderer.invoke('golive', 'tunnel:deactivate', { now }),
   restart:        () => ipcRenderer.invoke('golive', 'tunnel:restart'),
   restoreNetwork: () => ipcRenderer.invoke('golive', 'tunnel:restoreNetwork'),
+  phoneStatus: () => ipcRenderer.invoke('golive', 'phone:status'),
+  phoneGenerate: (delivery: 'qr' | 'file') => ipcRenderer.invoke('golive', 'phone:generate', { delivery }),
+  phoneSave: () => ipcRenderer.invoke('golive', 'phone:save'),
+  phoneDeleteSaved: () => ipcRenderer.invoke('golive', 'phone:deleteSaved'),
+  phoneClear: () => ipcRenderer.invoke('golive', 'phone:clear'),
   status:         () => ipcRenderer.invoke('golive', 'tunnel:status'),
   fetchProton:    (username: string, password?: string, mode?: string, server?: string) =>
                     ipcRenderer.invoke('golive', 'proton:fetch', { username, password, mode, server }),
@@ -27,7 +32,7 @@ contextBridge.exposeInMainWorld('golive', {
   setSettings:    (patch: Record<string, unknown>) => ipcRenderer.invoke('golive', 'settings:set', patch),
 
   onVencordPermission: (cb: (p: { granted: boolean }) => void) => ipcRenderer.on('vencord:permission', (_e, p) => cb(p)),
-  onTunnelState: (cb: (p: { state: string }) => void) => ipcRenderer.on('tunnel:state', (_e, p) => cb(p)),
+  onTunnelState: (cb: (p: { state: string; error?: string }) => void) => ipcRenderer.on('tunnel:state', (_e, p) => cb(p)),
   onTraffic:     (cb: (p: { pingMs: number | null }) => void) => ipcRenderer.on('tunnel:traffic', (_e, p) => cb(p)),
   onRoute:       (cb: (r: unknown) => void) => ipcRenderer.on('proton:route', (_e, r) => cb(r)),
   onLog:             (cb: (m: string) => void) => ipcRenderer.on('log', (_e, m) => cb(m)),
