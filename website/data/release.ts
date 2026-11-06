@@ -44,8 +44,8 @@ export interface ReleaseCatalog {
 
 const owner = 'PgLESv'
 const repo = 'GoLiveBypass'
-const fallbackTag = 'v2.1.12'
-const fallbackVersion = '2.1.12'
+const fallbackTag = 'v2.1.13'
+const fallbackVersion = '2.1.13'
 // O cliente macOS é outra aplicação, com release própria (macos-vX.Y.Z) e
 // make_latest=false: ele não aparece na estável da GUI. O fallback do site
 // precisa apontar para essa tag, senão oferece um arquivo que não existe.

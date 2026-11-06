@@ -843,7 +843,7 @@ if (!gotLock) {
     // movido = boot falha em silencio com o checkbox marcado. Reescrever a cada
     // abertura cura (reg add idempotente). (issue: "nao abre mesmo ativando")
     syncStartupEntry();
-    // No boot oculto do Windows, restaura somente a intenção persistida do
+    // Na abertura no Windows (oculta ou não), restaura somente a intenção persistida do
     // usuário. A otimização Proton acontece antes da ativação WireSock; o
     // Discord não é iniciado até a ativação terminar.
     void restoreBypassFromWindowsStartup();
@@ -3496,8 +3496,11 @@ function cancelStartupBypassRestore(): void {
 }
 
 function restoreBypassFromWindowsStartup(): Promise<void> {
-  if (!IS_WINDOWS || !launchedHidden() || !readBypassEnabled()) return Promise.resolve();
+  // Sem exigir --hidden: o relançamento do updater e o "reiniciar apps" do Windows abrem o app
+  // com janela no login, e aí a GUI só media a rota sem ativar. A preferência persistida decide.
+  if (!IS_WINDOWS || !readBypassEnabled()) return Promise.resolve();
   if (startupRestorePromise) return startupRestorePromise;
+  logger.info("bypass", "restauração automática iniciada", { oculto: launchedHidden() });
 
   const controller = new AbortController();
   startupRestoreController = controller;

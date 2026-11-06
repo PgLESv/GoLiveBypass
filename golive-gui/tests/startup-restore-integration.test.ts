@@ -5,9 +5,10 @@ import path from "node:path";
 const mainSource = () => fs.readFileSync(path.resolve(process.cwd(), "electron/main.ts"), "utf8");
 
 describe("integração da restauração automática do bypass", () => {
-  it("só agenda restauração automática no Windows e com --hidden", () => {
+  it("agenda restauração automática no Windows pela preferência, com ou sem --hidden", () => {
     const src = mainSource();
-    expect(src).toMatch(/if \(!IS_WINDOWS \|\| !launchedHidden\(\) \|\| !readBypassEnabled\(\)\)/);
+    // Relançamento do updater e "reiniciar apps" do Windows abrem sem --hidden no login.
+    expect(src).toMatch(/if \(!IS_WINDOWS \|\| !readBypassEnabled\(\)\) return Promise\.resolve\(\);/);
     expect(src).toContain("void restoreBypassFromWindowsStartup()");
   });
 
