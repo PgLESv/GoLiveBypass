@@ -331,6 +331,174 @@ segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - Corrige a troca do executável portable no Windows para relançar com o nome da nova versão, em vez de manter o nome anterior.
 - Adiciona um toast interno na GUI quando uma atualização é baixada e fica pronta para reiniciar.
 
+## [Unreleased upstream]
+
+### Adicionado
+
+- **Alerta quando a Proton deixar de aceitar a versão de um helper distribuído.** Em 19/11, a Proton passou a recusar a versão que o `proton-confgen` anunciava (código 5003), e todo login quebrou até sair uma release. O projeto só soube pelos relatos (#437 a #442).
+  - O novo workflow `proton-app-version.yml` pergunta à API, a cada 6 horas e sem login, se ainda é aceita a versão que cada helper manda. Ele confere três helpers:
+    - o da `main`;
+    - o da última release estável (Windows e Linux), em `x86-64` e `aarch64`;
+    - o da última release macOS, a maior `macos-vX.Y.Z` estável, a mesma que o updater do macOS escolhe. Ela sai com `make_latest=false`, então a checagem a procura na lista de releases. Quando o `api.go` da tag é de antes do `ClientVersion`, a checagem confere o par literal (`x-pm-appversion` e `User-Agent`) que aquele helper manda.
+  - A checagem manda os mesmos cabeçalhos explícitos do helper (`internal/api/transport.go`).
+  - Quando a Proton responde 5001, 5003 ou 5005, o workflow abre uma issue `[alerta] Proton recusa a versão do helper`, com a label `bug` e atribuída ao mantenedor. A issue traz a resposta da API para cada helper, a versão atual do cliente oficial e o passo a passo da correção.
+  - Fica uma issue só para o alerta:
+    - se o que a Proton recusa mudar, a checagem comenta na issue aberta e atualiza o título. Um run parcial (release fora, resposta inconclusiva ou erro) só soma recusas novas, sem tirar nenhuma;
+    - quando um run completo vê tudo aceito, a checagem troca o prefixo da issue para `[resolvido]` e a fecha;
+    - fechar à mão silencia o alerta: enquanto o que a Proton recusa couber no que foi fechado, a checagem não abre outra issue a cada 6 horas. Uma recusa diferente abre issue nova.
+  - O run fica vermelho quando o alerta muda (issue aberta ou atualizada) ou quando a própria checagem falha. Enquanto nada muda, a recusa fica como aviso no run, sem um e-mail de falha a cada 6 horas.
+  - Rede fora, 5xx ou qualquer outro código só viram aviso, sem issue.
+  - 5002, 2064 ou uma saída inesperada do script indicam erro da própria checagem: o run fica vermelho, sem issue. Uma recusa encontrada no mesmo run ainda abre a sua.
+  - O workflow só roda em `bezumiya/GoLiveBypass`.
+  - A mesma checagem roda à mão com `node scripts/check-proton-app-version.mjs`. Com `PROTON_CLIENT_VERSION=X.Y.Z`, testa outra versão.
+
+  **Verificado:**
+  - os 61 testes do script passam;
+  - contra a API real, a 6.1.2 da `main` e da `v2.0.18` foi aceita nas duas arquiteturas, o par da `macos-v0.8.0` (`linux-vpn@4.17.2`) recebeu 5003 e a rede fora deu inconclusivo;
+  - os passos do workflow rodaram localmente com `bash --noprofile --norc -eo pipefail`, o shell declarado no workflow. O `gh` real foi usado só para leitura (releases, `api.go` das tags, a escolha da release macOS e os filtros `--jq` contra issues fechadas) e um `gh` falso para escrever. Cenários:
+    - abrir, atualizar (também em run parcial), silenciar e fechar a issue;
+    - a label falhando sem tirar o responsável;
+    - script quebrado sem alarme falso;
+    - recusa junto com erro da checagem;
+    - API do GitHub fora.
+
+  **Não verificado:** um run de verdade no Actions, que só roda depois do merge, na branch padrão. Os `if:` dos passos e o que a Proton responde aos IPs dos runners também só se veem nesse primeiro run.
+
+## [2.0.18] - 2026-11-20
+
+### Alterado
+
+- **Relato de bug com log enxuto e um resumo no topo que nunca é cortado (GUI Windows/Linux e plugin).** Numa revisão das 327 issues de produção, o log chegava no teto (mediana de 64,5 KB para ~65 KB) e 127 dos 216 relatos com log vieram cortados. Na mediana, 57% dos bytes eram eventos repetitivos. A ativação saía do relato e cada issue virava pergunta (#431: duas buscas de rota encheram o ring do plugin e só sobrou progresso).
+  - **Menos ruído:**
+    - O plugin registra a busca de rota pela troca de fase e um resumo no fim, com contagem e servidores testados e o resultado de cada um, em vez de uma linha por servidor (`helper.progress_sampled` vira `helper.phase`). A tela continua recebendo todo o progresso.
+    - A GUI grava uma linha por chamada do `proton-confgen`, sem o par start/complete e sem a cauda do stderr quando dá certo. No plugin, o servidor escolhido e a medição dele (ping, download, upload) passam para o `helper.completed`, já que antes só existiam nas amostras de progresso.
+    - A varredura do Discord registra só as pastas que existem, mais uma linha `scan.raizes testadas=N achadas=M`.
+    - As linhas `script.*` do `--status` do Linux só entram de novo quando mudam (falha sempre entra).
+    - Na saúde do túnel, o aviso igual ao anterior e a leitura `wg stats` saudável entram no máximo a cada 5 minutos, e a volta ao normal entra na hora. No Linux, o `tunel.diagnostico` (a cada 15 s) entra na primeira falha, na troca de motivo e depois a cada ~5 min com a contagem, mais uma linha quando volta ao normal.
+    - Os IDs de operação da GUI passam de 36 para 8 caracteres.
+    - Nos relatos reais da 2.0.15 em diante, essas regras reduzem o log em cerca de 41%, já contando a data mais longa.
+  - **Estrutura:**
+    - As linhas do relato, na GUI e no plugin, passam a trazer data e hora locais no formato `[dd/mm/aaaa - hh:mm:ss]`, porque o relato junta sessões de dias diferentes. No plugin isso substitui o mês/dia em UTC com `Z`, para bater com o horário que a pessoa vê; o `plugin-vpn.log` continua com o horário ISO em UTC.
+    - O fim de cada operação serializada traz o resultado (`ok`, `erro` ou `cancelado`, inclusive quando a falha vem no valor devolvido, como `{ success: false }`) e a duração.
+    - Os logs do proxy legado só entram no relato da GUI se foram escritos nas últimas 24 h (estado misto, como no #277).
+  - **Resumo `=== resumo ===` no topo do log:**
+    - o que mostra: as últimas operações com resultado e duração, a ativação e o relaunch, o servidor escolhido, o último aviso ou erro de cada tipo e o horário do envio;
+    - o erro que a tela mostrou: na GUI, a falha devolvida à janela nas ações do usuário vira `ui erro.exibido` (a mesma falha repetida aparece uma vez, com a contagem); no plugin, ele já vem no `operation.*.failed`;
+    - operações de bastidor que dão certo (`aguardar-selecao-login`, `modo-vpn`, `preferencias-proton`) ficam fora da lista, porque nos relatos reais ocupavam quase todas as linhas;
+    - de onde sai: na GUI, de uma cauda maior do `gui.log`; no plugin, de uma fila própria de marcos que o ruído não consegue esvaziar.
+  - **Lacunas:**
+    - O cliente macOS não tem log nem relato, então não recebe nada disto por enquanto.
+    - O standalone segue pausado e não muda.
+    - As informações novas (handshake no Linux, erro do Discord no namespace, agente polkit, outras VPNs, versão desatualizada, sintoma obrigatório) ficam para a próxima etapa.
+
+### Corrigido
+
+- **O resumo do relato não perde mais a ativação quando a sessão acumula avisos (plugin).** A fila de marcos era única: numa sessão com muitos `route.probe.failed`, os avisos de rotina empurravam a ativação, o relaunch e as operações para fora do `=== resumo ===`, que é justamente o bloco que deveria preservá-los. Agora a fila de estado (operações, ativação, relaunch, aberturas, servidor escolhido) é separada da fila de avisos.
+- **Túnel Linux oscilando não repete aviso e recuperação a cada 15 s.** A leitura saudável zerava o motivo e o instante do `tunel.diagnostico`; com o túnel alternando falha/sucesso, cada falha voltava a parecer nova e o relato gravava o par aviso + `tunel.diagnostico.normal` em toda rodada. O limite agora conta do último aviso registrado e a recuperação só entra se um aviso entrou.
+- **Cancelamento não vira `ui erro.exibido` e o código numérico não se perde (GUI).** `{ success: false, cancelled: true, error }` era registrado como falha que a pessoa viu; agora é ignorado. A mensagem devolvida pelo handler também passa pela redação de valor (`token=`, `senha=` etc.) antes de ir para o `gui.log` e para o resumo.
+- **A seção "plugin-vpn.log (antes do ring)" volta a existir.** O arquivo é JSONL e o relato comparava a cauda com o texto do ring; a primeira linha nunca era encontrada e a cauda era descartada. A cauda agora é convertida para o mesmo formato do ring.
+
+## [2.0.17] - 2026-11-19
+
+### Corrigido
+
+- **Login da Proton recusado com o código 5003 em todas as versões (#437, #438, #439, #440, #441, #442).** Desde 19/11, a Proton recusa a identificação que o `proton-confgen` manda (`x-pm-appversion: linux-vpn@4.17.2`). A resposta é HTTP 422 com o código 5003, "This version of the app is no longer supported", logo no primeiro passo do login, antes de olhar a senha. Isso afetava a GUI no Windows e no Linux, o plugin e o macOS, na 2.0.16 e na 2.0.17-beta-4. Quem tinha sessão salva também a perdia: com o 5003, a renovação é tratada como sessão recusada e o helper apaga a sessão.
+
+  Agora o helper se identifica como o cliente oficial do Linux faz: `linux-vpn-gui@<versão da python-proton-vpn-api-core>+<arquitetura>` (hoje `linux-vpn-gui@6.1.2+x86-64`) e `ProtonVPN/6.1.2 (Linux; ubuntu/26.04)`. É o mesmo formato que o projeto de origem, `hatemosphere/protonvpn-wg-confgen`, adotou em 18/11. Na API, em `GET /vpn/v2/clientconfig`, `linux-vpn@4.17.2` recebe 422/5003 e `linux-vpn-gui@6.1.2+x86-64` recebe 200/1000. Quando a Proton subir o mínimo de novo, basta trocar `ClientVersion` em `tools/proton-confgen/internal/constants/api.go`, ou passar `-X …/internal/constants.ClientVersion=` no build, pela versão de `python-proton-vpn-api-core/stable/versions.yml`.
+
+  **A correção chega nesta versão hotfix (2.0.17).** O CI recompila o helper da GUI (e refaz o manifesto e os SHA-256) e o do macOS; o helper Linux embutido em `goLiveBypass/vpn-proton.ts` foi regerado nesta árvore com o mesmo build determinístico (`GOOS=linux GOARCH=amd64`, `-buildvcs=false -trimpath -ldflags='-s -w -buildid='`). O helper do Windows do plugin sai do build da release.
+
+- **Quando a Proton recusa a versão do app, o GoLiveBypass diz isso e não perde a sessão salva.** A Proton responde com o código 5003 ("This version of the app is no longer supported") quando sobe a versão mínima aceita. Foi isso que derrubou o login em 19/11 (#437 a #442). Até aqui, o erro aparecia como "Não foi possível concluir o login ProtonVPN" na GUI, como "Não foi possível concluir a operação ProtonVPN" no plugin e, no macOS, como "Usuário ou senha incorretos". Pior: na renovação ou na verificação da sessão salva, o helper tratava a recusa como sessão inválida, apagava a sessão e tentava entrar de novo com a senha, que também era recusada. Agora:
+  - o `proton-confgen` reporta 5001, 5003 e 5005 como `APP_VERSION_UNSUPPORTED` e mantém a sessão salva em todos os caminhos, na renovação e na verificação, com qualquer status HTTP;
+  - a GUI, o plugin e o macOS, inclusive o painel do celular, mostram "A Proton deixou de aceitar esta versão do GoLiveBypass. Atualize o GoLiveBypass para continuar.", tanto no login quanto nas operações de rota;
+  - na verificação da sessão, a GUI e o plugin mantêm a conta conectada.
+
+  **Testado no Windows** com um `.exe` desta branch, cujo helper ainda manda a versão recusada e por isso recebeu um 5003 de verdade da Proton:
+  - a conta continuou conectada, com a mensagem nova;
+  - a sessão salva ficou intacta, com o mesmo tamanho e o mesmo horário antes e depois de três verificações recusadas;
+  - a ativação com a rota já preparada funcionou (`verified=true`).
+
+  Isto não corrige a versão em si, que é o #443. Serve para a próxima vez que a Proton subir o mínimo.
+
+  No plugin no Linux, o helper embutido em `goLiveBypass/vpn-proton.ts` precisa ser regenerado de novo, como no #444, para levar a preservação da sessão. A mensagem já aparece com o helper atual, porque o plugin também reconhece o texto antigo do 5003.
+
+## [2.0.17-beta-4] - 2026-11-18
+
+### Corrigido
+
+- **GUI: as reservas da troca automática não falham mais quando o pacote perdeu o helper Proton embutido.** Quando o `proton-confgen` some do pacote (antivírus, extração incompleta, cópia portátil ruim), a GUI baixa o helper oficial da release e confere o SHA-256. A escolha da rota já usava esse helper consertado, mas a preparação das reservas não: o caminho era calculado e não chegava ao helper, que voltava a procurar só o embutido. A rota ativava, as reservas falhavam com `pool.background.failed … proton-confgen.exe não foi encontrado`, e a troca automática, que desde o #433 funciona no Windows, ficava sem reserva e desistia na sessão. Agora as reservas usam o mesmo helper consertado. Visto no teste do #433, com um `.exe` de teste sem o helper embutido. No build oficial íntegro nada muda. Vale para a GUI no Windows e no Linux; o plugin não tem conjunto de reservas.
+
+## [2.0.17-beta-3] - 2026-11-16
+
+### Corrigido
+
+- **Windows: a troca automática de rota passa a reagir a servidor que não responde (#411).** No #411 o servidor da rota respondeu só 2 de 22 handshakes em 4 minutos, o Discord ficou preso em "checking for updates" e a troca automática não fez nada. Na instalação comum (WireSock em modo direto, sem `wg.exe` nem CLI de status), ela não tinha como ver a rota morta: toda amostra saía "indeterminada", e a troca só acontecia se o processo do WireSock morresse. E mesmo que disparasse, a reserva só era aceita com o handshake "verificado", o que nessa instalação nunca acontecia, então todas seriam recusadas. Agora as duas pontas leem o log do próprio `wiresock-client`, que a GUI já lia para o diagnóstico:
+  - **detecção:** 6 tentativas seguidas de handshake sem resposta (cerca de 30 s, já que o WireGuard repete a cada 5 s), com o log vivo, contam como falha da rota. A contagem zera a cada resposta, ao contrário do `sem_resposta` do diagnóstico, que soma 10 minutos e acusaria uma rota que já voltou;
+  - **validação:** a reserva vale quando o servidor responde ao handshake depois do início do túnel novo (cada troca abre um log novo, e resposta da sessão anterior não conta). A prontidão da ativação passa a registrar `source=log verified=true` pelo mesmo caminho, só no log;
+  - **tela:** depois da troca, o cartão da rota recarrega e mostra a rota em uso, e a mensagem "Rota X selecionada!" da rota anterior some. Antes ele seguia mostrando a rota de antes da troca até a GUI reabrir. Nenhum aviso novo.
+
+  **Testado no Windows, com o WireSock em modo direto:** com o servidor da MX-FREE#10 bloqueado no firewall do Windows, a sexta tentativa sem resposta veio 32 s depois da última resposta, e a troca para a US-FREE#28 (com a reserva validada pelo log) terminou 52 s depois, sem fechar o Discord. Em 10 minutos de uso normal depois disso, nenhuma troca falsa.
+
+  Continuam valendo as travas que já existiam: falha sustentada fora da janela inicial, uma única renovação das reservas por ativação, quarentena de quem falha e desligamento da troca na sessão quando nada responde. **Limites:** se a internet da própria pessoa cair, os handshakes também ficam sem resposta, as reservas falham e a troca se desliga na sessão com o aviso que já existia. Do servidor mudo até a troca leva perto de 1 minuto. O plugin não tem troca automática de rota, então não há o que portar; Linux já usa os dados do `wg`.
+
+## [2.0.17-beta-2] - 2026-11-15
+
+### Alterado
+
+- **Windows (GUI e plugin): as rotas grátis do México voltam à escolha automática.** Elas saíram na 2.0.14 porque o WireSock gravava errado o checksum dos pacotes que chegavam fragmentados por dentro do túnel, e o anexo "carregava e sumia" (#373, #400). A 2.0.16 passou a exigir o WireSock 3.8.2.1, que corrige isso, e os contadores do #408 mostram que a fragmentação não é só do México: num Windows com o 3.8.2.1, a US-FREE#148 recebeu de 100 a 170 fragmentos a cada 5 minutos e a US-FREE#146, escolhida pela seleção automática, 710 em 5 minutos, sem falha de remontagem e com os anexos subindo. Excluir só o México deixou de proteger.
+  - **GUI:** "Evitar rotas grátis do México" em Configurações vem desligado. A preferência só é gravada quando a pessoa mexe no botão: quem nunca mexeu passa a ter o México na escolha automática, quem desligou continua desligado e quem religou continua ligado.
+  - **Plugin:** a opção passou a se chamar `protonExcludeFreeMexico`, desligada por padrão, e a antiga (`protonAvoidFreeMexico`) deixa de valer. O Vencord grava o valor padrão no `settings.json` quando a opção é lida, então o `true` salvo não dizia se a pessoa tinha escolhido. Quem quiser continuar evitando o México liga a opção nova.
+
+  **Limites:** o Go Live (UDP) nas rotas do México não foi testado de novo depois do WireSock 3.8.2.1. Numa máquina que ficou no WireSock anterior (a reserva quando a troca falha), o defeito dos anexos volta nas rotas que fragmentam, do México ou não; para ela, ligar a opção reduz o risco. Rota paga, Linux e macOS não mudam.
+
+### Corrigido
+- **GUI: pipe de console fechado deixa de gerar exceção não tratada no processo principal (#425).** O logger agora trata erros assíncronos de `stdout` e `stderr` (incluindo `EPIPE` e `EIO`), interrompe o espelho apenas na saída afetada e continua registrando em `gui.log` e no buffer do relatório. Antes, o `try/catch` cobria apenas erros síncronos; no AppImage 2.0.16 foi relatada uma janela "A JavaScript error occurred in the main process" com `write EPIPE`. A regressão fecha pipes reais em processos Node no Linux e confere a continuidade dos logs. Escopo: logger da GUI Windows/Linux; standalone, plugin e cliente macOS não usam esse tee e não foram alterados.
+- **No Windows traduzido (pt-BR incluído) o app deixa de ficar cego para o WireSock instalado.** As leituras vinham de `sc query` casando os rótulos em inglês (`SERVICE_NAME:`/`STATE :`), que o Windows traduz. Medido na VM Windows 11 pt-BR com o SDK 3.4.8.1: o filtro responde `NOME_DO_SERVIÇO: ndiswgc` / `ESTADO : 4 RUNNING` e aparece no `netcfg -s n` como `nt_ndiswgc`, mas o app respondia "sem driver" e "serviço parado" com o driver `KERNEL_DRIVER` genuinamente carregado. O que o Windows **não** traduz é o código numérico do SCM e o nome do estado (`4 RUNNING`), e é neles que a leitura passou a se apoiar (`scQueryShowsRunning`); a detecção do driver passou a usar o nome do serviço na saída e o código `1060` (inexistente), que também não é traduzido. Efeitos corrigidos:  - `isWireSockPacketFilterDriverInstalled()` voltava `false`, então a classificação de instalação pela metade perdia o último sinal de resíduo (driver carregado sem cliente) e `wireSockResidueNeedsRestore` liberava menos restauração de rede do que devia;  - `isWireSockRunning()`/`isWireSockActiveAsync()` voltavam `false` com o serviço em `RUNNING`;  - `isServiceRunning()` reprovava o modo de compatibilidade de serviço na ativação ("serviço não confirmou o processo próprio").  O plugin Vencord/Equicord tinha o mesmo detalhe no fallback `serviceRunningFromSc` (`goLiveBypass/vpn-windows.ts`) e foi corrigido junto. Nas máquinas do usuário o rótulo depende do idioma do Windows; a correção não muda nenhum resultado em máquina inglesa.- **Leitura do registro do WireSock que falha não conta mais como "não instalado".** `classifyWireSockInstallState` decidia por pasta, registro e driver; se a leitura do registro falhasse (PowerShell lento ou erro) e a pasta do pacote não existisse, o estado saía `none` e o app pulava o `/uninstall`. O setup então caía em manutenção, que em `/quiet` não instala nada e ainda assim devolve 0 — a máquina ficava sem par compatível com o popup "O instalador oficial terminou, mas não deixou um par WireSock SDK compatível" e sem nenhum sinal do porquê. Leitura falha agora entra como resíduo (desinstalar antes custa pouco: 1605/1614 são tolerados quando não havia nada) e o prazo dessa leitura subiu de 8 s para 20 s.  **Verificado:** 86 testes em `golive-gui/tests/wiresock.test.ts` + `wiresock-installation.test.ts` (inclui as saídas reais do `sc query` pt-BR) e 73 testes do plugin na suíte da GUI; e a prova real na VM Windows 11 pt-BR (`WinBoat`, SDK 3.4.8.1 com `ndiswgc` carregado), comparando o módulo antes e depois: `isWireSockPacketFilterDriverInstalled()` passou de `false` para `true` com o mesmo driver carregado, e a leitura nova responde `true` para `ndiswgc`/`Spooler` em `RUNNING` e `false` para serviço inexistente.### Não portado- **Standalone legado** (`standalone/`): pausado, sem caminho próprio de leitura do WireSock para corrigir.- **Linux/macOS**: não usam `sc query`; nada a portar.
+- **Windows (GUI e plugin): a troca obrigatória do WireSock não derruba mais quem já funcionava.** Desde a 2.0.16 a ativação exige o SDK 3.8.2.1 e troca a versão anterior. Num Windows em que o Windows Installer não instala nenhum pacote MSI, a troca falhava e a ativação parava, mesmo com a 3.4.8.1 instalada e funcionando. O caso medido foi um Windows "enxugado" sem a pasta `%SystemRoot%\Installer`, com o setup saindo com 1632. Agora, se a troca falhar e a versão anterior continuar instalada, o túnel ativa com ela. O app não repete a tentativa (download e pedido de elevação) a cada ativação da mesma sessão, e registra no log e no relato que ficou na versão anterior. Quando o próprio setup pede reinicialização (3010/1641) ou é morto por sinal, a reserva não entra: a reinicialização pode deixar a instalação nova pela metade, e processo morto não tem código de saída para registrar. O defeito dos anexos nas rotas que fragmentam volta só nessa máquina, e o México segue fora da escolha automática por padrão. Sem versão anterior, a falha continua bloqueando como antes.
+- **Windows (GUI e plugin): a falha do instalador do WireSock diz o motivo.** A mensagem trazia só `Command failed: powershell.exe …`. Agora traz:
+  - o código de saída do setup e o significado dos códigos conhecidos (1603, 1618, 1625, 1632 e outros);
+  - um aviso quando a pasta `%SystemRoot%\Installer` não existe.
+
+  O log também guarda as linhas de erro do próprio setup (`%TEMP%\WireSock_Secure_Connect_SDK_*.log`), sem caminhos. Antes era preciso pedir esses arquivos à pessoa.
+
+  O app não mexe na pasta do sistema. Quando ela falta, o log diz a causa provável e o reparo manual (`causa_provavel` e `acao_manual`) já na abertura, antes de qualquer falha. Os mesmos campos voltam a aparecer na falha da instalação e na ativação com a versão anterior.
+- **Plugin: o log não descarta mais campos em silêncio.** O filtro de privacidade só aceitava chaves de uma lista branca e apagava as outras sem deixar marca. Assim se perdiam as contagens do IPv6 pulado (#404), a versão e o canal do updater e o que sobrava da restauração de rede no Windows. Agora esses campos entram. Número e booleano passam com qualquer chave não sensível. Texto fora da lista continua fora, mas o nome da chave fica em `dropped_keys`.
+- **Relato (GUI e plugin): a recusa do polkit não perde mais a causa.** A redação de rótulos de identidade (`user: <nome>`) tratava a frase fixa do pkexec, "as another user: Not authorized", como nome de usuário. No relato ficava "another user:<usuario> authorized", sem o "Not".
+- **Instaladores do plugin: "pnpm build falhou (exit=1)" sem detalhe num checkout do Equicord atualizado.** O Equicord liga `verifyDepsBeforeRun: prompt` no `pnpm-workspace.yaml`. Quando o checkout muda (git pull, updater do próprio mod) e o `node_modules` fica fora de sincronia com o lockfile, o `pnpm build` tenta perguntar se pode rodar o install. No Windows, com a saída canalizada pelo instalador, ele saía com exit 1 em ~50 ms e só escrevia o aviso de versão do pnpm. No Linux sem terminal (`curl | sh`) dava `ERR_PNPM_VERIFY_DEPS_BEFORE_RUN`. O instalador só rodava `pnpm install` quando faltava o `node_modules`, então cada nova tentativa batia no mesmo erro.
+  - Os dois instaladores sincronizam as dependências antes de todo build, inclusive ao recompilar na desinstalação. Primeiro com `pnpm install --frozen-lockfile`, que não reescreve o lockfile do checkout; o install comum fica de reserva para quando o lockfile não bate com o `package.json`. `confirm-modules-purge=false` evita o outro prompt do pnpm.
+  - Se o build falhar mesmo assim, o `installer.log` ganha um `installer.build_context` com a versão do pnpm em uso e a que o projeto pede, a do node, se o `node_modules` existia, se a sincronização passou e o código de saída, sem caminho.
+  - Quando o pnpm sai sem escrever nada, a mensagem diz isso e manda rodar `pnpm build` na pasta do mod. Antes ela terminava em "falhou (exit=1): " e parecia cortada. Nos dois sistemas, a mensagem leva o fim da saída do pnpm: no Windows extraída do canal, no Linux da própria saída capturada do `pnpm build`.
+
+  Reproduzido no Windows (PowerShell 5.1, pnpm 12.8.1, console de verdade) com o lockfile atualizado e o `node_modules` antigo: antes, exit 1 só com o aviso de versão; depois, o build passa.
+
+- **GUI Linux e standalone: Discord Flatpak fechado segundos depois de abrir no túnel (#416).** No Bazzite, o Discord Flatpak abria dentro do namespace WireGuard e funcionava (dava para entrar em live), mas a ativação esperava 20 s, dizia "uma instancia do com.discordapp.Discord ficou fora do namespace" e fechava o cliente. O `flatpak ps` do reporter mostrava duas instâncias de `com.discordapp.Discord`: a principal no namespace (`ip netns identify` devolvia `discord-vpn`) e outra, mais nova, fora dele e listada primeiro. A confirmação lia só a primeira linha, e a ordem das linhas não é garantida. A instância extra continuou com `ZYPAK_DISABLE_SANDBOX=1`, e o que a cria ainda não foi identificado. Agora a confirmação da ativação e o `inNamespace` do status olham todas as instâncias do ID e aceitam a que está no namespace. Quando nenhuma está, a falha continua igual e o `flatpak ps` da hora vai para o log do Discord. Regressão hermética em `tests/test-linux-flatpak-instancias-netns.sh`, com a ordem do relato (a lógica anterior reproduz o `fora-do-namespace`); a correção ainda não rodou no Bazzite do reporter.
+
+- **GUI Linux e standalone: "não consegui reabrir o Discord automaticamente" com o Discord aberto na tela (#405, #421, #422).** Quando o Discord não sobe dentro do túnel, o rollback remove o namespace e reabre o cliente fora dele. A confirmação dessa reabertura usava `wait_discord_started`, que exige o PID dentro do namespace que o próprio rollback acabou de remover. Então ela falhava sempre: o Discord voltava normal e a janela de erro dizia que não. Pior, as linhas do rollback rodam no trap de saída, depois do `[X]` com a causa, e a GUI mostra só as três últimas linhas do stderr. A causa real sumia da tela e do relato.
+  - O rollback confirma a reabertura pelo processo do alvo, sem exigir namespace (`wait_discord_host_started`).
+  - A mensagem de erro da GUI põe a linha `[X]` na frente quando ela ficou fora do fim do stderr (`electron/script-stderr.ts`). O stderr completo da ativação que falhou vai para o log (`linux ativacao.falhou`).
+  - O Discord nativo abre numa unidade do `systemd-run`, então a saída dele ia para o journal, não para o `discord-vpn-*.log`. Quando ele não sobe no túnel, o trecho do journal da unidade (`_SYSTEMD_UNIT=discord-vpn-<n>.service`) é copiado para o log do launcher, e a última linha do Discord vira a "saída do launcher" citada na falha. No #421 essa linha seria `GPU process isn't usable. Goodbye.`, que só apareceu por acaso no log da reabertura.
+
+  A causa de o Discord nativo não subir no túnel (crash da GPU no Ubuntu 26.04 / NVIDIA; primeira ativação falhando e a segunda funcionando no #405) **não** foi corrigida aqui: a correção entrega a causa no relato para ela poder ser investigada. Regressão hermética em `tests/test-linux-rollback-reabertura.sh` (a versão anterior não tem a confirmação no host) e em `golive-gui/tests/linux-script-error-message.test.ts`. Não rodou em Linux real.
+- **Windows (GUI e plugin): WireSock instalado em outra unidade dava falha de instalação sem saída (#402).** A busca só olha `Program Files` das variáveis de ambiente (`C:`). Com o SDK registrado em `D:\Program Files\WireSock Secure Connect`, o setup reinstalava na mesma pasta, a ativação não achava o cliente e repetia a falha. A busca **continua** sem executar de outra unidade: o cliente roda elevado, e numa unidade que não é a do sistema a pasta costuma herdar escrita para usuários comuns. Mas, quando a instalação termina sem par compatível, o app lê `InstallLocation` (ou o `DisplayIcon`) do registro. Se a instalação está fora das raízes aceitas, a mensagem diz a pasta e manda desinstalar o "WireSock Secure Connect", reiniciar e ativar de novo, que foi exatamente o que resolveu para o reporter. A pasta registrada também entra no log de estado da instalação.
+- **Relato (GUI e plugin): a sessão atual não some mais do relato quando há log antigo grande (#379, #399).** A issue comporta uns 60 KB de log, e a API corta o meio (cabeça + cauda) para caber. A GUI mandava a sessão primeiro e até ~200 KB de logs do runtime legado (proxy/SOCKS) depois, então o corte levava justamente as linhas recentes da GUI, onde está a falha, e o relato ficava dominado pelo legado. O log agora sai do app dentro de 52 KB: o fim da sessão da GUI tem prioridade, o `gui.log` anterior entra com no máximo 8 KB e cada log legado só pela cauda (4 KB, 8 KB no total). O plugin tinha o mesmo desenho com o `plugin-vpn.log` anterior no fim e segue a mesma regra.
+- **GUI Windows: injeção legada de versões antigas seguia roteando o gateway por SOCKS por cima do túnel (#379, #399).** A GUI atual não mexe em `app.asar`/`_app.asar` de propósito, porque restaurar apagava mods de terceiros. Só que a injeção do modo proxy/Tor, deixada por versões antigas, continuava rodando a cada abertura do Discord: o `golivebypass.js` copiado para a pasta `app.asar` lê o `settings.json` da mesma pasta, que nenhuma versão atual atualiza, e escolhia saídas SOCKS gratuitas (`escolhida socks5://…`) com o WireSock já ativo. Agora, na ativação, a GUI grava `enabled: false` nessa cópia, que o runtime legado já respeita ("desligado em settings.json") e ainda carrega o Discord original. Só a pasta comprovadamente nossa é alterada (`_app.asar` presente, pasta `app.asar` com `index.js` que carrega `golivebypass.js`, e o próprio `golivebypass.js`); `app.asar`/`_app.asar` não são restaurados nem removidos, e Vencord/Equicord não são tocados. Vale a partir da reabertura do Discord que a ativação já faz. Linux não precisa: a ativação já roda `--cleanup-legacy`, que remove a injeção nossa. Que isso seja a causa do Canary sem mensagens do #379 ainda é hipótese.
+- **Plugin: país vazio com auto-ping desligado mostrava `countries flag is required` (#398).** O helper Proton não tem como escolher a rota sem país e sem auto-ping. Sem país, o plugin passa `-auto-ping` mesmo com a preferência desligada, na geração da rota e no catálogo; com país, a preferência continua valendo.
+
+### Adicionado
+
+- **Retrato do ambiente no log e no relato (GUI e plugin).** Uma linha `env.snapshot` por abertura e os mesmos campos nos metadados do relato. Entram só rótulos técnicos: nada de usuário, máquina, caminho, rede ou endpoint.
+  - **No Windows:** build, pasta do Windows Installer, versão do WireSock em uso e se a troca falhou.
+  - **No Linux:** distro (`ID` e `VERSION_ID`), kernel, IPv6 no kernel, estado do módulo WireGuard, empacotamento (nativo, Flatpak, Nix, AppImage ou Snap) e sessão gráfica.
+
+  Na #404, cada um desses dados foi perguntado à mão. No plugin Linux, a coleta não roda comando nem pede senha.
+- **Horários do log com data e fuso.**
+  - **Plugin:** a linha do relato passa de `HH:MM:SS` em UTC para mês/dia + horário com o `Z` do UTC, com a operação e a fase na linha (três `linux.network.phase` seguidos pareciam iguais).
+  - **GUI:** a abertura grava a data completa, porque o `gui.log` só tem `HH:MM:SS` e junta dias.
+  - **Os dois:** o relato traz o fuso (`-03:00`) para converter o horário que a pessoa conta.
+- **Plugin Linux: a falha elevada diz quem negou e onde parou.** A mensagem traz o elevador (`pkexec`/`sudo`), o código de saída e o passo da sequência. "Nenhum passo chegou a rodar" separa o polkit que recusou sem diálogo de um comando que falhou no meio. Esses dados vêm antes do texto do sistema, que o log corta quando é longo.
+- **Plugin Linux: o log aponta o cliente relançado que não subiu.** Se o relaunch no namespace foi aceito e o plugin não abriu de novo dentro dele, a próxima abertura registra `relaunch.cliente_nao_subiu`, com o namespace, os segundos desde o relaunch e a dica do `coredumpctl`. Na #404 (SIGILL no NixOS) o log ficava em silêncio entre o relaunch e a reabertura manual.
+- **Plugin: o retrato do ambiente usa o nome do app** (`vesktop`, `discord`…). No Nix o executável se chama só `electron`.
+
 ## [2.0.16] - 2026-11-05
 
 ### Corrigido

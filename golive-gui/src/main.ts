@@ -6,7 +6,7 @@ import {
   type ManualTargetKind,
 } from './manual-target-selection';
 import { protonMeasurementText } from './proton-measurement';
-import { decideProtonSession, type ProtonSessionVerdict } from './proton-session';
+import { decideProtonSession, protonSessionUnverifiedMessage, type ProtonSessionVerdict } from './proton-session';
 import { renderProtonCountryFlag } from './proton-flags';
 import { ProtonRouteSelect, type ProtonRouteOption } from './proton-route-select';
 import {
@@ -210,6 +210,7 @@ declare global {
       }>;
       setProtonSettings: (settings: any) => Promise<boolean>;
       onProtonFailoverNotice?: (callback: (notice: { message: string }) => void) => unknown;
+      onProtonRouteChanged?: (callback: () => void) => unknown;
     }
   }
 }
@@ -841,7 +842,7 @@ async function refreshAutoFailover() {
   try {
     const settings = await window.api.getProtonSettings();
     if (autoFailoverToggle) autoFailoverToggle.checked = settings.autoFailover !== false;
-    if (avoidFreeMexicoToggle) avoidFreeMexicoToggle.checked = settings.avoidFreeMexico !== false;
+    if (avoidFreeMexicoToggle) avoidFreeMexicoToggle.checked = settings.avoidFreeMexico === true;
     if (startupSpeedTestToggle) startupSpeedTestToggle.checked = settings.startupSpeedTest !== false;
   } catch (err) {
     console.error(err);
@@ -1491,6 +1492,7 @@ function protonLoginMessage(res: { code?: string; message?: string; error?: stri
     case 'TIMEOUT': return 'O ProtonVPN demorou demais para responder. Tente novamente em alguns instantes.';
     case 'MISSING_EXECUTABLE': return 'O componente de conexão ProtonVPN não foi encontrado. Reinstale o GoLiveBypass ou atualize para a versão mais recente.';
     case 'SESSION_PERSISTENCE': return 'Login concluído, mas a sessão não pôde ser salva neste computador. Verifique as permissões da pasta de dados.';
+    case 'APP_VERSION_UNSUPPORTED': return 'A Proton deixou de aceitar esta versão do GoLiveBypass. Atualize o GoLiveBypass para continuar.';
     default: return 'Não foi possível concluir o login ProtonVPN. Tente novamente ou envie um relatório de diagnóstico.';
   }
 }
@@ -1742,7 +1744,7 @@ async function refreshProtonState(forcePlan = false) {
       ? { server: rememberedServer, pingMs: Number.isFinite(rememberedPing) && rememberedPing > 0 ? rememberedPing : undefined }
       : null;
     if (autoFailoverToggle) autoFailoverToggle.checked = s.autoFailover !== false;
-    if (avoidFreeMexicoToggle) avoidFreeMexicoToggle.checked = s.avoidFreeMexico !== false;
+    if (avoidFreeMexicoToggle) avoidFreeMexicoToggle.checked = s.avoidFreeMexico === true;
     if (startupSpeedTestToggle) startupSpeedTestToggle.checked = s.startupSpeedTest !== false;
     if (protonCountrySelect) renderProtonMeasuredRouteOptions();
     protonProfileReady = s.profileReady === true;
@@ -1756,10 +1758,11 @@ async function refreshProtonState(forcePlan = false) {
         if (generation !== protonStateGeneration) return;
         verdict = decideProtonSession(chk);
         if (verdict === 'unverified') {
-          // Verificacao indisponivel agora (rede/helper): a conta e o perfil seguem
-          // como estavam e o botao de ativar nao e bloqueado por isso (#312/#316/#317).
+          // Verificacao indisponivel agora (rede/helper) ou versao do app recusada pela
+          // Proton: a conta e o perfil seguem como estavam e o botao de ativar nao e
+          // bloqueado por isso (#312/#316/#317).
           scheduleProtonSessionRetry();
-          setProtonFeedback('Não consegui confirmar sua sessão Proton agora. A ativação com a rota já preparada continua disponível.', 'busy');
+          setProtonFeedback(protonSessionUnverifiedMessage(chk), 'busy');
         }
       } catch (error) {
         if (generation !== protonStateGeneration) return;
@@ -2503,6 +2506,12 @@ window.api.onRefreshAutoUpdate?.(refreshAutoUpdate);
 window.api.onUpdateAvailable?.(showUpdateCard);
 window.api.onProtonFailoverNotice?.((notice) => {
   if (notice?.message) setProtonFeedback(notice.message, 'err');
+});
+// A troca automatica de rota deu certo: o cartao recarrega a rota em uso, e a mensagem da rota
+// anterior ("Rota X selecionada!") deixa de valer.
+window.api.onProtonRouteChanged?.(() => {
+  setProtonFeedback('');
+  void refreshProtonState();
 });
 
 // ---------------------------------------------------------------------------

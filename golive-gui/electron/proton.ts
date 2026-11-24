@@ -30,6 +30,7 @@ export type ProtonLoginErrorCode =
   | 'MISSING_EXECUTABLE'
   | 'SESSION_PERSISTENCE'
   | 'CONFIGURATION_ERROR'
+  | 'APP_VERSION_UNSUPPORTED'
   | 'UNKNOWN';
 
 export interface ProtonLoginResult {
@@ -230,15 +231,11 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
     const timeout = options.timeoutMs ?? 25000;
     const operationId = logger.createOperationId('proton-confgen');
     const startedAt = Date.now();
-    const logContext = {
-      operation_id: operationId,
-      phase: 'confgen',
-      executable: path.basename(exe),
-      timeout_ms: timeout,
-    };
-    logger.logEvent('info', 'proton', 'confgen.start', logContext, {
-      args: safeConfgenArgs(options.args),
-    });
+    // Uma linha por chamada, no fim: o login e a busca de rota chamam o helper dezenas de vezes
+    // e o par start/complete com stderr ocupava ~27% dos relatos. Executavel e timeout so
+    // aparecem quando a chamada falha, que e quando importam.
+    const logContext = { operation_id: operationId, args: safeConfgenArgs(options.args) };
+    const contextoDeFalha = { executable: path.basename(exe), timeout_ms: timeout };
     const child = spawn(exe, options.args, {
       windowsHide: true,
       env: { ...process.env },
@@ -268,6 +265,7 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
       settled = true;
       clearTimeout(timer);
       logger.logEvent('error', 'proton', 'confgen.failed', logContext, {
+        ...contextoDeFalha,
         durationMs: Date.now() - startedAt,
         error: error.message,
         aborted,
@@ -316,13 +314,18 @@ export function runConfgen(options: RunConfgenOptions): Promise<{ code: number |
       if (terminationError || aborted) { finishReject(terminationError || abortError()); return; }
       const parsedJson = parseConfgenJson(stdout);
       settled = true;
-      logger.logEvent(code === 0 ? 'info' : 'warn', 'proton', 'confgen.complete', logContext, {
+      const ok = code === 0;
+      logger.logEvent(ok ? 'info' : 'warn', 'proton', 'confgen.complete', logContext, {
         durationMs: Date.now() - startedAt,
         exitCode: code,
-        stdoutBytes: Buffer.byteLength(stdout, 'utf8'),
-        stderrBytes: Buffer.byteLength(stderr, 'utf8'),
         json: Boolean(parsedJson),
-        stderrTail: logger.clipLogText(stderr, 1200),
+        // Saida com sucesso e progresso/ruido; a cauda so ajuda quando o helper falha.
+        ...(ok ? {} : {
+          ...contextoDeFalha,
+          stdoutBytes: Buffer.byteLength(stdout, 'utf8'),
+          stderrBytes: Buffer.byteLength(stderr, 'utf8'),
+          stderrTail: logger.clipLogText(stderr, 1200),
+        }),
       });
       resolve({ code, stdout, stderr, json: parsedJson });
     });
@@ -350,8 +353,16 @@ export async function runRouteProbeFrom(exePath: string | undefined, timeoutMs =
   };
 }
 
+// A Proton recusa o identificador de versao do cliente (HTTP 422, codigo 5003).
+// Nenhuma nova tentativa resolve: so uma versao nova do GoLiveBypass.
+const APP_VERSION_UNSUPPORTED_MESSAGE = 'A Proton deixou de aceitar esta versão do GoLiveBypass. Atualize o GoLiveBypass para continuar.';
+
 export function classifyProtonError(error: unknown, stderr = '', stdout = ''): { code: ProtonLoginErrorCode; message: string; retryable: boolean } {
   const raw = `${error instanceof Error ? error.message : String(error)} ${stderr} ${stdout}`.toLowerCase();
+  // Antes de todos os outros padroes: helpers antigos so imprimem o codigo
+  // numerico ("authentication failed with code: 5003"), e credencial, rede ou o
+  // generico nao podem engolir uma versao recusada.
+  if (/app_version_unsupported|with code: 50(01|03|05)\b|no longer (supported|accepts)/i.test(raw)) return { code: 'APP_VERSION_UNSUPPORTED', message: APP_VERSION_UNSUPPORTED_MESSAGE, retryable: false };
   if (/flag provided but not defined|unknown flag/.test(raw)) {
     return { code: 'UNKNOWN', message: 'Erro nos parâmetros de inicialização do ProtonVPN. Atualize o aplicativo.', retryable: false };
   }
@@ -464,10 +475,11 @@ function ensureInstallDir(installDir: string) {
 
 /**
  * Contrato de `-check-session`. `retryable` marca falha de verificacao (rede,
- * timeout, helper ausente) que NAO invalida a sessao: a GUI mantem o usuario
- * autenticado e a ativacao continua disponivel com o perfil ja gerado.
+ * timeout, helper ausente, versao do app recusada pela Proton) que NAO invalida
+ * a sessao: a GUI mantem o usuario autenticado e a ativacao continua disponivel
+ * com o perfil ja gerado.
  */
-export type ProtonSessionCheckCode = 'INVALID_SESSION' | 'NETWORK_ERROR' | 'TIMEOUT' | 'MISSING_EXECUTABLE' | 'SESSION_PERSISTENCE' | 'UNKNOWN';
+export type ProtonSessionCheckCode = 'INVALID_SESSION' | 'NETWORK_ERROR' | 'TIMEOUT' | 'MISSING_EXECUTABLE' | 'SESSION_PERSISTENCE' | 'APP_VERSION_UNSUPPORTED' | 'UNKNOWN';
 
 export interface ProtonSessionCheckResult {
   valid: boolean;
@@ -487,6 +499,7 @@ const PROTON_SESSION_CODES: Record<ProtonSessionCheckCode, true> = {
   TIMEOUT: true,
   MISSING_EXECUTABLE: true,
   SESSION_PERSISTENCE: true,
+  APP_VERSION_UNSUPPORTED: true,
   UNKNOWN: true,
 };
 
@@ -497,6 +510,7 @@ const RETRYABLE_SESSION_CODES: Record<ProtonSessionCheckCode, boolean> = {
   TIMEOUT: true,
   MISSING_EXECUTABLE: true,
   SESSION_PERSISTENCE: true,
+  APP_VERSION_UNSUPPORTED: true,
   UNKNOWN: false,
 };
 
@@ -762,6 +776,8 @@ function structuredProtonError(code: string): { message: string; retryable: bool
         message: 'A sessão Proton já salva não pôde ser atualizada neste computador. Sua senha não foi verificada e a sessão anterior foi preservada. Feche outras versões do aplicativo e tente novamente.',
         retryable: true,
       };
+    case 'APP_VERSION_UNSUPPORTED':
+      return { message: APP_VERSION_UNSUPPORTED_MESSAGE, retryable: false };
     default:
       return undefined;
   }
@@ -774,6 +790,18 @@ export const PAID_AUTO_COUNTRIES = 'US,CA,MX,AR,CL,CO,PE,CR,EC,PA,PR,UY,VE,BO,PY
 export function automaticCountries(options: { countries?: string; freeOnly?: boolean }): string {
   const explicit = options.countries?.trim() ?? '';
   return explicit || options.freeOnly !== false ? explicit : PAID_AUTO_COUNTRIES;
+}
+
+/**
+ * O renderer mostra o `error` das operacoes de rota (otimizacao, catalogo, rota
+ * manual) como chega. A versao do app recusada pela Proton (codigo do helper ou
+ * texto de helpers antigos) ja sai traduzida; qualquer outro erro segue intacto.
+ */
+function appVersionRouteError(json: any, rawError: unknown): string | undefined {
+  if (json?.code === 'APP_VERSION_UNSUPPORTED' || classifyProtonError(rawError).code === 'APP_VERSION_UNSUPPORTED') {
+    return APP_VERSION_UNSUPPORTED_MESSAGE;
+  }
+  return undefined;
 }
 
 export async function generateOptimalProtonConfig(
@@ -913,7 +941,7 @@ export async function generateOptimalProtonConfig(
     medicao_valida: options.speedTest ? measuredResultValid : undefined,
     erro: errMsg.replace(/\s+/g, ' ').trim().slice(0, 300),
   });
-  return { success: false, error: errMsg };
+  return { success: false, error: appVersionRouteError(res.json, errMsg) ?? errMsg };
 }
 
 export interface ProtonManualRouteOptions {
@@ -1051,7 +1079,7 @@ export async function generateManualProtonConfig(
     codigo_saida: res.code,
     resposta_json: Boolean(json),
   });
-  return { success: false, error: redactManualRouteError(rawError, username) };
+  return { success: false, error: appVersionRouteError(json, rawError) ?? redactManualRouteError(rawError, username) };
 }
 
 export function removeStagedProtonConfig(stagedFile: string | undefined): void {
@@ -1178,7 +1206,7 @@ export async function generateProtonRouteCatalog(
       'Não foi possível carregar o catálogo de rotas ProtonVPN.';
     return {
       success: false,
-      error: redactManualRouteError(rawError, username),
+      error: appVersionRouteError(res.json, rawError) ?? redactManualRouteError(rawError, username),
     };
   }
   return { success: true, routes };
@@ -1241,6 +1269,8 @@ export async function generateProtonRoutePool(
   if (excluded.length > 0) args.push('-exclude-servers', excluded.join(','));
 
   try {
+    // O helper do caminho de reparo: sem exePath o runConfgen volta a procurar só o embutido, e as
+    // reservas falhavam no pacote que perdeu o helper (antivírus, extração incompleta).
     const res = await runConfgen({
       args,
       timeoutMs: 120_000,

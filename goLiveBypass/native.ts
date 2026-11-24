@@ -42,6 +42,7 @@ import {
     interpretarResposta,
     interpretarStatusDeBloqueio,
     limparEntradaDoRenderer,
+    montarAmbiente,
     montarLog,
     montarMeta,
     montarPayload,
@@ -72,14 +73,16 @@ import {
     isProcessInNamespace,
     isValidLinuxName,
     linuxAuthorizationGuidance,
+    linuxEnvironmentSnapshot,
     relaunchEnvironment,
     waitForFile,
 } from "./vpn-linux";
+import { installerFolderDiagnosis, windowsEnvironmentSnapshot } from "./vpn-windows";
 import * as proton from "./vpn-proton";
 import { safeDiagnosticDetail } from "./vpn-types";
-import { createOperationId, createPluginLogger, trimJsonlTailByBytes, type PluginLogContext } from "./plugin-log";
+import { createOperationId, createPluginLogger, formatarLinhaDoArquivo, montarResumoDoPlugin, pendingNamespaceRelaunch, trimJsonlTailByBytes, type PluginLogContext } from "./plugin-log";
 
-const PLUGIN_VERSION = "2.0.16";
+const PLUGIN_VERSION = "2.0.18";
 const PLUGIN_ASSET = "goLiveBypass-vencord.zip";
 const PLUGIN_CHECKSUM_ASSET = `${PLUGIN_ASSET}.sha256`;
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/PgLESv/GoLiveBypass/releases?per_page=20";
@@ -407,7 +410,9 @@ function controllerSettings(): PluginSettingsRecord {
         protonCountry: typeof stored.protonCountry === "string" ? stored.protonCountry : "",
         protonFreeOnly: stored.protonFreeOnly !== false,
         protonAutoPing: stored.protonAutoPing !== false,
-        protonAvoidFreeMexico: stored.protonAvoidFreeMexico !== false,
+        // Opção nova, desligada por padrão. O Vencord grava o padrão no settings.json quando a opção
+        // é lida, então o antigo `protonAvoidFreeMexico: true` salvo não diz se a pessoa escolheu.
+        protonAvoidFreeMexico: stored.protonExcludeFreeMexico === true,
     };
 }
 
@@ -436,6 +441,26 @@ function eventForMessage(message: string): string {
     if (lower.includes("updater") || lower.includes("update")) return "updater.event";
     if (lower.includes("proton") || lower.includes("autenticação") || lower.includes("sessão")) return "proton.event";
     return "legacy.message";
+}
+
+// Retrato do ambiente que vai no log (env.snapshot, uma vez por abertura) e nos metadados do relato.
+// O fuso é só o deslocamento ("-03:00"): o texto do relato sai no horário local e o plugin-vpn.log, em UTC.
+function pluginEnvironmentSnapshot(): Record<string, string> {
+    let base: Record<string, string | boolean> = { so: process.platform };
+    try {
+        if (process.platform === "linux") base = linuxEnvironmentSnapshot();
+        else if (process.platform === "win32") base = windowsEnvironmentSnapshot();
+    } catch {
+        // Diagnóstico nunca impede o plugin de abrir.
+    }
+    const offset = -new Date().getTimezoneOffset();
+    const pad = (value: number) => String(Math.floor(value)).padStart(2, "0");
+    const fuso = `${offset >= 0 ? "+" : "-"}${pad(Math.abs(offset) / 60)}:${pad(Math.abs(offset) % 60)}`;
+    // Nome do app (vesktop, discord, equibop…): no Nix o executável se chama só "electron".
+    let nomeApp = "";
+    try { nomeApp = app.getName(); } catch { nomeApp = ""; }
+    const cliente = (nomeApp || basename(process.execPath).replace(/\.exe$/i, "")).toLowerCase().replace(/[^a-z0-9._-]/g, "").slice(0, 32) || "desconhecido";
+    return montarAmbiente({ ...base, cliente, fuso });
 }
 
 function log(level: "info" | "warn" | "error", message: string, data?: Record<string, unknown>): void {
@@ -1094,7 +1119,10 @@ function lerCaudaDoLog(maxBytes = BUG_LOG_TAIL_BYTES): string {
         const pedaco = buffer.length > maxBytes ? buffer.subarray(buffer.length - maxBytes) : buffer;
         const texto = pedaco.toString("utf8");
         // O corte pode cair no meio de uma linha: descarta a primeira, parcial.
-        return pedaco.length < buffer.length ? texto.slice(texto.indexOf("\n") + 1) : texto;
+        const linhas = (pedaco.length < buffer.length ? texto.slice(texto.indexOf("\n") + 1) : texto).split(/\r?\n/);
+        // O arquivo é JSONL; o relato usa o texto do ring. Sem converter, complementoDaCauda não
+        // encontrava a primeira linha do ring e a cauda anterior a ele nunca entrava no relato.
+        return linhas.map(formatarLinhaDoArquivo).filter(Boolean).join("\n");
     } catch (error) {
         log("warn", "não consegui ler o log do plugin para o relato", { erro: error });
         return "";
@@ -1199,7 +1227,14 @@ export async function submitBugReport(_: IpcMainInvokeEvent, value: unknown): Pr
 
     const segredos = coletarSegredosLocais();
     const blocoDeLog = pedido.includeLogs
-        ? montarLog({ ring: pluginLogger.getLog(), caudaArquivo: lerCaudaDoLog(), sessao: pedido.session, segredos, token: BUG_API_TOKEN })
+        ? montarLog({
+            ring: pluginLogger.getLog(),
+            caudaArquivo: lerCaudaDoLog(),
+            sessao: pedido.session,
+            segredos,
+            token: BUG_API_TOKEN,
+            resumo: montarResumoDoPlugin(pluginLogger.milestones()),
+        })
         : "";
     const status = await controller.getStatusAsync();
     const meta = montarMeta({
@@ -1210,6 +1245,7 @@ export async function submitBugReport(_: IpcMainInvokeEvent, value: unknown): Pr
         estadoVpn: { state: status.state, active: status.active, owned: status.owned, generation: status.generation },
         modo: pluginSettings().vpnMode === "custom" ? "custom" : "proton",
         onboarding: pluginSettings().onboardingCompleted === true,
+        ambiente: pluginEnvironmentSnapshot(),
     });
 
     const montado = montarPayload({ titulo: pedido.title, descricao: pedido.description, log: blocoDeLog, meta, segredos, token: BUG_API_TOKEN });
@@ -2854,7 +2890,23 @@ app.on("will-quit", () => {
 });
 
 app.whenReady().then(async () => {
+    const relaunchPendente = process.platform === "linux" ? pendingNamespaceRelaunch(pluginLogger.records()) : null;
     log("info", `abrindo plugin VPN | ${process.platform} ${process.arch} | electron ${process.versions.electron}`);
+    const ambiente = pluginEnvironmentSnapshot();
+    log("info", "env.snapshot", ambiente);
+    // O cliente relançado no namespace nunca abriu o plugin e este processo está fora dele: o relaunch
+    // morreu ao iniciar. Sem esta linha o log ficava mudo entre o relaunch e a reabertura manual.
+    if (relaunchPendente && !isProcessInNamespace()) {
+        log("warn", "relaunch.cliente_nao_subiu", {
+            namespace: relaunchPendente.namespace,
+            segundos_desde: Math.max(0, Math.round((Date.now() - Date.parse(relaunchPendente.at)) / 1000)),
+            operacao: relaunchPendente.operation_id,
+            motivo: "o cliente relançado no namespace não chegou a carregar o plugin; provável crash ao iniciar (no Linux, 'coredumpctl list' mostra se houve)",
+        });
+    }
+    // O plugin não conserta a pasta do sistema; só deixa explícito, já na abertura, que instalar ou
+    // atualizar o WireSock vai falhar e o que fazer à mão.
+    if (ambiente.msi_pasta_installer === "nao") log("warn", "env.windows_installer_ausente", { ...installerFolderDiagnosis(false) });
     try {
         const lock = acquirePluginUpdateLock();
         try { await recoverInterruptedPluginUpdate({ allowStaged: true }); }

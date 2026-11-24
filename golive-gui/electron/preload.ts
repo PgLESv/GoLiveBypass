@@ -81,4 +81,5 @@ import type { TunnelStats } from './wiresock';
   applyPendingUpdate: () => ipcRenderer.invoke('apply-pending-update') as Promise<boolean>,
   onUpdateAvailable: (callback: (info: { version: string; prerelease: boolean } | null) => void) =>
     ipcRenderer.on('update-available', (_event, info: { version: string; prerelease: boolean } | null) => callback(info)),
+  onProtonRouteChanged: (callback: () => void) => ipcRenderer.on('proton-route-changed', () => callback()),
 };

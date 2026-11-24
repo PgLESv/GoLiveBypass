@@ -25,6 +25,8 @@ export interface FailoverHealthSample {
   trafficIncreasing?: boolean;
   /** A Linux status error naming a missing namespace/interface is evidence of failure. */
   statsFailureEvidence?: boolean;
+  /** Windows: the wiresock-client log shows the latest handshake attempts went unanswered. */
+  wireSockHandshakeUnanswered?: boolean;
 }
 
 // PersistentKeepalive=10 in profiles generated for the managed Proton path gives us a
@@ -56,8 +58,10 @@ export function classifyFailoverHealth(
 
   // A missing wg.exe, or an unprivileged diagnostic read, is not enough evidence
   // to switch a live route. Linux callers can explicitly mark a missing namespace
-  // or interface as evidence; Windows falls back to CLI/adapter observations.
-  if (sample.statsFailureEvidence) return "failed";
+  // or interface as evidence. On Windows the WireSock log is that evidence: with the
+  // usual direct mode there is neither wg.exe nor a status CLI, and a "connected"
+  // CLI or a traffic sample must not hide a server that stopped answering handshakes.
+  if (sample.statsFailureEvidence || sample.wireSockHandshakeUnanswered) return "failed";
   if (sample.wireSock?.state === "connected") return "healthy";
   if (sample.trafficIncreasing) return "healthy";
   return "unknown";
@@ -139,15 +143,15 @@ export interface ProtonRoutePoolManifest {
 // pacote interno a 1000 B. Nas rotas gratuitas do México isso chega como IP fragmentado, e até a
 // 3.8.1 o WireSock gravava o checksum TCP calculado só sobre o primeiro fragmento: o Windows
 // descartava o pacote e o anexo "carregava e sumia" (#373, #400). A 3.8.2.1, mínimo exigido em
-// wiresock-preflight.ts, corrige o checksum (wiresock/WireSockUI#168). A exclusão continua ligada
-// por padrão até o Go Live (UDP) ser validado nessas rotas sem ela. A preferência
-// protonAvoidFreeMexico desliga a exclusão. Só o que foi medido: rota paga e Linux ficam como
-// estão, e pedir México explicitamente continua valendo.
+// wiresock-preflight.ts, corrige o checksum (wiresock/WireSockUI#168), e rotas dos EUA também
+// fragmentam (US-FREE#146 e #148 nos contadores do #408). Por isso o México voltou à escolha
+// automática: a exclusão só vale com a preferência protonAvoidFreeMexico ligada. Rota paga e Linux
+// ficam como estão, e pedir México explicitamente continua valendo.
 export function automaticExcludedCountries(
   options: { countries?: string; freeOnly?: boolean; avoidFreeMexico?: boolean },
   platform: NodeJS.Platform = process.platform,
 ): string {
-  if (platform !== "win32" || options.freeOnly === false || options.avoidFreeMexico === false) return "BR";
+  if (platform !== "win32" || options.freeOnly === false || options.avoidFreeMexico !== true) return "BR";
   const requested = (options.countries ?? "").split(",").map((item) => item.trim().toUpperCase());
   return requested.includes("MX") ? "BR" : "BR,MX";
 }

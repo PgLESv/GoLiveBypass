@@ -9,7 +9,8 @@ import https from "https";
 import * as logger from "./logger";
 import { elevatedPowerShellFileArgs, wireSockCleanupScript, wireSockDirectScript, wireSockNetworkRestoreScript, wireSockServiceScript } from "./wiresock-service";
 import { inspectGuiWireSockOwnership, wireSockOwnershipSnapshotScript, type GuiWireSockInspection } from "./wiresock-ownership";
-import { enumerateWireSockCandidatesAsync, selectSupportedWireSock } from "./wiresock-preflight";
+import { enumerateWireSockCandidatesAsync, FALLBACK_WIRESOCK_SDK, formatWireSockVersion, MIN_WIRESOCK_SDK, pickWireSock, selectSupportedWireSock } from "./wiresock-preflight";
+import { collectWireSockInstallerLogErrors, describeWireSockInstallerExit, installerFolderDiagnosis, windowsInstallerFolderPresent, wireSockInstallerFailureDetail } from "./wiresock-install-diag";
 import { registrarLogWireSock } from "./wiresock-log";
 
 const EMBEDDED_WG_CONF = `[Interface]
@@ -255,6 +256,8 @@ export interface WireSockInstallStateProbe {
   installDir: boolean;
   registered: boolean;
   driverService: boolean;
+  /** Leitura do registro falhou: ausencia nao e o mesmo que "nao registrado". */
+  registrationUnknown?: boolean;
 }
 
 /**
@@ -262,10 +265,15 @@ export interface WireSockInstallStateProbe {
  * sem um par cliente/booster utilizavel. Nesse estado o setup reexecutado cai
  * em manutencao ("Modify Setup"), que em /quiet nao instala nada e pode deixar
  * o driver pela metade — foi assim que maquinas ficaram sem internet.
+ *
+ * Leitura de registro que falhou entra como "stale": desinstalar antes custa
+ * pouco (1605/1614 sao tolerados quando nao havia nada) e o erro oposto —
+ * tratar incerteza como ausencia — termina no setup em manutencao, que devolve
+ * 0 sem instalar o par.
  */
 export function classifyWireSockInstallState(probe: WireSockInstallStateProbe): WireSockInstallState {
   if (probe.compatiblePair) return "compatible";
-  if (probe.installDir || probe.registered || probe.driverService) return "stale";
+  if (probe.installDir || probe.registered || probe.driverService || probe.registrationUnknown === true) return "stale";
   return "none";
 }
 
@@ -280,6 +288,52 @@ export function parseWireSockUninstallEntries(raw: string): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Pastas onde o registro diz que o WireSock foi instalado. MSI nem sempre grava
+ * InstallLocation; o DisplayIcon (exe do app) supre o diretorio nesses casos.
+ */
+export function parseWireSockUninstallLocations(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const out = new Set<string>();
+    for (const row of rows) {
+      const { location, icon } = (row ?? {}) as { location?: unknown; icon?: unknown };
+      let dir = typeof location === "string" ? location.trim().replace(/^"|"$/g, "") : "";
+      if (!dir && typeof icon === "string" && icon.trim()) {
+        const exe = icon.trim().replace(/,\s*-?\d+$/, "").replace(/^"|"$/g, "");
+        if (/\.exe$/i.test(exe)) dir = path.win32.dirname(exe);
+      }
+      if (dir) out.add(dir.replace(/[\\/]+$/, ""));
+    }
+    return [...out];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Instalacoes registradas fora das raizes que a GUI aceita executar (#402: SDK em
+ * "D:\Program Files"). O cliente roda elevado, entao a busca NAO se estende a essas
+ * pastas: numa unidade que nao e a do sistema, a pasta costuma herdar escrita para
+ * usuarios comuns, e executar um wiresock-client.exe dali seria escalar privilegio.
+ */
+export function wireSockForeignInstallLocations(locations: string[], roots: string[]): string[] {
+  const norm = (value: string) => path.win32.normalize(value).replace(/[\\/]+$/, "").toLowerCase();
+  const accepted = roots.map(norm);
+  return locations.filter((location) => {
+    const current = norm(location);
+    return !accepted.some((root) => current === root || current.startsWith(`${root}\\`));
+  });
+}
+
+export function wireSockForeignInstallMessage(location: string): string {
+  return `O WireSock está instalado em "${location}", fora da pasta de programas do Windows. `
+    + "Por segurança o GoLiveBypass só usa o WireSock instalado em C:\\Program Files. "
+    + "Desinstale o \"WireSock Secure Connect\" em Configurações > Aplicativos, reinicie o computador e ative de novo: "
+    + "o GoLiveBypass instala a versão certa no lugar certo.";
 }
 
 export interface WireSockNetworkRestoreResult {
@@ -517,20 +571,35 @@ export async function restoreWireSockNetwork(
 }
 
 /** Registro do Windows que sobrou sem um par cliente/booster utilizavel. */
-async function hasWireSockUninstallRegistration(): Promise<{ registered: boolean; entries: string[] }> {
-  if (process.platform !== "win32") return { registered: false, entries: [] };
-  const script = "$roots=@('HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); $found=@(); foreach($root in $roots){ try { Get-ItemProperty -Path $root -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and $_.DisplayName -match '(?i)wire\\s?sock|wglaunch' } | ForEach-Object { $found += [PSCustomObject]@{ name=[string]$_.DisplayName } } } catch {} }; ConvertTo-Json -Compress $found";
+async function hasWireSockUninstallRegistration(): Promise<{ registered: boolean; entries: string[]; known: boolean; locations: string[] }> {
+  if (process.platform !== "win32") return { registered: false, entries: [], known: true, locations: [] };
+  const script = "$roots=@('HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); $found=@(); foreach($root in $roots){ try { Get-ItemProperty -Path $root -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and $_.DisplayName -match '(?i)wire\\s?sock|wglaunch' } | ForEach-Object { $found += [PSCustomObject]@{ name=[string]$_.DisplayName; location=[string]$_.InstallLocation; icon=[string]$_.DisplayIcon } } } catch {} }; ConvertTo-Json -Compress $found";
   try {
     const output = await new Promise<string>((resolve, reject) => execFile(
       "powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
-      { encoding: "utf8", windowsHide: true, timeout: 8000 },
+      { encoding: "utf8", windowsHide: true, timeout: 20000 },
       (error, stdout) => error ? reject(error) : resolve(stdout),
     ));
     const entries = parseWireSockUninstallEntries(output);
-    return { registered: entries.length > 0, entries };
-  } catch {
-    return { registered: false, entries: [] };
+    return { registered: entries.length > 0, entries, known: true, locations: parseWireSockUninstallLocations(output) };
+  } catch (error) {
+    // Leitura que falhou NAO e o mesmo que "nao esta registrado". Assumir a
+    // ausencia pulava o `/uninstall` e deixava o setup em manutencao — que em
+    // /quiet nao instala nada e ainda assim termina com 0 —, ou seja, a maquina
+    // ficava sem par compatível e sem nenhum sinal do porque. Quem chama trata
+    // leitura falha como sinal de instalacao previa (desinstalar antes e barato
+    // e tolera 1605/1614 quando nao havia nada).
+    logger.warn("wiresock", "leitura do registro do WireSock nao confirmada", { detalhe: detalheErro(error) });
+    return { registered: false, entries: [], known: false, locations: [] };
   }
+}
+
+/** Primeira instalacao registrada fora das raizes aceitas, ou null. */
+async function foreignWireSockInstallLocation(): Promise<string | null> {
+  const registration = await hasWireSockUninstallRegistration();
+  const foreign = wireSockForeignInstallLocations(registration.locations, wireSockSearchRoots());
+  if (foreign.length > 0) logger.warn("wiresock", "instalacao fora das raizes aceitas", { pastas: foreign.join(" | ") });
+  return foreign[0] ?? null;
 }
 
 async function detectWireSockInstallState(compatiblePair: boolean): Promise<WireSockInstallState> {
@@ -543,8 +612,9 @@ async function detectWireSockInstallState(compatiblePair: boolean): Promise<Wire
     installDir,
     registered: registration.registered,
     driverService: isWireSockPacketFilterDriverInstalled(),
+    registrationUnknown: !registration.known,
   });
-  logger.info("wiresock", "estado de instalacao do WireSock", { state, installDir, registered: registration.registered, entradas: registration.entries.join(" | ") });
+  logger.info("wiresock", "estado de instalacao do WireSock", { state, installDir, registered: registration.registered, registro_conhecido: registration.known, entradas: registration.entries.join(" | "), pastas: registration.locations.join(" | ") });
   return state;
 }
 
@@ -552,6 +622,7 @@ async function installOfficialWireSock(onProgress?: (message: string) => void): 
   const platform = wireSockPlatform();
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "golive-wiresock-"));
   const installer = path.join(tempDir, "wiresock-sdk.exe");
+  const startedAt = Date.now();
   try {
     onProgress?.("Baixando o instalador oficial do WireSock…");
     await downloadOfficialWireSock(platform.query, installer);
@@ -597,7 +668,13 @@ async function installOfficialWireSock(onProgress?: (message: string) => void): 
       }
       selected = await waitForCompatibleWireSock(WIRESOCK_SETTLE_TIMEOUT_MS);
     }
-    if (!selected) throw new Error("O instalador oficial terminou, mas não deixou um par WireSock SDK compatível.");
+    if (!selected) {
+      // O setup reinstala na pasta que ja estava registrada; se ela fica fora das raizes
+      // aceitas, repetir a ativacao nunca acha o cliente. Dizer onde esta e como sair.
+      const foreign = await foreignWireSockInstallLocation();
+      if (foreign) throw new Error(wireSockForeignInstallMessage(foreign));
+      throw new Error("O instalador oficial terminou, mas não deixou um par WireSock SDK compatível.");
+    }
     return selected;
   } catch (error) {
     const installError = wireSockInstallModeError(error, "install");
@@ -606,12 +683,25 @@ async function installOfficialWireSock(onProgress?: (message: string) => void): 
     // foi quebrada por um setup que parou antes de mexer no driver.
     if (code === WIRESOCK_INSTALL_REBOOT) markWireSockRebootPending();
     if (code !== WIRESOCK_INSTALL_REBOOT && code !== WIRESOCK_INSTALL_CANCEL) {
+      // Código de saída, pasta do Windows Installer e as linhas de erro do log do próprio setup:
+      // é o que responde "por que não instalou" sem pedir arquivo nenhum à pessoa.
+      const installerFolder = windowsInstallerFolderPresent();
+      const exit = describeWireSockInstallerExit(code);
+      const setupErrors = collectWireSockInstallerLogErrors(startedAt);
+      logger.logEvent("error", "wiresock", "install.failed", { phase: "install" }, {
+        exit_code: exit.code ?? "desconhecido",
+        significado: exit.meaning || undefined,
+        msi_pasta_installer: installerFolder === null ? "desconhecida" : installerFolder ? "sim" : "nao",
+        setup_erros: setupErrors.length ? setupErrors.join(" || ") : undefined,
+        ...installerFolderDiagnosis(installerFolder),
+      });
       const restore = await restoreWireSockNetwork("instalacao-falhou", { force: true });
       // O script de recuperacao roda elevado e relata o que fez; so a sonda de
       // saida diz se o Windows voltou a navegar, e e ela que vai no popup.
       const network = restore.executed ? await verifyWindowsNetworkStable().catch(() => undefined) : undefined;
       const hint = wireSockInstallFailureHint(restore, network);
-      throw new Error(detalheErro(installError) + (hint ? ` ${hint}` : ""));
+      const detail = wireSockInstallerFailureDetail(code, installerFolder);
+      throw new Error(detalheErro(installError) + (detail ? ` ${detail}` : "") + (hint ? ` ${hint}` : ""));
     }
     throw installError;
   } finally {
@@ -619,8 +709,22 @@ async function installOfficialWireSock(onProgress?: (message: string) => void): 
   }
 }
 
+/**
+ * O `sc query` sai traduzido na maquina do usuario (medido no Windows 11 pt-BR
+ * com o 3.4.8.1: `NOME_DO_SERVICO: ndiswgc` e `ESTADO : 4 RUNNING`). Ler os
+ * rotulos `SERVICE_NAME`/`STATE` dava "nada instalado" em toda maquina que nao
+ * seja inglesa — inclusive o publico pt-BR do app, que ficava sem ver o driver
+ * carregado e sem "Restaurar internet" para um driver orfao. O que o Windows
+ * NAO traduz e o codigo numerico do SCM e o nome do estado (`4 RUNNING`), e e
+ * neles que a leitura se apoia. `1060` (servico inexistente) tambem e codigo.
+ */
+export function scQueryShowsRunning(output: string): boolean {
+  return /:\s*4\s+RUNNING\b/i.test(output);
+}
+
 export function wireSockDriverQueryShowsInstalled(output: string): boolean {
-  return /SERVICE_NAME:\s*(?:ndiswgc|ndiswg|NDISRD)\b/i.test(output) && !/\b1060\b/.test(output);
+  if (/\b1060\b/.test(output)) return false;
+  return WIRESOCK_DRIVER_SERVICE_NAMES.some((name) => new RegExp(`\\b${name}\\b`, "i").test(output));
 }
 
 export function isWireSockPacketFilterDriverInstalled(): boolean {
@@ -646,7 +750,7 @@ export function isWireSockRunning(): boolean {
         encoding: "utf8",
         windowsHide: true,
       });
-      return /STATE\s*:\s*\d+\s+RUNNING/i.test(out);
+      return scQueryShowsRunning(out);
     } catch {
       return false;
     }
@@ -891,7 +995,7 @@ export async function isWireSockActiveAsync(options: { processAlive?: boolean } 
   for (const name of WIRESOCK_SERVICE_NAMES) {
     try {
       const output = await execFileText("sc.exe", ["query", name]);
-      if (/STATE\s*:\s*\d+\s+RUNNING/i.test(output)) return true;
+      if (scQueryShowsRunning(output)) return true;
     } catch {}
   }
   return false;
@@ -1062,10 +1166,14 @@ export function ensureWireGuardConf(installDir: string, customPath?: string): st
   return confPath;
 }
 
+// Versão do último par compatível encontrado, só para o relato saber o que a ativação usou.
+let lastCompatibleWireSockVersion: string | null = null;
 async function findCompatibleWireSockAsync(env: NodeJS.ProcessEnv = process.env): Promise<string | null> {
   try {
     const candidates = await enumerateWireSockCandidatesAsync(wireSockSearchRoots(env));
-    return selectSupportedWireSock(candidates).executable;
+    const selected = selectSupportedWireSock(candidates);
+    lastCompatibleWireSockVersion = formatWireSockVersion(selected.executableVersion);
+    return selected.executable;
   } catch {
     return null;
   }
@@ -1078,11 +1186,38 @@ export async function ensureWireSockInstalled(onProgress?: (message: string) => 
   return wireSockInstallInFlight;
 }
 
+/** Par anterior à exigência (>= 3.4.8.1) ainda instalado; só serve de reserva. */
+async function findPreviousWireSockAsync(env: NodeJS.ProcessEnv = process.env): Promise<{ executable: string; version: string } | null> {
+  try {
+    const previous = pickWireSock(await enumerateWireSockCandidatesAsync(wireSockSearchRoots(env)), FALLBACK_WIRESOCK_SDK);
+    return previous ? { executable: previous.executable, version: formatWireSockVersion(previous.executableVersion) } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** O que a última ativação usou, para o relato: versão e se a troca do SDK falhou. */
+export type WireSockSelection = { version: string; upgrade: "ok" | "falhou_usando_anterior" | "nao_necessario" };
+let lastWireSockSelection: WireSockSelection | null = null;
+export function wireSockSelectionForReport(): WireSockSelection | null {
+  return lastWireSockSelection;
+}
+function recordWireSockSelection(upgrade: WireSockSelection["upgrade"], version?: string): void {
+  lastWireSockSelection = { version: version ?? lastCompatibleWireSockVersion ?? formatWireSockVersion(MIN_WIRESOCK_SDK), upgrade };
+}
+// Uma troca que falhou não se repete a cada ativação da mesma sessão: cada tentativa baixa o setup e
+// pede elevação de novo, e numa máquina que não instala MSI o resultado só muda depois de reiniciar.
+const wireSockUpgradeState = { failed: false };
+function isWireSockRebootPending(): boolean {
+  return wiresockRebootPending;
+}
+
 async function ensureWireSockInstalledOnce(onProgress?: (message: string) => void): Promise<string> {
   assertNoPendingWireSockReboot();
   onProgress?.("Verificando instalação compatível do WireSock…");
   const existing = await findCompatibleWireSockAsync();
   if (existing) {
+    recordWireSockSelection("nao_necessario");
     // Consultar o SCM a partir de um Electron não elevado pode ocultar drivers
     // que estão carregados (o 3.4.8.1 responde por `ndiswgc`, um KERNEL_DRIVER).
     // Isso é telemetria: a observação funcional após o start fica só nos logs.
@@ -1091,9 +1226,42 @@ async function ensureWireSockInstalledOnce(onProgress?: (message: string) => voi
     }
     return existing;
   }
+  if (wireSockUpgradeState.failed) {
+    const previous = await findPreviousWireSockAsync();
+    if (previous) {
+      recordWireSockSelection("falhou_usando_anterior", previous.version);
+      logger.warn("wiresock", "upgrade.skipped", { version: previous.version, motivo: "a troca ja falhou nesta sessao; reinicie o app para tentar de novo" });
+      return previous.executable;
+    }
+  }
 
   logger.info("wiresock", "nenhuma instalação compatível; usando instalador oficial com hash fixado", { url: WIRESOCK_OFFICIAL_DOWNLOAD });
-  return installOfficialWireSock(onProgress);
+  try {
+    const installed = await installOfficialWireSock(onProgress);
+    recordWireSockSelection("ok");
+    return installed;
+  } catch (error) {
+    // Reinicialização pedida pelo setup: a instalação nova pode estar pela metade, não dá para
+    // confiar na anterior até o Windows reiniciar.
+    if (isWireSockRebootPending()) throw error;
+    // A versão anterior continua lá quando o setup desfaz a própria falha (medido: 1632 no MSI
+    // novo, 3.4.8.1 intacta). Ela funcionava até a exigência subir; ativar com ela é melhor que
+    // travar quem já usava. O problema dos anexos nas rotas que fragmentam volta só nessa
+    // máquina (e o México segue fora da escolha automática), e fica registrado no log e no relato.
+    const previous = await findPreviousWireSockAsync();
+    if (!previous) throw error;
+    wireSockUpgradeState.failed = true;
+    recordWireSockSelection("falhou_usando_anterior", previous.version);
+    logger.warn("wiresock", "upgrade.fallback", {
+      version: previous.version,
+      esperado: formatWireSockVersion(MIN_WIRESOCK_SDK),
+      erro: detalheErro(error),
+      motivo: "troca do SDK falhou; ativando com a versao ja instalada, sem a correcao de fragmentos IP",
+      ...installerFolderDiagnosis(windowsInstallerFolderPresent()),
+    });
+    onProgress?.("A atualização do WireSock falhou; usando a versão já instalada.");
+    return previous.executable;
+  }
 }
 
 export function formatAllowedApps(paths: string[]): string {
@@ -1728,7 +1896,7 @@ export async function recoverWireSockNetwork(options: { forceNetworkRestore?: bo
 function isServiceRunning(name: string): boolean {
   try {
     const out = execFileSync("sc.exe", ["query", name], { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
-    return /STATE\s*:\s*\d+\s+RUNNING/i.test(out);
+    return scQueryShowsRunning(out);
   } catch {
     return false;
   }

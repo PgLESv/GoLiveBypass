@@ -99,7 +99,7 @@ vi.mock('child_process', () => ({
 // O produto exige um helper existente; o stub evita depender do proton-confgen compilado.
 vi.mock('../electron/proton-runtime', async (original) =>
   (await import('./helpers/confgen-runtime-stub')).stubProtonRuntime(await original<object>()));
-import { removeConfgenStub } from './helpers/confgen-runtime-stub';
+import { caminhoDoConfgenStub, removeConfgenStub, simularHelperEmbutidoAusente } from './helpers/confgen-runtime-stub';
 
 import { automaticExcludedCountries } from '../electron/route-failover';
 import { canReuseMeasuredProfile, generateManualProtonConfig, generateOptimalProtonConfig, generateProtonRouteCatalog, generateProtonRoutePool, findProtonConfgenExe, MEASUREMENT_CRITERION_VERSION, removeStagedProtonConfig, runConfgen } from '../electron/proton';
@@ -321,6 +321,29 @@ describe('medidor isolado da regra WireSock', () => {
       fs.rmSync(result.stagingDir!, { recursive: true, force: true });
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
+  it('prepara as reservas com o helper do caminho de reparo quando o pacote perdeu o embutido', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-route-pool-reparo-'));
+    simularHelperEmbutidoAusente(true);
+    try {
+      expect(() => findProtonConfgenExe()).toThrow(/não foi encontrado/);
+      const result = await generateProtonRoutePool(dir, { username: 'test', size: 2, countries: 'US,NL' });
+      expect(result.success).toBe(true);
+      expect(state.executable).toBe(caminhoDoConfgenStub());
+      expect(state.existed).toBe(true);
+      fs.rmSync(result.stagingDir!, { recursive: true, force: true });
+    } finally {
+      simularHelperEmbutidoAusente(false);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('toda chamada do helper em proton.ts passa o caminho consertado', () => {
+    const fonte = fs.readFileSync(path.resolve(process.cwd(), 'electron/proton.ts'), 'utf8');
+    const chamadas = [...fonte.matchAll(/runConfgen\(\{[\s\S]*?\}\)/g)].map((m) => m[0]);
+    expect(chamadas.length).toBeGreaterThanOrEqual(10);
+    for (const chamada of chamadas) expect(chamada).toContain('exePath');
+  });
+
   it('propaga progresso de ping enquanto prepara reservas', async () => {
     state.progressChunks = [
       'GOLIVE_PROGRESS {"phase":"ping","total":24,"tested":1,"succeeded":1,"server":"NL#12","pingMs":42,"status":"success"}\n',
@@ -424,18 +447,28 @@ describe('medidor isolado da regra WireSock', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('tira as rotas gratuitas do México da escolha automática só no Windows e sem pedido explícito', () => {
-    expect(automaticExcludedCountries({ freeOnly: true }, 'win32')).toBe('BR,MX');
-    expect(automaticExcludedCountries({}, 'win32')).toBe('BR,MX');
-    expect(automaticExcludedCountries({ countries: 'US,NL', freeOnly: true }, 'win32')).toBe('BR,MX');
-    expect(automaticExcludedCountries({ countries: 'us, mx', freeOnly: true }, 'win32')).toBe('BR');
-    expect(automaticExcludedCountries({ freeOnly: false }, 'win32')).toBe('BR');
-    expect(automaticExcludedCountries({ freeOnly: true }, 'linux')).toBe('BR');
+  it('o México entra na escolha automática por padrão', () => {
+    expect(automaticExcludedCountries({ freeOnly: true }, 'win32')).toBe('BR');
+    expect(automaticExcludedCountries({}, 'win32')).toBe('BR');
+    expect(automaticExcludedCountries({ freeOnly: true, avoidFreeMexico: false }, 'win32')).toBe('BR');
   });
 
-  it('deixa desligar a exclusão das rotas gratuitas do México', () => {
-    expect(automaticExcludedCountries({ freeOnly: true, avoidFreeMexico: false }, 'win32')).toBe('BR');
+  it('com a preferência ligada, tira as rotas gratuitas do México só no Windows e sem pedido explícito', () => {
     expect(automaticExcludedCountries({ freeOnly: true, avoidFreeMexico: true }, 'win32')).toBe('BR,MX');
+    expect(automaticExcludedCountries({ avoidFreeMexico: true }, 'win32')).toBe('BR,MX');
+    expect(automaticExcludedCountries({ countries: 'US,NL', freeOnly: true, avoidFreeMexico: true }, 'win32')).toBe('BR,MX');
+    expect(automaticExcludedCountries({ countries: 'us, mx', freeOnly: true, avoidFreeMexico: true }, 'win32')).toBe('BR');
+    expect(automaticExcludedCountries({ freeOnly: false, avoidFreeMexico: true }, 'win32')).toBe('BR');
+    expect(automaticExcludedCountries({ freeOnly: true, avoidFreeMexico: true }, 'linux')).toBe('BR');
+  });
+
+  // A GUI só grava protonAvoidFreeMexico quando a pessoa mexe no botão: sem o valor, fica desligada.
+  it('a preferência da GUI nasce desligada', () => {
+    const main = fs.readFileSync(path.resolve(process.cwd(), 'electron/main.ts'), 'utf8');
+    const html = fs.readFileSync(path.resolve(process.cwd(), 'index.html'), 'utf8');
+    expect(main).not.toContain('protonAvoidFreeMexico !== false');
+    expect(main.split('protonAvoidFreeMexico === true').length - 1).toBe(6);
+    expect(html).toContain('<input type="checkbox" id="avoidFreeMexicoToggle" />');
   });
 
   it('reutiliza cache somente com conta, filtros, versão, métricas e perfil compatíveis', () => {
@@ -447,9 +480,57 @@ describe('medidor isolado da regra WireSock', () => {
     expect(canReuseMeasuredProfile(dir, { ...previous, measurementCountry: 'NL' }, { username: 'test', country: 'US', freeOnly: true, autoPing: true })).toBe(false);
     expect(canReuseMeasuredProfile(dir, { ...previous, uploadMbps: 0 }, { username: 'test', country: 'US', freeOnly: true, autoPing: true })).toBe(false);
     if (process.platform === 'win32') {
-      expect(canReuseMeasuredProfile(dir, { ...previous, country: 'MX', measurementCountry: '' }, { username: 'test', country: '', freeOnly: true, autoPing: true })).toBe(false);
-      expect(canReuseMeasuredProfile(dir, { ...previous, country: 'MX', measurementCountry: '' }, { username: 'test', country: '', freeOnly: true, autoPing: true, avoidFreeMexico: false })).toBe(true);
+      expect(canReuseMeasuredProfile(dir, { ...previous, country: 'MX', measurementCountry: '' }, { username: 'test', country: '', freeOnly: true, autoPing: true })).toBe(true);
+      expect(canReuseMeasuredProfile(dir, { ...previous, country: 'MX', measurementCountry: '' }, { username: 'test', country: '', freeOnly: true, autoPing: true, avoidFreeMexico: true })).toBe(false);
     }
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('versão do app recusada nas operações de rota', () => {
+  const VERSAO_RECUSADA = 'A Proton deixou de aceitar esta versão do GoLiveBypass. Atualize o GoLiveBypass para continuar.';
+  const TEXTO_HELPER_NOVO = 'failed to load session: Proton no longer accepts this app version (code 5003); update GoLiveBypass';
+
+  // O renderer mostra o `error` destas três operações como chega.
+  const operacoes: Array<[string, (dir: string) => Promise<{ success: boolean; error?: string }>]> = [
+    ['otimização', (dir) => generateOptimalProtonConfig(dir, { username: 'test@example.test', speedTest: true })],
+    ['catálogo', (dir) => generateProtonRouteCatalog(dir, { username: 'test@example.test' })],
+    ['rota manual', (dir) => generateManualProtonConfig(dir, { username: 'test@example.test', server: 'US#8' })],
+  ];
+  const resultadoDe = async (operacao: (dir: string) => Promise<{ success: boolean; error?: string }>) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'golive-route-version-'));
+    try { return await operacao(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  };
+
+  beforeEach(() => {
+    state.success = false; state.json = undefined; state.error = ''; state.code = 1; state.closeDelay = 0; state.createOutput = false;
+    state.progressChunks = []; state.killAt = 0; state.downloadMbps = 30; state.uploadMbps = 10;
+  });
+
+  it.each(operacoes)('%s traduz o código APP_VERSION_UNSUPPORTED do helper', async (_nome, operacao) => {
+    state.json = { success: false, error: TEXTO_HELPER_NOVO, code: 'APP_VERSION_UNSUPPORTED', retryable: false };
+    expect(await resultadoDe(operacao)).toEqual({ success: false, error: VERSAO_RECUSADA });
+  });
+
+  it.each(operacoes)('%s traduz o texto 5003 de helpers antigos', async (_nome, operacao) => {
+    state.json = { success: false, error: 'authentication failed: failed to get auth info: authentication failed with code: 5003' };
+    expect(await resultadoDe(operacao)).toEqual({ success: false, error: VERSAO_RECUSADA });
+  });
+
+  it('mantém os demais erros como vinham', async () => {
+    state.json = { success: false, error: 'nenhum servidor respondeu para test@example.test', code: 'NETWORK_ERROR', retryable: true };
+    const [otimizacao, catalogo, manual] = operacoes.map(([, operacao]) => operacao);
+    expect(await resultadoDe(otimizacao)).toEqual({ success: false, error: 'nenhum servidor respondeu para test@example.test' });
+    expect(await resultadoDe(catalogo)).toEqual({ success: false, error: 'nenhum servidor respondeu para [account]' });
+    expect(await resultadoDe(manual)).toEqual({ success: false, error: 'nenhum servidor respondeu para [account]' });
+  });
+
+  it('o log da otimização guarda o texto original do helper', async () => {
+    state.json = { success: false, error: TEXTO_HELPER_NOVO, code: 'APP_VERSION_UNSUPPORTED', retryable: false };
+    logger._resetForTests();
+    expect((await resultadoDe(operacoes[0][1])).error).toBe(VERSAO_RECUSADA);
+    const recent = logger.getRecent();
+    expect(recent).toContain(TEXTO_HELPER_NOVO);
+    expect(recent).toContain('APP_VERSION_UNSUPPORTED');
   });
 });

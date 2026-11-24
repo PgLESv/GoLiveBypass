@@ -29,9 +29,13 @@ import {
 } from "./updater";
 import * as logger from "./logger";
 import * as discordscan from "./discordscan";
+import { descreverFalhaDaTela, resultadoDaOperacao } from "./relato-resumo";
 import * as logsDir from "./logsDir";
-import { ensureWireSockInstalled, listRunningImageNamesAsync, getWireSockAdapterTrafficNetshAsync, pingHostAsync, trafficSample, type TunnelStats, type WireSockAdapterTraffic, getWireSockConnectionStatus, getWireSockConnectionStatusAsync, getWireSockAdapterTraffic, getWireSockAdapterTrafficAsync, hasWireSockAdapterTrafficIncrease, isWireSockActive, isWireSockActiveAsync, startWireSockService, switchWireSockService, recoverWireSockNetwork, verifyWindowsNetwork, type WireSockConnectionStatus } from "./wiresock";
+import { ensureWireSockInstalled, listRunningImageNamesAsync, getWireSockAdapterTrafficNetshAsync, pingHostAsync, trafficSample, type TunnelStats, type WireSockAdapterTraffic, getWireSockConnectionStatus, getWireSockConnectionStatusAsync, getWireSockAdapterTraffic, getWireSockAdapterTrafficAsync, hasWireSockAdapterTrafficIncrease, isWireSockActive, isWireSockActiveAsync, startWireSockService, switchWireSockService, recoverWireSockNetwork, verifyWindowsNetwork, type WireSockConnectionStatus, wireSockSelectionForReport } from "./wiresock";
+import { guiEnvironmentSnapshot } from "./env-snapshot";
+import { installerFolderDiagnosis } from "./wiresock-install-diag";
 import { classifyWgReadiness, getWgStats, getWgStatsAsync, iniciarWgStatsWatchdog, pararWgStatsWatchdog, type WgTunnelStats } from "./wgstats";
+import { caminhoLogWireSock, lerResumoLogWireSock, respostaNaSessaoAtual, servidorSemResposta } from "./wiresock-log";
 import { automaticExcludedCountries, classifyFailoverHealth, FailoverHealthTracker, FAILOVER_ROUTE_TIMEOUT_MS, FAILOVER_SAMPLE_INTERVAL_MS, routeCandidateUsable, routePoolDirectory, readRoutePoolManifest, makeRoutePoolManifest, routePoolMatches, ROUTE_POOL_RESERVE_COUNT, ROUTE_POOL_TOTAL, safeRoutePoolPath, writeRoutePoolManifest, type ProtonRouteMetadata, type ProtonRoutePoolManifest } from "./route-failover";
 import { validateWgConfContent } from "./wg-validator";
 import * as proton from "./proton";
@@ -48,7 +52,9 @@ import { createProcSeams } from "./linux-proc-seams";
 import { clearSelectedTarget, listRunningApps, selectManualTarget, type ManualTargetServiceDeps } from "./linux-manual-target-service";
 import { readManualTarget } from "./linux-manual-target";
 import { sessionMarkerPaths } from "./linux-session-marker";
-import { classifyLinuxHealth } from "./linux-health";
+import { classifyLinuxHealth, criarRegistroDeDiagnostico } from "./linux-health";
+import { stripAnsiCodes, tailErroScript } from "./script-stderr";
+import { neutralizeLegacyInjection } from "./legacy-injection";
 import { PROTON_CAPTCHA_IPC_CHANNEL, isAllowedProtonCaptchaNavigation, parseProtonCaptchaChallenge, validateProtonCaptchaResponse } from "./proton-captcha";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -189,10 +195,19 @@ let protonRoutePoolAbort: AbortController | null = null;
 function withWireSockLifecycle<T>(operation: string, task: () => Promise<T>): Promise<T> {
   const run = wireSockLifecycleQueue.then(async () => {
     logger.info("wiresock", "inicio de operacao serializada", { operation });
+    const inicio = Date.now();
+    let resultado = "ok";
     try {
-      return await task();
+      const valor = await task();
+      // Varias operacoes falham pelo valor ({ success:false }, recovery com ok:false), sem lancar.
+      resultado = resultadoDaOperacao(valor);
+      return valor;
+    } catch (error) {
+      resultado = "erro";
+      throw error;
     } finally {
-      logger.info("wiresock", "fim de operacao serializada", { operation });
+      // Resultado e duracao: o resumo do relato monta a lista de operacoes a partir desta linha.
+      logger.info("wiresock", "fim de operacao serializada", { operation, resultado, duracao_ms: Date.now() - inicio });
     }
   });
   wireSockLifecycleQueue = run.then(() => undefined, () => undefined);
@@ -608,7 +623,9 @@ let linuxStatusLastLog = "";
 let linuxStatusLastLogAt = 0;
 let linuxHealthTimer: ReturnType<typeof setInterval> | null = null;
 let linuxHealthInFlight = false;
-let linuxHealthFailures = 0;
+// O watchdog roda a cada 15s; o limitador deixa no log a primeira falha, a troca de motivo e o
+// mesmo motivo a cada 5 min, sem repetir o par aviso/volta-ao-normal quando o tunel oscila.
+const linuxHealthLog = criarRegistroDeDiagnostico({ intervaloMs: 5 * 60_000 });
 let linuxHealthStatusNotificado = "";
 function linuxStatusLogAllowed(signature: string): boolean {
   const now = Date.now();
@@ -794,7 +811,14 @@ if (!gotLock) {
       const logs = logsDir.garantirLogsDir(app.getPath("home"), process.platform);
       logger.initLogger(logs);
       logger.patchConsole();
-      logger.info("app", "iniciado", { versao: app.getVersion(), plataforma: process.platform });
+      // Instante exato da abertura, em ISO: o gui.log de versoes anteriores so tinha HH:MM:SS.
+      logger.info("app", "iniciado", { versao: app.getVersion(), plataforma: process.platform, inicio: new Date().toISOString() });
+      // Uma linha por abertura com SO/build, fuso e o que o relato precisaria perguntar (env-snapshot.ts).
+      const ambiente = guiEnvironmentSnapshot();
+      logger.info("env", "snapshot", ambiente);
+      // O app nao conserta a pasta do sistema; so deixa explicito, ja na abertura, que instalar ou
+      // atualizar o WireSock vai falhar e o que fazer a mao.
+      if (ambiente.msi_pasta_installer === "nao") logger.warn("env", "pasta do Windows Installer ausente", { ...installerFolderDiagnosis(false) });
     } catch {}
     // Beta 16: esta nao e mais uma preferencia. Corrige na abertura tanto o
     // settings compartilhado (Linux) quanto o settings de injecoes existentes
@@ -975,12 +999,18 @@ function logWindowsDiscoveryRoots(
   env: WindowsDiscoveryEnvironment,
   roots = rootsForEnvironment(env),
 ): void {
+  let testadas = 0;
+  let achadas = 0;
   for (const root of roots) {
     for (const flavour of ALL_APPS) {
       const rootPath = path.win32.join(root, flavour);
-      discordscan.scanRaiz(rootPath, diskFs.existsSync(rootPath), flavour);
+      testadas++;
+      if (!diskFs.existsSync(rootPath)) continue;
+      achadas++;
+      discordscan.scanRaiz(rootPath, true, flavour);
     }
   }
+  discordscan.scanRaizes(testadas, achadas);
 }
 
 
@@ -996,6 +1026,9 @@ function getMacDiscordInstalls(): DiscordInstall[] {
   const installs: DiscordInstall[] = [];
   const seen = new Set<string>();
   discordscan.scanInicio("darwin");
+  // Mesma semantica do Windows: testadas = caminhos olhados, achadas = os que existem no disco.
+  let testadas = 0;
+  let achadas = 0;
 
   for (const root of roots) {
     for (const { flavour, appName } of MAC_APPS) {
@@ -1005,7 +1038,11 @@ function getMacDiscordInstalls(): DiscordInstall[] {
       const asar = path.join(resources, "app.asar");
       const originalAsar = path.join(resources, "_app.asar");
       const existe = diskFs.existsSync(asar) || diskFs.existsSync(originalAsar);
-      discordscan.scanRaiz(bundlePath, existe, flavour);
+      testadas++;
+      if (existe || diskFs.existsSync(bundlePath)) {
+        achadas++;
+        discordscan.scanRaiz(bundlePath, true, flavour);
+      }
       if (existe) {
         installs.push({ flavour, resources, exePath: "", bundlePath });
         discordscan.scanInstall(resources, flavour);
@@ -1013,6 +1050,7 @@ function getMacDiscordInstalls(): DiscordInstall[] {
       }
     }
   }
+  discordscan.scanRaizes(testadas, achadas);
   discordscan.scanResultado(installs.length);
   return installs;
 }
@@ -1417,6 +1455,18 @@ async function executarAtivacao(event: any) {
     throw new Error("Nenhum Discord encontrado.");
   }
 
+  // Injeção legada que sobrou de versões antigas roteia o gateway por SOCKS por cima do
+  // túnel. Desliga só a cópia comprovadamente nossa (settings.json dela), sem restaurar nem
+  // remover o asar do Discord; vale a partir da reabertura que a própria ativação faz.
+  if (IS_WINDOWS) {
+    for (const install of installs) {
+      const resultado = neutralizeLegacyInjection(install.resources, diskFs);
+      if (resultado !== "nao_nossa") {
+        logger.warn("ativacao", "injecao.legada", { flavour: install.flavour, resultado });
+      }
+    }
+  }
+
   // Com WireSock, o estado ativo e somente tunel + Discord rodando. Reativar com a mesma
   // configuracao derrubaria conexoes a toa; nao consultamos nem alteramos o cliente.
   const assinatura = assinaturaAtivacao("");
@@ -1742,7 +1792,7 @@ function stopLinuxHealthWatchdog() {
   if (linuxHealthTimer !== null) clearInterval(linuxHealthTimer);
   linuxHealthTimer = null;
   linuxHealthInFlight = false;
-  linuxHealthFailures = 0;
+  linuxHealthLog.reiniciar();
   linuxHealthStatusNotificado = "";
 }
 
@@ -1753,10 +1803,11 @@ function startLinuxHealthWatchdog() {
     linuxHealthInFlight = true;
     void checkLinuxTunnelHealth().then((result) => {
       if (result.healthy) {
-        linuxHealthFailures = 0;
+        const normal = linuxHealthLog.saudavel();
+        if (normal) logger.info("linux", "tunel.diagnostico.normal", { falhas_antes: normal.falhasAntes });
       } else {
-        linuxHealthFailures += 1;
-        logger.warn("linux", "tunel.diagnostico", { mode: "log-only", falhas: linuxHealthFailures, motivo: result.reason });
+        const falha = linuxHealthLog.falhou(String(result.reason ?? ""));
+        if (falha) logger.warn("linux", "tunel.diagnostico", { mode: "log-only", falhas: falha.falhas, motivo: result.reason });
       }
       // A janela le o MESMO estado que este watchdog observa. Sem esta
       // comparacao, fechar o Discord ou perder o namespace deixava o botao
@@ -1820,7 +1871,7 @@ function validProtonPoolReserves(manifest: ProtonRoutePoolManifest): ProtonRoute
   const excludedCountries = automaticExcludedCountries({
     countries: manifest.country,
     freeOnly: manifest.freeOnly,
-    avoidFreeMexico: (readSharedSettings() as any).protonAvoidFreeMexico !== false,
+    avoidFreeMexico: (readSharedSettings() as any).protonAvoidFreeMexico === true,
   }).split(",");
   for (const candidate of manifest.reserves) {
     const safe = safeRoutePoolPath(poolDir, candidate.confFile);
@@ -1860,6 +1911,14 @@ function notifyProtonFailover(message: string): void {
   logger.warn("proton", "failover.aviso", { message, mode: "discreet" });
   if (mainWindow && !mainWindow.isDestroyed()) {
     try { mainWindow.webContents.send("proton-failover-notice", { message }); } catch {}
+  }
+}
+
+// Troca automatica concluida: a tela recarrega o cartao da rota, sem aviso novo. Sem isto ele
+// seguia mostrando a rota de antes da troca ate a GUI reabrir.
+function notifyProtonRouteChanged(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send("proton-route-changed"); } catch {}
   }
 }
 
@@ -1921,7 +1980,7 @@ async function buildProtonRoutePoolNow(
       countries: typeof settings.protonCountry === "string" ? settings.protonCountry || undefined : undefined,
       freeOnly: true,
       autoPing: settings.protonAutoPing !== false,
-      avoidFreeMexico: settings.protonAvoidFreeMexico !== false,
+      avoidFreeMexico: settings.protonAvoidFreeMexico === true,
       size: Math.max(1, Math.min(3, Math.floor(count))),
       excludeServers: [...excluded],
       signal: controller?.signal,
@@ -2302,6 +2361,7 @@ async function attemptProtonFailover(generation: number): Promise<void> {
           updatedAt: new Date().toISOString(),
         },
       });
+      notifyProtonRouteChanged();
       protonFailoverTracker?.reset();
       scheduleProtonRoutePoolBuild(generation, Math.max(0, ROUTE_POOL_RESERVE_COUNT - manifest.reserves.length));
       return;
@@ -2329,6 +2389,7 @@ async function collectProtonFailoverSample(generation: number): Promise<void> {
   if (settings.vpnMode === "custom" || settings.protonAutoFailover === false) return;
 
   let sample;
+  let semRespostaSeguidos: number | undefined;
   if (IS_LINUX) {
     const status = await linuxStatus();
     const stats = await linuxWgStats();
@@ -2355,6 +2416,11 @@ async function collectProtonFailoverSample(generation: number): Promise<void> {
     const wireSock = await getWireSockConnectionStatusAsync({ activeHint: tunnelActive });
     const trafficIncreasing = hasWireSockAdapterTrafficIncrease(protonFailoverPreviousAdapterTraffic, traffic);
     protonFailoverPreviousAdapterTraffic = traffic;
+    // No modo direto (o normal) nao ha wg.exe nem CLI de status: so o log do wiresock-client
+    // mostra o servidor deixando de responder ao handshake (#411). Le so o fim do arquivo.
+    const caminhoLog = caminhoLogWireSock();
+    const logWireSock = caminhoLog ? lerResumoLogWireSock(caminhoLog) : null;
+    if (logWireSock?.ok) semRespostaSeguidos = logWireSock.semRespostaSeguidos;
     sample = {
       discordRunning,
       // Se uma leitura assíncrona do processo falhar, o estado WireSock ainda
@@ -2366,6 +2432,7 @@ async function collectProtonFailoverSample(generation: number): Promise<void> {
       stats,
       wireSock,
       trafficIncreasing,
+      wireSockHandshakeUnanswered: logWireSock ? servidorSemResposta(logWireSock) : false,
     };
   } else {
     return;
@@ -2378,6 +2445,7 @@ async function collectProtonFailoverSample(generation: number): Promise<void> {
       health,
       consecutive_failures: observation.consecutiveFailures,
       grace: observation.inGracePeriod,
+      ...(semRespostaSeguidos !== undefined ? { wiresock_sem_resposta_seguidos: semRespostaSeguidos } : {}),
     });
   }
   if (!observation.trigger || generation !== protonFailoverGeneration) return;
@@ -2443,7 +2511,7 @@ function startProtonFailoverMonitor(): void {
 export type WindowsRouteReadiness = {
   verified: boolean;
   state: "connected" | "unverified" | "disconnected";
-  source: WireSockConnectionStatus["source"] | "wg" | "functional" | "none";
+  source: WireSockConnectionStatus["source"] | "wg" | "functional" | "log" | "none";
   detail?: string;
 }
 
@@ -2496,6 +2564,14 @@ async function waitForWindowsWgReady(timeoutMs = 20_000): Promise<WindowsRouteRe
     const readiness = classifyWgReadiness(last, true);
     if (readiness.ready) {
       return finish({ verified: true, state: "connected", source: "wg", detail: "handshake recente e tráfego WireGuard bidirecional confirmados" });
+    }
+    // Sem wg.exe nem CLI (o modo direto normal), a resposta de handshake no log do
+    // wiresock-client e a prova de que o servidor atendeu. A troca de rota abre um log novo, e
+    // so conta resposta depois do inicio do tunel atual. O primeiro handshake costuma vir antes
+    // desta espera comecar, entao "resposta desde agora" recusaria uma reserva boa.
+    const caminhoLog = caminhoLogWireSock();
+    if (caminhoLog && respostaNaSessaoAtual(lerResumoLogWireSock(caminhoLog))) {
+      return finish({ verified: true, state: "connected", source: "log", detail: "resposta de handshake no log do WireSock" });
     }
     // Instalações oficiais nem sempre incluem wg.exe. Dois estados Connected
     // consecutivos com endereço externo são a confirmação funcional da CLI;
@@ -2670,32 +2746,6 @@ function manualTargetView(preflight: LinuxPreflight): { name: string; kind: stri
   };
 }
 
-// As ultimas linhas do stderr do script viram a mensagem de erro na UI. O ruido imutavel de
-// distro imutavel (Bluefin/Bazzite preenchem LD_PRELOAD da sessao: "ERROR: ld.so: object ...
-// cannot be preloaded" em cada filho) ocupava o fim do stderr e escondia o erro de verdade
-// (issue #108) -- filtrado aqui antes de qualquer tail.
-// O standalone colore o stderr com ANSI. Em algumas sessões Wayland/Flatpak o
-// byte ESC chega ao Electron como U+FFFD, deixando sequências literais como
-// "�[36m" na mensagem. Removemos os dois formatos antes de mostrar o erro.
-function stripAnsiCodes(value: string): string {
-  return value
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/(?:\x1b|\u009b|\uFFFD)\[[0-?]*[ -/]*[@-~]/g, "");
-}
-
-function tailErroScript(stderr: string, linhas: number): string {
-  const uteis = stripAnsiCodes(stderr)
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .filter((l) => !/^ERROR: ld\.so:/.test(l))
-    // Passos informativos do teardown ocupavam as ultimas linhas e viravam a
-    // mensagem de erro da UI, escondendo o "[X] ..." que explica a falha.
-    .filter((l) => !/^\[\*\]\s*Removendo namespace de rede/i.test(l))
-    .filter((l) => !/^\[OK\]\s*Tunel WireGuard encerrado/i.test(l));
-  return uteis.slice(-linhas).join("\n");
-}
-
 // Explicit activation remains available after a skipped/failed benchmark. Call only
 // inside the lifecycle queue, so this fallback cannot overwrite an ongoing selection.
 async function ensureProtonActivationProfile() {
@@ -2711,7 +2761,7 @@ async function ensureProtonActivationProfile() {
     // response can expose paid tiers to the selector.
     freeOnly: plan.status !== "premium",
     autoPing: s.protonAutoPing !== false,
-    avoidFreeMexico: s.protonAvoidFreeMexico !== false,
+    avoidFreeMexico: s.protonAvoidFreeMexico === true,
     speedTest: false,
   });
   if (!gen.success) throw new Error(gen.error || "Não foi possível preparar uma rota ProtonVPN.");
@@ -2775,7 +2825,7 @@ async function optimizeProtonRouteAtStartup(
         countries: countries || undefined,
         freeOnly,
         autoPing,
-        avoidFreeMexico: settings.protonAvoidFreeMexico !== false,
+        avoidFreeMexico: settings.protonAvoidFreeMexico === true,
         speedTest: fullTest,
         signal,
         onProgress: (progress) => {
@@ -3163,6 +3213,9 @@ async function linuxActivateInner(
   updateSharedSettings({ routeMode: "wireguard" });
   const { code, stderr } = await elevated.run(["--yes", "--cleanup-legacy"], forwardLinuxChunk);
   if (code !== 0) {
+    // A mensagem da UI cabe em poucas linhas; o relatório precisa do trecho inteiro
+    // (falha, rollback e caminho do log do Discord) para separar causa de consequência.
+    logger.warn("linux", "ativacao.falhou", { stderr: tailErroScript(stderr, 30) });
     throw new Error(
       tailErroScript(stderr, 3) ||
         "Falha ao ativar",
@@ -3230,6 +3283,42 @@ async function linuxDeactivate(onChunk: (c: string) => void) {
 
 // A bandeja precisa refletir o que os botoes da janela fizeram, entao os handlers de IPC
 // tambem remontam o menu ao terminar.
+// O que a pessoa viu na tela era a pergunta mais repetida nas issues ("qual erro apareceu?"). Nas
+// acoes que ela dispara, a falha devolvida a janela vira uma linha `ui erro.exibido` no log e entra
+// no resumo do relato. Canais de leitura (get-*, check-*) ficam fora: devolvem "sem sessao" e afins
+// como resultado normal, nao como erro mostrado.
+const CANAIS_DE_ACAO = new Set([
+  "activate", "deactivate", "restart-bypass", "restore-internet",
+  "login-proton", "logout-proton", "discover-proton-routes", "optimize-proton-route", "select-proton-route",
+  "import-wg-conf", "import-wg-conf-file", "test-wg-conf", "set-vpn-mode",
+  "set-linux-manual-target", "clear-linux-manual-target",
+]);
+{
+  const registrarOriginal = ipcMain.handle.bind(ipcMain);
+  const registrarFalha = (canal: string, valor: unknown) => {
+    const falha = descreverFalhaDaTela(valor);
+    // *_CANCELLED e a tentativa substituida por outra (ex.: login refeito): nao e erro que a pessoa viu.
+    // O texto vem de handler e pode carregar token/senha; a redacao de valor do logger nao roda
+    // em warn(), entao ela e aplicada aqui antes de gravar o arquivo e o resumo.
+    if (falha && !/_CANCELLED$/.test(falha.codigo ?? "")) {
+      logger.warn("ui", "erro.exibido", { canal, ...(falha.codigo ? { codigo: falha.codigo } : {}), mensagem: logger.redactLogValue(falha.mensagem, "mensagem") });
+    }
+  };
+  ipcMain.handle = ((canal: string, handler: Parameters<typeof ipcMain.handle>[1]) => {
+    if (!CANAIS_DE_ACAO.has(canal)) return registrarOriginal(canal, handler);
+    return registrarOriginal(canal, async (...args: Parameters<typeof handler>) => {
+      try {
+        const resultado = await handler(...args);
+        registrarFalha(canal, resultado);
+        return resultado;
+      } catch (error) {
+        registrarFalha(canal, error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      }
+    });
+  }) as typeof ipcMain.handle;
+}
+
 ipcMain.handle("activate", async (event) => {
   if (IS_LINUX) {
     // No Linux, a GUI delega pro script standalone; o script.sh ja tem a heuristica
@@ -4276,7 +4365,7 @@ ipcMain.handle("get-proton-settings", async () => {
     freeOnly: s.protonFreeOnly !== undefined ? Boolean(s.protonFreeOnly) : !isPaid,
     autoPing: s.protonAutoPing !== false,
     autoFailover: s.protonAutoFailover !== false,
-    avoidFreeMexico: s.protonAvoidFreeMexico !== false,
+    avoidFreeMexico: s.protonAvoidFreeMexico === true,
     startupSpeedTest: s.protonStartupSpeedTest !== false,
     routePreference: s.protonRoutePreference === "manual"
       ? "manual"
@@ -4748,7 +4837,7 @@ ipcMain.handle("optimize-proton-route", async (event, options?: ProtonOptimizati
       // renderers but cannot accidentally unlock paid tiers.
       const freeOnly = plan.status !== "premium";
       const autoPing = options?.autoPing !== undefined ? options.autoPing : (s.protonAutoPing !== false);
-      const avoidFreeMexico = s.protonAvoidFreeMexico !== false;
+      const avoidFreeMexico = s.protonAvoidFreeMexico === true;
 
       // A abertura/login deve confirmar a rota novamente quando o túnel está
       // inativo. O reaproveitamento continua disponível apenas para fluxos que
