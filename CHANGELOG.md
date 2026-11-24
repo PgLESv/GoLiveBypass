@@ -4,7 +4,14 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
-## [Unreleased]
+## [2.1.14] - 2026-11-24
+
+### Sincronização Upstream (GoLiveBypass 2.0.17 e 2.0.18 Estáveis)
+- **Login Proton:** o helper se identifica como o cliente oficial 6.1.2; a Proton recusava a versão antiga desde 19/11 (código 5003), e a versão recusada agora vira mensagem clara sem apagar a sessão.
+- **Troca automática de rota (Windows):** reage a servidor que para de responder; reservas usam o helper consertado.
+- **México grátis:** volta à escolha automática no Windows ("Evitar rotas grátis do México" agora desligado por padrão).
+- **WireSock e Linux:** troca de SDK que falha usa a versão anterior, leitura do serviço com `sc query` traduzido, rollback Linux e auto-ping.
+- **Logs:** formato de data `dd/mm/aaaa - hh:mm:ss` e menos ruído.
 
 ### Adicionado (Fork PgLESv)
 - **Configurações → "Teste de velocidade ao abrir"** (ligado por padrão). Desligado, a abertura do app e a restauração automática do Windows escolhem a rota Proton só pelo ping, no país da última rota usada, sem o teste de download/upload. País escolhido manualmente continua valendo; a otimização manual ("Otimizar rota") continua medindo velocidade. Se o último país não tiver mais rota utilizável, refaz a verificação completa (todos os países, com teste de velocidade).
