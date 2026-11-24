@@ -36,4 +36,19 @@ describe("integração da restauração automática do bypass", () => {
     const startup = src.slice(src.indexOf("function restoreBypassFromWindowsStartup"), src.indexOf("function recoverProtonUsername"));
     expect(startup).toContain("preferência preservada");
   });
+
+  it("sem teste de velocidade na abertura, escolhe só por ping no último país", () => {
+    const src = mainSource();
+    const boot = src.slice(src.indexOf("async function optimizeProtonRouteAtStartup"), src.indexOf("type LinuxElevationEventName"));
+    expect(boot).toContain('let speedTest = settings.protonStartupSpeedTest !== false;');
+    expect(boot).toContain('const lastCountry = country || speedTest ? "" : lastProtonCountry(settings);');
+    expect(boot).toContain("generated = await generate(routeCountry, speedTest);");
+    expect(src).toContain('const lastCountry = !country && refreshOnStartup && !speedTest ? lastProtonCountry(s) : "";');
+    // Último país sem rota: verificação completa de novo, nos dois caminhos.
+    expect(boot).toContain('generated = await generate("", true);');
+    expect(src).toContain('gen = await generate("", true);');
+    expect(src).toContain("startupSpeedTest: s.protonStartupSpeedTest !== false");
+    const renderer = fs.readFileSync(path.resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(renderer).toContain("speedTest = !onStartup || startupSpeedTestToggle?.checked !== false");
+  });
 });

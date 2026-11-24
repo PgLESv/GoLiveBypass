@@ -192,6 +192,7 @@ declare global {
         planTitle?: string;
         isPaid?: boolean;
         avoidFreeMexico: boolean;
+        startupSpeedTest?: boolean;
         routePreference?: 'auto' | 'manual';
         /** Perfil Proton ja gerado no disco (username + wireguard.conf). */
         profileReady?: boolean;
@@ -298,6 +299,7 @@ const compactWindowToggle = document.getElementById('compactWindowToggle') as HT
 const autoFailoverToggle = document.getElementById('autoFailoverToggle') as HTMLInputElement | null;
 const avoidFreeMexicoRow = document.getElementById('avoidFreeMexicoRow') as HTMLElement | null;
 const avoidFreeMexicoToggle = document.getElementById('avoidFreeMexicoToggle') as HTMLInputElement | null;
+const startupSpeedTestToggle = document.getElementById('startupSpeedTestToggle') as HTMLInputElement | null;
 if (avoidFreeMexicoRow) avoidFreeMexicoRow.hidden = platform !== 'win32';
 const settingsBtn = document.getElementById('settingsBtn') as HTMLButtonElement | null;
 const settingsDialog = document.getElementById('settingsDialog') as HTMLElement | null;
@@ -840,6 +842,7 @@ async function refreshAutoFailover() {
     const settings = await window.api.getProtonSettings();
     if (autoFailoverToggle) autoFailoverToggle.checked = settings.autoFailover !== false;
     if (avoidFreeMexicoToggle) avoidFreeMexicoToggle.checked = settings.avoidFreeMexico !== false;
+    if (startupSpeedTestToggle) startupSpeedTestToggle.checked = settings.startupSpeedTest !== false;
   } catch (err) {
     console.error(err);
   }
@@ -1740,6 +1743,7 @@ async function refreshProtonState(forcePlan = false) {
       : null;
     if (autoFailoverToggle) autoFailoverToggle.checked = s.autoFailover !== false;
     if (avoidFreeMexicoToggle) avoidFreeMexicoToggle.checked = s.avoidFreeMexico !== false;
+    if (startupSpeedTestToggle) startupSpeedTestToggle.checked = s.startupSpeedTest !== false;
     if (protonCountrySelect) renderProtonMeasuredRouteOptions();
     protonProfileReady = s.profileReady === true;
 
@@ -2122,7 +2126,7 @@ function stopProtonOptimizeAnimation(): void {
 }
 
 
-async function optimizeProtonRoute(onStartup = false, speedTest = true) {
+async function optimizeProtonRoute(onStartup = false, speedTest = !onStartup || startupSpeedTestToggle?.checked !== false) {
   if (protonOptimizationInFlight || protonRouteDiscoveryInFlight || protonManualSelectionInFlight || !isProtonAuthenticated) return;
   startProtonOptimizeAnimation();
 
@@ -2473,6 +2477,15 @@ autoFailoverToggle?.addEventListener('change', async () => {
     await window.api.setProtonSettings({ autoFailover: autoFailoverToggle.checked });
   } catch {
     autoFailoverToggle.checked = !autoFailoverToggle.checked;
+  }
+});
+
+startupSpeedTestToggle?.addEventListener('change', async () => {
+  if (!startupSpeedTestToggle) return;
+  try {
+    await window.api.setProtonSettings({ startupSpeedTest: startupSpeedTestToggle.checked });
+  } catch {
+    startupSpeedTestToggle.checked = !startupSpeedTestToggle.checked;
   }
 });
 

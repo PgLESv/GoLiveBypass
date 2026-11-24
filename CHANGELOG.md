@@ -4,6 +4,11 @@ Todas as mudanças notáveis deste projeto são documentadas aqui. O formato seg
 [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e o versionamento
 segue [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [Unreleased]
+
+### Adicionado (Fork PgLESv)
+- **Configurações → "Teste de velocidade ao abrir"** (ligado por padrão). Desligado, a abertura do app e a restauração automática do Windows escolhem a rota Proton só pelo ping, no país da última rota usada, sem o teste de download/upload. País escolhido manualmente continua valendo; a otimização manual ("Otimizar rota") continua medindo velocidade. Se o último país não tiver mais rota utilizável, refaz a verificação completa (todos os países, com teste de velocidade).
+
 ## [2.1.13] - 2026-11-05
 
 ### Sincronização Upstream (GoLiveBypass 2.0.16 Estável)

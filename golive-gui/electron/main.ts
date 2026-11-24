@@ -2725,6 +2725,12 @@ async function ensureProtonActivationProfile() {
 // medicao roda aqui, antes de activateBypass(), e grava o perfil somente depois
 // de o confgen entregar uma configuracao valida. Se falhar, o arquivo anterior
 // continua no lugar e a ativacao abaixo faz o fallback normal.
+// Sem o teste de velocidade da abertura, a seleção rápida (só ping) fica no país da última rota.
+function lastProtonCountry(settings: any): string {
+  const country = String(settings.protonLastServer?.country ?? "").trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(country) ? country : "";
+}
+
 async function optimizeProtonRouteAtStartup(
   signal?: AbortSignal,
 ): Promise<StartupOptimizationResult & { server?: string; skipped?: boolean }> {
@@ -2755,19 +2761,22 @@ async function optimizeProtonRouteAtStartup(
   }
 
   const country = (settings.protonCountry as string) || "";
+  let speedTest = settings.protonStartupSpeedTest !== false;
+  const lastCountry = country || speedTest ? "" : lastProtonCountry(settings);
+  const routeCountry = country || lastCountry;
   const plan = await resolveProtonPlan(username);
   const freeOnly = plan.status !== "premium";
   const autoPing = settings.protonAutoPing !== false;
+  logger.info("proton", "otimizacao de boot", { teste_velocidade: speedTest, pais: routeCountry || "AUTO" });
   let generated: Awaited<ReturnType<typeof proton.generateOptimalProtonConfig>>;
-  try {
-    generated = await withWireSockLifecycle("otimizacao-boot", () =>
+  const generate = (countries: string, fullTest: boolean) => withWireSockLifecycle("otimizacao-boot", () =>
       proton.generateOptimalProtonConfig(settingsDir(), {
         username,
-        countries: country || undefined,
+        countries: countries || undefined,
         freeOnly,
         autoPing,
         avoidFreeMexico: settings.protonAvoidFreeMexico !== false,
-        speedTest: true,
+        speedTest: fullTest,
         signal,
         onProgress: (progress) => {
           logger.info("proton", "otimizacao.boot.progresso", {
@@ -2780,6 +2789,14 @@ async function optimizeProtonRouteAtStartup(
         },
       }),
     );
+  try {
+    generated = await generate(routeCountry, speedTest);
+    // Último país sem servidor utilizável: refaz a verificação completa em todos os países.
+    if (!generated.success && lastCountry && !signal?.aborted && !quitting) {
+      logger.warn("proton", "ultimo pais sem rota; verificando novamente", { pais: lastCountry, erro: generated.error || "" });
+      speedTest = true;
+      generated = await generate("", true);
+    }
   } catch (error) {
     return {
       success: false,
@@ -2797,8 +2814,8 @@ async function optimizeProtonRouteAtStartup(
   const saved = {
     ...generated,
     measurementUsername: username.trim().toLowerCase(),
-    measurementVersion: proton.MEASUREMENT_CRITERION_VERSION,
-    measuredAt: new Date().toISOString(),
+    // Seleção só por ping não é medição: não pode ser reaproveitada como perfil medido.
+    ...(speedTest ? { measurementVersion: proton.MEASUREMENT_CRITERION_VERSION, measuredAt: new Date().toISOString() } : {}),
     measurementCountry: country,
     measurementFreeOnly: freeOnly,
     measurementAutoPing: autoPing,
@@ -4260,6 +4277,7 @@ ipcMain.handle("get-proton-settings", async () => {
     autoPing: s.protonAutoPing !== false,
     autoFailover: s.protonAutoFailover !== false,
     avoidFreeMexico: s.protonAvoidFreeMexico !== false,
+    startupSpeedTest: s.protonStartupSpeedTest !== false,
     routePreference: s.protonRoutePreference === "manual"
       ? "manual"
       : s.protonRoutePreference === "auto" ? "auto" : s.protonLastServer?.manual === true ? "manual" : "auto",
@@ -4304,6 +4322,7 @@ ipcMain.handle("set-proton-settings", async (_event, settings: any) => {
     if (typeof settings?.autoPing === "boolean") patch.protonAutoPing = settings.autoPing;
     if (typeof settings?.autoFailover === "boolean") patch.protonAutoFailover = settings.autoFailover;
     if (typeof settings?.avoidFreeMexico === "boolean") patch.protonAvoidFreeMexico = settings.avoidFreeMexico;
+    if (typeof settings?.startupSpeedTest === "boolean") patch.protonStartupSpeedTest = settings.startupSpeedTest;
     if (settings?.routePreference === "auto" || settings?.routePreference === "manual") {
       patch.protonRoutePreference = settings.routePreference;
       // Quem escolheu (aqui ou em Configuracoes) nao precisa mais da pergunta inicial.
@@ -4735,7 +4754,7 @@ ipcMain.handle("optimize-proton-route", async (event, options?: ProtonOptimizati
       // inativo. O reaproveitamento continua disponível apenas para fluxos que
       // o solicitam explicitamente (por exemplo, "continuar sem medir").
       const previous = s.protonLastServer;
-      const speedTest = options?.speedTest !== false;
+      let speedTest = options?.speedTest !== false;
       const refreshOnStartup = options?.refreshOnStartup === true;
       if (!refreshOnStartup && options?.reuseMeasured && proton.canReuseMeasuredProfile(settingsDir(), previous, { username, country, freeOnly, autoPing, avoidFreeMexico })) {
         return { ...previous, success: true };
@@ -4797,17 +4816,25 @@ ipcMain.handle("optimize-proton-route", async (event, options?: ProtonOptimizati
 
       if (signal.aborted) return { success: false, cancelled: true };
       let gen: Awaited<ReturnType<typeof proton.generateOptimalProtonConfig>>;
+      const lastCountry = !country && refreshOnStartup && !speedTest ? lastProtonCountry(s) : "";
+      const generate = (countries: string, fullTest: boolean) => proton.generateOptimalProtonConfig(settingsDir(), {
+        username,
+        countries: countries || undefined,
+        freeOnly,
+        autoPing,
+        avoidFreeMexico,
+        speedTest: fullTest,
+        signal,
+        onProgress: sendProgress,
+      });
       try {
-        gen = await proton.generateOptimalProtonConfig(settingsDir(), {
-          username,
-          countries: country || undefined,
-          freeOnly,
-          autoPing,
-          avoidFreeMexico,
-          speedTest,
-          signal,
-          onProgress: sendProgress,
-        });
+        gen = await generate(country || lastCountry, speedTest);
+        // Último país sem servidor utilizável: refaz a verificação completa em todos os países.
+        if (!gen.success && lastCountry && !signal.aborted) {
+          logger.warn("proton", "ultimo pais sem rota; verificando novamente", { pais: lastCountry, erro: gen.error || "" });
+          speedTest = true;
+          gen = await generate("", true);
+        }
       } catch (error) {
         gen = { success: false, error: String((error as Error)?.message ?? error) };
       }
